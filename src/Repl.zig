@@ -94,7 +94,7 @@ fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
         result.zir,
         stdout,
     ) catch |err| switch (err) {
-        error.UnsupportedZirInst => return, // diagnostic already written
+        error.AnalysisFail => return, // diagnostic already written
         else => |e| return e,
     }) |value| {
         try renderValue(value, &repl.session.intern_pool, stdout);

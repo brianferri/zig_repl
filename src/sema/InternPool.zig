@@ -408,29 +408,86 @@ fn wellKnownIntType(signedness: std.builtin.Signedness, bits: u16) ?Index {
 
 /// Intern an integer value of the given type. `value`'s limbs are copied
 /// into the pool's arena, so the caller may free its own buffer afterwards.
+///
+/// Aliasing-safe: if `value.limbs` is a borrowed view into this pool's own
+/// `big_int_limbs` (for example a caller forwarding a previously-interned
+/// value through a sign flip), the buffer is copied through a gpa temp
+/// first. Without that guard, `appendSlice`'s ensure-capacity step could
+/// reallocate `big_int_limbs` and leave `value.limbs.ptr` dangling before
+/// the memcpy ran — the classic ArrayList aliasing footgun.
 pub fn internIntValue(
     pool: *InternPool,
     ty: Index,
     value: BigIntConst,
 ) Allocator.Error!Index {
+    assert(@intFromPtr(pool) != 0);
     assert(ty != .none);
     assert(value.limbs.len > 0);
+    assert(value.limbs.len <= std.math.maxInt(u32));
 
-    const limbs_index: u32 = @intCast(pool.big_int_limbs.items.len);
-    try pool.big_int_limbs.appendSlice(pool.gpa, value.limbs);
+    const items_before = pool.items.len;
 
-    const extra_index: u32 = @intCast(pool.extra.items.len);
+    const result = if (limbsAliasPool(pool, value.limbs)) blk: {
+        const copy = try pool.gpa.dupe(std.math.big.Limb, value.limbs);
+        defer pool.gpa.free(copy);
+        break :blk try appendIntValueAssumingSafe(pool, ty, copy, value.positive);
+    } else try appendIntValueAssumingSafe(pool, ty, value.limbs, value.positive);
+
+    assert(result != .none);
+    assert(pool.items.len == items_before + 1);
+    assert(@intFromEnum(result) == items_before);
+    return result;
+}
+
+fn limbsAliasPool(pool: *const InternPool, limbs: []const std.math.big.Limb) bool {
+    assert(@intFromPtr(pool) != 0);
+    if (limbs.len == 0) return false;
+
+    const buffer = pool.big_int_limbs.allocatedSlice();
+    if (buffer.len == 0) return false;
+
+    const buf_start = @intFromPtr(buffer.ptr);
+    const buf_end = buf_start + buffer.len * @sizeOf(std.math.big.Limb);
+    assert(buf_end >= buf_start); // no wraparound
+
+    const slice_start = @intFromPtr(limbs.ptr);
+    return slice_start >= buf_start and slice_start < buf_end;
+}
+
+fn appendIntValueAssumingSafe(
+    pool: *InternPool,
+    ty: Index,
+    limbs: []const std.math.big.Limb,
+    positive: bool,
+) Allocator.Error!Index {
+    assert(@intFromPtr(pool) != 0);
+    assert(ty != .none);
+    assert(limbs.len > 0);
+    assert(!limbsAliasPool(pool, limbs)); // caller is responsible for dupe
+
+    const limbs_before = pool.big_int_limbs.items.len;
+    const extra_before = pool.extra.items.len;
+    const items_before = pool.items.len;
+
+    const limbs_index: u32 = @intCast(limbs_before);
+    try pool.big_int_limbs.appendSlice(pool.gpa, limbs);
+
+    const extra_index: u32 = @intCast(extra_before);
     try pool.extra.appendSlice(pool.gpa, &.{
         @intFromEnum(ty),
-        @intFromBool(value.positive),
+        @intFromBool(positive),
         limbs_index,
-        @intCast(value.limbs.len),
+        @intCast(limbs.len),
     });
 
     try pool.items.append(pool.gpa, .{
         .tag = .int_value,
         .data = extra_index,
     });
+
+    assert(pool.big_int_limbs.items.len == limbs_before + limbs.len);
+    assert(pool.extra.items.len == extra_before + 4);
+    assert(pool.items.len == items_before + 1);
     return @enumFromInt(@as(u32, @intCast(pool.items.len - 1)));
 }
 
@@ -502,6 +559,30 @@ test "arbitrary-width int types intern dynamically" {
     const u65535_idx = try pool.internIntType(.unsigned, std.math.maxInt(u16));
     const @"u65535" = pool.get(u65535_idx).int_type;
     try std.testing.expectEqual(@as(u16, std.math.maxInt(u16)), @"u65535".bits);
+}
+
+test "internIntValue is aliasing-safe under buffer growth" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    var src = [_]std.math.big.Limb{42};
+    const a_idx = try pool.internComptimeInt(.{ .limbs = &src, .positive = true });
+
+    // Force big_int_limbs to exactly its capacity so the next append must
+    // reallocate. Without the aliasing guard in internIntValue, the
+    // subsequent reintern would memcpy from a stale source pointer.
+    while (pool.big_int_limbs.items.len < pool.big_int_limbs.capacity) {
+        try pool.big_int_limbs.append(pool.gpa, 0);
+    }
+
+    const a_view = pool.get(a_idx).int_value.value;
+    const aliased: BigIntConst = .{ .limbs = a_view.limbs, .positive = false };
+
+    const b_idx = try pool.internComptimeInt(aliased);
+    const b = pool.get(b_idx).int_value;
+    try std.testing.expectEqual(@as(usize, 1), b.value.limbs.len);
+    try std.testing.expectEqual(@as(std.math.big.Limb, 42), b.value.limbs[0]);
+    try std.testing.expectEqual(false, b.value.positive);
 }
 
 test "comptime int round-trip" {

@@ -23,7 +23,7 @@ const arith = @import("arith.zig");
 const Sema = @This();
 
 pub const Error = Allocator.Error || std.Io.Writer.Error || error{
-    UnsupportedZirInst,
+    AnalysisFail,
 };
 
 /// The REPL's `front/InputShape` wraps every expression line as
@@ -99,7 +99,7 @@ fn evalBody(sema: *Sema, body: []const Zir.Inst.Index) Error!Value {
         }
     }
     try sema.writer.writeAll("internal error: body did not terminate with break\n");
-    return error.UnsupportedZirInst;
+    return error.AnalysisFail;
 }
 
 fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
@@ -108,6 +108,11 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .add => sema.evalBinaryArith(inst, .add),
         .sub => sema.evalBinaryArith(inst, .sub),
         .mul => sema.evalBinaryArith(inst, .mul),
+        .div_exact => sema.evalBinaryArith(inst, .div_exact),
+        .div_floor => sema.evalBinaryArith(inst, .div_floor),
+        .div_trunc => sema.evalBinaryArith(inst, .div_trunc),
+        .mod => sema.evalBinaryArith(inst, .mod),
+        .rem => sema.evalBinaryArith(inst, .rem),
         .negate => sema.evalNegate(inst),
         .dbg_stmt => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
@@ -135,59 +140,112 @@ fn evalPassthroughUnNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return try sema.resolveRef(operand);
 }
 
-/// Integer add/sub/mul share the same operand shape (`pl_node` + `Bin`) and
-/// the same comptime_int-only first cut. Each routes to the matching kernel
-/// in `arith.zig`; fixed-width and float dispatch land with their coercion
-/// handlers.
+/// Integer add/sub/mul/div_*/mod/rem share the same operand shape
+/// (`pl_node` + `Bin`) and the same comptime_int-only first cut. Each
+/// routes to the matching kernel in `arith.zig`; fixed-width and float
+/// dispatch land with their coercion handlers. Division kernels can fail
+/// with `DivisionByZero` or `DivisionNotExact`; those become an
+/// `AnalysisFail` after writing a runtime-style diagnostic.
 ///
 /// Compiler reference: src/Sema.zig:zirArithmetic ->
-/// src/Sema/arith.zig:{add,sub,mul} -> {add,sub,mul}Scalar -> int{Add,Sub,Mul}.
-const BinaryArithOp = enum { add, sub, mul };
+/// src/Sema/arith.zig:{add,sub,mul,divTrunc,divFloor,mod,rem,negate}.
+const BinaryArithOp = enum { add, sub, mul, div_exact, div_floor, div_trunc, mod, rem };
 
 fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, op: BinaryArithOp) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    assert(bin.lhs != .none);
+    assert(bin.rhs != .none);
 
     const op_name: []const u8 = @tagName(op);
+    assert(op_name.len > 0);
     const lhs = try sema.resolveComptimeInt(bin.lhs, op_name);
     const rhs = try sema.resolveComptimeInt(bin.rhs, op_name);
 
+    const ip = sema.intern_pool;
+    const gpa = sema.gpa;
     const idx = switch (op) {
-        .add => try arith.internAdd(sema.gpa, sema.intern_pool, lhs, rhs),
-        .sub => try arith.internSub(sema.gpa, sema.intern_pool, lhs, rhs),
-        .mul => try arith.internMul(sema.gpa, sema.intern_pool, lhs, rhs),
+        .add => try arith.internAdd(gpa, ip, lhs, rhs),
+        .sub => try arith.internSub(gpa, ip, lhs, rhs),
+        .mul => try arith.internMul(gpa, ip, lhs, rhs),
+        .div_exact => try sema.unwrapDivResult(arith.internDivExact(gpa, ip, lhs, rhs), "@divExact"),
+        .div_floor => try sema.unwrapDivResult(arith.internDivFloor(gpa, ip, lhs, rhs), "@divFloor"),
+        .div_trunc => try sema.unwrapDivResult(arith.internDivTrunc(gpa, ip, lhs, rhs), "@divTrunc"),
+        .mod => try sema.unwrapDivResult(arith.internMod(gpa, ip, lhs, rhs), "@mod"),
+        .rem => try sema.unwrapDivResult(arith.internRem(gpa, ip, lhs, rhs), "@rem"),
     };
     return .{ .index = idx };
+}
+
+/// Translate an arith.DivError into either a successful Index or a written
+/// runtime-style diagnostic + AnalysisFail.
+fn unwrapDivResult(
+    sema: *Sema,
+    result: arith.DivError!InternPool.Index,
+    op_name: []const u8,
+) Error!InternPool.Index {
+    assert(@intFromPtr(sema) != 0);
+    assert(op_name.len > 0);
+
+    const idx = result catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DivisionByZero => {
+            try sema.writer.print("error: {s}: division by zero\n", .{op_name});
+            return error.AnalysisFail;
+        },
+        error.DivisionNotExact => {
+            try sema.writer.print("error: {s}: remainder is non-zero\n", .{op_name});
+            return error.AnalysisFail;
+        },
+    };
+    assert(idx != .none);
+    return idx;
 }
 
 /// Compiler reference: src/Sema.zig:zirNegate -> src/Sema/arith.zig:negate.
 /// AstGen lowers `-x` as `negate(x)`; constant-folded literals like `-1`
 /// instead come through as `Ref.negative_one` and never reach here.
 fn evalNegate(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
+
     const operand = try sema.resolveComptimeInt(un_node.operand, "negate");
     const idx = try arith.internNegate(sema.gpa, sema.intern_pool, operand);
+    assert(idx != .none);
     return .{ .index = idx };
 }
 
 /// Resolve a Ref and require it to be a `comptime_int` value. Reports the
-/// op-specific diagnostic and returns `error.UnsupportedZirInst` for any
+/// op-specific diagnostic and returns `error.AnalysisFail` for any
 /// non-integer or fixed-width-int operand until those land.
 fn resolveComptimeInt(
     sema: *Sema,
     ref: Zir.Inst.Ref,
     op_name: []const u8,
 ) Error!std.math.big.int.Const {
+    assert(@intFromPtr(sema) != 0);
+    assert(ref != .none);
+    assert(op_name.len > 0);
+
     const value = try sema.resolveRef(ref);
+    assert(value.index != .none);
+
     const key = sema.intern_pool.get(value.index);
     if (key != .int_value) {
         try sema.writer.print("{s}: non-integer operand not yet supported\n", .{op_name});
-        return error.UnsupportedZirInst;
+        return error.AnalysisFail;
     }
     if (key.int_value.ty != .comptime_int_type) {
         try sema.writer.print("{s}: fixed-width int arithmetic not yet supported\n", .{op_name});
-        return error.UnsupportedZirInst;
+        return error.AnalysisFail;
     }
+    assert(key.int_value.value.limbs.len > 0);
     return key.int_value.value;
 }
 
@@ -200,12 +258,12 @@ fn resolveRef(sema: *Sema, ref: Zir.Inst.Ref) Error!Value {
             "internal error: unresolved instruction ref %{d}\n",
             .{@intFromEnum(inst_idx)},
         );
-        return error.UnsupportedZirInst;
+        return error.AnalysisFail;
     }
 
     return wellKnownRefToValue(ref) orelse {
         try sema.writer.print("unsupported ZIR ref: {s}\n", .{@tagName(ref)});
-        return error.UnsupportedZirInst;
+        return error.AnalysisFail;
     };
 }
 
@@ -230,5 +288,5 @@ fn wellKnownRefToValue(ref: Zir.Inst.Ref) ?Value {
 
 fn reportUnsupportedTag(sema: *Sema, comptime tag: Zir.Inst.Tag) Error!?Value {
     try sema.writer.print("unsupported ZIR instruction: {s}\n", .{@tagName(tag)});
-    return error.UnsupportedZirInst;
+    return error.AnalysisFail;
 }
