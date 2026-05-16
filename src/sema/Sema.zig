@@ -104,6 +104,7 @@ fn evalBody(sema: *Sema, body: []const Zir.Inst.Index) Error!Value {
 fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     return switch (tag) {
         .int => sema.evalInt(inst),
+        .add => sema.evalAdd(inst),
         .dbg_stmt => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
         inline else => |unhandled| sema.reportUnsupportedTag(unhandled),
@@ -128,6 +129,52 @@ fn evalInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 fn evalPassthroughUnNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node.operand;
     return try sema.resolveRef(operand);
+}
+
+/// Initial integer-only cut: dispatches comptime_int + comptime_int through
+/// `std.math.big.int.Mutable.add`. Mixed widths, fixed-width ints (asserting
+/// no overflow), floats, and vectors are unsupported and land alongside
+/// their respective coercion handlers.
+///
+/// Compiler reference: src/Sema.zig:zirArithmetic ->
+/// src/Sema/arith.zig:add -> addScalar -> intAdd.
+fn evalAdd(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+
+    const lhs_val = try sema.resolveRef(bin.lhs);
+    const rhs_val = try sema.resolveRef(bin.rhs);
+    const lhs_key = sema.intern_pool.get(lhs_val.index);
+    const rhs_key = sema.intern_pool.get(rhs_val.index);
+
+    if (lhs_key != .int_value or rhs_key != .int_value) {
+        try sema.writer.writeAll("add: non-integer operands not yet supported\n");
+        return error.UnsupportedZirInst;
+    }
+    if (lhs_key.int_value.ty != .comptime_int_type or
+        rhs_key.int_value.ty != .comptime_int_type)
+    {
+        try sema.writer.writeAll("add: fixed-width int arithmetic not yet supported\n");
+        return error.UnsupportedZirInst;
+    }
+
+    const lhs_big = lhs_key.int_value.value;
+    const rhs_big = rhs_key.int_value.value;
+
+    // Workspace is freed via defer on the original allocation; `mutable.toConst()`
+    // returns a sub-slice view that would mis-free if used as the alloc handle.
+    const workspace = try sema.gpa.alloc(Limb, @max(lhs_big.limbs.len, rhs_big.limbs.len) + 1);
+    defer sema.gpa.free(workspace);
+
+    var mutable: std.math.big.int.Mutable = .{
+        .limbs = workspace,
+        .len = undefined,
+        .positive = undefined,
+    };
+    mutable.add(lhs_big, rhs_big);
+
+    const idx = try sema.intern_pool.internComptimeInt(mutable.toConst());
+    return .{ .index = idx };
 }
 
 fn resolveRef(sema: *Sema, ref: Zir.Inst.Ref) Error!Value {
