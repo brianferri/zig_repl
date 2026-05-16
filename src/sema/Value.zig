@@ -26,9 +26,10 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
     return switch (key) {
         .simple_value => |sv| switch (sv) {
             .void => .void_type,
-            .bool_true, .bool_false => .bool_type,
+            .true, .false => .bool_type,
             .null => .{ .index = .null_type },
             .undefined => .{ .index = .undefined_type },
+            .@"unreachable" => .{ .index = .noreturn_type },
         },
         .int_value => |iv| .{ .index = iv.ty },
         .type_value => .type_type,

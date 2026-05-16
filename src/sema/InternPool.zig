@@ -1,10 +1,14 @@
-//! Runtime-only port of the compiler's `src/InternPool.zig`. Strips the
+//! Runtime-only port of the compiler's `src/InternPool.zig`. Drops
 //! incremental-compilation machinery (`*_deps`, `TrackedInst`, `AnalUnit`,
-//! thread sharding, `memoized_call`) and keeps the part that matters for a
-//! REPL: canonical, deduplicated storage of types and values.
+//! thread sharding, `memoized_call`) and keeps the canonical-storage core.
 //!
-//! Reference (compiler tip): codeberg.org/ziglang/zig/src/InternPool.zig.
-//! Every Index returned from `intern` is stable for the lifetime of the pool.
+//! Reference: /home/brianferri/Desktop/Main/Projects/zig/src/InternPool.zig.
+//! The well-known `Index` set, `SimpleType`/`SimpleValue` shape, and
+//! `Item.Tag` naming mirror the compiler so the port reads against it
+//! directly. Compiler-internal markers (`adhoc_inferred_error_set`,
+//! `generic_poison`) plus the convenience pointer/slice/vector well-knowns
+//! are deliberately deferred — they need Key variants (`ptr_type`,
+//! `vector_type`, etc.) that land alongside their handlers.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -13,74 +17,160 @@ const BigIntConst = std.math.big.int.Const;
 
 const InternPool = @This();
 
-/// Stable handle into the pool. `none` is reserved as a null sentinel.
+/// Stable handle into the pool. The first `first_dynamic_index` slots are
+/// reserved for well-known entries populated by `init`; later slots come
+/// from dynamic interning. `none` is the null sentinel.
+///
+/// Ordering mirrors the compiler's enum so `SimpleType`/`SimpleValue` can
+/// pin variant values to the corresponding Index via `@intFromEnum`.
 pub const Index = enum(u32) {
-    /// Reserved sentinels, statically populated by `init`. Must stay in sync
-    /// with `well_known` below.
-    none = std.math.maxInt(u32),
-    void_type = 0,
-    bool_type = 1,
-    type_type = 2,
-    noreturn_type = 3,
-    anyopaque_type = 4,
-    comptime_int_type = 5,
-    comptime_float_type = 6,
-    undefined_type = 7,
-    null_type = 8,
-    u8_type = 9,
-    u16_type = 10,
-    u32_type = 11,
-    u64_type = 12,
-    i8_type = 13,
-    i16_type = 14,
-    i32_type = 15,
-    i64_type = 16,
-    void_value = 17,
-    bool_true = 18,
-    bool_false = 19,
-    null_value = 20,
-    undefined_value = 21,
-    _,
-};
+    // --- Types: fixed-width integers (Key.int_type) ---
+    u0_type,
+    u1_type,
+    u8_type,
+    i8_type,
+    u16_type,
+    i16_type,
+    u29_type,
+    u32_type,
+    i32_type,
+    u64_type,
+    i64_type,
+    u80_type,
+    u128_type,
+    i128_type,
+    u256_type,
 
-const first_dynamic_index: u32 = 22;
+    // --- Types: target-dependent / nominal primitives (Key.simple_type) ---
+    usize_type,
+    isize_type,
+    c_char_type,
+    c_short_type,
+    c_ushort_type,
+    c_int_type,
+    c_uint_type,
+    c_long_type,
+    c_ulong_type,
+    c_longlong_type,
+    c_ulonglong_type,
+    c_longdouble_type,
 
-// `usize`/`isize` are intentionally absent from the well-known set: they are
-// nominally distinct from u64/i64 even when bit widths match (the compiler
-// uses dedicated indices that route through a different mechanism). They will
-// land alongside the first handler that actually needs them, either as
-// simple_type variants or a dedicated ptr_sized_int_type Key.
+    // --- Types: floats (Key.simple_type) ---
+    f16_type,
+    f32_type,
+    f64_type,
+    f80_type,
+    f128_type,
 
-pub const SimpleType = enum {
-    void,
-    bool,
-    type,
-    noreturn,
-    anyopaque,
-    comptime_int,
-    comptime_float,
-    undefined,
-    null,
-};
+    // --- Types: language primitives (Key.simple_type) ---
+    anyopaque_type,
+    bool_type,
+    void_type,
+    type_type,
+    anyerror_type,
+    comptime_int_type,
+    comptime_float_type,
+    noreturn_type,
+    null_type,
+    undefined_type,
+    enum_literal_type,
 
-pub const SimpleValue = enum {
-    void,
+    // --- Values ---
+    /// `undefined` (untyped)
+    undef,
+    /// `0` (comptime_int)
+    zero,
+    /// `1` (comptime_int)
+    one,
+    /// `-1` (comptime_int)
+    negative_one,
+    /// `{}`
+    void_value,
+    /// `unreachable` (noreturn)
+    unreachable_value,
+    /// `null` (untyped)
+    null_value,
+    /// `true`
     bool_true,
+    /// `false`
     bool_false,
-    null,
-    undefined,
+
+    /// Used by Air/Sema only.
+    none = std.math.maxInt(u32),
+
+    _,
+
+    /// Range bounds for well-known types. Anything strictly between these
+    /// (inclusive) is a type whose Key shape can be looked up via `get`
+    /// without further checks. Dynamic indices fall outside this range.
+    pub const first_type: Index = .u0_type;
+    pub const last_type: Index = .enum_literal_type;
+    pub const first_value: Index = .undef;
+    pub const last_value: Index = .bool_false;
+
+    pub fn isWellKnownType(index: Index) bool {
+        const raw = @intFromEnum(index);
+        return raw >= @intFromEnum(first_type) and raw <= @intFromEnum(last_type);
+    }
+
+    pub fn isWellKnownValue(index: Index) bool {
+        const raw = @intFromEnum(index);
+        return raw >= @intFromEnum(first_value) and raw <= @intFromEnum(last_value);
+    }
+};
+
+const first_dynamic_index: u32 = @intFromEnum(Index.bool_false) + 1;
+
+/// Mirrors compiler `InternPool.SimpleType`. Each variant's integer value is
+/// the corresponding `Index`, so converting between the two is identity.
+pub const SimpleType = enum(u32) {
+    usize = @intFromEnum(Index.usize_type),
+    isize = @intFromEnum(Index.isize_type),
+    c_char = @intFromEnum(Index.c_char_type),
+    c_short = @intFromEnum(Index.c_short_type),
+    c_ushort = @intFromEnum(Index.c_ushort_type),
+    c_int = @intFromEnum(Index.c_int_type),
+    c_uint = @intFromEnum(Index.c_uint_type),
+    c_long = @intFromEnum(Index.c_long_type),
+    c_ulong = @intFromEnum(Index.c_ulong_type),
+    c_longlong = @intFromEnum(Index.c_longlong_type),
+    c_ulonglong = @intFromEnum(Index.c_ulonglong_type),
+    c_longdouble = @intFromEnum(Index.c_longdouble_type),
+    f16 = @intFromEnum(Index.f16_type),
+    f32 = @intFromEnum(Index.f32_type),
+    f64 = @intFromEnum(Index.f64_type),
+    f80 = @intFromEnum(Index.f80_type),
+    f128 = @intFromEnum(Index.f128_type),
+    anyopaque = @intFromEnum(Index.anyopaque_type),
+    bool = @intFromEnum(Index.bool_type),
+    void = @intFromEnum(Index.void_type),
+    type = @intFromEnum(Index.type_type),
+    anyerror = @intFromEnum(Index.anyerror_type),
+    comptime_int = @intFromEnum(Index.comptime_int_type),
+    comptime_float = @intFromEnum(Index.comptime_float_type),
+    noreturn = @intFromEnum(Index.noreturn_type),
+    null = @intFromEnum(Index.null_type),
+    undefined = @intFromEnum(Index.undefined_type),
+    enum_literal = @intFromEnum(Index.enum_literal_type),
+};
+
+/// Mirrors compiler `InternPool.SimpleValue`. Same identity trick as `SimpleType`.
+pub const SimpleValue = enum(u32) {
+    void = @intFromEnum(Index.void_value),
+    null = @intFromEnum(Index.null_value),
+    true = @intFromEnum(Index.bool_true),
+    false = @intFromEnum(Index.bool_false),
+    @"unreachable" = @intFromEnum(Index.unreachable_value),
 };
 
 pub const Key = union(enum) {
     simple_type: SimpleType,
     simple_value: SimpleValue,
-    /// Concrete fixed-width integer type. Reuses `std.builtin.Type.Int` so the
-    /// shape stays identical to what `@typeInfo(T).int` reports for any
-    /// non-pointer-sized integer.
+    /// Concrete fixed-width integer type. Shape matches `@typeInfo(T).int`.
     int_type: std.builtin.Type.Int,
     /// An integer value tagged with its type. The `value` field is a plain
-    /// `std.math.big.int.Const`; its limbs slice is borrowed from the pool's
-    /// arena and is valid for the lifetime of the pool.
+    /// `std.math.big.int.Const` whose limbs are borrowed from the pool's
+    /// arena and valid for the pool's lifetime.
     int_value: Int,
     /// A value whose runtime type is `type` and whose payload is the
     /// interned type itself.
@@ -92,26 +182,24 @@ pub const Key = union(enum) {
     };
 };
 
-/// Tagged storage. `data` interpretation depends on `tag` per the
-/// switch in `get`. Most variants fit in this 8 bytes; larger payloads
-/// (currently just int_value) spill into `extra`.
+/// Tagged storage. `data` interpretation depends on `tag`. Naming mirrors
+/// the compiler's `Item.Tag` to keep ports legible.
 const Item = struct {
     tag: Tag,
     data: u32,
 
     const Tag = enum(u8) {
-        simple_type, // data = SimpleType ordinal
-        simple_value, // data = SimpleValue ordinal
-        int_type_unsigned, // data = bits
-        int_type_signed, // data = bits
+        simple_type, // data = SimpleType ordinal == Index of the corresponding type
+        simple_value, // data = SimpleValue ordinal == Index of the corresponding value
+        type_int_unsigned, // data = bits
+        type_int_signed, // data = bits
         int_value, // data = extra index of IntValueRepr
         type_value, // data = Index of the interned type
     };
 };
 
-/// Internal storage encoding for `Key.int_value`. Lives in `extra` because it
-/// is larger than a u32 slot. Never escapes the pool — consumers see only the
-/// decoded `Key.Int` with a plain `BigIntConst`.
+/// Internal storage encoding for `Key.int_value`. Lives in `extra` because
+/// it is larger than a u32 slot. Never escapes the pool.
 const IntValueRepr = extern struct {
     ty: u32,
     positive: u32, // 0 or 1
@@ -123,8 +211,6 @@ gpa: Allocator,
 items: std.MultiArrayList(Item),
 extra: std.ArrayListUnmanaged(u32),
 big_int_limbs: std.ArrayListUnmanaged(std.math.big.Limb),
-/// Key → Index dedup map. Hash + equality go through `KeyAdapter`.
-map: std.AutoArrayHashMapUnmanaged(void, void),
 
 pub fn init(gpa: Allocator) Allocator.Error!InternPool {
     var pool: InternPool = .{
@@ -132,7 +218,6 @@ pub fn init(gpa: Allocator) Allocator.Error!InternPool {
         .items = .{},
         .extra = .empty,
         .big_int_limbs = .empty,
-        .map = .empty,
     };
     errdefer pool.deinit();
 
@@ -146,39 +231,84 @@ pub fn deinit(pool: *InternPool) void {
     pool.items.deinit(pool.gpa);
     pool.extra.deinit(pool.gpa);
     pool.big_int_limbs.deinit(pool.gpa);
-    pool.map.deinit(pool.gpa);
     pool.* = undefined;
 }
 
 fn populateWellKnown(pool: *InternPool) Allocator.Error!void {
     assert(pool.items.len == 0);
 
-    inline for (.{
-        .{ Item.Tag.simple_type, @intFromEnum(SimpleType.void) },
-        .{ Item.Tag.simple_type, @intFromEnum(SimpleType.bool) },
-        .{ Item.Tag.simple_type, @intFromEnum(SimpleType.type) },
-        .{ Item.Tag.simple_type, @intFromEnum(SimpleType.noreturn) },
-        .{ Item.Tag.simple_type, @intFromEnum(SimpleType.anyopaque) },
-        .{ Item.Tag.simple_type, @intFromEnum(SimpleType.comptime_int) },
-        .{ Item.Tag.simple_type, @intFromEnum(SimpleType.comptime_float) },
-        .{ Item.Tag.simple_type, @intFromEnum(SimpleType.undefined) },
-        .{ Item.Tag.simple_type, @intFromEnum(SimpleType.null) },
-        .{ Item.Tag.int_type_unsigned, 8 },
-        .{ Item.Tag.int_type_unsigned, 16 },
-        .{ Item.Tag.int_type_unsigned, 32 },
-        .{ Item.Tag.int_type_unsigned, 64 },
-        .{ Item.Tag.int_type_signed, 8 },
-        .{ Item.Tag.int_type_signed, 16 },
-        .{ Item.Tag.int_type_signed, 32 },
-        .{ Item.Tag.int_type_signed, 64 },
-        .{ Item.Tag.simple_value, @intFromEnum(SimpleValue.void) },
-        .{ Item.Tag.simple_value, @intFromEnum(SimpleValue.bool_true) },
-        .{ Item.Tag.simple_value, @intFromEnum(SimpleValue.bool_false) },
-        .{ Item.Tag.simple_value, @intFromEnum(SimpleValue.null) },
-        .{ Item.Tag.simple_value, @intFromEnum(SimpleValue.undefined) },
-    }) |entry| {
-        pool.items.appendAssumeCapacity(.{ .tag = entry.@"0", .data = entry.@"1" });
+    // Order MUST match the Index enum exactly.
+    appendIntType(pool, .unsigned, 0);
+    appendIntType(pool, .unsigned, 1);
+    appendIntType(pool, .unsigned, 8);
+    appendIntType(pool, .signed, 8);
+    appendIntType(pool, .unsigned, 16);
+    appendIntType(pool, .signed, 16);
+    appendIntType(pool, .unsigned, 29);
+    appendIntType(pool, .unsigned, 32);
+    appendIntType(pool, .signed, 32);
+    appendIntType(pool, .unsigned, 64);
+    appendIntType(pool, .signed, 64);
+    appendIntType(pool, .unsigned, 80);
+    appendIntType(pool, .unsigned, 128);
+    appendIntType(pool, .signed, 128);
+    appendIntType(pool, .unsigned, 256);
+
+    inline for (@typeInfo(SimpleType).@"enum".fields) |field| {
+        appendSimpleType(pool, @field(SimpleType, field.name));
     }
+
+    // Untyped `undefined` is encoded as `type_value(.undefined_type)`. The
+    // typed undef family (undef_bool, undef_usize, ...) lands when handlers
+    // need it.
+    pool.items.appendAssumeCapacity(.{
+        .tag = .type_value,
+        .data = @intFromEnum(Index.undefined_type),
+    });
+
+    try appendComptimeIntValue(pool, 0, true);
+    try appendComptimeIntValue(pool, 1, true);
+    try appendComptimeIntValue(pool, 1, false);
+
+    inline for (@typeInfo(SimpleValue).@"enum".fields) |field| {
+        appendSimpleValue(pool, @field(SimpleValue, field.name));
+    }
+}
+
+fn appendIntType(pool: *InternPool, signedness: std.builtin.Signedness, bits: u16) void {
+    const tag: Item.Tag = switch (signedness) {
+        .unsigned => .type_int_unsigned,
+        .signed => .type_int_signed,
+    };
+    pool.items.appendAssumeCapacity(.{ .tag = tag, .data = bits });
+}
+
+fn appendSimpleType(pool: *InternPool, simple: SimpleType) void {
+    pool.items.appendAssumeCapacity(.{
+        .tag = .simple_type,
+        .data = @intFromEnum(simple),
+    });
+}
+
+fn appendSimpleValue(pool: *InternPool, simple: SimpleValue) void {
+    pool.items.appendAssumeCapacity(.{
+        .tag = .simple_value,
+        .data = @intFromEnum(simple),
+    });
+}
+
+fn appendComptimeIntValue(pool: *InternPool, magnitude: std.math.big.Limb, positive: bool) Allocator.Error!void {
+    const limbs_index: u32 = @intCast(pool.big_int_limbs.items.len);
+    try pool.big_int_limbs.append(pool.gpa, magnitude);
+
+    const extra_index: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.appendSlice(pool.gpa, &.{
+        @intFromEnum(Index.comptime_int_type),
+        @intFromBool(positive),
+        limbs_index,
+        1,
+    });
+    pool.items.appendAssumeCapacity(.{ .tag = .int_value, .data = extra_index });
 }
 
 pub fn get(pool: *const InternPool, index: Index) Key {
@@ -187,13 +317,13 @@ pub fn get(pool: *const InternPool, index: Index) Key {
     assert(i < pool.items.len);
     const item = pool.items.get(i);
     return switch (item.tag) {
-        .simple_type => .{ .simple_type = @enumFromInt(@as(u8, @intCast(item.data))) },
-        .simple_value => .{ .simple_value = @enumFromInt(@as(u8, @intCast(item.data))) },
-        .int_type_unsigned => .{ .int_type = .{
+        .simple_type => .{ .simple_type = @enumFromInt(item.data) },
+        .simple_value => .{ .simple_value = @enumFromInt(item.data) },
+        .type_int_unsigned => .{ .int_type = .{
             .signedness = .unsigned,
             .bits = @intCast(item.data),
         } },
-        .int_type_signed => .{ .int_type = .{
+        .type_int_signed => .{ .int_type = .{
             .signedness = .signed,
             .bits = @intCast(item.data),
         } },
@@ -221,9 +351,9 @@ fn intValueFromExtra(pool: *const InternPool, extra_index: u32) Key {
 }
 
 /// Intern a fixed-width integer type. Returns one of the well-known indices
-/// for u8/u16/u32/u64/i8/i16/i32/i64, otherwise appends a new item. Zig
-/// permits `u0`..`u65535` and `i0`..`i65535`; any `bits` in that range is
-/// representable because `std.builtin.Type.Int.bits` is itself `u16`.
+/// when `bits` matches a cached width, otherwise appends a new item. Zig
+/// permits `u0`..`u65535` and `i0`..`i65535` (the language limit is the
+/// `u16` width of `std.builtin.Type.Int.bits`).
 pub fn internIntType(
     pool: *InternPool,
     signedness: std.builtin.Signedness,
@@ -232,8 +362,8 @@ pub fn internIntType(
     if (wellKnownIntType(signedness, bits)) |idx| return idx;
 
     const tag: Item.Tag = switch (signedness) {
-        .unsigned => .int_type_unsigned,
-        .signed => .int_type_signed,
+        .unsigned => .type_int_unsigned,
+        .signed => .type_int_signed,
     };
     try pool.items.append(pool.gpa, .{ .tag = tag, .data = bits });
     return @enumFromInt(@as(u32, @intCast(pool.items.len - 1)));
@@ -242,10 +372,16 @@ pub fn internIntType(
 fn wellKnownIntType(signedness: std.builtin.Signedness, bits: u16) ?Index {
     return switch (signedness) {
         .unsigned => switch (bits) {
+            0 => .u0_type,
+            1 => .u1_type,
             8 => .u8_type,
             16 => .u16_type,
+            29 => .u29_type,
             32 => .u32_type,
             64 => .u64_type,
+            80 => .u80_type,
+            128 => .u128_type,
+            256 => .u256_type,
             else => null,
         },
         .signed => switch (bits) {
@@ -253,6 +389,7 @@ fn wellKnownIntType(signedness: std.builtin.Signedness, bits: u16) ?Index {
             16 => .i16_type,
             32 => .i32_type,
             64 => .i64_type,
+            128 => .i128_type,
             else => null,
         },
     };
@@ -286,7 +423,6 @@ pub fn internIntValue(
     return @enumFromInt(@as(u32, @intCast(pool.items.len - 1)));
 }
 
-/// Convenience wrapper around `internIntValue` for comptime-typed integers.
 pub fn internComptimeInt(pool: *InternPool, value: BigIntConst) Allocator.Error!Index {
     return pool.internIntValue(.comptime_int_type, value);
 }
@@ -295,43 +431,66 @@ pub fn itemCount(pool: *const InternPool) u32 {
     return @intCast(pool.items.len);
 }
 
-test "well-known indices have expected keys" {
+test "well-known types have expected keys" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    try std.testing.expectEqual(SimpleType.void, pool.get(.void_type).simple_type);
-    try std.testing.expectEqual(SimpleType.bool, pool.get(.bool_type).simple_type);
+    try std.testing.expectEqual(@as(u16, 8), pool.get(.u8_type).int_type.bits);
     try std.testing.expectEqual(@as(u16, 32), pool.get(.u32_type).int_type.bits);
     try std.testing.expectEqual(std.builtin.Signedness.signed, pool.get(.i32_type).int_type.signedness);
-    try std.testing.expectEqual(SimpleValue.bool_true, pool.get(.bool_true).simple_value);
+
+    try std.testing.expectEqual(SimpleType.usize, pool.get(.usize_type).simple_type);
+    try std.testing.expectEqual(SimpleType.c_int, pool.get(.c_int_type).simple_type);
+    try std.testing.expectEqual(SimpleType.f64, pool.get(.f64_type).simple_type);
+    try std.testing.expectEqual(SimpleType.bool, pool.get(.bool_type).simple_type);
+}
+
+test "well-known values have expected keys" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    try std.testing.expectEqual(SimpleValue.true, pool.get(.bool_true).simple_value);
+    try std.testing.expectEqual(SimpleValue.false, pool.get(.bool_false).simple_value);
+    try std.testing.expectEqual(SimpleValue.void, pool.get(.void_value).simple_value);
+
+    const zero = pool.get(.zero).int_value;
+    try std.testing.expectEqual(Index.comptime_int_type, zero.ty);
+    try std.testing.expectEqual(@as(std.math.big.Limb, 0), zero.value.limbs[0]);
+
+    const negative_one = pool.get(.negative_one).int_value;
+    try std.testing.expectEqual(false, negative_one.value.positive);
+    try std.testing.expectEqual(@as(std.math.big.Limb, 1), negative_one.value.limbs[0]);
+}
+
+test "range markers cover the well-known sets" {
+    try std.testing.expect(Index.isWellKnownType(.u0_type));
+    try std.testing.expect(Index.isWellKnownType(.enum_literal_type));
+    try std.testing.expect(!Index.isWellKnownType(.bool_true));
+    try std.testing.expect(!Index.isWellKnownType(.none));
+
+    try std.testing.expect(Index.isWellKnownValue(.undef));
+    try std.testing.expect(Index.isWellKnownValue(.bool_false));
+    try std.testing.expect(!Index.isWellKnownValue(.u8_type));
 }
 
 test "arbitrary-width int types intern dynamically" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    // Well-known widths return the reserved index without growing the pool.
     const items_before = pool.itemCount();
     const u32_idx = try pool.internIntType(.unsigned, 32);
     try std.testing.expectEqual(Index.u32_type, u32_idx);
     try std.testing.expectEqual(items_before, pool.itemCount());
 
-    // Non-cached widths take a fresh slot and round-trip.
-    const @"u17_idx" = try pool.internIntType(.unsigned, 17);
-    try std.testing.expect(@"u17_idx" != .u8_type and @"u17_idx" != .u16_type and @"u17_idx" != .u32_type);
-    const @"u17" = pool.get(@"u17_idx").int_type;
+    const u17_idx = try pool.internIntType(.unsigned, 17);
+    try std.testing.expect(!Index.isWellKnownType(u17_idx));
+    const @"u17" = pool.get(u17_idx).int_type;
     try std.testing.expectEqual(std.builtin.Signedness.unsigned, @"u17".signedness);
     try std.testing.expectEqual(@as(u16, 17), @"u17".bits);
 
-    // Zig's upper bound on integer widths is u65535 / i65535.
-    const @"u65535_idx" = try pool.internIntType(.unsigned, std.math.maxInt(u16));
-    const @"u65535" = pool.get(@"u65535_idx").int_type;
+    const u65535_idx = try pool.internIntType(.unsigned, std.math.maxInt(u16));
+    const @"u65535" = pool.get(u65535_idx).int_type;
     try std.testing.expectEqual(@as(u16, std.math.maxInt(u16)), @"u65535".bits);
-
-    const @"i9999_idx" = try pool.internIntType(.signed, 9999);
-    const @"i9999" = pool.get(@"i9999_idx").int_type;
-    try std.testing.expectEqual(std.builtin.Signedness.signed, @"i9999".signedness);
-    try std.testing.expectEqual(@as(u16, 9999), @"i9999".bits);
 }
 
 test "comptime int round-trip" {
