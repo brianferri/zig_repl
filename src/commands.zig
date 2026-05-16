@@ -7,6 +7,7 @@ const Spec = @import("commands/Spec.zig");
 pub const registry = [_]Spec{
     @import("commands/help.zig").spec,
     @import("commands/quit.zig").spec,
+    @import("commands/show_zir.zig").spec,
 };
 
 const max_name_bytes: u32 = 64;
@@ -26,9 +27,10 @@ pub fn run(session: *Session, name_and_args: []const u8, stdout: *std.Io.Writer)
 
     var iter = std.mem.splitScalar(u8, name_and_args, ' ');
     const name = iter.first();
+    const argument = iter.rest();
     const spec = lookup(name) orelse {
         try stdout.print("unknown command: :{s}\n", .{name});
         return;
     };
-    return spec.run(session, stdout);
+    return spec.run(session, argument, stdout);
 }

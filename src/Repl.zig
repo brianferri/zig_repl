@@ -3,6 +3,8 @@ const assert = std.debug.assert;
 
 const Session = @import("Session.zig");
 const commands = @import("commands.zig");
+const Pipeline = @import("front/Pipeline.zig");
+const Diagnostic = @import("render/Diagnostic.zig");
 
 const Repl = @This();
 
@@ -58,5 +60,30 @@ fn dispatch(repl: *Repl, raw_line: []const u8, stdout: *std.Io.Writer) !void {
     const trimmed = std.mem.trim(u8, raw_line, " \t\r");
     if (trimmed.len == 0) return;
     if (trimmed[0] == ':') return commands.run(repl.session, trimmed[1..], stdout);
+    return repl.evaluate(trimmed, stdout);
+}
+
+fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
+    assert(input.len > 0);
+    assert(input.len <= input_buffer_bytes);
+
+    var result = Pipeline.run(repl.session.gpa, input) catch |err| {
+        try stdout.print("front-end failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer result.deinit(repl.session.gpa);
+
+    if (result.hasParseErrors()) {
+        return Diagnostic.renderParseErrors(result.tree, result.source(), stdout);
+    }
+    if (result.hasZirErrors()) {
+        return Diagnostic.renderZirErrors(
+            repl.session.gpa,
+            result.zir,
+            result.tree,
+            result.source(),
+            stdout,
+        );
+    }
     try stdout.writeAll("not-yet-evaluable: requires Sema\n");
 }

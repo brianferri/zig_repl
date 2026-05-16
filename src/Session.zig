@@ -15,7 +15,7 @@ pub fn init(
     gpa: std.mem.Allocator,
     session_arena: std.mem.Allocator,
     io: std.Io,
-) error{}!Session {
+) Session {
     assert(@intFromPtr(io.vtable) != 0);
     assert(@intFromPtr(io.userdata) != 0);
     return .{

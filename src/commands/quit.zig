@@ -10,9 +10,10 @@ pub const spec: Spec = .{
     .run = run,
 };
 
-fn run(session: *Session, stdout: *std.Io.Writer) anyerror!void {
+fn run(session: *Session, argument: []const u8, stdout: *std.Io.Writer) anyerror!void {
     assert(@intFromPtr(session) != 0);
     assert(@intFromPtr(stdout) != 0);
+    _ = argument;
 
     try stdout.writeAll("bye\n");
     session.should_quit = true;
