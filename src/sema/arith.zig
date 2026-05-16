@@ -40,6 +40,50 @@ pub fn internAdd(
     return intern_pool.internComptimeInt(mutable.toConst());
 }
 
+/// `lhs - rhs` as a fresh `comptime_int` value in the pool. Workspace is
+/// sized to the bound documented on `BigIntMutable.sub`:
+/// `@max(lhs.limbs.len, rhs.limbs.len) + 1` limbs.
+pub fn internSub(
+    gpa: Allocator,
+    intern_pool: *InternPool,
+    lhs: BigIntConst,
+    rhs: BigIntConst,
+) Allocator.Error!InternPool.Index {
+    const workspace = try gpa.alloc(Limb, @max(lhs.limbs.len, rhs.limbs.len) + 1);
+    defer gpa.free(workspace);
+
+    var mutable: BigIntMutable = .{
+        .limbs = workspace,
+        .len = undefined,
+        .positive = undefined,
+    };
+    mutable.sub(lhs, rhs);
+    return intern_pool.internComptimeInt(mutable.toConst());
+}
+
+/// `lhs * rhs` as a fresh `comptime_int` value in the pool. Workspace is
+/// sized to the bound documented on `BigIntMutable.mulNoAlias`:
+/// `lhs.limbs.len + rhs.limbs.len` limbs. The fresh workspace cannot alias
+/// either operand (both live in the pool's arena), so `mulNoAlias` is
+/// strictly safe and avoids the extra temp buffer `mul` would need.
+pub fn internMul(
+    gpa: Allocator,
+    intern_pool: *InternPool,
+    lhs: BigIntConst,
+    rhs: BigIntConst,
+) Allocator.Error!InternPool.Index {
+    const workspace = try gpa.alloc(Limb, lhs.limbs.len + rhs.limbs.len);
+    defer gpa.free(workspace);
+
+    var mutable: BigIntMutable = .{
+        .limbs = workspace,
+        .len = undefined,
+        .positive = undefined,
+    };
+    mutable.mulNoAlias(lhs, rhs, gpa);
+    return intern_pool.internComptimeInt(mutable.toConst());
+}
+
 /// `-operand` as a fresh `comptime_int` value in the pool. Allocation-free
 /// in the steady state: `BigIntConst.negate` returns a sign-flipped view
 /// over the operand's limbs, and `internComptimeInt` copies them into the

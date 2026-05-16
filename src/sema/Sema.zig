@@ -105,7 +105,9 @@ fn evalBody(sema: *Sema, body: []const Zir.Inst.Index) Error!Value {
 fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     return switch (tag) {
         .int => sema.evalInt(inst),
-        .add => sema.evalAdd(inst),
+        .add => sema.evalBinaryArith(inst, .add),
+        .sub => sema.evalBinaryArith(inst, .sub),
+        .mul => sema.evalBinaryArith(inst, .mul),
         .negate => sema.evalNegate(inst),
         .dbg_stmt => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
@@ -133,15 +135,28 @@ fn evalPassthroughUnNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return try sema.resolveRef(operand);
 }
 
+/// Integer add/sub/mul share the same operand shape (`pl_node` + `Bin`) and
+/// the same comptime_int-only first cut. Each routes to the matching kernel
+/// in `arith.zig`; fixed-width and float dispatch land with their coercion
+/// handlers.
+///
 /// Compiler reference: src/Sema.zig:zirArithmetic ->
-/// src/Sema/arith.zig:add -> addScalar -> intAdd.
-fn evalAdd(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+/// src/Sema/arith.zig:{add,sub,mul} -> {add,sub,mul}Scalar -> int{Add,Sub,Mul}.
+const BinaryArithOp = enum { add, sub, mul };
+
+fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, op: BinaryArithOp) Error!?Value {
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
 
-    const lhs = try sema.resolveComptimeInt(bin.lhs, "add");
-    const rhs = try sema.resolveComptimeInt(bin.rhs, "add");
-    const idx = try arith.internAdd(sema.gpa, sema.intern_pool, lhs, rhs);
+    const op_name: []const u8 = @tagName(op);
+    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name);
+    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name);
+
+    const idx = switch (op) {
+        .add => try arith.internAdd(sema.gpa, sema.intern_pool, lhs, rhs),
+        .sub => try arith.internSub(sema.gpa, sema.intern_pool, lhs, rhs),
+        .mul => try arith.internMul(sema.gpa, sema.intern_pool, lhs, rhs),
+    };
     return .{ .index = idx };
 }
 
