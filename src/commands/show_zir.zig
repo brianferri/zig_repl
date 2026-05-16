@@ -29,7 +29,7 @@ fn run(session: *Session, argument: []const u8, stdout: *std.Io.Writer) anyerror
     defer result.deinit(session.gpa);
 
     if (result.hasParseErrors()) {
-        try Diagnostic.renderParseErrors(result.tree, result.source(), stdout);
+        try Diagnostic.renderParseErrors(result.tree, stdout);
         return;
     }
     if (result.hasZirErrors()) {

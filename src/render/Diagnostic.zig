@@ -6,11 +6,9 @@ const repl_source_path: []const u8 = "<repl>";
 
 pub fn renderParseErrors(
     tree: std.zig.Ast,
-    source: [:0]const u8,
     writer: *std.Io.Writer,
 ) std.Io.Writer.Error!void {
     assert(tree.errors.len > 0);
-    assert(source.len > 0);
 
     var rendered: u32 = 0;
     for (tree.errors) |parse_error| {
@@ -18,8 +16,7 @@ pub fn renderParseErrors(
             try writer.writeAll("... further parse errors elided\n");
             break;
         }
-        const offset = tree.tokenStart(parse_error.token);
-        const loc = std.zig.findLineColumn(source, offset);
+        const loc = tree.tokenLocation(0, parse_error.token);
         try writer.print("{s}:{d}:{d}: parse error: ", .{
             repl_source_path,
             loc.line + 1,

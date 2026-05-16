@@ -74,7 +74,7 @@ fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
     defer result.deinit(repl.session.gpa);
 
     if (result.hasParseErrors()) {
-        return Diagnostic.renderParseErrors(result.tree, result.source(), stdout);
+        return Diagnostic.renderParseErrors(result.tree, stdout);
     }
     if (result.hasZirErrors()) {
         return Diagnostic.renderZirErrors(
