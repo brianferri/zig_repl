@@ -6,6 +6,7 @@ const commands = @import("commands.zig");
 const Pipeline = @import("front/Pipeline.zig");
 const Diagnostic = @import("render/Diagnostic.zig");
 const Sema = @import("sema/Sema.zig");
+const renderValue = @import("render/Value.zig").render;
 
 const Repl = @This();
 
@@ -95,8 +96,8 @@ fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
     ) catch |err| switch (err) {
         error.UnsupportedZirInst => return, // diagnostic already written
         else => |e| return e,
-    }) |_| {
-        try stdout.writeAll("(value produced — renderer not yet wired)\n");
+    }) |value| {
+        try renderValue(value, &repl.session.intern_pool, stdout);
     } else {
         try stdout.writeAll("(no value)\n");
     }

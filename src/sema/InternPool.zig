@@ -270,8 +270,19 @@ fn populateWellKnown(pool: *InternPool) Allocator.Error!void {
     try appendComptimeIntValue(pool, 1, true);
     try appendComptimeIntValue(pool, 1, false);
 
-    inline for (@typeInfo(SimpleValue).@"enum".fields) |field| {
-        appendSimpleValue(pool, @field(SimpleValue, field.name));
+    // SimpleValue source order does not match Index slot order
+    // (`unreachable_value` sits between `void_value` and `null_value` in the
+    // Index enum, whereas SimpleValue places it last). List explicitly in
+    // Index order so each slot gets the SimpleValue whose ordinal equals it.
+    inline for ([_]struct { Index, SimpleValue }{
+        .{ .void_value, .void },
+        .{ .unreachable_value, .@"unreachable" },
+        .{ .null_value, .null },
+        .{ .bool_true, .true },
+        .{ .bool_false, .false },
+    }) |entry| {
+        assert(@intFromEnum(entry[0]) == pool.items.len);
+        appendSimpleValue(pool, entry[1]);
     }
 }
 
