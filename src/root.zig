@@ -6,6 +6,7 @@ pub const sema = struct {
     pub const Type = @import("sema/Type.zig");
     pub const Value = @import("sema/Value.zig");
     pub const Sema = @import("sema/Sema.zig");
+    pub const arith = @import("sema/arith.zig");
 };
 pub const render = struct {
     pub const Diagnostic = @import("render/Diagnostic.zig");
@@ -27,4 +28,5 @@ test {
     _ = @import("sema/Type.zig");
     _ = @import("sema/Value.zig");
     _ = @import("sema/Sema.zig");
+    _ = @import("sema/arith.zig");
 }
