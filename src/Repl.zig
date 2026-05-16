@@ -5,6 +5,7 @@ const Session = @import("Session.zig");
 const commands = @import("commands.zig");
 const Pipeline = @import("front/Pipeline.zig");
 const Diagnostic = @import("render/Diagnostic.zig");
+const Sema = @import("sema/Sema.zig");
 
 const Repl = @This();
 
@@ -85,5 +86,18 @@ fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
             stdout,
         );
     }
-    try stdout.writeAll("not-yet-evaluable: requires Sema\n");
+
+    if (Sema.analyze(
+        repl.session.gpa,
+        &repl.session.intern_pool,
+        result.zir,
+        stdout,
+    ) catch |err| switch (err) {
+        error.UnsupportedZirInst => return, // diagnostic already written
+        else => |e| return e,
+    }) |_| {
+        try stdout.writeAll("(value produced — renderer not yet wired)\n");
+    } else {
+        try stdout.writeAll("(no value)\n");
+    }
 }

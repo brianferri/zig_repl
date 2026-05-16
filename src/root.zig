@@ -5,4 +5,5 @@ pub const sema = struct {
     pub const InternPool = @import("sema/InternPool.zig");
     pub const Type = @import("sema/Type.zig");
     pub const Value = @import("sema/Value.zig");
+    pub const Sema = @import("sema/Sema.zig");
 };
