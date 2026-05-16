@@ -4,7 +4,7 @@
 //! (`pt`/`owner`/`func_index`). Replaces the compiler's AIR backend with
 //! direct interpretation against the InternPool.
 //!
-//! Reference: /home/brianferri/Desktop/Main/Projects/zig/src/Sema.zig.
+//! Reference: src/Sema.zig in the Zig compiler tree.
 //! Handler arms land per ZIR-tag group; until a tag is explicitly handled
 //! it surfaces a deterministic `unsupported_zir_inst: <tag>` diagnostic.
 //! There is no silent fallback.

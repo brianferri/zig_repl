@@ -2,7 +2,7 @@
 //! incremental-compilation machinery (`*_deps`, `TrackedInst`, `AnalUnit`,
 //! thread sharding, `memoized_call`) and keeps the canonical-storage core.
 //!
-//! Reference: /home/brianferri/Desktop/Main/Projects/zig/src/InternPool.zig.
+//! Reference: src/InternPool.zig in the Zig compiler tree.
 //! The well-known `Index` set, `SimpleType`/`SimpleValue` shape, and
 //! `Item.Tag` naming mirror the compiler so the port reads against it
 //! directly. Compiler-internal markers (`adhoc_inferred_error_set`,

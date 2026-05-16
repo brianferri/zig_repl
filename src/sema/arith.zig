@@ -4,7 +4,7 @@
 //! interns the result. Callers (typically Sema's per-tag handlers) own the
 //! type-check + Value-wrapping above this layer.
 //!
-//! Compiler reference: /home/brianferri/Desktop/Main/Projects/zig/src/Sema/arith.zig.
+//! Compiler reference: src/Sema/arith.zig in the Zig compiler tree.
 //! Their `intAdd`/`intSub`/`intMul`/`intNegate` correspond directly to the
 //! `internAdd`/`internSub`/`internMul`/`internNegate` helpers here. The
 //! compiler's outer `add`/`sub`/etc. wrappers (which dispatch
