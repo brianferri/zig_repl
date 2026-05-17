@@ -105,6 +105,7 @@ fn evalBody(sema: *Sema, body: []const Zir.Inst.Index) Error!Value {
 fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     return switch (tag) {
         .int => sema.evalInt(inst),
+        .int_big => sema.evalIntBig(inst),
         .add => sema.evalBinaryArith(inst, .add),
         .sub => sema.evalBinaryArith(inst, .sub),
         .mul => sema.evalBinaryArith(inst, .mul),
@@ -132,6 +133,47 @@ fn evalInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     mutable.set(value);
 
     const idx = try sema.intern_pool.internComptimeInt(mutable.toConst());
+    return .{ .index = idx };
+}
+
+/// Arbitrary-precision integer literal. AstGen stores raw limb bytes
+/// inline in `zir.string_bytes`, with `data.str.len` measured in limbs
+/// (not bytes). Always positive: AstGen lowers `-N` as
+/// `negate(int_big N)`, so negative-magnitude encoding is unnecessary.
+///
+/// Known waste: `zir.string_bytes` is `[]u8` (alignment 1), so the limb
+/// bytes inside it may land at any offset. `std.math.big.Limb` is
+/// `usize` and needs `@alignOf(usize)` alignment to read safely
+/// (misaligned reads are UB on stricter architectures and trip Zig's
+/// safety checks). The fix would be aligning the limb runs in
+/// `string_bytes` upstream so we could reinterpret in place — neither
+/// AstGen nor the compiler's Sema do this yet. Until that lands we eat
+/// one `gpa.alloc` + `@memcpy` per `int_big` instruction. Worth
+/// revisiting if `int_big` ever shows up in REPL profiling.
+///
+/// Compiler reference: src/Sema.zig:zirIntBig in the Zig compiler tree
+/// (carries the same TODO).
+fn evalIntBig(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const str = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str;
+    const limb_count: u32 = str.len;
+    assert(limb_count > 0);
+
+    const byte_count = limb_count * @sizeOf(std.math.big.Limb);
+    const start: u32 = @intFromEnum(str.start);
+    assert(start + byte_count <= sema.zir.string_bytes.len);
+
+    const limb_bytes = sema.zir.string_bytes[start..][0..byte_count];
+
+    const limbs = try sema.gpa.alloc(std.math.big.Limb, limb_count);
+    defer sema.gpa.free(limbs);
+    @memcpy(std.mem.sliceAsBytes(limbs), limb_bytes);
+
+    const value: std.math.big.int.Const = .{ .limbs = limbs, .positive = true };
+    const idx = try sema.intern_pool.internComptimeInt(value);
+    assert(idx != .none);
     return .{ .index = idx };
 }
 
