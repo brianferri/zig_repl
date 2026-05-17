@@ -105,3 +105,45 @@ test "division returns sign-correct results" {
     try expectEvalDecimal(gpa, &pool, "@mod(-7, 2)", "1");
     try expectEvalDecimal(gpa, &pool, "@rem(-7, 2)", "-1");
 }
+
+fn expectEvalBool(
+    gpa: std.mem.Allocator,
+    intern_pool: *InternPool,
+    source: []const u8,
+    expected: bool,
+) !void {
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, intern_pool, source, &diag_buf);
+    const expected_index: InternPool.Index = if (expected) .bool_true else .bool_false;
+    try testing.expectEqual(expected_index, value.index);
+}
+
+test "comparison operators yield the well-known bool indices" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalBool(gpa, &pool, "1 < 2", true);
+    try expectEvalBool(gpa, &pool, "2 < 2", false);
+    try expectEvalBool(gpa, &pool, "2 <= 2", true);
+    try expectEvalBool(gpa, &pool, "2 == 2", true);
+    try expectEvalBool(gpa, &pool, "2 != 2", false);
+    try expectEvalBool(gpa, &pool, "3 >= 2", true);
+    try expectEvalBool(gpa, &pool, "3 > 2", true);
+}
+
+test "comparison handles negatives and big ints" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalBool(gpa, &pool, "-7 < 0", true);
+    try expectEvalBool(gpa, &pool, "-7 < -3", true);
+    try expectEvalBool(gpa, &pool, "-3 > -7", true);
+    try expectEvalBool(
+        gpa,
+        &pool,
+        "340282366920938463463374607431768211456 > 18446744073709551615",
+        true,
+    );
+}

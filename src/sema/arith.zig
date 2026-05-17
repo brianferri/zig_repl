@@ -222,6 +222,20 @@ pub fn internRem(
     return idx;
 }
 
+/// Integer comparison. Result is a plain `bool` (no intern needed —
+/// callers map to `Index.bool_true` / `Index.bool_false`). Sign and
+/// magnitude are handled by `BigIntConst.order`; the `Order.compare`
+/// helper translates that to the requested operator.
+pub fn compareInt(
+    lhs: BigIntConst,
+    rhs: BigIntConst,
+    op: std.math.CompareOperator,
+) bool {
+    assert(lhs.limbs.len > 0);
+    assert(rhs.limbs.len > 0);
+    return lhs.order(rhs).compare(op);
+}
+
 const DivKind = enum { trunc, floor };
 
 const DivPair = struct {
@@ -414,6 +428,57 @@ test "internMod and internRem differ in sign for negative dividend" {
     // @rem: result has sign of dividend → -1
     const rem_idx = try internRem(gpa, &pool, constLimbs(&a, false), constLimbs(&b, true));
     try expectInternedDecimal(gpa, &pool, rem_idx, "-1");
+}
+
+test "compareInt covers all six operators on simple positives" {
+    var three = [_]Limb{3};
+    var five = [_]Limb{5};
+    const a = constLimbs(&three, true);
+    const b = constLimbs(&five, true);
+
+    try testing.expect(compareInt(a, b, .lt));
+    try testing.expect(compareInt(a, b, .lte));
+    try testing.expect(!compareInt(a, b, .eq));
+    try testing.expect(!compareInt(a, b, .gte));
+    try testing.expect(!compareInt(a, b, .gt));
+    try testing.expect(compareInt(a, b, .neq));
+}
+
+test "compareInt: equal values" {
+    var seven = [_]Limb{7};
+    var seven_again = [_]Limb{7};
+    const a = constLimbs(&seven, true);
+    const b = constLimbs(&seven_again, true);
+
+    try testing.expect(compareInt(a, b, .eq));
+    try testing.expect(compareInt(a, b, .lte));
+    try testing.expect(compareInt(a, b, .gte));
+    try testing.expect(!compareInt(a, b, .lt));
+    try testing.expect(!compareInt(a, b, .gt));
+    try testing.expect(!compareInt(a, b, .neq));
+}
+
+test "compareInt: sign matters when magnitudes match" {
+    var seven_pos = [_]Limb{7};
+    var seven_neg = [_]Limb{7};
+    const pos = constLimbs(&seven_pos, true);
+    const neg = constLimbs(&seven_neg, false);
+
+    // -7 < +7
+    try testing.expect(compareInt(neg, pos, .lt));
+    try testing.expect(compareInt(pos, neg, .gt));
+    try testing.expect(compareInt(neg, pos, .neq));
+}
+
+test "compareInt: signed zero is canonical positive zero" {
+    var zero_a = [_]Limb{0};
+    var zero_b = [_]Limb{0};
+    const a = constLimbs(&zero_a, true);
+    const b = constLimbs(&zero_b, true);
+
+    try testing.expect(compareInt(a, b, .eq));
+    try testing.expect(!compareInt(a, b, .lt));
+    try testing.expect(!compareInt(a, b, .gt));
 }
 
 test "all division ops error on zero divisor" {

@@ -114,6 +114,12 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .div_trunc => sema.evalBinaryArith(inst, .div_trunc),
         .mod => sema.evalBinaryArith(inst, .mod),
         .rem => sema.evalBinaryArith(inst, .rem),
+        .cmp_lt => sema.evalComparison(inst, .lt),
+        .cmp_lte => sema.evalComparison(inst, .lte),
+        .cmp_eq => sema.evalComparison(inst, .eq),
+        .cmp_gte => sema.evalComparison(inst, .gte),
+        .cmp_gt => sema.evalComparison(inst, .gt),
+        .cmp_neq => sema.evalComparison(inst, .neq),
         .negate => sema.evalNegate(inst),
         .dbg_stmt => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
@@ -245,6 +251,33 @@ fn unwrapDivResult(
     };
     assert(idx != .none);
     return idx;
+}
+
+/// `cmp_lt / cmp_lte / cmp_eq / cmp_gte / cmp_gt / cmp_neq`. Same operand
+/// shape as `evalBinaryArith` (pl_node + Bin), but the kernel returns a
+/// raw `bool` and we map to the well-known `Index.bool_true` /
+/// `Index.bool_false` — no new interning needed.
+///
+/// Compiler reference: src/Sema.zig:zirCmp -> src/Sema/arith.zig:cmpScalar.
+fn evalComparison(
+    sema: *Sema,
+    inst: Zir.Inst.Index,
+    op: std.math.CompareOperator,
+) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    assert(bin.lhs != .none);
+    assert(bin.rhs != .none);
+
+    const op_name: []const u8 = @tagName(op);
+    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name);
+    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name);
+
+    const result = arith.compareInt(lhs, rhs, op);
+    return .{ .index = if (result) .bool_true else .bool_false };
 }
 
 /// Compiler reference: src/Sema.zig:zirNegate -> src/Sema/arith.zig:negate.
