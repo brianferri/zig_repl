@@ -29,4 +29,5 @@ test {
     _ = @import("sema/Value.zig");
     _ = @import("sema/Sema.zig");
     _ = @import("sema/arith.zig");
+    _ = @import("sema_eval_test.zig");
 }

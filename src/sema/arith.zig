@@ -236,6 +236,202 @@ const DivPair = struct {
 /// Both quotient and remainder are interned even when only one is wanted —
 /// the pool has no GC and the redundant slot is cheap compared to the
 /// per-call alloc.
+const testing = std.testing;
+
+fn constLimbs(slice: []std.math.big.Limb, positive: bool) BigIntConst {
+    return .{ .limbs = slice, .positive = positive };
+}
+
+fn expectInternedDecimal(
+    gpa: Allocator,
+    intern_pool: *InternPool,
+    idx: InternPool.Index,
+    expected: []const u8,
+) !void {
+    const stored = intern_pool.get(idx).int_value.value;
+    const actual = try stored.toStringAlloc(gpa, 10, .lower);
+    defer gpa.free(actual);
+    try testing.expectEqualStrings(expected, actual);
+}
+
+test "internAdd: small positives" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{3};
+    var b = [_]Limb{4};
+    const idx = try internAdd(gpa, &pool, constLimbs(&a, true), constLimbs(&b, true));
+    try expectInternedDecimal(gpa, &pool, idx, "7");
+}
+
+test "internAdd: multi-limb carry across u64 boundary" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{std.math.maxInt(Limb)};
+    var b = [_]Limb{1};
+    const idx = try internAdd(gpa, &pool, constLimbs(&a, true), constLimbs(&b, true));
+    // 2^64 on 64-bit hosts (or 2^32 on 32-bit). Same result either way: the
+    // value equals @sizeOf(Limb) bits worth of 2-power.
+    const stored = pool.get(idx).int_value.value;
+    try testing.expect(stored.limbs.len >= 2);
+    try testing.expect(stored.positive);
+}
+
+test "internSub: yields negative when rhs > lhs" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{3};
+    var b = [_]Limb{5};
+    const idx = try internSub(gpa, &pool, constLimbs(&a, true), constLimbs(&b, true));
+    try expectInternedDecimal(gpa, &pool, idx, "-2");
+}
+
+test "internMul: multi-limb result" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{1_000_000};
+    var b = [_]Limb{1_000_000};
+    const idx = try internMul(gpa, &pool, constLimbs(&a, true), constLimbs(&b, true));
+    try expectInternedDecimal(gpa, &pool, idx, "1000000000000");
+}
+
+test "internNegate: flips sign of non-zero" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var v = [_]Limb{42};
+    const idx = try internNegate(gpa, &pool, constLimbs(&v, true));
+    try expectInternedDecimal(gpa, &pool, idx, "-42");
+}
+
+test "internNegate: zero stays positive (canonical representation)" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var z = [_]Limb{0};
+    const idx = try internNegate(gpa, &pool, constLimbs(&z, true));
+    const stored = pool.get(idx).int_value.value;
+    try testing.expect(stored.positive);
+    try testing.expectEqual(@as(usize, 1), stored.limbs.len);
+    try testing.expectEqual(@as(Limb, 0), stored.limbs[0]);
+}
+
+test "internNegate: forwarding pool-aliased operand is safe" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var seven = [_]Limb{7};
+    const seven_idx = try pool.internComptimeInt(constLimbs(&seven, true));
+
+    // Drain capacity so the next intern must reallocate big_int_limbs. This
+    // is the exact pattern the InternPool aliasing-safety guard defends.
+    while (pool.big_int_limbs.items.len < pool.big_int_limbs.capacity) {
+        try pool.big_int_limbs.append(pool.gpa, 0);
+    }
+
+    const aliased = pool.get(seven_idx).int_value.value;
+    const neg_idx = try internNegate(gpa, &pool, aliased);
+    try expectInternedDecimal(gpa, &pool, neg_idx, "-7");
+}
+
+test "internDivTrunc: positive operands" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{7};
+    var b = [_]Limb{2};
+    const idx = try internDivTrunc(gpa, &pool, constLimbs(&a, true), constLimbs(&b, true));
+    try expectInternedDecimal(gpa, &pool, idx, "3");
+}
+
+test "internDivTrunc: negative dividend rounds toward zero" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{7};
+    var b = [_]Limb{2};
+    const idx = try internDivTrunc(gpa, &pool, constLimbs(&a, false), constLimbs(&b, true));
+    try expectInternedDecimal(gpa, &pool, idx, "-3");
+}
+
+test "internDivFloor: negative dividend rounds toward -inf" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{7};
+    var b = [_]Limb{2};
+    const idx = try internDivFloor(gpa, &pool, constLimbs(&a, false), constLimbs(&b, true));
+    try expectInternedDecimal(gpa, &pool, idx, "-4");
+}
+
+test "internDivExact: succeeds when remainder is zero" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{10};
+    var b = [_]Limb{2};
+    const idx = try internDivExact(gpa, &pool, constLimbs(&a, true), constLimbs(&b, true));
+    try expectInternedDecimal(gpa, &pool, idx, "5");
+}
+
+test "internDivExact: errors when remainder is non-zero" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{7};
+    var b = [_]Limb{2};
+    try testing.expectError(
+        error.DivisionNotExact,
+        internDivExact(gpa, &pool, constLimbs(&a, true), constLimbs(&b, true)),
+    );
+}
+
+test "internMod and internRem differ in sign for negative dividend" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{7};
+    var b = [_]Limb{2};
+    // @mod: result has sign of divisor → +1
+    const mod_idx = try internMod(gpa, &pool, constLimbs(&a, false), constLimbs(&b, true));
+    try expectInternedDecimal(gpa, &pool, mod_idx, "1");
+    // @rem: result has sign of dividend → -1
+    const rem_idx = try internRem(gpa, &pool, constLimbs(&a, false), constLimbs(&b, true));
+    try expectInternedDecimal(gpa, &pool, rem_idx, "-1");
+}
+
+test "all division ops error on zero divisor" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{1};
+    var z = [_]Limb{0};
+    const lhs = constLimbs(&a, true);
+    const rhs = constLimbs(&z, true);
+    try testing.expectError(error.DivisionByZero, internDivTrunc(gpa, &pool, lhs, rhs));
+    try testing.expectError(error.DivisionByZero, internDivFloor(gpa, &pool, lhs, rhs));
+    try testing.expectError(error.DivisionByZero, internDivExact(gpa, &pool, lhs, rhs));
+    try testing.expectError(error.DivisionByZero, internMod(gpa, &pool, lhs, rhs));
+    try testing.expectError(error.DivisionByZero, internRem(gpa, &pool, lhs, rhs));
+}
+
 fn computeDivPair(
     gpa: Allocator,
     intern_pool: *InternPool,
