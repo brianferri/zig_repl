@@ -106,17 +106,16 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     return switch (tag) {
         .int => sema.evalInt(inst),
         .int_big => sema.evalIntBig(inst),
-        .add => sema.evalBinaryArith(inst, .add),
-        .sub => sema.evalBinaryArith(inst, .sub),
-        .mul => sema.evalBinaryArith(inst, .mul),
-        .div_exact => sema.evalBinaryArith(inst, .div_exact),
-        .div_floor => sema.evalBinaryArith(inst, .div_floor),
-        .div_trunc => sema.evalBinaryArith(inst, .div_trunc),
-        .mod => sema.evalBinaryArith(inst, .mod),
-        .rem => sema.evalBinaryArith(inst, .rem),
-        .bit_and => sema.evalBitwise(inst, .bit_and),
-        .bit_or => sema.evalBitwise(inst, .bit_or),
-        .xor => sema.evalBitwise(inst, .xor),
+        .add,
+        .sub,
+        .mul,
+        .div_exact,
+        .div_floor,
+        .div_trunc,
+        .mod,
+        .rem,
+        => sema.evalBinaryArith(inst, tag),
+        .bit_and, .bit_or, .xor => sema.evalBitwise(inst, tag),
         .shl => sema.evalShift(inst, "shl", arith.internShl),
         .shr => sema.evalShift(inst, "shr", arith.internShr),
         .typeof_log2_int_type => sema.evalTypeofLog2IntType(inst),
@@ -200,16 +199,15 @@ fn evalPassthroughUnNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// Integer add/sub/mul/div_*/mod/rem share the same operand shape
 /// (`pl_node` + `Bin`) and the same comptime_int-only first cut. Each
-/// routes to the matching kernel in `arith.zig`; fixed-width and float
-/// dispatch land with their coercion handlers. Division kernels can fail
-/// with `DivisionByZero` or `DivisionNotExact`; those become an
-/// `AnalysisFail` after writing a runtime-style diagnostic.
+/// routes to the matching kernel in `arith.zig` keyed on the ZIR tag the
+/// dispatcher captured; fixed-width and float dispatch land with their
+/// coercion handlers. Division kernels can fail with `DivisionByZero` or
+/// `DivisionNotExact`; those become an `AnalysisFail` after writing a
+/// runtime-style diagnostic.
 ///
 /// Compiler reference: src/Sema.zig:zirArithmetic ->
 /// src/Sema/arith.zig:{add,sub,mul,divTrunc,divFloor,mod,rem,negate}.
-const BinaryArithOp = enum { add, sub, mul, div_exact, div_floor, div_trunc, mod, rem };
-
-fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, op: BinaryArithOp) Error!?Value {
+fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
@@ -218,14 +216,14 @@ fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, op: BinaryArithOp) Error!?
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
-    const op_name: []const u8 = @tagName(op);
+    const op_name: []const u8 = @tagName(tag);
     assert(op_name.len > 0);
     const lhs = try sema.resolveComptimeInt(bin.lhs, op_name);
     const rhs = try sema.resolveComptimeInt(bin.rhs, op_name);
 
     const ip = sema.intern_pool;
     const gpa = sema.gpa;
-    const idx = switch (op) {
+    const idx = switch (tag) {
         .add => try arith.internAdd(gpa, ip, lhs, rhs),
         .sub => try arith.internSub(gpa, ip, lhs, rhs),
         .mul => try arith.internMul(gpa, ip, lhs, rhs),
@@ -234,6 +232,7 @@ fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, op: BinaryArithOp) Error!?
         .div_trunc => try sema.unwrapDivResult(arith.internDivTrunc(gpa, ip, lhs, rhs), "@divTrunc"),
         .mod => try sema.unwrapDivResult(arith.internMod(gpa, ip, lhs, rhs), "@mod"),
         .rem => try sema.unwrapDivResult(arith.internRem(gpa, ip, lhs, rhs), "@rem"),
+        else => unreachable,
     };
     return .{ .index = idx };
 }
@@ -446,15 +445,11 @@ fn evalShift(
 }
 
 /// `bit_and / bit_or / xor`. Same operand shape as `evalBinaryArith`
-/// (pl_node + Bin); routes to `arith.internBitwise` which dispatches on
-/// the op via std.math.big.int.Mutable's bitAnd/bitOr/bitXor.
+/// (pl_node + Bin); routes to a per-op `arith.internBit*` kernel keyed
+/// on the captured Zir.Inst.Tag.
 ///
 /// Compiler reference: src/Sema.zig:zirBitBinOp -> src/Sema/arith.zig.
-fn evalBitwise(
-    sema: *Sema,
-    inst: Zir.Inst.Index,
-    op: arith.BitwiseBinOp,
-) Error!?Value {
+fn evalBitwise(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
@@ -463,11 +458,18 @@ fn evalBitwise(
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
-    const op_name: []const u8 = @tagName(op);
+    const op_name: []const u8 = @tagName(tag);
     const lhs = try sema.resolveComptimeInt(bin.lhs, op_name);
     const rhs = try sema.resolveComptimeInt(bin.rhs, op_name);
 
-    const idx = try arith.internBitwise(sema.gpa, sema.intern_pool, op, lhs, rhs);
+    const ip = sema.intern_pool;
+    const gpa = sema.gpa;
+    const idx = switch (tag) {
+        .bit_and => try arith.internBitAnd(gpa, ip, lhs, rhs),
+        .bit_or => try arith.internBitOr(gpa, ip, lhs, rhs),
+        .xor => try arith.internXor(gpa, ip, lhs, rhs),
+        else => unreachable,
+    };
     return .{ .index = idx };
 }
 
