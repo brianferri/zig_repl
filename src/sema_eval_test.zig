@@ -132,6 +132,43 @@ test "comparison operators yield the well-known bool indices" {
     try expectEvalBool(gpa, &pool, "3 > 2", true);
 }
 
+test "bool_not flips well-known bool values" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalBool(gpa, &pool, "!true", false);
+    try expectEvalBool(gpa, &pool, "!false", true);
+    try expectEvalBool(gpa, &pool, "!!true", true);
+}
+
+test "short-circuit and / or cover the full truth tables" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalBool(gpa, &pool, "true and true", true);
+    try expectEvalBool(gpa, &pool, "true and false", false);
+    try expectEvalBool(gpa, &pool, "false and true", false);
+    try expectEvalBool(gpa, &pool, "false and false", false);
+
+    try expectEvalBool(gpa, &pool, "true or true", true);
+    try expectEvalBool(gpa, &pool, "true or false", true);
+    try expectEvalBool(gpa, &pool, "false or true", true);
+    try expectEvalBool(gpa, &pool, "false or false", false);
+}
+
+test "short-circuit composes with comparisons" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalBool(gpa, &pool, "1 < 2 and 3 < 4", true);
+    try expectEvalBool(gpa, &pool, "1 < 2 and 4 < 3", false);
+    try expectEvalBool(gpa, &pool, "1 > 2 or 3 < 4", true);
+    try expectEvalBool(gpa, &pool, "1 > 2 or 3 > 4", false);
+}
+
 test "shifts on comptime_int" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);

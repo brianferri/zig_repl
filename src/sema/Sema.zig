@@ -121,6 +121,9 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .shr => sema.evalShift(inst, "shr", arith.internShr),
         .typeof_log2_int_type => sema.evalTypeofLog2IntType(inst),
         .as_node, .as_shift_operand => sema.evalAsNode(inst),
+        .bool_not => sema.evalBoolNot(inst),
+        .bool_br_and => sema.evalBoolBr(inst, .bool_br_and),
+        .bool_br_or => sema.evalBoolBr(inst, .bool_br_or),
         .cmp_lt => sema.evalComparison(inst, .lt),
         .cmp_lte => sema.evalComparison(inst, .lte),
         .cmp_eq => sema.evalComparison(inst, .eq),
@@ -266,6 +269,66 @@ const ShiftKernel = *const fn (
     std.math.big.int.Const,
     std.math.big.int.Const,
 ) arith.ShiftError!InternPool.Index;
+
+/// `!operand` (bool_not). Operand must be one of the two well-known bool
+/// indices; we map directly to the opposite without going through Sema
+/// type machinery.
+fn evalBoolNot(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
+
+    const operand = try sema.resolveRef(un_node.operand);
+    return switch (operand.index) {
+        .bool_true => .{ .index = .bool_false },
+        .bool_false => .{ .index = .bool_true },
+        else => {
+            try sema.writer.writeAll("bool_not: operand is not a bool\n");
+            return error.AnalysisFail;
+        },
+    };
+}
+
+/// Short-circuiting `and` / `or`. `lhs` is a bool Ref; the rhs is a ZIR
+/// body the compiler emits to evaluate the right operand only when the
+/// short-circuit doesn't fire. First nested-body path in Sema — the body
+/// is just a sub-sequence of `Zir.Inst.Index` and `evalBody` already does
+/// the right thing. `tag` distinguishes the two variants directly via
+/// `Zir.Inst.Tag` rather than a parallel local enum.
+///
+/// Compiler reference: src/Sema.zig:zirBoolBr.
+fn evalBoolBr(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    assert(tag == .bool_br_and or tag == .bool_br_or);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.BoolBr, pl_node.payload_index);
+    const bool_br = extra.data;
+    assert(bool_br.lhs != .none);
+
+    const lhs_value = try sema.resolveRef(bool_br.lhs);
+    const lhs_is_true = switch (lhs_value.index) {
+        .bool_true => true,
+        .bool_false => false,
+        else => {
+            try sema.writer.writeAll("bool_br: lhs is not a bool\n");
+            return error.AnalysisFail;
+        },
+    };
+
+    const short_circuited = switch (tag) {
+        .bool_br_and => !lhs_is_true, // false and X -> false
+        .bool_br_or => lhs_is_true, // true  or  X -> true
+        else => unreachable,
+    };
+    if (short_circuited) return lhs_value;
+
+    const body = sema.zir.bodySlice(extra.end, bool_br.body_len);
+    return try sema.evalBody(body);
+}
 
 /// `typeof_log2_int_type`: returns the type whose values are valid as the
 /// right-hand operand of `lhs << rhs` / `lhs >> rhs`. For `comptime_int`
