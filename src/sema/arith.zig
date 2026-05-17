@@ -265,6 +265,89 @@ pub fn internBitwise(
     return idx;
 }
 
+/// Error set for the shift kernels. `ConvertError` is reused from
+/// `std.math.big.int.Const` so a negative-shift surfaces as
+/// `error.NegativeIntoUnsigned` and a shift-too-big-for-usize surfaces as
+/// `error.TargetTooSmall` — the same names stdlib gives those conditions
+/// when extracting via `BigIntConst.toInt`. `ShiftAmountTooLarge` is the
+/// one project-specific addition: our soft cap on workspace size.
+pub const ShiftError =
+    Allocator.Error || std.math.big.int.Const.ConvertError || error{ShiftAmountTooLarge};
+
+/// Cap on shift amounts. A comptime_int shift is mathematically defined
+/// for any non-negative amount, but allocating workspace for a shift of
+/// `usize.max` bits is absurd. The cap stays high enough that any
+/// plausible numeric work fits (~2 MB of limbs).
+pub const max_shift_bits: usize = 1 << 24;
+
+/// `lhs << rhs`. Workspace sized to the bound on
+/// `BigIntMutable.shiftLeft`: `a.limbs.len + ceil(shift / limb_bits)`.
+pub fn internShl(
+    gpa: Allocator,
+    intern_pool: *InternPool,
+    lhs: BigIntConst,
+    rhs: BigIntConst,
+) ShiftError!InternPool.Index {
+    const shift = try shiftAmount(rhs);
+    const limb_bits = @sizeOf(Limb) * 8;
+    return runShift(gpa, intern_pool, lhs, shift, lhs.limbs.len + (shift / limb_bits) + 1, .left);
+}
+
+/// `lhs >> rhs`. Workspace cannot grow beyond `lhs.limbs.len`.
+pub fn internShr(
+    gpa: Allocator,
+    intern_pool: *InternPool,
+    lhs: BigIntConst,
+    rhs: BigIntConst,
+) ShiftError!InternPool.Index {
+    const shift = try shiftAmount(rhs);
+    return runShift(gpa, intern_pool, lhs, shift, lhs.limbs.len, .right);
+}
+
+fn shiftAmount(rhs: BigIntConst) ShiftError!usize {
+    assert(rhs.limbs.len > 0);
+    // Stdlib's `toInt` short-circuits negative-into-unsigned through
+    // `TargetTooSmall` (its sign check happens before the explicit
+    // `NegativeIntoUnsigned` arm), so pre-check the sign here so callers
+    // see the more precise error name.
+    if (!rhs.positive and !rhs.eqlZero()) return error.NegativeIntoUnsigned;
+    const shift = try rhs.toInt(usize);
+    if (shift > max_shift_bits) return error.ShiftAmountTooLarge;
+    return shift;
+}
+
+fn runShift(
+    gpa: Allocator,
+    intern_pool: *InternPool,
+    lhs: BigIntConst,
+    shift: usize,
+    workspace_len: usize,
+    direction: enum { left, right },
+) Allocator.Error!InternPool.Index {
+    assert(@intFromPtr(intern_pool) != 0);
+    assert(lhs.limbs.len > 0);
+
+    const workspace = try gpa.alloc(Limb, workspace_len);
+    defer gpa.free(workspace);
+
+    var mutable: BigIntMutable = .{
+        .limbs = workspace,
+        .len = undefined,
+        .positive = undefined,
+    };
+    switch (direction) {
+        .left => mutable.shiftLeft(lhs, shift),
+        .right => mutable.shiftRight(lhs, shift),
+    }
+
+    assert(mutable.len > 0);
+    assert(mutable.len <= workspace_len);
+
+    const idx = try intern_pool.internComptimeInt(mutable.toConst());
+    assert(idx != .none);
+    return idx;
+}
+
 /// Integer comparison. Result is a plain `bool` (no intern needed —
 /// callers map to `Index.bool_true` / `Index.bool_false`). Sign and
 /// magnitude are handled by `BigIntConst.order`; the `Order.compare`
@@ -471,6 +554,60 @@ test "internMod and internRem differ in sign for negative dividend" {
     // @rem: result has sign of dividend → -1
     const rem_idx = try internRem(gpa, &pool, constLimbs(&a, false), constLimbs(&b, true));
     try expectInternedDecimal(gpa, &pool, rem_idx, "-1");
+}
+
+test "internShl: small" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{1};
+    var s = [_]Limb{5};
+    const idx = try internShl(gpa, &pool, constLimbs(&a, true), constLimbs(&s, true));
+    try expectInternedDecimal(gpa, &pool, idx, "32");
+}
+
+test "internShl: across limb boundary" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{1};
+    var s = [_]Limb{128};
+    const idx = try internShl(gpa, &pool, constLimbs(&a, true), constLimbs(&s, true));
+    try expectInternedDecimal(gpa, &pool, idx, "340282366920938463463374607431768211456"); // 2^128
+}
+
+test "internShr: small" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{1024};
+    var s = [_]Limb{3};
+    const idx = try internShr(gpa, &pool, constLimbs(&a, true), constLimbs(&s, true));
+    try expectInternedDecimal(gpa, &pool, idx, "128");
+}
+
+test "shift kernels surface stdlib ConvertError variants" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{1};
+    var s = [_]Limb{2};
+    // Negative shift -> stdlib's NegativeIntoUnsigned, propagated verbatim.
+    try testing.expectError(
+        error.NegativeIntoUnsigned,
+        internShl(gpa, &pool, constLimbs(&a, true), constLimbs(&s, false)),
+    );
+
+    // Shift beyond our soft cap -> our one project-specific variant.
+    var s_huge = [_]Limb{max_shift_bits + 1};
+    try testing.expectError(
+        error.ShiftAmountTooLarge,
+        internShl(gpa, &pool, constLimbs(&a, true), constLimbs(&s_huge, true)),
+    );
 }
 
 test "internBitwise: bit_and on positives" {

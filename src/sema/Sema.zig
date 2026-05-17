@@ -117,6 +117,10 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .bit_and => sema.evalBitwise(inst, .bit_and),
         .bit_or => sema.evalBitwise(inst, .bit_or),
         .xor => sema.evalBitwise(inst, .xor),
+        .shl => sema.evalShift(inst, "shl", arith.internShl),
+        .shr => sema.evalShift(inst, "shr", arith.internShr),
+        .typeof_log2_int_type => sema.evalTypeofLog2IntType(inst),
+        .as_node, .as_shift_operand => sema.evalAsNode(inst),
         .cmp_lt => sema.evalComparison(inst, .lt),
         .cmp_lte => sema.evalComparison(inst, .lte),
         .cmp_eq => sema.evalComparison(inst, .eq),
@@ -254,6 +258,128 @@ fn unwrapDivResult(
     };
     assert(idx != .none);
     return idx;
+}
+
+const ShiftKernel = *const fn (
+    std.mem.Allocator,
+    *InternPool,
+    std.math.big.int.Const,
+    std.math.big.int.Const,
+) arith.ShiftError!InternPool.Index;
+
+/// `typeof_log2_int_type`: returns the type whose values are valid as the
+/// right-hand operand of `lhs << rhs` / `lhs >> rhs`. For `comptime_int`
+/// operands this is `comptime_int` itself (the compiler's behavior); for
+/// fixed-width int operands it is `unsigned(log2_ceil(bits))`.
+///
+/// Compiler reference: src/Sema.zig:zirTypeofLog2IntType -> log2IntType.
+fn evalTypeofLog2IntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
+
+    const operand = try sema.resolveRef(un_node.operand);
+    const operand_type = Value.typeOf(operand, sema.intern_pool);
+
+    if (operand_type.index == .comptime_int_type) {
+        const idx = try sema.intern_pool.internTypeValue(.comptime_int_type);
+        return .{ .index = idx };
+    }
+
+    const operand_type_key = sema.intern_pool.get(operand_type.index);
+    if (operand_type_key == .int_type) {
+        const bits = operand_type_key.int_type.bits;
+        const log2_bits: u16 = if (bits == 0) 0 else std.math.log2_int_ceil(u16, bits);
+        const log2_type = try sema.intern_pool.internIntType(.unsigned, log2_bits);
+        const idx = try sema.intern_pool.internTypeValue(log2_type);
+        return .{ .index = idx };
+    }
+
+    try sema.writer.writeAll("typeof_log2_int_type: non-integer operand not yet supported\n");
+    return error.AnalysisFail;
+}
+
+/// `as_node` / `as_shift_operand`: coerce `operand` to `dest_type`. The
+/// initial cut handles only comptime_int -> comptime_int (identity
+/// passthrough). Other coercions land alongside fixed-width int support.
+///
+/// Compiler reference: src/Sema.zig:zirAsNode -> analyzeAs.
+fn evalAsNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const as = sema.zir.extraData(Zir.Inst.As, pl_node.payload_index).data;
+    assert(as.dest_type != .none);
+    assert(as.operand != .none);
+
+    const dest_value = try sema.resolveRef(as.dest_type);
+    const dest_key = sema.intern_pool.get(dest_value.index);
+    if (dest_key != .type_value) {
+        try sema.writer.writeAll("as: destination is not a type\n");
+        return error.AnalysisFail;
+    }
+    const dest_type_index = dest_key.type_value;
+
+    const operand_value = try sema.resolveRef(as.operand);
+    const operand_type = Value.typeOf(operand_value, sema.intern_pool);
+
+    // Identity coercion is always safe.
+    if (dest_type_index == operand_type.index) return operand_value;
+
+    try sema.writer.print(
+        "as: only identity coercion is supported yet (dest != operand type)\n",
+        .{},
+    );
+    return error.AnalysisFail;
+}
+
+/// `shl / shr`. Same operand shape as the other binary ops, but `rhs` is a
+/// shift amount that must fit in `usize` and be non-negative — the kernel's
+/// stdlib-named `ConvertError.NegativeIntoUnsigned` /
+/// `ConvertError.TargetTooSmall` flow through here and become runtime-style
+/// diagnostics + `AnalysisFail`.
+///
+/// `shl_exact` / `shr_exact` land alongside fixed-width int support — the
+/// "no bits lost" check is meaningful only when the operand has a width.
+///
+/// Compiler reference: src/Sema.zig:zirShl / zirShr.
+fn evalShift(
+    sema: *Sema,
+    inst: Zir.Inst.Index,
+    op_name: []const u8,
+    kernel: ShiftKernel,
+) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    assert(op_name.len > 0);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    assert(bin.lhs != .none);
+    assert(bin.rhs != .none);
+
+    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name);
+    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name);
+
+    const idx = kernel(sema.gpa, sema.intern_pool, lhs, rhs) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NegativeIntoUnsigned => {
+            try sema.writer.print("error: {s}: shift amount is negative\n", .{op_name});
+            return error.AnalysisFail;
+        },
+        error.TargetTooSmall => {
+            try sema.writer.print("error: {s}: shift amount exceeds usize\n", .{op_name});
+            return error.AnalysisFail;
+        },
+        error.ShiftAmountTooLarge => {
+            try sema.writer.print("error: {s}: shift amount exceeds {d} bits\n", .{ op_name, arith.max_shift_bits });
+            return error.AnalysisFail;
+        },
+    };
+    return .{ .index = idx };
 }
 
 /// `bit_and / bit_or / xor`. Same operand shape as `evalBinaryArith`

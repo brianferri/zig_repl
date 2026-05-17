@@ -495,6 +495,20 @@ pub fn internComptimeInt(pool: *InternPool, value: BigIntConst) Allocator.Error!
     return pool.internIntValue(.comptime_int_type, value);
 }
 
+/// Intern a value whose runtime type is `type` and whose payload is the
+/// interned type identified by `ty`. This is how Sema returns "the
+/// expression evaluated to a type" results (e.g. `@TypeOf(x)` or the
+/// type computed by `typeof_log2_int_type`).
+pub fn internTypeValue(pool: *InternPool, ty: Index) Allocator.Error!Index {
+    assert(@intFromPtr(pool) != 0);
+    assert(ty != .none);
+
+    const items_before = pool.items.len;
+    try pool.items.append(pool.gpa, .{ .tag = .type_value, .data = @intFromEnum(ty) });
+    assert(pool.items.len == items_before + 1);
+    return @enumFromInt(@as(u32, @intCast(pool.items.len - 1)));
+}
+
 pub fn itemCount(pool: *const InternPool) u32 {
     return @intCast(pool.items.len);
 }

@@ -132,6 +132,17 @@ test "comparison operators yield the well-known bool indices" {
     try expectEvalBool(gpa, &pool, "3 > 2", true);
 }
 
+test "shifts on comptime_int" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalDecimal(gpa, &pool, "1 << 5", "32");
+    try expectEvalDecimal(gpa, &pool, "1 << 128", "340282366920938463463374607431768211456");
+    try expectEvalDecimal(gpa, &pool, "1024 >> 3", "128");
+    try expectEvalDecimal(gpa, &pool, "0xFF00 >> 8", "255");
+}
+
 test "bitwise binary ops on comptime_int" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
