@@ -132,6 +132,86 @@ test "comparison operators yield the well-known bool indices" {
     try expectEvalBool(gpa, &pool, "3 > 2", true);
 }
 
+test "if expression selects then branch" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalDecimal(gpa, &pool, "if (true) 10 else 20", "10");
+    try expectEvalDecimal(gpa, &pool, "if (1 < 2) 100 else 200", "100");
+}
+
+test "if expression selects else branch" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalDecimal(gpa, &pool, "if (false) 10 else 20", "20");
+    try expectEvalDecimal(gpa, &pool, "if (2 < 1) 100 else 200", "200");
+}
+
+test "if expression composes with arithmetic" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalDecimal(gpa, &pool, "if (true) 1 + 2 else 9", "3");
+    try expectEvalDecimal(gpa, &pool, "(if (1 < 2) 10 else 20) + 5", "15");
+}
+
+test "nested if expressions" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalDecimal(gpa, &pool, "if (1 == 1) if (2 > 1) 7 else 8 else 9", "7");
+    try expectEvalDecimal(gpa, &pool, "if (1 == 1) if (2 < 1) 7 else 8 else 9", "8");
+    try expectEvalDecimal(gpa, &pool, "if (1 != 1) if (2 > 1) 7 else 8 else 9", "9");
+}
+
+test "if / else if chains" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // else-if desugars to else { if ... }; exercises the recursive condbr
+    // path through the picked else-body.
+    const ladder = "if (false) 1 else if (false) 2 else if (true) 3 else 4";
+    try expectEvalDecimal(gpa, &pool, ladder, "3");
+}
+
+test "labeled block as expression" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // `blk: { break :blk N; }` exercises block / break_inline directly,
+    // without an `if` wrapper.
+    try expectEvalDecimal(gpa, &pool, "blk: { break :blk 42; }", "42");
+    try expectEvalDecimal(gpa, &pool, "blk: { break :blk 1 + 2; }", "3");
+}
+
+test "if branches with negative results" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalDecimal(gpa, &pool, "if (3 < 0) 3 else -3", "-3");
+    try expectEvalDecimal(gpa, &pool, "if (-7 < 0) -1 else 1", "-1");
+}
+
+test "if-as-value inside bool short-circuit" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // The rhs of `and` is a ZIR body; an if inside it exercises a
+    // condbr nested under bool_br.
+    try expectEvalBool(gpa, &pool, "true and (if (1 < 2) true else false)", true);
+    try expectEvalBool(gpa, &pool, "true and (if (1 > 2) true else false)", false);
+    try expectEvalBool(gpa, &pool, "false or (if (1 < 2) true else false)", true);
+}
+
 test "bool_not flips well-known bool values" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);

@@ -91,6 +91,7 @@ fn evalBody(sema: *Sema, body: []const Zir.Inst.Index) Error!Value {
                 const operand = datas[@intFromEnum(inst)].@"break".operand;
                 return sema.resolveRef(operand);
             },
+            .condbr, .condbr_inline => return sema.evalCondbr(inst),
             else => {
                 if (try sema.evalInst(inst, tag)) |result| {
                     try sema.results.put(sema.gpa, inst, result);
@@ -123,6 +124,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .bool_not => sema.evalBoolNot(inst),
         .bool_br_and => sema.evalBoolBr(inst, .bool_br_and),
         .bool_br_or => sema.evalBoolBr(inst, .bool_br_or),
+        .block, .block_inline => sema.evalBlock(inst),
         .cmp_lt => sema.evalComparison(inst, .lt),
         .cmp_lte => sema.evalComparison(inst, .lte),
         .cmp_eq => sema.evalComparison(inst, .eq),
@@ -268,6 +270,64 @@ const ShiftKernel = *const fn (
     std.math.big.int.Const,
     std.math.big.int.Const,
 ) arith.ShiftError!InternPool.Index;
+
+/// `block` / `block_inline`: evaluate an inner ZIR body and yield the value
+/// it breaks with. Sema's existing `evalBody` already does this — `block`
+/// here is just an `evalInst` arm that exposes the inner body's break
+/// value as the instruction's own result.
+///
+/// Each `evalBody` call corresponds to one block scope; `break_inline`
+/// inside the inner body terminates *that* call and returns the value
+/// here. Labeled multi-level breaks need a return-signal mechanism we
+/// haven't built yet; the single-target case suffices for `if`-as-value
+/// and the bodies AstGen emits around comparison/shift sequences.
+///
+/// Compiler reference: src/Sema.zig:zirBlock / zirBlockInline.
+fn evalBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.Block, pl_node.payload_index);
+    const body = sema.zir.bodySlice(extra.end, extra.data.body_len);
+    return try sema.evalBody(body);
+}
+
+/// `condbr` / `condbr_inline`: resolve a bool condition, pick the then or
+/// else body, recursively evalBody on the chosen one. The picked body
+/// terminates with `break_inline` to its enclosing block, which exits the
+/// recursive `evalBody` call here. Treated as a terminator by the outer
+/// `evalBody` because it always transfers control — never falls through.
+///
+/// Compiler reference: src/Sema.zig:zirCondbr.
+fn evalCondbr(sema: *Sema, inst: Zir.Inst.Index) Error!Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.CondBr, pl_node.payload_index);
+    const condbr = extra.data;
+    assert(condbr.condition != .none);
+
+    const cond_value = try sema.resolveRef(condbr.condition);
+    const cond_is_true = switch (cond_value.index) {
+        .bool_true => true,
+        .bool_false => false,
+        else => {
+            try sema.writer.writeAll("condbr: condition is not a bool\n");
+            return error.AnalysisFail;
+        },
+    };
+
+    const then_body_start = extra.end;
+    const else_body_start = then_body_start + condbr.then_body_len;
+    const body = if (cond_is_true)
+        sema.zir.bodySlice(then_body_start, condbr.then_body_len)
+    else
+        sema.zir.bodySlice(else_body_start, condbr.else_body_len);
+
+    return try sema.evalBody(body);
+}
 
 /// `!operand` (bool_not). Operand must be one of the two well-known bool
 /// indices; we map directly to the opposite without going through Sema
