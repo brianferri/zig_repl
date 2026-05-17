@@ -114,6 +114,9 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .div_trunc => sema.evalBinaryArith(inst, .div_trunc),
         .mod => sema.evalBinaryArith(inst, .mod),
         .rem => sema.evalBinaryArith(inst, .rem),
+        .bit_and => sema.evalBitwise(inst, .bit_and),
+        .bit_or => sema.evalBitwise(inst, .bit_or),
+        .xor => sema.evalBitwise(inst, .xor),
         .cmp_lt => sema.evalComparison(inst, .lt),
         .cmp_lte => sema.evalComparison(inst, .lte),
         .cmp_eq => sema.evalComparison(inst, .eq),
@@ -251,6 +254,32 @@ fn unwrapDivResult(
     };
     assert(idx != .none);
     return idx;
+}
+
+/// `bit_and / bit_or / xor`. Same operand shape as `evalBinaryArith`
+/// (pl_node + Bin); routes to `arith.internBitwise` which dispatches on
+/// the op via std.math.big.int.Mutable's bitAnd/bitOr/bitXor.
+///
+/// Compiler reference: src/Sema.zig:zirBitBinOp -> src/Sema/arith.zig.
+fn evalBitwise(
+    sema: *Sema,
+    inst: Zir.Inst.Index,
+    op: arith.BitwiseBinOp,
+) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    assert(bin.lhs != .none);
+    assert(bin.rhs != .none);
+
+    const op_name: []const u8 = @tagName(op);
+    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name);
+    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name);
+
+    const idx = try arith.internBitwise(sema.gpa, sema.intern_pool, op, lhs, rhs);
+    return .{ .index = idx };
 }
 
 /// `cmp_lt / cmp_lte / cmp_eq / cmp_gte / cmp_gt / cmp_neq`. Same operand

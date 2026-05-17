@@ -222,6 +222,49 @@ pub fn internRem(
     return idx;
 }
 
+/// Bitwise binary op family. The workspace bound `@max(lhs, rhs) + 1`
+/// covers every sign combination per the stdlib docs:
+///   - bitAnd: `@min(a, b)` for two positives, `@max(a, b) + 1` if both
+///     negative — `@max + 1` is the safe over-allocation.
+///   - bitOr / bitXor: `@max(a, b)` for matched signs, `@max + 1` for
+///     mixed signs.
+/// Using one `+1` upper bound for all three keeps the kernel uniform.
+pub const BitwiseBinOp = enum { bit_and, bit_or, xor };
+
+pub fn internBitwise(
+    gpa: Allocator,
+    intern_pool: *InternPool,
+    op: BitwiseBinOp,
+    lhs: BigIntConst,
+    rhs: BigIntConst,
+) Allocator.Error!InternPool.Index {
+    assert(@intFromPtr(intern_pool) != 0);
+    assert(lhs.limbs.len > 0);
+    assert(rhs.limbs.len > 0);
+
+    const workspace_len = @max(lhs.limbs.len, rhs.limbs.len) + 1;
+    const workspace = try gpa.alloc(Limb, workspace_len);
+    defer gpa.free(workspace);
+
+    var mutable: BigIntMutable = .{
+        .limbs = workspace,
+        .len = undefined,
+        .positive = undefined,
+    };
+    switch (op) {
+        .bit_and => mutable.bitAnd(lhs, rhs),
+        .bit_or => mutable.bitOr(lhs, rhs),
+        .xor => mutable.bitXor(lhs, rhs),
+    }
+
+    assert(mutable.len > 0);
+    assert(mutable.len <= workspace_len);
+
+    const idx = try intern_pool.internComptimeInt(mutable.toConst());
+    assert(idx != .none);
+    return idx;
+}
+
 /// Integer comparison. Result is a plain `bool` (no intern needed —
 /// callers map to `Index.bool_true` / `Index.bool_false`). Sign and
 /// magnitude are handled by `BigIntConst.order`; the `Order.compare`
@@ -428,6 +471,50 @@ test "internMod and internRem differ in sign for negative dividend" {
     // @rem: result has sign of dividend → -1
     const rem_idx = try internRem(gpa, &pool, constLimbs(&a, false), constLimbs(&b, true));
     try expectInternedDecimal(gpa, &pool, rem_idx, "-1");
+}
+
+test "internBitwise: bit_and on positives" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{0b1100};
+    var b = [_]Limb{0b1010};
+    const idx = try internBitwise(gpa, &pool, .bit_and, constLimbs(&a, true), constLimbs(&b, true));
+    try expectInternedDecimal(gpa, &pool, idx, "8"); // 0b1000
+}
+
+test "internBitwise: bit_or on positives" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{0b1100};
+    var b = [_]Limb{0b1010};
+    const idx = try internBitwise(gpa, &pool, .bit_or, constLimbs(&a, true), constLimbs(&b, true));
+    try expectInternedDecimal(gpa, &pool, idx, "14"); // 0b1110
+}
+
+test "internBitwise: xor on positives" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{0b1100};
+    var b = [_]Limb{0b1010};
+    const idx = try internBitwise(gpa, &pool, .xor, constLimbs(&a, true), constLimbs(&b, true));
+    try expectInternedDecimal(gpa, &pool, idx, "6"); // 0b0110
+}
+
+test "internBitwise: xor of a value with itself is zero" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var a = [_]Limb{0xCAFE};
+    var b = [_]Limb{0xCAFE};
+    const idx = try internBitwise(gpa, &pool, .xor, constLimbs(&a, true), constLimbs(&b, true));
+    try expectInternedDecimal(gpa, &pool, idx, "0");
 }
 
 test "compareInt covers all six operators on simple positives" {
