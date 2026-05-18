@@ -23,6 +23,7 @@ pub fn render(
             const big = iv.storage.toBigInt(&space);
             return writer.print("{f}\n", .{big});
         },
+        .float => |fv| renderFloat(fv, writer),
         .simple_value => |sv| writer.print("{s}\n", .{simpleValueText(sv)}),
         .undef => writer.writeAll("undefined\n"),
         .type_value => |ty_idx| renderTypeRef(ty_idx, pool, writer),
@@ -63,6 +64,22 @@ fn renderTypeRef(
             renderAnyframeChild(child, pool, writer),
         else => writer.writeAll("<type>\n"),
     };
+}
+
+/// Print each float-storage variant in its native precision. f80 has no
+/// dedicated `std.fmt` formatter, so we widen to f128 for display only;
+/// the stored value keeps its precision.
+fn renderFloat(
+    float: InternPool.Key.Float,
+    writer: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    switch (float.storage) {
+        .f16 => |v| try writer.print("{d}\n", .{v}),
+        .f32 => |v| try writer.print("{d}\n", .{v}),
+        .f64 => |v| try writer.print("{d}\n", .{v}),
+        .f80 => |v| try writer.print("{d}\n", .{@as(f128, @floatCast(v))}),
+        .f128 => |v| try writer.print("{d}\n", .{v}),
+    }
 }
 
 fn renderAnyframeChild(

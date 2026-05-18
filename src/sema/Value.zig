@@ -31,6 +31,7 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
             .@"unreachable" => .{ .index = .noreturn_type },
         },
         .int => |iv| .{ .index = iv.ty },
+        .float => |fv| .{ .index = fv.ty },
         .undef => |ty| .{ .index = ty },
         .type_value => .type_type,
         // A bare type Key (the slot a type lives in) doubles as the value

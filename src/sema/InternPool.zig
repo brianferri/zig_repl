@@ -179,6 +179,12 @@ pub const Key = union(enum) {
     /// arbitrary precision. For `big_int`, the limbs slice borrows from
     /// the pool's arena and is valid for the pool's lifetime.
     int: Int,
+    /// A floating-point value tagged with its type. Mirrors the compiler's
+    /// `Key.float`. The storage variant must match the type's bit width,
+    /// except for `c_longdouble_type` (storage may be any width — promoted
+    /// to f128 on emit unless f80) and `comptime_float_type` (always
+    /// f128).
+    float: Float,
     /// `undefined` of type `Index`. Untyped `undefined` uses
     /// `.undefined_type` here; the well-known `Index.undef` slot stores
     /// exactly that shape. Mirrors the compiler's `Key.undef`.
@@ -217,6 +223,22 @@ pub const Key = union(enum) {
         };
     };
 
+    pub const Float = struct {
+        ty: Index,
+        /// The storage variant used must match the size of the float type
+        /// being represented (except for `c_longdouble_type`, see the
+        /// emit dispatcher).
+        storage: Storage,
+
+        pub const Storage = union(enum) {
+            f16: f16,
+            f32: f32,
+            f64: f64,
+            f80: f80,
+            f128: f128,
+        };
+    };
+
     /// Stable hash for dedup. `pool` is reserved for future Key variants
     /// (e.g. `struct_type`) whose canonical form requires pool lookup;
     /// today's variants ignore it. Storage variants of `int` are
@@ -245,6 +267,15 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, big.positive);
                 for (big.limbs) |limb| std.hash.autoHash(&hasher, limb);
             },
+            .float => |f| {
+                std.hash.autoHash(&hasher, f.ty);
+                switch (f.storage) {
+                    inline else => |v| {
+                        const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(v)));
+                        std.hash.autoHash(&hasher, @as(Bits, @bitCast(v)));
+                    },
+                }
+            },
             .undef => |ty| std.hash.autoHash(&hasher, ty),
             .type_value => |t| std.hash.autoHash(&hasher, t),
         }
@@ -269,6 +300,33 @@ pub const Key = union(enum) {
                 var sa: Int.Storage.BigIntSpace = undefined;
                 var sb: Int.Storage.BigIntSpace = undefined;
                 break :blk x.storage.toBigInt(&sa).eql(y.storage.toBigInt(&sb));
+            },
+            .float => |x| blk: {
+                const y = b.float;
+                if (x.ty != y.ty) break :blk false;
+                // c_longdouble may be stored as any width and is promoted to
+                // f128 on emit (except f80, which has its own tag). Two
+                // c_longdouble Keys with different storage widths compare
+                // equal iff they round-trip to the same f128 bit-pattern.
+                // Mirrors the compiler's `Key.eql` branch.
+                if (x.ty == .c_longdouble_type and x.storage != .f80) {
+                    const a_bits: u128 = switch (x.storage) {
+                        inline else => |v| @bitCast(@as(f128, @floatCast(v))),
+                    };
+                    const b_bits: u128 = switch (y.storage) {
+                        inline else => |v| @bitCast(@as(f128, @floatCast(v))),
+                    };
+                    break :blk a_bits == b_bits;
+                }
+                const StorageTag = @typeInfo(Float.Storage).@"union".tag_type.?;
+                if (@as(StorageTag, x.storage) != @as(StorageTag, y.storage)) break :blk false;
+                break :blk switch (x.storage) {
+                    inline else => |xv, tag| eq: {
+                        const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(xv)));
+                        const yv = @field(y.storage, @tagName(tag));
+                        break :eq @as(Bits, @bitCast(xv)) == @as(Bits, @bitCast(yv));
+                    },
+                };
             },
             .undef => |x| x == b.undef,
             .type_value => |x| x == b.type_value,
@@ -308,6 +366,21 @@ const Item = struct {
         // head of a Limb-aligned arena, limbs trailing).
         int_positive,
         int_negative,
+        // Floats. Tag implies the type. For f16/f32 the bit-pattern fits in
+        // `data` directly. f64/f80/f128 spill to `extra` as packed u32 pieces
+        // (see Float64 / Float80 / Float128). c_longdouble has two tags
+        // because the compiler stores either f80 (native x87) or f128 (every
+        // other target); a runtime-only port doesn't pick the active arm but
+        // mirrors the storage so the tag set matches the compiler exactly.
+        // `comptime_float` is always stored as f128.
+        float_f16, // ty = .f16_type;  data = @as(u16, @bitCast(f16)) inline
+        float_f32, // ty = .f32_type;  data = @as(u32, @bitCast(f32)) inline
+        float_f64, // ty = .f64_type;  data = extra index of Float64
+        float_f80, // ty = .f80_type;  data = extra index of Float80
+        float_f128, // ty = .f128_type; data = extra index of Float128
+        float_c_longdouble_f80, // ty = .c_longdouble_type; storage f80, data = extra index of Float80
+        float_c_longdouble_f128, // ty = .c_longdouble_type; storage f128, data = extra index of Float128
+        float_comptime_float, // ty = .comptime_float_type; data = extra index of Float128
         undef, // data = Index of the value's type (`undefined_type` for untyped)
         type_value, // data = Index of the interned type
     };
@@ -334,6 +407,83 @@ const IntBigHeader = packed struct {
 
     /// Number of Limb slots this header occupies (1 on 64-bit, 2 on 32-bit).
     const limbs_items_len = @divExact(@sizeOf(IntBigHeader), @sizeOf(std.math.big.Limb));
+};
+
+/// Extra-arena payload for `Item.Tag.float_f64`. Mirrors the compiler's
+/// `Float64`: the f64 bit-pattern split into two u32 pieces so it fits
+/// in the u32-typed `extra` array.
+pub const Float64 = extern struct {
+    piece0: u32,
+    piece1: u32,
+
+    pub fn pack(value: f64) Float64 {
+        const bits: u64 = @bitCast(value);
+        return .{
+            .piece0 = @truncate(bits),
+            .piece1 = @truncate(bits >> 32),
+        };
+    }
+
+    pub fn get(self: Float64) f64 {
+        const bits: u64 = @as(u64, self.piece0) | (@as(u64, self.piece1) << 32);
+        return @bitCast(bits);
+    }
+};
+
+/// Extra-arena payload for `Item.Tag.float_f80` and
+/// `Item.Tag.float_c_longdouble_f80`. Mirrors the compiler's `Float80`:
+/// the f80 bit-pattern split across two u32 pieces and one u16 piece
+/// (zero-padded to a u32 slot).
+pub const Float80 = extern struct {
+    piece0: u32,
+    piece1: u32,
+    /// Low u16 carries the high 16 bits of the f80; upper u16 is zero.
+    piece2: u32,
+
+    pub fn pack(value: f80) Float80 {
+        const bits: u80 = @bitCast(value);
+        return .{
+            .piece0 = @truncate(bits),
+            .piece1 = @truncate(bits >> 32),
+            .piece2 = @truncate(bits >> 64),
+        };
+    }
+
+    pub fn get(self: Float80) f80 {
+        const bits: u80 = @as(u80, self.piece0) |
+            (@as(u80, self.piece1) << 32) |
+            (@as(u80, self.piece2) << 64);
+        return @bitCast(bits);
+    }
+};
+
+/// Extra-arena payload for `Item.Tag.float_f128`,
+/// `Item.Tag.float_c_longdouble_f128`, and
+/// `Item.Tag.float_comptime_float`. Mirrors the compiler's `Float128`:
+/// the f128 bit-pattern split into four u32 pieces.
+pub const Float128 = extern struct {
+    piece0: u32,
+    piece1: u32,
+    piece2: u32,
+    piece3: u32,
+
+    pub fn pack(value: f128) Float128 {
+        const bits: u128 = @bitCast(value);
+        return .{
+            .piece0 = @truncate(bits),
+            .piece1 = @truncate(bits >> 32),
+            .piece2 = @truncate(bits >> 64),
+            .piece3 = @truncate(bits >> 96),
+        };
+    }
+
+    pub fn get(self: Float128) f128 {
+        const bits: u128 = @as(u128, self.piece0) |
+            (@as(u128, self.piece1) << 32) |
+            (@as(u128, self.piece2) << 64) |
+            (@as(u128, self.piece3) << 96);
+        return @bitCast(bits);
+    }
 };
 
 gpa: Allocator,
@@ -537,6 +687,7 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
             });
         },
         .int => |i| try emitInt(pool, i),
+        .float => |f| try emitFloat(pool, f),
     }
 
     assert(pool.items.len == gop.index + 1);
@@ -572,9 +723,50 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .int_small => intSmallFromExtra(pool, item.data),
         .int_positive => intBigFromArena(pool, item.data, true),
         .int_negative => intBigFromArena(pool, item.data, false),
+        .float_f16 => .{ .float = .{
+            .ty = .f16_type,
+            .storage = .{ .f16 = @bitCast(@as(u16, @intCast(item.data))) },
+        } },
+        .float_f32 => .{ .float = .{
+            .ty = .f32_type,
+            .storage = .{ .f32 = @bitCast(item.data) },
+        } },
+        .float_f64 => .{ .float = .{
+            .ty = .f64_type,
+            .storage = .{ .f64 = floatFromExtra(pool, Float64, item.data).get() },
+        } },
+        .float_f80 => .{ .float = .{
+            .ty = .f80_type,
+            .storage = .{ .f80 = floatFromExtra(pool, Float80, item.data).get() },
+        } },
+        .float_f128 => .{ .float = .{
+            .ty = .f128_type,
+            .storage = .{ .f128 = floatFromExtra(pool, Float128, item.data).get() },
+        } },
+        .float_c_longdouble_f80 => .{ .float = .{
+            .ty = .c_longdouble_type,
+            .storage = .{ .f80 = floatFromExtra(pool, Float80, item.data).get() },
+        } },
+        .float_c_longdouble_f128 => .{ .float = .{
+            .ty = .c_longdouble_type,
+            .storage = .{ .f128 = floatFromExtra(pool, Float128, item.data).get() },
+        } },
+        .float_comptime_float => .{ .float = .{
+            .ty = .comptime_float_type,
+            .storage = .{ .f128 = floatFromExtra(pool, Float128, item.data).get() },
+        } },
         .undef => .{ .undef = @enumFromInt(item.data) },
         .type_value => .{ .type_value = @enumFromInt(item.data) },
     };
+}
+
+/// Reconstruct a packed `Float64` / `Float80` / `Float128` from `extra`.
+/// The struct is stored as `@sizeOf(T) / 4` consecutive u32 slots.
+fn floatFromExtra(pool: *const InternPool, comptime T: type, extra_index: u32) T {
+    const pieces_len = comptime @divExact(@sizeOf(T), @sizeOf(u32));
+    assert(extra_index + pieces_len <= pool.extra.items.len);
+    const pieces: [pieces_len]u32 = pool.extra.items[extra_index..][0..pieces_len].*;
+    return @bitCast(pieces);
 }
 
 inline fn intKey(ty: Index, storage: Key.Int.Storage) Key {
@@ -777,6 +969,105 @@ fn emitInt(pool: *InternPool, int: Key.Int) Allocator.Error!void {
 /// Intern an integer value with any storage form.
 pub fn internInt(pool: *InternPool, int: Key.Int) Allocator.Error!Index {
     return pool.get(.{ .int = int });
+}
+
+/// Emit the `Item` (and any extra) for a `Key.float`. Mirrors the
+/// `.float =>` arm of the compiler's `intern` (`src/InternPool.zig`):
+/// outer switch on `float.ty`; the c_longdouble arm picks a tag based
+/// on storage variant (f80 → its own tag, otherwise promoted to f128);
+/// comptime_float always stores as f128. Callers must have ensured one
+/// item of capacity — only reachable from `get`'s miss path.
+fn emitFloat(pool: *InternPool, float: Key.Float) Allocator.Error!void {
+    assert(isFloatType(float.ty));
+    switch (float.ty) {
+        .f16_type => {
+            assert(float.storage == .f16);
+            pool.items.appendAssumeCapacity(.{
+                .tag = .float_f16,
+                .data = @as(u16, @bitCast(float.storage.f16)),
+            });
+        },
+        .f32_type => {
+            assert(float.storage == .f32);
+            pool.items.appendAssumeCapacity(.{
+                .tag = .float_f32,
+                .data = @as(u32, @bitCast(float.storage.f32)),
+            });
+        },
+        .f64_type => {
+            assert(float.storage == .f64);
+            const extra_index = try addFloatExtra(pool, Float64.pack(float.storage.f64));
+            pool.items.appendAssumeCapacity(.{ .tag = .float_f64, .data = extra_index });
+        },
+        .f80_type => {
+            assert(float.storage == .f80);
+            const extra_index = try addFloatExtra(pool, Float80.pack(float.storage.f80));
+            pool.items.appendAssumeCapacity(.{ .tag = .float_f80, .data = extra_index });
+        },
+        .f128_type => {
+            assert(float.storage == .f128);
+            const extra_index = try addFloatExtra(pool, Float128.pack(float.storage.f128));
+            pool.items.appendAssumeCapacity(.{ .tag = .float_f128, .data = extra_index });
+        },
+        .c_longdouble_type => switch (float.storage) {
+            .f80 => |v| {
+                const extra_index = try addFloatExtra(pool, Float80.pack(v));
+                pool.items.appendAssumeCapacity(.{
+                    .tag = .float_c_longdouble_f80,
+                    .data = extra_index,
+                });
+            },
+            inline .f16, .f32, .f64, .f128 => |v| {
+                const extra_index = try addFloatExtra(pool, Float128.pack(@floatCast(v)));
+                pool.items.appendAssumeCapacity(.{
+                    .tag = .float_c_longdouble_f128,
+                    .data = extra_index,
+                });
+            },
+        },
+        .comptime_float_type => {
+            assert(float.storage == .f128);
+            const extra_index = try addFloatExtra(pool, Float128.pack(float.storage.f128));
+            pool.items.appendAssumeCapacity(.{
+                .tag = .float_comptime_float,
+                .data = extra_index,
+            });
+        },
+        else => unreachable,
+    }
+}
+
+/// Append a packed Float64/Float80/Float128 to `extra` and return its
+/// starting u32 index. The struct is laid out as `@sizeOf(T) / 4`
+/// consecutive u32 slots.
+fn addFloatExtra(pool: *InternPool, value: anytype) Allocator.Error!u32 {
+    const T = @TypeOf(value);
+    const pieces_len = comptime @divExact(@sizeOf(T), @sizeOf(u32));
+    const pieces: [pieces_len]u32 = @bitCast(value);
+    const extra_index: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.appendSlice(pool.gpa, &pieces);
+    return extra_index;
+}
+
+/// Intern a float value with any storage form.
+pub fn internFloat(pool: *InternPool, float: Key.Float) Allocator.Error!Index {
+    return pool.get(.{ .float = float });
+}
+
+/// True iff `ty` identifies a Zig float type. Mirrors the compiler's
+/// `isFloatType`.
+fn isFloatType(ty: Index) bool {
+    return switch (ty) {
+        .f16_type,
+        .f32_type,
+        .f64_type,
+        .f80_type,
+        .f128_type,
+        .c_longdouble_type,
+        .comptime_float_type,
+        => true,
+        else => false,
+    };
 }
 
 /// True if `ty` identifies a Zig integer type: any int_type slot, any
@@ -1024,6 +1315,61 @@ test "small comptime int compresses to inline tag" {
     const round = pool.indexToKey(idx).int;
     try std.testing.expectEqual(Index.comptime_int_type, round.ty);
     try std.testing.expectEqual(@as(u64, 42), round.storage.u64);
+}
+
+test "float storage: per-type tags and bit-pattern round-trip" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    // f32 inline tag.
+    const f32_idx = try pool.internFloat(.{ .ty = .f32_type, .storage = .{ .f32 = 1.5 } });
+    const f32_round = pool.indexToKey(f32_idx).float;
+    try std.testing.expectEqual(Index.f32_type, f32_round.ty);
+    try std.testing.expectEqual(@as(f32, 1.5), f32_round.storage.f32);
+
+    // f64 extra-arena tag.
+    const f64_idx = try pool.internFloat(.{
+        .ty = .f64_type,
+        .storage = .{ .f64 = 3.141592653589793 },
+    });
+    const f64_round = pool.indexToKey(f64_idx).float;
+    try std.testing.expectEqual(Index.f64_type, f64_round.ty);
+    try std.testing.expectEqual(@as(f64, 3.141592653589793), f64_round.storage.f64);
+
+    // f128 extra-arena tag.
+    const f128_idx = try pool.internFloat(.{
+        .ty = .f128_type,
+        .storage = .{ .f128 = 1e30 },
+    });
+    const f128_round = pool.indexToKey(f128_idx).float;
+    try std.testing.expectEqual(Index.f128_type, f128_round.ty);
+    try std.testing.expectEqual(@as(f128, 1e30), f128_round.storage.f128);
+}
+
+test "float dedup: equal values intern once; equal bit-patterns dedup; differing NaNs do not" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    // Same value, same type: single Item.
+    const items_before = pool.itemCount();
+    const a = try pool.internFloat(.{ .ty = .f32_type, .storage = .{ .f32 = 2.5 } });
+    const b = try pool.internFloat(.{ .ty = .f32_type, .storage = .{ .f32 = 2.5 } });
+    try std.testing.expectEqual(a, b);
+    try std.testing.expectEqual(items_before + 1, pool.itemCount());
+
+    // NaN with identical bit-pattern: dedups. (eql compares bit-patterns,
+    // not float equality, so NaN==NaN at the bit level.)
+    const nan_bits: u32 = 0x7fc00001;
+    const nan1: f32 = @bitCast(nan_bits);
+    const nan2: f32 = @bitCast(nan_bits);
+    const n1 = try pool.internFloat(.{ .ty = .f32_type, .storage = .{ .f32 = nan1 } });
+    const n2 = try pool.internFloat(.{ .ty = .f32_type, .storage = .{ .f32 = nan2 } });
+    try std.testing.expectEqual(n1, n2);
+
+    // NaN with a different payload bit-pattern: distinct Index.
+    const other_nan: f32 = @bitCast(@as(u32, 0x7fc00002));
+    const n3 = try pool.internFloat(.{ .ty = .f32_type, .storage = .{ .f32 = other_nan } });
+    try std.testing.expect(n1 != n3);
 }
 
 test "undef Key variant: well-known slot and typed undef" {

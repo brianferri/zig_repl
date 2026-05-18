@@ -107,6 +107,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     return switch (tag) {
         .int => sema.evalInt(inst),
         .int_big => sema.evalIntBig(inst),
+        .float => sema.evalFloat(inst),
+        .float128 => sema.evalFloat128(inst),
         .add,
         .sub,
         .mul,
@@ -190,6 +192,39 @@ fn evalIntBig(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const value: std.math.big.int.Const = .{ .limbs = limbs, .positive = true };
     const idx = try sema.intern_pool.internComptimeInt(value);
+    assert(idx != .none);
+    return .{ .index = idx };
+}
+
+/// f64-width float literal. AstGen stashes the value directly in the
+/// instruction's `float` union field; we widen it to f128 here so the
+/// stored Key matches the pool's invariant that `comptime_float_type`
+/// always uses `.f128` storage. Mirrors the compiler's zirFloat.
+fn evalFloat(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const value: f64 = sema.zir.instructions.items(.data)[@intFromEnum(inst)].float;
+    const idx = try sema.intern_pool.internFloat(.{
+        .ty = .comptime_float_type,
+        .storage = .{ .f128 = @floatCast(value) },
+    });
+    assert(idx != .none);
+    return .{ .index = idx };
+}
+
+/// f128-width float literal. AstGen stores the value as a 4-u32-piece
+/// `Zir.Inst.Float128` payload referenced by `pl_node`. Mirrors the
+/// compiler's zirFloat128.
+fn evalFloat128(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const payload = sema.zir.extraData(Zir.Inst.Float128, pl_node.payload_index).data;
+
+    const idx = try sema.intern_pool.internFloat(.{
+        .ty = .comptime_float_type,
+        .storage = .{ .f128 = payload.get() },
+    });
     assert(idx != .none);
     return .{ .index = idx };
 }
