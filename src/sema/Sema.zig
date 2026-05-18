@@ -112,6 +112,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .add,
         .sub,
         .mul,
+        .div,
         .div_exact,
         .div_floor,
         .div_trunc,
@@ -234,16 +235,15 @@ fn evalPassthroughUnNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return try sema.resolveRef(operand);
 }
 
-/// Integer add/sub/mul/div_*/mod/rem share the same operand shape
-/// (`pl_node` + `Bin`) and the same comptime_int-only first cut. Each
-/// routes to the matching kernel in `arith.zig` keyed on the ZIR tag the
-/// dispatcher captured; fixed-width and float dispatch land with their
-/// coercion handlers. Division kernels can fail with `DivisionByZero` or
-/// `DivisionNotExact`; those become an `AnalysisFail` after writing a
-/// runtime-style diagnostic.
+/// Binary arith dispatcher (`add/sub/mul/div(_*)?/mod/rem`). Picks int
+/// vs float kernels by operand type. When one operand is `comptime_int`
+/// and the other is `comptime_float`, the int side is promoted via
+/// `BigIntConst.toFloat(f128, .nearest_even)` — peer-type resolution as
+/// the compiler does for these specific types. Fixed-width arithmetic
+/// and full peer-type resolution land with their coercion handlers.
 ///
 /// Compiler reference: src/Sema.zig:zirArithmetic ->
-/// src/Sema/arith.zig:{add,sub,mul,divTrunc,divFloor,mod,rem,negate}.
+/// src/Sema/arith.zig:{add,sub,mul,divTrunc,divFloor,mod,rem}.
 fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
@@ -255,10 +255,63 @@ fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?
 
     const op_name: []const u8 = @tagName(tag);
     assert(op_name.len > 0);
+
+    const ip = sema.intern_pool;
+    const lhs_value = try sema.resolveRef(bin.lhs);
+    const rhs_value = try sema.resolveRef(bin.rhs);
+    const lhs_key = ip.indexToKey(lhs_value.index);
+    const rhs_key = ip.indexToKey(rhs_value.index);
+
+    const lhs_is_cti = lhs_key == .int and lhs_key.int.ty == .comptime_int_type;
+    const rhs_is_cti = rhs_key == .int and rhs_key.int.ty == .comptime_int_type;
+    const lhs_is_ctf = lhs_key == .float and lhs_key.float.ty == .comptime_float_type;
+    const rhs_is_ctf = rhs_key == .float and rhs_key.float.ty == .comptime_float_type;
+
+    if (lhs_is_cti and rhs_is_cti) {
+        return sema.evalBinaryArithInt(tag, lhs_key.int, rhs_key.int);
+    }
+    if ((lhs_is_cti or lhs_is_ctf) and (rhs_is_cti or rhs_is_ctf)) {
+        const lhs_f: InternPool.Key.Float = if (lhs_is_ctf) lhs_key.float else comptimeIntToComptimeFloat(lhs_key.int);
+        const rhs_f: InternPool.Key.Float = if (rhs_is_ctf) rhs_key.float else comptimeIntToComptimeFloat(rhs_key.int);
+        return sema.evalBinaryArithFloat(tag, lhs_f, rhs_f);
+    }
+
+    if ((lhs_key == .int or lhs_key == .float) and (rhs_key == .int or rhs_key == .float)) {
+        try sema.writer.print("{s}: fixed-width numeric arithmetic not yet supported\n", .{op_name});
+    } else {
+        try sema.writer.print("{s}: non-numeric or mismatched operands\n", .{op_name});
+    }
+    return error.AnalysisFail;
+}
+
+/// Peer-type promotion `comptime_int -> comptime_float`. The pool stores
+/// `comptime_float` as f128, so we round the big-int to f128 nearest-even
+/// — IEEE-754 default — matching the compiler's behavior for the same
+/// mixed-arithmetic case.
+fn comptimeIntToComptimeFloat(int: InternPool.Key.Int) InternPool.Key.Float {
+    assert(int.ty == .comptime_int_type);
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const big = int.storage.toBigInt(&space);
+    const promoted = big.toFloat(f128, .nearest_even);
+    return .{
+        .ty = .comptime_float_type,
+        .storage = .{ .f128 = promoted[0] },
+    };
+}
+
+fn evalBinaryArithInt(
+    sema: *Sema,
+    tag: Zir.Inst.Tag,
+    lhs_int: InternPool.Key.Int,
+    rhs_int: InternPool.Key.Int,
+) Error!?Value {
+    assert(lhs_int.ty == .comptime_int_type);
+    assert(rhs_int.ty == .comptime_int_type);
+
     var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name, &lhs_space);
-    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name, &rhs_space);
+    const lhs = lhs_int.storage.toBigInt(&lhs_space);
+    const rhs = rhs_int.storage.toBigInt(&rhs_space);
 
     const ip = sema.intern_pool;
     const gpa = sema.gpa;
@@ -266,11 +319,42 @@ fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?
         .add => try arith.internAdd(gpa, ip, lhs, rhs),
         .sub => try arith.internSub(gpa, ip, lhs, rhs),
         .mul => try arith.internMul(gpa, ip, lhs, rhs),
+        // ZIR `div` is the generic `/` operator; for comptime_int operands
+        // Zig defines it as truncation toward zero, so route to the same
+        // kernel as `@divTrunc`. `div_exact` / `div_floor` are the
+        // builtins with their own kernels.
+        .div, .div_trunc => try sema.unwrapDivResult(arith.internDivTrunc(gpa, ip, lhs, rhs), "/"),
         .div_exact => try sema.unwrapDivResult(arith.internDivExact(gpa, ip, lhs, rhs), "@divExact"),
         .div_floor => try sema.unwrapDivResult(arith.internDivFloor(gpa, ip, lhs, rhs), "@divFloor"),
-        .div_trunc => try sema.unwrapDivResult(arith.internDivTrunc(gpa, ip, lhs, rhs), "@divTrunc"),
         .mod => try sema.unwrapDivResult(arith.internMod(gpa, ip, lhs, rhs), "@mod"),
         .rem => try sema.unwrapDivResult(arith.internRem(gpa, ip, lhs, rhs), "@rem"),
+        else => unreachable,
+    };
+    return .{ .index = idx };
+}
+
+fn evalBinaryArithFloat(
+    sema: *Sema,
+    tag: Zir.Inst.Tag,
+    lhs_float: InternPool.Key.Float,
+    rhs_float: InternPool.Key.Float,
+) Error!?Value {
+    assert(lhs_float.ty == .comptime_float_type);
+    assert(rhs_float.ty == .comptime_float_type);
+
+    const lhs = lhs_float.storage.f128;
+    const rhs = rhs_float.storage.f128;
+    const ip = sema.intern_pool;
+    const idx = switch (tag) {
+        .add => try arith.internFloatAdd(ip, lhs, rhs),
+        .sub => try arith.internFloatSub(ip, lhs, rhs),
+        .mul => try arith.internFloatMul(ip, lhs, rhs),
+        .div => try sema.unwrapDivResult(arith.internFloatDiv(ip, lhs, rhs), "/"),
+        .div_exact => try sema.unwrapDivResult(arith.internFloatDivExact(ip, lhs, rhs), "@divExact"),
+        .div_floor => try sema.unwrapDivResult(arith.internFloatDivFloor(ip, lhs, rhs), "@divFloor"),
+        .div_trunc => try sema.unwrapDivResult(arith.internFloatDivTrunc(ip, lhs, rhs), "@divTrunc"),
+        .mod => try sema.unwrapDivResult(arith.internFloatMod(ip, lhs, rhs), "@mod"),
+        .rem => try sema.unwrapDivResult(arith.internFloatRem(ip, lhs, rhs), "@rem"),
         else => unreachable,
     };
     return .{ .index = idx };
@@ -515,8 +599,50 @@ fn evalAsNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         }
     }
 
+    // comptime_float -> fixed-width float: narrow the stored f128 to the
+    // destination width. f64 / f32 / f16 lose precision but never error
+    // (the language permits the cast); f80 / f128 are lossless.
+    if (operand_type.index == .comptime_float_type and isFixedWidthFloatType(dest_type_index)) {
+        return try sema.coerceComptimeFloatToFixedFloat(operand_value, dest_type_index);
+    }
+
     try sema.writer.writeAll("as: this coercion is not yet supported\n");
     return error.AnalysisFail;
+}
+
+fn isFixedWidthFloatType(ty: InternPool.Index) bool {
+    return switch (ty) {
+        .f16_type, .f32_type, .f64_type, .f80_type, .f128_type => true,
+        else => false,
+    };
+}
+
+fn coerceComptimeFloatToFixedFloat(
+    sema: *Sema,
+    operand_value: Value,
+    dest_type_index: InternPool.Index,
+) Error!Value {
+    assert(dest_type_index != .none);
+    assert(isFixedWidthFloatType(dest_type_index));
+
+    const op_key = sema.intern_pool.indexToKey(operand_value.index);
+    assert(op_key == .float);
+    assert(op_key.float.ty == .comptime_float_type);
+
+    const v: f128 = op_key.float.storage.f128;
+    const storage: InternPool.Key.Float.Storage = switch (dest_type_index) {
+        .f16_type => .{ .f16 = @floatCast(v) },
+        .f32_type => .{ .f32 = @floatCast(v) },
+        .f64_type => .{ .f64 = @floatCast(v) },
+        .f80_type => .{ .f80 = @floatCast(v) },
+        .f128_type => .{ .f128 = v },
+        else => unreachable,
+    };
+    const idx = try sema.intern_pool.internFloat(.{
+        .ty = dest_type_index,
+        .storage = storage,
+    });
+    return .{ .index = idx };
 }
 
 fn coerceComptimeIntToFixedInt(
@@ -629,9 +755,9 @@ fn evalBitwise(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Valu
 }
 
 /// `cmp_lt / cmp_lte / cmp_eq / cmp_gte / cmp_gt / cmp_neq`. Same operand
-/// shape as `evalBinaryArith` (pl_node + Bin), but the kernel returns a
-/// raw `bool` and we map to the well-known `Index.bool_true` /
-/// `Index.bool_false` — no new interning needed.
+/// shape as `evalBinaryArith` (pl_node + Bin); int vs float kernels are
+/// selected by the operand types, results map to the well-known
+/// `Index.bool_true` / `Index.bool_false`.
 ///
 /// Compiler reference: src/Sema.zig:zirCmp -> src/Sema/arith.zig:cmpScalar.
 fn evalComparison(
@@ -648,18 +774,45 @@ fn evalComparison(
     assert(bin.rhs != .none);
 
     const op_name: []const u8 = @tagName(op);
-    var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name, &lhs_space);
-    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name, &rhs_space);
+    const ip = sema.intern_pool;
+    const lhs_value = try sema.resolveRef(bin.lhs);
+    const rhs_value = try sema.resolveRef(bin.rhs);
+    const lhs_key = ip.indexToKey(lhs_value.index);
+    const rhs_key = ip.indexToKey(rhs_value.index);
 
-    const result = arith.compareInt(lhs, rhs, op);
-    return .{ .index = if (result) .bool_true else .bool_false };
+    const lhs_is_cti = lhs_key == .int and lhs_key.int.ty == .comptime_int_type;
+    const rhs_is_cti = rhs_key == .int and rhs_key.int.ty == .comptime_int_type;
+    const lhs_is_ctf = lhs_key == .float and lhs_key.float.ty == .comptime_float_type;
+    const rhs_is_ctf = rhs_key == .float and rhs_key.float.ty == .comptime_float_type;
+
+    if (lhs_is_cti and rhs_is_cti) {
+        var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+        var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+        const lhs = lhs_key.int.storage.toBigInt(&lhs_space);
+        const rhs = rhs_key.int.storage.toBigInt(&rhs_space);
+        const result = arith.compareInt(lhs, rhs, op);
+        return .{ .index = if (result) .bool_true else .bool_false };
+    }
+    if ((lhs_is_cti or lhs_is_ctf) and (rhs_is_cti or rhs_is_ctf)) {
+        const lhs_f: InternPool.Key.Float = if (lhs_is_ctf) lhs_key.float else comptimeIntToComptimeFloat(lhs_key.int);
+        const rhs_f: InternPool.Key.Float = if (rhs_is_ctf) rhs_key.float else comptimeIntToComptimeFloat(rhs_key.int);
+        const result = arith.compareFloat(lhs_f.storage.f128, rhs_f.storage.f128, op);
+        return .{ .index = if (result) .bool_true else .bool_false };
+    }
+
+    if ((lhs_key == .int or lhs_key == .float) and (rhs_key == .int or rhs_key == .float)) {
+        try sema.writer.print("{s}: fixed-width numeric comparison not yet supported\n", .{op_name});
+    } else {
+        try sema.writer.print("{s}: non-numeric or mismatched operands\n", .{op_name});
+    }
+    return error.AnalysisFail;
 }
 
 /// Compiler reference: src/Sema.zig:zirNegate -> src/Sema/arith.zig:negate.
-/// AstGen lowers `-x` as `negate(x)`; constant-folded literals like `-1`
-/// instead come through as `Ref.negative_one` and never reach here.
+/// AstGen lowers `-x` as `negate(x)`; constant-folded literals like `-1` /
+/// `-1.5` instead come through as well-known Refs or as a single signed
+/// literal and never reach here. Routes to the int or float kernel by
+/// operand type.
 fn evalNegate(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
@@ -667,11 +820,34 @@ fn evalNegate(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     assert(un_node.operand != .none);
 
-    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const operand = try sema.resolveComptimeInt(un_node.operand, "negate", &space);
-    const idx = try arith.internNegate(sema.gpa, sema.intern_pool, operand);
-    assert(idx != .none);
-    return .{ .index = idx };
+    const ip = sema.intern_pool;
+    const operand_value = try sema.resolveRef(un_node.operand);
+    const operand_key = ip.indexToKey(operand_value.index);
+
+    if (operand_key == .float) {
+        if (operand_key.float.ty != .comptime_float_type) {
+            try sema.writer.writeAll("negate: fixed-width float negation not yet supported\n");
+            return error.AnalysisFail;
+        }
+        const idx = try arith.internFloatNegate(ip, operand_key.float.storage.f128);
+        assert(idx != .none);
+        return .{ .index = idx };
+    }
+
+    if (operand_key == .int) {
+        if (operand_key.int.ty != .comptime_int_type) {
+            try sema.writer.writeAll("negate: fixed-width int negation not yet supported\n");
+            return error.AnalysisFail;
+        }
+        var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+        const operand = operand_key.int.storage.toBigInt(&space);
+        const idx = try arith.internNegate(sema.gpa, ip, operand);
+        assert(idx != .none);
+        return .{ .index = idx };
+    }
+
+    try sema.writer.writeAll("negate: non-numeric operand\n");
+    return error.AnalysisFail;
 }
 
 /// Resolve a Ref and require it to be a `comptime_int` value. Reports the

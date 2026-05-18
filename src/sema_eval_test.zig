@@ -358,3 +358,107 @@ test "comparison handles negatives and big ints" {
         true,
     );
 }
+
+fn expectEvalComptimeFloat(
+    gpa: std.mem.Allocator,
+    intern_pool: *InternPool,
+    source: []const u8,
+    expected: f128,
+) !void {
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, intern_pool, source, &diag_buf);
+    const key = intern_pool.indexToKey(value.index);
+    try testing.expect(key == .float);
+    try testing.expectEqual(InternPool.Index.comptime_float_type, key.float.ty);
+    try testing.expectEqual(expected, key.float.storage.f128);
+}
+
+fn expectEvalTypedFloat(
+    gpa: std.mem.Allocator,
+    intern_pool: *InternPool,
+    source: []const u8,
+    expected_type: InternPool.Index,
+    expected_bits: u128,
+) !void {
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, intern_pool, source, &diag_buf);
+    const key = intern_pool.indexToKey(value.index);
+    try testing.expect(key == .float);
+    try testing.expectEqual(expected_type, key.float.ty);
+
+    const actual_bits: u128 = switch (key.float.storage) {
+        .f16 => |v| @as(u16, @bitCast(v)),
+        .f32 => |v| @as(u32, @bitCast(v)),
+        .f64 => |v| @as(u64, @bitCast(v)),
+        .f80 => |v| @as(u80, @bitCast(v)),
+        .f128 => |v| @as(u128, @bitCast(v)),
+    };
+    try testing.expectEqual(expected_bits, actual_bits);
+}
+
+test "float arithmetic on comptime_float" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalComptimeFloat(gpa, &pool, "1.5 + 2.5", 4.0);
+    try expectEvalComptimeFloat(gpa, &pool, "10.0 - 3.5", 6.5);
+    try expectEvalComptimeFloat(gpa, &pool, "2.0 * 3.5", 7.0);
+    try expectEvalComptimeFloat(gpa, &pool, "7.5 / 2.5", 3.0);
+    try expectEvalComptimeFloat(gpa, &pool, "@divTrunc(7.5, 2.5)", 3.0);
+    try expectEvalComptimeFloat(gpa, &pool, "@divFloor(-7.5, 2.5)", -3.0);
+    try expectEvalComptimeFloat(gpa, &pool, "@divExact(6.0, 2.0)", 3.0);
+    try expectEvalComptimeFloat(gpa, &pool, "@mod(7.5, 2.5)", 0.0);
+}
+
+test "float division errors surface at Sema" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalFails(gpa, &pool, "1.5 / 0.0", "division by zero");
+    try expectEvalFails(gpa, &pool, "@divExact(7.0, 2.0)", "remainder is non-zero");
+}
+
+test "float comparison yields the well-known bool indices" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalBool(gpa, &pool, "1.5 < 2.5", true);
+    try expectEvalBool(gpa, &pool, "1.5 == 1.5", true);
+    try expectEvalBool(gpa, &pool, "3.14 != 3.14", false);
+    try expectEvalBool(gpa, &pool, "-1.5 > -2.5", true);
+}
+
+test "@as coerces comptime_float to fixed-width float and stores the type" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // 1.5 has an exact representation in every IEEE-754 width.
+    try expectEvalTypedFloat(gpa, &pool, "@as(f16, 1.5)", .f16_type, @as(u16, @bitCast(@as(f16, 1.5))));
+    try expectEvalTypedFloat(gpa, &pool, "@as(f32, 1.5)", .f32_type, @as(u32, @bitCast(@as(f32, 1.5))));
+    try expectEvalTypedFloat(gpa, &pool, "@as(f64, 1.5)", .f64_type, @as(u64, @bitCast(@as(f64, 1.5))));
+    try expectEvalTypedFloat(gpa, &pool, "@as(f128, 1.5)", .f128_type, @as(u128, @bitCast(@as(f128, 1.5))));
+}
+
+test "mixed comptime_int + comptime_float promotes via peer-type resolution" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // Both orderings: the int side is promoted to comptime_float (f128
+    // nearest-even) before the float kernel runs.
+    try expectEvalComptimeFloat(gpa, &pool, "1 + 1.5", 2.5);
+    try expectEvalComptimeFloat(gpa, &pool, "1.5 + 1", 2.5);
+    try expectEvalComptimeFloat(gpa, &pool, "10 - 2.5", 7.5);
+    try expectEvalComptimeFloat(gpa, &pool, "3 * 2.5", 7.5);
+    try expectEvalComptimeFloat(gpa, &pool, "10 / 4.0", 2.5);
+    try expectEvalComptimeFloat(gpa, &pool, "-3 + 0.5", -2.5);
+
+    // Mixed comparison: the int side promotes the same way.
+    try expectEvalBool(gpa, &pool, "1 < 1.5", true);
+    try expectEvalBool(gpa, &pool, "2.5 > 2", true);
+    try expectEvalBool(gpa, &pool, "1 == 1.0", true);
+}

@@ -24,7 +24,7 @@ const InternPool = @This();
 /// Ordering mirrors the compiler's enum so `SimpleType`/`SimpleValue` can
 /// pin variant values to the corresponding Index via `@intFromEnum`.
 pub const Index = enum(u32) {
-    // --- Types: fixed-width integers (Key.int_type) ---
+    // Fixed-width integer types (Key.int_type).
     u0_type,
     i0_type,
     u1_type,
@@ -42,7 +42,7 @@ pub const Index = enum(u32) {
     i128_type,
     u256_type,
 
-    // --- Types: target-dependent / nominal primitives (Key.simple_type) ---
+    // Target-dependent / nominal primitive types (Key.simple_type).
     usize_type,
     isize_type,
     c_char_type,
@@ -56,14 +56,14 @@ pub const Index = enum(u32) {
     c_ulonglong_type,
     c_longdouble_type,
 
-    // --- Types: floats (Key.simple_type) ---
+    // Float types (Key.simple_type).
     f16_type,
     f32_type,
     f64_type,
     f80_type,
     f128_type,
 
-    // --- Types: language primitives (Key.simple_type) ---
+    // Language-primitive types (Key.simple_type).
     anyopaque_type,
     bool_type,
     void_type,
@@ -77,7 +77,7 @@ pub const Index = enum(u32) {
     undefined_type,
     enum_literal_type,
 
-    // --- Values ---
+    // Values.
     /// `undefined` (untyped)
     undef,
     /// `0` (comptime_int)

@@ -69,17 +69,38 @@ fn renderTypeRef(
 /// Print each float-storage variant in its native precision. f80 has no
 /// dedicated `std.fmt` formatter, so we widen to f128 for display only;
 /// the stored value keeps its precision.
+///
+/// `std.fmt`'s `{d}` strips the trailing decimal for integral values
+/// (`4.0` -> "4"), which is ambiguous next to integers in REPL output.
+/// We restore the `.0` when the printed form has no decimal exponent or
+/// dot — but leave NaN / inf / -inf untouched.
 fn renderFloat(
     float: InternPool.Key.Float,
     writer: *std.Io.Writer,
 ) std.Io.Writer.Error!void {
-    switch (float.storage) {
-        .f16 => |v| try writer.print("{d}\n", .{v}),
-        .f32 => |v| try writer.print("{d}\n", .{v}),
-        .f64 => |v| try writer.print("{d}\n", .{v}),
-        .f80 => |v| try writer.print("{d}\n", .{@as(f128, @floatCast(v))}),
-        .f128 => |v| try writer.print("{d}\n", .{v}),
-    }
+    var buf: [128]u8 = undefined;
+    const text = switch (float.storage) {
+        .f16 => |v| std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable,
+        .f32 => |v| std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable,
+        .f64 => |v| std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable,
+        .f80 => |v| std.fmt.bufPrint(&buf, "{d}", .{@as(f128, @floatCast(v))}) catch unreachable,
+        .f128 => |v| std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable,
+    };
+    try writer.writeAll(text);
+    if (needsTrailingDecimal(text)) try writer.writeAll(".0");
+    try writer.writeAll("\n");
+}
+
+/// True iff `text` is a finite-magnitude float printed without a decimal
+/// point or exponent (e.g. "4", "-7") — in which case appending ".0"
+/// keeps the value visually distinct from an integer. NaN / inf / -inf
+/// start with a non-digit and are left alone.
+fn needsTrailingDecimal(text: []const u8) bool {
+    if (text.len == 0) return false;
+    if (std.mem.indexOfAny(u8, text, ".eE") != null) return false;
+    const start: usize = if (text[0] == '-' or text[0] == '+') 1 else 0;
+    if (start >= text.len) return false;
+    return std.ascii.isDigit(text[start]);
 }
 
 fn renderAnyframeChild(

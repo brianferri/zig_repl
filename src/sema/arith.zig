@@ -390,13 +390,115 @@ const DivPair = struct {
     remainder: InternPool.Index,
 };
 
-/// Shared worker for all five division ops. Allocates one combined
-/// workspace sized per the bounds documented on `BigIntMutable.divTrunc` /
-/// `BigIntMutable.divFloor`: `q` up to `lhs.limbs.len`, `r` up to
-/// `rhs.limbs.len`, plus the temp buffer from `calcDivLimbsBufferLen`.
-/// Both quotient and remainder are interned even when only one is wanted —
-/// the pool has no GC and the redundant slot is cheap compared to the
-/// per-call alloc.
+/// `lhs + rhs` as a fresh `comptime_float`. Float kernels operate
+/// directly on the f128 storage the pool uses for comptime_float and
+/// share the int kernels' `DivError` set, so callers can route division
+/// errors through the same `unwrapDivResult` translator.
+pub fn internFloatAdd(intern_pool: *InternPool, lhs: f128, rhs: f128) Allocator.Error!InternPool.Index {
+    return intern_pool.internFloat(.{
+        .ty = .comptime_float_type,
+        .storage = .{ .f128 = lhs + rhs },
+    });
+}
+
+/// `lhs - rhs` as a fresh `comptime_float`.
+pub fn internFloatSub(intern_pool: *InternPool, lhs: f128, rhs: f128) Allocator.Error!InternPool.Index {
+    return intern_pool.internFloat(.{
+        .ty = .comptime_float_type,
+        .storage = .{ .f128 = lhs - rhs },
+    });
+}
+
+/// `lhs * rhs` as a fresh `comptime_float`.
+pub fn internFloatMul(intern_pool: *InternPool, lhs: f128, rhs: f128) Allocator.Error!InternPool.Index {
+    return intern_pool.internFloat(.{
+        .ty = .comptime_float_type,
+        .storage = .{ .f128 = lhs * rhs },
+    });
+}
+
+/// `lhs / rhs`: plain float division. The generic `/` operator maps here
+/// (the ZIR `div` tag), separate from the `@divTrunc` / `@divFloor` /
+/// `@divExact` builtins which use the kernels below.
+pub fn internFloatDiv(intern_pool: *InternPool, lhs: f128, rhs: f128) DivError!InternPool.Index {
+    if (rhs == 0) return error.DivisionByZero;
+    return intern_pool.internFloat(.{
+        .ty = .comptime_float_type,
+        .storage = .{ .f128 = lhs / rhs },
+    });
+}
+
+/// `@divTrunc(lhs, rhs)`: float division rounded toward zero.
+pub fn internFloatDivTrunc(intern_pool: *InternPool, lhs: f128, rhs: f128) DivError!InternPool.Index {
+    if (rhs == 0) return error.DivisionByZero;
+    return intern_pool.internFloat(.{
+        .ty = .comptime_float_type,
+        .storage = .{ .f128 = @divTrunc(lhs, rhs) },
+    });
+}
+
+/// `@divFloor(lhs, rhs)`: float division rounded toward -inf.
+pub fn internFloatDivFloor(intern_pool: *InternPool, lhs: f128, rhs: f128) DivError!InternPool.Index {
+    if (rhs == 0) return error.DivisionByZero;
+    return intern_pool.internFloat(.{
+        .ty = .comptime_float_type,
+        .storage = .{ .f128 = @divFloor(lhs, rhs) },
+    });
+}
+
+/// `@divExact(lhs, rhs)`: float division asserting `rhs` evenly divides
+/// `lhs`. Mirrors the comptime safety check the compiler emits.
+pub fn internFloatDivExact(intern_pool: *InternPool, lhs: f128, rhs: f128) DivError!InternPool.Index {
+    if (rhs == 0) return error.DivisionByZero;
+    if (@rem(lhs, rhs) != 0) return error.DivisionNotExact;
+    return intern_pool.internFloat(.{
+        .ty = .comptime_float_type,
+        .storage = .{ .f128 = lhs / rhs },
+    });
+}
+
+/// `@mod(lhs, rhs)`: float modulo, result has sign of `rhs`.
+pub fn internFloatMod(intern_pool: *InternPool, lhs: f128, rhs: f128) DivError!InternPool.Index {
+    if (rhs == 0) return error.DivisionByZero;
+    return intern_pool.internFloat(.{
+        .ty = .comptime_float_type,
+        .storage = .{ .f128 = @mod(lhs, rhs) },
+    });
+}
+
+/// `@rem(lhs, rhs)`: float remainder, result has sign of `lhs`.
+pub fn internFloatRem(intern_pool: *InternPool, lhs: f128, rhs: f128) DivError!InternPool.Index {
+    if (rhs == 0) return error.DivisionByZero;
+    return intern_pool.internFloat(.{
+        .ty = .comptime_float_type,
+        .storage = .{ .f128 = @rem(lhs, rhs) },
+    });
+}
+
+/// `-operand` as a fresh `comptime_float`. Float negation flips the sign
+/// bit, so `-0.0` and `0.0` are distinct values — keeping that distinction
+/// matches Zig's float semantics (and what `internFloat` will dedup).
+pub fn internFloatNegate(intern_pool: *InternPool, operand: f128) Allocator.Error!InternPool.Index {
+    return intern_pool.internFloat(.{
+        .ty = .comptime_float_type,
+        .storage = .{ .f128 = -operand },
+    });
+}
+
+/// Float comparison. NaN comparisons follow IEEE: any comparison with a
+/// NaN is false except `.neq`, which is true. `std.math.order` doesn't
+/// totalise NaN, so we use the language operators directly.
+pub fn compareFloat(lhs: f128, rhs: f128, op: std.math.CompareOperator) bool {
+    return switch (op) {
+        .lt => lhs < rhs,
+        .lte => lhs <= rhs,
+        .eq => lhs == rhs,
+        .gte => lhs >= rhs,
+        .gt => lhs > rhs,
+        .neq => lhs != rhs,
+    };
+}
+
 const testing = std.testing;
 
 fn constLimbs(slice: []std.math.big.Limb, positive: bool) BigIntConst {
