@@ -16,7 +16,7 @@ pub fn render(
 ) std.Io.Writer.Error!void {
     assert(value.index != .none);
 
-    const key = pool.get(value.index);
+    const key = pool.indexToKey(value.index);
     return switch (key) {
         .int => |iv| {
             var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
@@ -46,7 +46,7 @@ fn renderTypeRef(
     pool: *const InternPool,
     writer: *std.Io.Writer,
 ) std.Io.Writer.Error!void {
-    const key = pool.get(type_index);
+    const key = pool.indexToKey(type_index);
     return switch (key) {
         .simple_type => |st| writer.print("{s}\n", .{@tagName(st)}),
         .int_type => |it| writer.print("{c}{d}\n", .{

@@ -212,6 +212,62 @@ pub const Key = union(enum) {
             };
         };
     };
+
+    /// Stable hash for dedup. `pool` is reserved for future Key variants
+    /// (e.g. `struct_type`) whose canonical form requires pool lookup;
+    /// today's variants ignore it. Storage variants of `int` are
+    /// normalised to `BigIntConst` before hashing so that
+    /// `.{ .u64 = 5 }` and `.{ .big_int = +5 }` hash identically — the
+    /// read-side compresses limbs back to inline storage so the pool's
+    /// canonical form is stable, but a freshly constructed Key may
+    /// arrive in any variant. Same canonicalisation in `eql`.
+    pub fn hash64(key: Key, pool: *const InternPool) u64 {
+        _ = pool;
+        var hasher = std.hash.Wyhash.init(0);
+        const Tag = @typeInfo(Key).@"union".tag_type.?;
+        std.hash.autoHash(&hasher, @as(Tag, key));
+        switch (key) {
+            .simple_type => |s| std.hash.autoHash(&hasher, s),
+            .simple_value => |s| std.hash.autoHash(&hasher, s),
+            .int_type => |it| {
+                std.hash.autoHash(&hasher, it.signedness);
+                std.hash.autoHash(&hasher, it.bits);
+            },
+            .anyframe_type => |child| std.hash.autoHash(&hasher, child),
+            .int => |i| {
+                std.hash.autoHash(&hasher, i.ty);
+                var space: Int.Storage.BigIntSpace = undefined;
+                const big = i.storage.toBigInt(&space);
+                std.hash.autoHash(&hasher, big.positive);
+                for (big.limbs) |limb| std.hash.autoHash(&hasher, limb);
+            },
+            .type_value => |t| std.hash.autoHash(&hasher, t),
+        }
+        return hasher.final();
+    }
+
+    /// Structural equality, paired with `hash64`. See `hash64` for the
+    /// `int` canonicalisation rationale.
+    pub fn eql(a: Key, b: Key, pool: *const InternPool) bool {
+        _ = pool;
+        const Tag = @typeInfo(Key).@"union".tag_type.?;
+        if (@as(Tag, a) != @as(Tag, b)) return false;
+        return switch (a) {
+            .simple_type => |x| x == b.simple_type,
+            .simple_value => |x| x == b.simple_value,
+            .int_type => |x| x.signedness == b.int_type.signedness and
+                x.bits == b.int_type.bits,
+            .anyframe_type => |x| x == b.anyframe_type,
+            .int => |x| blk: {
+                const y = b.int;
+                if (x.ty != y.ty) break :blk false;
+                var sa: Int.Storage.BigIntSpace = undefined;
+                var sb: Int.Storage.BigIntSpace = undefined;
+                break :blk x.storage.toBigInt(&sa).eql(y.storage.toBigInt(&sb));
+            },
+            .type_value => |x| x == b.type_value,
+        };
+    }
 };
 
 /// Tagged storage. `data` interpretation depends on `tag`. Naming mirrors
@@ -279,6 +335,28 @@ extra: std.ArrayListUnmanaged(u32),
 /// Limb-aligned arena holding `int_positive` / `int_negative` payloads
 /// (packed `IntBigHeader` at the head + trailing limbs).
 big_int_limbs: std.ArrayListUnmanaged(std.math.big.Limb),
+/// Dedup map. Entries are appended in lockstep with `items`, so the
+/// map's insertion-order index is the `Item` index (and thus the
+/// `Index` enum value). The key is `void` because the canonical Key is
+/// reconstructed via `indexToKey`; lookup goes through `KeyAdapter`.
+/// Single-shard equivalent of the compiler's sharded `getOrPutKey`.
+map: std.AutoArrayHashMapUnmanaged(void, void),
+
+/// Adapter that lets `getOrPutAdapted` hash and compare a `Key` against
+/// entries stored as bare `Index`es. Mirrors the role of the compiler's
+/// `KeyAdapter`.
+const KeyAdapter = struct {
+    pool: *const InternPool,
+
+    pub fn hash(self: KeyAdapter, key: Key) u32 {
+        return @truncate(key.hash64(self.pool));
+    }
+
+    pub fn eql(self: KeyAdapter, key: Key, _: void, b_index: usize) bool {
+        const existing = self.pool.indexToKey(@enumFromInt(@as(u32, @intCast(b_index))));
+        return key.eql(existing, self.pool);
+    }
+};
 
 pub fn init(gpa: Allocator) Allocator.Error!InternPool {
     var pool: InternPool = .{
@@ -286,12 +364,15 @@ pub fn init(gpa: Allocator) Allocator.Error!InternPool {
         .items = .{},
         .extra = .empty,
         .big_int_limbs = .empty,
+        .map = .empty,
     };
     errdefer pool.deinit();
 
     try pool.items.ensureTotalCapacity(gpa, first_dynamic_index);
+    try pool.map.ensureTotalCapacity(gpa, first_dynamic_index);
     try populateWellKnown(&pool);
     assert(pool.items.len == first_dynamic_index);
+    assert(pool.map.count() == first_dynamic_index);
     return pool;
 }
 
@@ -299,6 +380,7 @@ pub fn deinit(pool: *InternPool) void {
     pool.items.deinit(pool.gpa);
     pool.extra.deinit(pool.gpa);
     pool.big_int_limbs.deinit(pool.gpa);
+    pool.map.deinit(pool.gpa);
     pool.* = undefined;
 }
 
@@ -370,23 +452,15 @@ const static_keys: [first_dynamic_index]Key = .{
 
 fn populateWellKnown(pool: *InternPool) Allocator.Error!void {
     assert(pool.items.len == 0);
+    assert(pool.map.count() == 0);
 
-    inline for (static_keys) |key| {
-        try appendStaticKey(pool, key);
-    }
-}
-
-fn appendStaticKey(pool: *InternPool, key: Key) Allocator.Error!void {
-    switch (key) {
-        .simple_type => |s| appendSimpleType(pool, s),
-        .simple_value => |s| appendSimpleValue(pool, s),
-        .int_type => |it| appendIntType(pool, it.signedness, it.bits),
-        .anyframe_type => |child| appendAnyframeType(pool, child),
-        .type_value => |t| pool.items.appendAssumeCapacity(.{
-            .tag = .type_value,
-            .data = @intFromEnum(t),
-        }),
-        .int => |i| _ = try internInt(pool, i),
+    inline for (static_keys, 0..) |key, expected_position| {
+        const index = try pool.get(key);
+        // Identity of static_keys position to Index enum value is
+        // load-bearing: SimpleType / SimpleValue variant values are pinned
+        // via `@intFromEnum(Index.X)`, and Sema's `wellKnownRefToValue`
+        // assumes positions 0..44 match `Zir.Inst.Ref`'s well-known set.
+        assert(@intFromEnum(index) == expected_position);
     }
 }
 
@@ -419,7 +493,46 @@ fn appendAnyframeType(pool: *InternPool, child: Index) void {
     });
 }
 
-pub fn get(pool: *const InternPool, index: Index) Key {
+/// Intern a `Key`, returning a stable `Index`. Dedups against existing
+/// entries via `getOrPutAdapted`. Single-threaded equivalent of the
+/// compiler's `pub fn get(ip, gpa, io, tid, key) !Index` (the
+/// `getOrPutKey` + emit dispatcher in `src/InternPool.zig`).
+///
+/// Invariant: `map` and `items` are appended in lockstep, so the map's
+/// insertion-order `gop.index` equals the `items.len` at the time of
+/// the miss (and the resulting `Item`'s position). This is what makes
+/// the bare-`void` map sound — the adapter reconstructs the existing
+/// Key from the position alone via `indexToKey`.
+pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
+    const adapter: KeyAdapter = .{ .pool = pool };
+    const gop = try pool.map.getOrPutAdapted(pool.gpa, key, adapter);
+    if (gop.found_existing) {
+        const existing: u32 = @intCast(gop.index);
+        assert(existing < pool.items.len);
+        return @enumFromInt(existing);
+    }
+    assert(gop.index == pool.items.len);
+
+    try pool.items.ensureUnusedCapacity(pool.gpa, 1);
+    switch (key) {
+        .simple_type => |s| appendSimpleType(pool, s),
+        .simple_value => |s| appendSimpleValue(pool, s),
+        .int_type => |it| appendIntType(pool, it.signedness, it.bits),
+        .anyframe_type => |child| appendAnyframeType(pool, child),
+        .type_value => |t| pool.items.appendAssumeCapacity(.{
+            .tag = .type_value,
+            .data = @intFromEnum(t),
+        }),
+        .int => |i| try emitInt(pool, i),
+    }
+
+    assert(pool.items.len == gop.index + 1);
+    return @enumFromInt(@as(u32, @intCast(gop.index)));
+}
+
+/// Look up the `Key` for an `Index`. Mirrors the compiler's
+/// `indexToKey` (`src/InternPool.zig`).
+pub fn indexToKey(pool: *const InternPool, index: Index) Key {
     assert(index != .none);
     const i = @intFromEnum(index);
     assert(i < pool.items.len);
@@ -492,65 +605,27 @@ fn intBigFromArena(pool: *const InternPool, limb_index: u32, positive: bool) Key
     return intKey(@enumFromInt(header.ty), storage);
 }
 
-/// Intern a fixed-width integer type. Returns one of the well-known indices
-/// when `bits` matches a cached width, otherwise appends a new item. Zig
-/// permits `u0`..`u65535` and `i0`..`i65535` (the language limit is the
-/// `u16` width of `std.builtin.Type.Int.bits`).
+/// Intern a fixed-width integer type. Well-known widths dedup to their
+/// reserved well-known `Index` through the `get` map. Zig permits
+/// `u0`..`u65535` / `i0`..`i65535` — the language limit is the `u16`
+/// width of `std.builtin.Type.Int.bits`.
 pub fn internIntType(
     pool: *InternPool,
     signedness: std.builtin.Signedness,
     bits: u16,
 ) Allocator.Error!Index {
-    if (wellKnownIntType(signedness, bits)) |idx| return idx;
-
-    const tag: Item.Tag = switch (signedness) {
-        .unsigned => .type_int_unsigned,
-        .signed => .type_int_signed,
-    };
-    try pool.items.append(pool.gpa, .{ .tag = tag, .data = bits });
-    return @enumFromInt(@as(u32, @intCast(pool.items.len - 1)));
+    return pool.get(.{ .int_type = .{ .signedness = signedness, .bits = bits } });
 }
 
-fn wellKnownIntType(signedness: std.builtin.Signedness, bits: u16) ?Index {
-    return switch (signedness) {
-        .unsigned => switch (bits) {
-            0 => .u0_type,
-            1 => .u1_type,
-            8 => .u8_type,
-            16 => .u16_type,
-            29 => .u29_type,
-            32 => .u32_type,
-            64 => .u64_type,
-            80 => .u80_type,
-            128 => .u128_type,
-            256 => .u256_type,
-            else => null,
-        },
-        .signed => switch (bits) {
-            0 => .i0_type,
-            8 => .i8_type,
-            16 => .i16_type,
-            32 => .i32_type,
-            64 => .i64_type,
-            128 => .i128_type,
-            else => null,
-        },
-    };
-}
-
-/// Intern an integer value with any storage form. Picks the narrowest
-/// `Item.Tag` and emits it directly. Mirrors the `.int =>` arm of the
-/// compiler's `intern` (`src/InternPool.zig`): one labelled-block switch
-/// on `ty` for the type-specialised inline tags, then a fallthrough
-/// switch on `storage` for `int_small` or `int_positive` /
-/// `int_negative`.
-pub fn internInt(pool: *InternPool, int: Key.Int) Allocator.Error!Index {
-    assert(@intFromPtr(pool) != 0);
+/// Emit the `Item` (and any extra / limbs) for a `Key.int`. Mirrors the
+/// `.int =>` arm of the compiler's `intern` (`src/InternPool.zig`): one
+/// labelled-block switch on `ty` for the type-specialised inline tags,
+/// then a fallthrough switch on `storage` for `int_small` or
+/// `int_positive` / `int_negative`. Callers must have ensured one item
+/// of capacity — only reachable from `get`'s miss path.
+fn emitInt(pool: *InternPool, int: Key.Int) Allocator.Error!void {
     assert(isIntegerType(int.ty));
-
     const ty = int.ty;
-    const items_before = pool.items.len;
-    try pool.items.ensureUnusedCapacity(pool.gpa, 1);
 
     b: {
         switch (ty) {
@@ -683,9 +758,11 @@ pub fn internInt(pool: *InternPool, int: Key.Int) Allocator.Error!Index {
             },
         }
     }
+}
 
-    assert(pool.items.len == items_before + 1);
-    return @enumFromInt(@as(u32, @intCast(items_before)));
+/// Intern an integer value with any storage form.
+pub fn internInt(pool: *InternPool, int: Key.Int) Allocator.Error!Index {
+    return pool.get(.{ .int = int });
 }
 
 /// True if `ty` identifies a Zig integer type: any int_type slot, any
@@ -805,13 +882,8 @@ pub fn internComptimeInt(pool: *InternPool, value: BigIntConst) Allocator.Error!
 /// expression evaluated to a type" results (e.g. `@TypeOf(x)` or the
 /// type computed by `typeof_log2_int_type`).
 pub fn internTypeValue(pool: *InternPool, ty: Index) Allocator.Error!Index {
-    assert(@intFromPtr(pool) != 0);
     assert(ty != .none);
-
-    const items_before = pool.items.len;
-    try pool.items.append(pool.gpa, .{ .tag = .type_value, .data = @intFromEnum(ty) });
-    assert(pool.items.len == items_before + 1);
-    return @enumFromInt(@as(u32, @intCast(pool.items.len - 1)));
+    return pool.get(.{ .type_value = ty });
 }
 
 pub fn itemCount(pool: *const InternPool) u32 {
@@ -822,14 +894,14 @@ test "well-known types have expected keys" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    try std.testing.expectEqual(@as(u16, 8), pool.get(.u8_type).int_type.bits);
-    try std.testing.expectEqual(@as(u16, 32), pool.get(.u32_type).int_type.bits);
-    try std.testing.expectEqual(std.builtin.Signedness.signed, pool.get(.i32_type).int_type.signedness);
+    try std.testing.expectEqual(@as(u16, 8), pool.indexToKey(.u8_type).int_type.bits);
+    try std.testing.expectEqual(@as(u16, 32), pool.indexToKey(.u32_type).int_type.bits);
+    try std.testing.expectEqual(std.builtin.Signedness.signed, pool.indexToKey(.i32_type).int_type.signedness);
 
-    try std.testing.expectEqual(SimpleType.usize, pool.get(.usize_type).simple_type);
-    try std.testing.expectEqual(SimpleType.c_int, pool.get(.c_int_type).simple_type);
-    try std.testing.expectEqual(SimpleType.f64, pool.get(.f64_type).simple_type);
-    try std.testing.expectEqual(SimpleType.bool, pool.get(.bool_type).simple_type);
+    try std.testing.expectEqual(SimpleType.usize, pool.indexToKey(.usize_type).simple_type);
+    try std.testing.expectEqual(SimpleType.c_int, pool.indexToKey(.c_int_type).simple_type);
+    try std.testing.expectEqual(SimpleType.f64, pool.indexToKey(.f64_type).simple_type);
+    try std.testing.expectEqual(SimpleType.bool, pool.indexToKey(.bool_type).simple_type);
 }
 
 test "i0_type and anyframe_type slots match compiler ordering" {
@@ -837,8 +909,8 @@ test "i0_type and anyframe_type slots match compiler ordering" {
     defer pool.deinit();
 
     // i0_type lives at compiler position 1, between u0_type and u1_type.
-    try std.testing.expectEqual(@as(u16, 0), pool.get(.i0_type).int_type.bits);
-    try std.testing.expectEqual(std.builtin.Signedness.signed, pool.get(.i0_type).int_type.signedness);
+    try std.testing.expectEqual(@as(u16, 0), pool.indexToKey(.i0_type).int_type.bits);
+    try std.testing.expectEqual(std.builtin.Signedness.signed, pool.indexToKey(.i0_type).int_type.signedness);
     // internIntType for (.signed, 0) returns the well-known slot, no fresh item.
     const items_before = pool.itemCount();
     const @"i0_idx" = try pool.internIntType(.signed, 0);
@@ -847,22 +919,22 @@ test "i0_type and anyframe_type slots match compiler ordering" {
 
     // anyframe_type with .none child (untyped anyframe) at the position
     // between noreturn_type and null_type.
-    try std.testing.expectEqual(Index.none, pool.get(.anyframe_type).anyframe_type);
+    try std.testing.expectEqual(Index.none, pool.indexToKey(.anyframe_type).anyframe_type);
 }
 
 test "well-known values have expected keys" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    try std.testing.expectEqual(SimpleValue.true, pool.get(.bool_true).simple_value);
-    try std.testing.expectEqual(SimpleValue.false, pool.get(.bool_false).simple_value);
-    try std.testing.expectEqual(SimpleValue.void, pool.get(.void_value).simple_value);
+    try std.testing.expectEqual(SimpleValue.true, pool.indexToKey(.bool_true).simple_value);
+    try std.testing.expectEqual(SimpleValue.false, pool.indexToKey(.bool_false).simple_value);
+    try std.testing.expectEqual(SimpleValue.void, pool.indexToKey(.void_value).simple_value);
 
-    const zero = pool.get(.zero).int;
+    const zero = pool.indexToKey(.zero).int;
     try std.testing.expectEqual(Index.comptime_int_type, zero.ty);
     try std.testing.expectEqual(@as(u64, 0), zero.storage.u64);
 
-    const negative_one = pool.get(.negative_one).int;
+    const negative_one = pool.indexToKey(.negative_one).int;
     try std.testing.expectEqual(@as(i64, -1), negative_one.storage.i64);
 }
 
@@ -888,12 +960,12 @@ test "arbitrary-width int types intern dynamically" {
 
     const u17_idx = try pool.internIntType(.unsigned, 17);
     try std.testing.expect(!Index.isWellKnownType(u17_idx));
-    const @"u17" = pool.get(u17_idx).int_type;
+    const @"u17" = pool.indexToKey(u17_idx).int_type;
     try std.testing.expectEqual(std.builtin.Signedness.unsigned, @"u17".signedness);
     try std.testing.expectEqual(@as(u16, 17), @"u17".bits);
 
     const u65535_idx = try pool.internIntType(.unsigned, std.math.maxInt(u16));
-    const @"u65535" = pool.get(u65535_idx).int_type;
+    const @"u65535" = pool.indexToKey(u65535_idx).int_type;
     try std.testing.expectEqual(@as(u16, std.math.maxInt(u16)), @"u65535".bits);
 }
 
@@ -914,11 +986,11 @@ test "internInt big-int storage is aliasing-safe under buffer growth" {
         try pool.big_int_limbs.append(pool.gpa, 0);
     }
 
-    const a_view = pool.get(a_idx).int.storage.big_int;
+    const a_view = pool.indexToKey(a_idx).int.storage.big_int;
     const aliased: BigIntConst = .{ .limbs = a_view.limbs, .positive = false };
 
     const b_idx = try pool.internIntValue(.u128_type, aliased);
-    const b = pool.get(b_idx).int.storage.big_int;
+    const b = pool.indexToKey(b_idx).int.storage.big_int;
     try std.testing.expectEqual(@as(usize, 2), b.limbs.len);
     try std.testing.expectEqual(@as(std.math.big.Limb, 0), b.limbs[0]);
     try std.testing.expectEqual(@as(std.math.big.Limb, 1), b.limbs[1]);
@@ -935,9 +1007,36 @@ test "small comptime int compresses to inline tag" {
 
     // 42 fits in u32 so the compressor picks `int_comptime_int_u32` and
     // surfaces the value as `.storage.u64`, not `.big_int`.
-    const round = pool.get(idx).int;
+    const round = pool.indexToKey(idx).int;
     try std.testing.expectEqual(Index.comptime_int_type, round.ty);
     try std.testing.expectEqual(@as(u64, 42), round.storage.u64);
+}
+
+test "interning identical keys dedups to a single Index" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    // Dynamic int_type — hits the dedup map on the second call.
+    const items_before = pool.itemCount();
+    const u17_a = try pool.internIntType(.unsigned, 17);
+    const u17_b = try pool.internIntType(.unsigned, 17);
+    try std.testing.expectEqual(u17_a, u17_b);
+    try std.testing.expectEqual(items_before + 1, pool.itemCount());
+
+    // Storage normalisation: `.u64=5` and `.big_int=+5` (as a single
+    // u32-fitting limb) must dedup, because `indexToKey` re-emits the
+    // big-int as `.u64` and `Key.hash64` normalises inline storage to
+    // BigIntConst before hashing.
+    var limb = [_]std.math.big.Limb{5};
+    const big5: BigIntConst = .{ .limbs = &limb, .positive = true };
+    const a = try pool.internInt(.{ .ty = .comptime_int_type, .storage = .{ .u64 = 5 } });
+    const b = try pool.internInt(.{ .ty = .comptime_int_type, .storage = .{ .big_int = big5 } });
+    try std.testing.expectEqual(a, b);
+
+    // Well-known slots are reached through the same map, so re-interning
+    // their key returns the well-known Index (not a fresh dynamic one).
+    const zero_again = try pool.internInt(.{ .ty = .comptime_int_type, .storage = .{ .u64 = 0 } });
+    try std.testing.expectEqual(Index.zero, zero_again);
 }
 
 test "big comptime int round-trips through int_positive limbs" {
@@ -950,7 +1049,7 @@ test "big comptime int round-trips through int_positive limbs" {
     const value: BigIntConst = .{ .limbs = &limbs, .positive = true };
     const idx = try pool.internIntValue(.u128_type, value);
 
-    const round = pool.get(idx).int;
+    const round = pool.indexToKey(idx).int;
     try std.testing.expectEqual(Index.u128_type, round.ty);
     const big = round.storage.big_int;
     try std.testing.expect(big.positive);

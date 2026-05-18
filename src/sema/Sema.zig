@@ -412,7 +412,7 @@ fn evalTypeofLog2IntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return .{ .index = idx };
     }
 
-    const operand_type_key = sema.intern_pool.get(operand_type.index);
+    const operand_type_key = sema.intern_pool.indexToKey(operand_type.index);
     if (operand_type_key == .int_type) {
         const bits = operand_type_key.int_type.bits;
         const log2_bits: u16 = if (bits == 0) 0 else std.math.log2_int_ceil(u16, bits);
@@ -446,7 +446,7 @@ fn evalAsNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(as.operand != .none);
 
     const dest_value = try sema.resolveRef(as.dest_type);
-    const dest_key = sema.intern_pool.get(dest_value.index);
+    const dest_key = sema.intern_pool.indexToKey(dest_value.index);
     // The destination may be either a `type_value` wrapping a type
     // (the dynamic case for synthesized types), or the bare type slot
     // itself when it came in via a well-known `Ref.X_type` (which Sema
@@ -470,7 +470,7 @@ fn evalAsNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // new type. The pool's aliasing guard handles the case where the
     // BigIntConst still references the operand's interned limbs.
     if (operand_type.index == .comptime_int_type) {
-        const dest_key2 = sema.intern_pool.get(dest_type_index);
+        const dest_key2 = sema.intern_pool.indexToKey(dest_type_index);
         if (dest_key2 == .int_type) {
             return try sema.coerceComptimeIntToFixedInt(
                 operand_value,
@@ -493,7 +493,7 @@ fn coerceComptimeIntToFixedInt(
     assert(@intFromPtr(sema) != 0);
     assert(dest_type_index != .none);
 
-    const op_key = sema.intern_pool.get(operand_value.index);
+    const op_key = sema.intern_pool.indexToKey(operand_value.index);
     assert(op_key == .int);
     assert(op_key.int.ty == .comptime_int_type);
 
@@ -655,7 +655,7 @@ fn resolveComptimeInt(
     const value = try sema.resolveRef(ref);
     assert(value.index != .none);
 
-    const key = sema.intern_pool.get(value.index);
+    const key = sema.intern_pool.indexToKey(value.index);
     if (key != .int) {
         try sema.writer.print("{s}: non-integer operand not yet supported\n", .{op_name});
         return error.AnalysisFail;

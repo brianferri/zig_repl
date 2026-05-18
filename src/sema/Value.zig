@@ -22,7 +22,7 @@ pub fn toIndex(val: Value) InternPool.Index {
 
 /// Returns the type of the value, looked up through `pool`.
 pub fn typeOf(val: Value, pool: *const InternPool) Type {
-    const key = pool.get(val.index);
+    const key = pool.indexToKey(val.index);
     return switch (key) {
         .simple_value => |sv| switch (sv) {
             .void => .void_type,

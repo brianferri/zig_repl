@@ -149,7 +149,7 @@ pub fn internNegate(
 
     assert(idx != .none);
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const stored = intern_pool.get(idx).int.storage.toBigInt(&space);
+    const stored = intern_pool.indexToKey(idx).int.storage.toBigInt(&space);
     assert(stored.limbs.len == operand_len);
     return idx;
 }
@@ -195,7 +195,7 @@ pub fn internDivExact(
     assert(pair.remainder != .none);
 
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const remainder = intern_pool.get(pair.remainder).int.storage.toBigInt(&space);
+    const remainder = intern_pool.indexToKey(pair.remainder).int.storage.toBigInt(&space);
     if (!remainder.eqlZero()) return error.DivisionNotExact;
     return pair.quotient;
 }
@@ -410,7 +410,7 @@ fn expectInternedDecimal(
     expected: []const u8,
 ) !void {
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const stored = intern_pool.get(idx).int.storage.toBigInt(&space);
+    const stored = intern_pool.indexToKey(idx).int.storage.toBigInt(&space);
     const actual = try stored.toStringAlloc(gpa, 10, .lower);
     defer gpa.free(actual);
     try testing.expectEqualStrings(expected, actual);
@@ -438,7 +438,7 @@ test "internAdd: multi-limb carry across u64 boundary" {
     // 2^64 on 64-bit hosts (or 2^32 on 32-bit). Same result either way: the
     // value equals @sizeOf(Limb) bits worth of 2-power.
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const stored = pool.get(idx).int.storage.toBigInt(&space);
+    const stored = pool.indexToKey(idx).int.storage.toBigInt(&space);
     try testing.expect(stored.limbs.len >= 2);
     try testing.expect(stored.positive);
 }
@@ -483,7 +483,7 @@ test "internNegate: zero stays positive (canonical representation)" {
     var z = [_]Limb{0};
     const idx = try internNegate(gpa, &pool, constLimbs(&z, true));
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const stored = pool.get(idx).int.storage.toBigInt(&space);
+    const stored = pool.indexToKey(idx).int.storage.toBigInt(&space);
     try testing.expect(stored.positive);
     try testing.expectEqual(@as(usize, 1), stored.limbs.len);
     try testing.expectEqual(@as(Limb, 0), stored.limbs[0]);
@@ -508,10 +508,10 @@ test "internNegate: forwarding pool-aliased operand is safe" {
     }
 
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const aliased = pool.get(big_idx).int.storage.toBigInt(&space);
+    const aliased = pool.indexToKey(big_idx).int.storage.toBigInt(&space);
     const neg_idx = try internNegate(gpa, &pool, aliased);
     var print_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const stored = pool.get(neg_idx).int.storage.toBigInt(&print_space);
+    const stored = pool.indexToKey(neg_idx).int.storage.toBigInt(&print_space);
     try testing.expect(!stored.positive);
     try testing.expectEqual(@as(usize, 2), stored.limbs.len);
 }

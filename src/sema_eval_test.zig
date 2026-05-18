@@ -34,7 +34,7 @@ fn expectEvalDecimal(
 ) !void {
     var diag_buf: [4096]u8 = undefined;
     const value = try evalSource(gpa, intern_pool, source, &diag_buf);
-    const key = intern_pool.get(value.index);
+    const key = intern_pool.indexToKey(value.index);
     try testing.expect(key == .int);
 
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
@@ -202,7 +202,7 @@ fn expectEvalTypedDecimal(
 ) !void {
     var diag_buf: [4096]u8 = undefined;
     const value = try evalSource(gpa, intern_pool, source, &diag_buf);
-    const key = intern_pool.get(value.index);
+    const key = intern_pool.indexToKey(value.index);
     try testing.expect(key == .int);
     try testing.expectEqual(expected_type, key.int.ty);
 
