@@ -191,6 +191,73 @@ test "labeled block as expression" {
     try expectEvalDecimal(gpa, &pool, "blk: { break :blk 1 + 2; }", "3");
 }
 
+fn expectEvalTypedDecimal(
+    gpa: std.mem.Allocator,
+    intern_pool: *InternPool,
+    source: []const u8,
+    expected_type: InternPool.Index,
+    expected_decimal: []const u8,
+) !void {
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, intern_pool, source, &diag_buf);
+    const key = intern_pool.get(value.index);
+    try testing.expect(key == .int_value);
+    try testing.expectEqual(expected_type, key.int_value.ty);
+
+    const decimal = try key.int_value.value.toStringAlloc(gpa, 10, .lower);
+    defer gpa.free(decimal);
+    try testing.expectEqualStrings(expected_decimal, decimal);
+}
+
+fn expectEvalFails(
+    gpa: std.mem.Allocator,
+    intern_pool: *InternPool,
+    source: []const u8,
+    expected_diagnostic_substring: []const u8,
+) !void {
+    var result = try Pipeline.run(gpa, source);
+    defer result.deinit(gpa);
+
+    var diag_buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&diag_buf);
+    const sema_result = Sema.analyze(gpa, intern_pool, result.zir, &writer);
+    try testing.expectError(error.AnalysisFail, sema_result);
+
+    const written = diag_buf[0 .. writer.buffer.len - writer.unusedCapacityLen()];
+    try testing.expect(std.mem.indexOf(u8, written, expected_diagnostic_substring) != null);
+}
+
+test "@as coerces comptime_int to fixed-width int and stores the type" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u32, 5)", .u32_type, "5");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(i32, -100)", .i32_type, "-100");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u64, 1234567890)", .u64_type, "1234567890");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(i8, -128)", .i8_type, "-128");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 255)", .u8_type, "255");
+}
+
+test "@as identity coercion is a free passthrough" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // comptime_int -> comptime_int (identity) was the original supported case.
+    try expectEvalDecimal(gpa, &pool, "@as(comptime_int, 42)", "42");
+}
+
+test "@as rejects values that don't fit in the target int type" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalFails(gpa, &pool, "@as(u8, 256)", "does not fit in u8");
+    try expectEvalFails(gpa, &pool, "@as(i8, 128)", "does not fit in i8");
+    try expectEvalFails(gpa, &pool, "@as(u32, -1)", "does not fit in u32");
+}
+
 test "if branches with negative results" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);

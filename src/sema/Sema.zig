@@ -423,9 +423,15 @@ fn evalTypeofLog2IntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return error.AnalysisFail;
 }
 
-/// `as_node` / `as_shift_operand`: coerce `operand` to `dest_type`. The
-/// initial cut handles only comptime_int -> comptime_int (identity
-/// passthrough). Other coercions land alongside fixed-width int support.
+/// `as_node` / `as_shift_operand`: coerce `operand` to `dest_type`.
+/// Currently supported:
+///   * identity (operand type == dest type) — free passthrough.
+///   * comptime_int -> any fixed-width int: range-checked via stdlib's
+///     `BigIntConst.fitsInTwosComp`; failure raises a runtime-style
+///     "value does not fit" diagnostic and returns AnalysisFail.
+/// Other coercions (int widening / narrowing between fixed widths,
+/// float, optional, error union, pointer) land alongside their
+/// respective handlers.
 ///
 /// Compiler reference: src/Sema.zig:zirAsNode -> analyzeAs.
 fn evalAsNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
@@ -439,11 +445,18 @@ fn evalAsNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const dest_value = try sema.resolveRef(as.dest_type);
     const dest_key = sema.intern_pool.get(dest_value.index);
-    if (dest_key != .type_value) {
-        try sema.writer.writeAll("as: destination is not a type\n");
-        return error.AnalysisFail;
-    }
-    const dest_type_index = dest_key.type_value;
+    // The destination may be either a `type_value` wrapping a type
+    // (the dynamic case for synthesized types), or the bare type slot
+    // itself when it came in via a well-known `Ref.X_type` (which Sema
+    // treats as the value-of-type-type identifying that slot directly).
+    const dest_type_index: InternPool.Index = switch (dest_key) {
+        .type_value => |t| t,
+        .simple_type, .int_type => dest_value.index,
+        else => {
+            try sema.writer.writeAll("as: destination is not a type\n");
+            return error.AnalysisFail;
+        },
+    };
 
     const operand_value = try sema.resolveRef(as.operand);
     const operand_type = Value.typeOf(operand_value, sema.intern_pool);
@@ -451,11 +464,51 @@ fn evalAsNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // Identity coercion is always safe.
     if (dest_type_index == operand_type.index) return operand_value;
 
-    try sema.writer.print(
-        "as: only identity coercion is supported yet (dest != operand type)\n",
-        .{},
-    );
+    // comptime_int -> fixed-width int: range-check then re-intern with the
+    // new type. The pool's aliasing guard handles the case where the
+    // BigIntConst still references the operand's interned limbs.
+    if (operand_type.index == .comptime_int_type) {
+        const dest_key2 = sema.intern_pool.get(dest_type_index);
+        if (dest_key2 == .int_type) {
+            return try sema.coerceComptimeIntToFixedInt(
+                operand_value,
+                dest_type_index,
+                dest_key2.int_type,
+            );
+        }
+    }
+
+    try sema.writer.writeAll("as: this coercion is not yet supported\n");
     return error.AnalysisFail;
+}
+
+fn coerceComptimeIntToFixedInt(
+    sema: *Sema,
+    operand_value: Value,
+    dest_type_index: InternPool.Index,
+    dest_int_type: std.builtin.Type.Int,
+) Error!Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(dest_type_index != .none);
+
+    const op_key = sema.intern_pool.get(operand_value.index);
+    assert(op_key == .int_value);
+    assert(op_key.int_value.ty == .comptime_int_type);
+
+    const big = op_key.int_value.value;
+    if (!big.fitsInTwosComp(dest_int_type.signedness, dest_int_type.bits)) {
+        try sema.writer.print(
+            "@as: value does not fit in {c}{d}\n",
+            .{ @as(u8, switch (dest_int_type.signedness) {
+                .signed => 'i',
+                .unsigned => 'u',
+            }), dest_int_type.bits },
+        );
+        return error.AnalysisFail;
+    }
+
+    const idx = try sema.intern_pool.internIntValue(dest_type_index, big);
+    return .{ .index = idx };
 }
 
 /// `shl / shr`. Same operand shape as the other binary ops, but `rhs` is a
@@ -622,23 +675,43 @@ fn resolveRef(sema: *Sema, ref: Zir.Inst.Ref) Error!Value {
     };
 }
 
-/// Maps a static ZIR `Ref` (one of the well-known constants) to the
-/// corresponding interned Value. The full Ref→InternPool.Index identity
-/// the compiler relies on requires Key variants we haven't ported yet
-/// (ptr_type, vector_type, the convenience pointer/slice shapes); we map
-/// only the variants reachable from currently-supported handlers.
+/// Maps a static ZIR `Ref` to the corresponding interned Value.
+///
+/// The compiler does this in three lines (src/Sema.zig:resolveInst):
+///
+///     return @enumFromInt(@intFromEnum(zir_ref));
+///
+/// because its `Zir.Inst.Ref` and `InternPool.Index` are kept in
+/// lock-step. A non-instruction Ref *is* the matching InternPool index,
+/// by construction. Pure integer identity, no lookup.
+///
+/// Our parity is partial — the type-prefix of `Index` through
+/// `enum_literal_type` (positions 0..44) mirrors the compiler's
+/// `Index` enum exactly, so we use the compiler's identity pattern
+/// directly for that range. Positions beyond it diverge until further
+/// compliance steps add the ptr/slice/vector wells and the typed
+/// undef/int values; the reflection bridge below covers them by name.
+/// Once the gap is closed, the reflection block disappears and only
+/// the identity line remains.
 fn wellKnownRefToValue(ref: Zir.Inst.Ref) ?Value {
-    return switch (ref) {
-        .zero => .{ .index = .zero },
-        .one => .{ .index = .one },
-        .negative_one => .{ .index = .negative_one },
-        .void_value => .{ .index = .void_value },
-        .bool_true => .{ .index = .bool_true },
-        .bool_false => .{ .index = .bool_false },
-        .null_value => .{ .index = .null_value },
-        .undef => .{ .index = .undef },
-        else => null,
-    };
+    if (ref == .none) return null;
+    if (ref.toIndex() != null) return null; // dynamic instruction ref
+
+    const ref_int = @intFromEnum(ref);
+    const identity_boundary = @intFromEnum(InternPool.Index.enum_literal_type);
+    if (ref_int <= identity_boundary) {
+        return Value{ .index = @enumFromInt(ref_int) };
+    }
+
+    inline for (@typeInfo(Zir.Inst.Ref).@"enum".fields) |field| {
+        if (comptime std.mem.eql(u8, field.name, "none")) continue;
+        if (comptime !@hasField(InternPool.Index, field.name)) continue;
+        if (comptime field.value <= @intFromEnum(InternPool.Index.enum_literal_type)) continue;
+        if (ref_int == field.value) {
+            return Value{ .index = @field(InternPool.Index, field.name) };
+        }
+    }
+    return null;
 }
 
 fn reportUnsupportedTag(sema: *Sema, comptime tag: Zir.Inst.Tag) Error!?Value {

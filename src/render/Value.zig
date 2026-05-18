@@ -21,7 +21,9 @@ pub fn render(
         .int_value => |iv| writer.print("{f}\n", .{iv.value}),
         .simple_value => |sv| writer.print("{s}\n", .{simpleValueText(sv)}),
         .type_value => |ty_idx| renderTypeRef(ty_idx, pool, writer),
-        .simple_type, .int_type => unreachable, // not values
+        // A bare type Key viewed as a value identifies the type itself
+        // (Sema's value-of-type-type convention; see Value.typeOf).
+        .simple_type, .int_type, .anyframe_type => renderTypeRef(value.index, pool, writer),
     };
 }
 
@@ -50,6 +52,19 @@ fn renderTypeRef(
             }),
             it.bits,
         }),
+        .anyframe_type => |child| if (child == .none)
+            writer.writeAll("anyframe\n")
+        else
+            renderAnyframeChild(child, pool, writer),
         else => writer.writeAll("<type>\n"),
     };
+}
+
+fn renderAnyframeChild(
+    child: InternPool.Index,
+    pool: *const InternPool,
+    writer: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    try writer.writeAll("anyframe->");
+    try renderTypeRef(child, pool, writer);
 }
