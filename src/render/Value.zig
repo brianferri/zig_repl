@@ -24,6 +24,7 @@ pub fn render(
             return writer.print("{f}\n", .{big});
         },
         .simple_value => |sv| writer.print("{s}\n", .{simpleValueText(sv)}),
+        .undef => writer.writeAll("undefined\n"),
         .type_value => |ty_idx| renderTypeRef(ty_idx, pool, writer),
         // A bare type Key viewed as a value identifies the type itself
         // (Sema's value-of-type-type convention; see Value.typeOf).

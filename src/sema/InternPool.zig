@@ -179,6 +179,10 @@ pub const Key = union(enum) {
     /// arbitrary precision. For `big_int`, the limbs slice borrows from
     /// the pool's arena and is valid for the pool's lifetime.
     int: Int,
+    /// `undefined` of type `Index`. Untyped `undefined` uses
+    /// `.undefined_type` here; the well-known `Index.undef` slot stores
+    /// exactly that shape. Mirrors the compiler's `Key.undef`.
+    undef: Index,
     /// A value whose runtime type is `type` and whose payload is the
     /// interned type itself.
     type_value: Index,
@@ -241,6 +245,7 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, big.positive);
                 for (big.limbs) |limb| std.hash.autoHash(&hasher, limb);
             },
+            .undef => |ty| std.hash.autoHash(&hasher, ty),
             .type_value => |t| std.hash.autoHash(&hasher, t),
         }
         return hasher.final();
@@ -265,6 +270,7 @@ pub const Key = union(enum) {
                 var sb: Int.Storage.BigIntSpace = undefined;
                 break :blk x.storage.toBigInt(&sa).eql(y.storage.toBigInt(&sb));
             },
+            .undef => |x| x == b.undef,
             .type_value => |x| x == b.type_value,
         };
     }
@@ -302,6 +308,7 @@ const Item = struct {
         // head of a Limb-aligned arena, limbs trailing).
         int_positive,
         int_negative,
+        undef, // data = Index of the value's type (`undefined_type` for untyped)
         type_value, // data = Index of the interned type
     };
 };
@@ -437,9 +444,8 @@ const static_keys: [first_dynamic_index]Key = .{
     .{ .simple_type = .undefined },
     .{ .simple_type = .enum_literal },
 
-    // Untyped `undefined`. Compiler shape is `.{ .undef = .undefined_type }`;
-    // ours uses a `type_value` until the `undef` Key variant lands.
-    .{ .type_value = .undefined_type },
+    // Untyped `undefined` — same shape as the compiler.
+    .{ .undef = .undefined_type },
     .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 0 } } },
     .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 1 } } },
     .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .i64 = -1 } } },
@@ -523,6 +529,13 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
             .tag = .type_value,
             .data = @intFromEnum(t),
         }),
+        .undef => |ty| {
+            assert(ty != .none);
+            pool.items.appendAssumeCapacity(.{
+                .tag = .undef,
+                .data = @intFromEnum(ty),
+            });
+        },
         .int => |i| try emitInt(pool, i),
     }
 
@@ -559,6 +572,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .int_small => intSmallFromExtra(pool, item.data),
         .int_positive => intBigFromArena(pool, item.data, true),
         .int_negative => intBigFromArena(pool, item.data, false),
+        .undef => .{ .undef = @enumFromInt(item.data) },
         .type_value => .{ .type_value = @enumFromInt(item.data) },
     };
 }
@@ -1010,6 +1024,26 @@ test "small comptime int compresses to inline tag" {
     const round = pool.indexToKey(idx).int;
     try std.testing.expectEqual(Index.comptime_int_type, round.ty);
     try std.testing.expectEqual(@as(u64, 42), round.storage.u64);
+}
+
+test "undef Key variant: well-known slot and typed undef" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    // The well-known `Index.undef` slot is untyped undef, i.e. undef
+    // whose carrier type is `.undefined_type` — compiler-exact shape.
+    const untyped = pool.indexToKey(.undef).undef;
+    try std.testing.expectEqual(Index.undefined_type, untyped);
+
+    // Re-interning the same untyped undef must return the well-known slot,
+    // not a fresh dynamic item.
+    const round = try pool.get(.{ .undef = .undefined_type });
+    try std.testing.expectEqual(Index.undef, round);
+
+    // Typed undef: undef of u32 is a distinct entry and round-trips.
+    const u32_undef = try pool.get(.{ .undef = .u32_type });
+    try std.testing.expect(u32_undef != .undef);
+    try std.testing.expectEqual(Index.u32_type, pool.indexToKey(u32_undef).undef);
 }
 
 test "interning identical keys dedups to a single Index" {
