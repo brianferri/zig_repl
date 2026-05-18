@@ -30,7 +30,7 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
             .null => .{ .index = .null_type },
             .@"unreachable" => .{ .index = .noreturn_type },
         },
-        .int_value => |iv| .{ .index = iv.ty },
+        .int => |iv| .{ .index = iv.ty },
         .type_value => .type_type,
         // A bare type Key (the slot a type lives in) doubles as the value
         // of type `type` with that type as its payload — the compiler's

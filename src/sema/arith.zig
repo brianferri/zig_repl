@@ -148,7 +148,8 @@ pub fn internNegate(
         try intern_pool.internComptimeInt(operand.negate());
 
     assert(idx != .none);
-    const stored = intern_pool.get(idx).int_value.value;
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const stored = intern_pool.get(idx).int.storage.toBigInt(&space);
     assert(stored.limbs.len == operand_len);
     return idx;
 }
@@ -193,7 +194,8 @@ pub fn internDivExact(
     assert(pair.quotient != .none);
     assert(pair.remainder != .none);
 
-    const remainder = intern_pool.get(pair.remainder).int_value.value;
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const remainder = intern_pool.get(pair.remainder).int.storage.toBigInt(&space);
     if (!remainder.eqlZero()) return error.DivisionNotExact;
     return pair.quotient;
 }
@@ -407,7 +409,8 @@ fn expectInternedDecimal(
     idx: InternPool.Index,
     expected: []const u8,
 ) !void {
-    const stored = intern_pool.get(idx).int_value.value;
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const stored = intern_pool.get(idx).int.storage.toBigInt(&space);
     const actual = try stored.toStringAlloc(gpa, 10, .lower);
     defer gpa.free(actual);
     try testing.expectEqualStrings(expected, actual);
@@ -434,7 +437,8 @@ test "internAdd: multi-limb carry across u64 boundary" {
     const idx = try internAdd(gpa, &pool, constLimbs(&a, true), constLimbs(&b, true));
     // 2^64 on 64-bit hosts (or 2^32 on 32-bit). Same result either way: the
     // value equals @sizeOf(Limb) bits worth of 2-power.
-    const stored = pool.get(idx).int_value.value;
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const stored = pool.get(idx).int.storage.toBigInt(&space);
     try testing.expect(stored.limbs.len >= 2);
     try testing.expect(stored.positive);
 }
@@ -478,7 +482,8 @@ test "internNegate: zero stays positive (canonical representation)" {
 
     var z = [_]Limb{0};
     const idx = try internNegate(gpa, &pool, constLimbs(&z, true));
-    const stored = pool.get(idx).int_value.value;
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const stored = pool.get(idx).int.storage.toBigInt(&space);
     try testing.expect(stored.positive);
     try testing.expectEqual(@as(usize, 1), stored.limbs.len);
     try testing.expectEqual(@as(Limb, 0), stored.limbs[0]);
@@ -489,18 +494,26 @@ test "internNegate: forwarding pool-aliased operand is safe" {
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
 
-    var seven = [_]Limb{7};
-    const seven_idx = try pool.internComptimeInt(constLimbs(&seven, true));
+    // Multi-limb value: forces the big-int path, otherwise the small-int
+    // compressor packs it into an inline tag and the aliasing concern
+    // (limbs borrowed from the pool's `extra` buffer) never arises.
+    var big = [_]Limb{ 0, 1 }; // 2^@bitSizeOf(Limb)
+    const big_idx = try pool.internIntValue(.u128_type, constLimbs(&big, true));
 
-    // Drain capacity so the next intern must reallocate big_int_limbs. This
-    // is the exact pattern the InternPool aliasing-safety guard defends.
+    // Drain `big_int_limbs` capacity so the next intern triggers a realloc
+    // that would invalidate any aliased source pointer before its memcpy
+    // ran.
     while (pool.big_int_limbs.items.len < pool.big_int_limbs.capacity) {
         try pool.big_int_limbs.append(pool.gpa, 0);
     }
 
-    const aliased = pool.get(seven_idx).int_value.value;
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const aliased = pool.get(big_idx).int.storage.toBigInt(&space);
     const neg_idx = try internNegate(gpa, &pool, aliased);
-    try expectInternedDecimal(gpa, &pool, neg_idx, "-7");
+    var print_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const stored = pool.get(neg_idx).int.storage.toBigInt(&print_space);
+    try testing.expect(!stored.positive);
+    try testing.expectEqual(@as(usize, 2), stored.limbs.len);
 }
 
 test "internDivTrunc: positive operands" {

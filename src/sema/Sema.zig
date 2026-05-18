@@ -220,8 +220,10 @@ fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?
 
     const op_name: []const u8 = @tagName(tag);
     assert(op_name.len > 0);
-    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name);
-    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name);
+    var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name, &lhs_space);
+    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name, &rhs_space);
 
     const ip = sema.intern_pool;
     const gpa = sema.gpa;
@@ -492,10 +494,11 @@ fn coerceComptimeIntToFixedInt(
     assert(dest_type_index != .none);
 
     const op_key = sema.intern_pool.get(operand_value.index);
-    assert(op_key == .int_value);
-    assert(op_key.int_value.ty == .comptime_int_type);
+    assert(op_key == .int);
+    assert(op_key.int.ty == .comptime_int_type);
 
-    const big = op_key.int_value.value;
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const big = op_key.int.storage.toBigInt(&space);
     if (!big.fitsInTwosComp(dest_int_type.signedness, dest_int_type.bits)) {
         try sema.writer.print(
             "@as: value does not fit in {c}{d}\n",
@@ -536,8 +539,10 @@ fn evalShift(
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
-    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name);
-    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name);
+    var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name, &lhs_space);
+    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name, &rhs_space);
 
     const idx = kernel(sema.gpa, sema.intern_pool, lhs, rhs) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -572,8 +577,10 @@ fn evalBitwise(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Valu
     assert(bin.rhs != .none);
 
     const op_name: []const u8 = @tagName(tag);
-    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name);
-    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name);
+    var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name, &lhs_space);
+    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name, &rhs_space);
 
     const ip = sema.intern_pool;
     const gpa = sema.gpa;
@@ -606,8 +613,10 @@ fn evalComparison(
     assert(bin.rhs != .none);
 
     const op_name: []const u8 = @tagName(op);
-    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name);
-    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name);
+    var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name, &lhs_space);
+    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name, &rhs_space);
 
     const result = arith.compareInt(lhs, rhs, op);
     return .{ .index = if (result) .bool_true else .bool_false };
@@ -623,7 +632,8 @@ fn evalNegate(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     assert(un_node.operand != .none);
 
-    const operand = try sema.resolveComptimeInt(un_node.operand, "negate");
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const operand = try sema.resolveComptimeInt(un_node.operand, "negate", &space);
     const idx = try arith.internNegate(sema.gpa, sema.intern_pool, operand);
     assert(idx != .none);
     return .{ .index = idx };
@@ -636,6 +646,7 @@ fn resolveComptimeInt(
     sema: *Sema,
     ref: Zir.Inst.Ref,
     op_name: []const u8,
+    space: *InternPool.Key.Int.Storage.BigIntSpace,
 ) Error!std.math.big.int.Const {
     assert(@intFromPtr(sema) != 0);
     assert(ref != .none);
@@ -645,16 +656,17 @@ fn resolveComptimeInt(
     assert(value.index != .none);
 
     const key = sema.intern_pool.get(value.index);
-    if (key != .int_value) {
+    if (key != .int) {
         try sema.writer.print("{s}: non-integer operand not yet supported\n", .{op_name});
         return error.AnalysisFail;
     }
-    if (key.int_value.ty != .comptime_int_type) {
+    if (key.int.ty != .comptime_int_type) {
         try sema.writer.print("{s}: fixed-width int arithmetic not yet supported\n", .{op_name});
         return error.AnalysisFail;
     }
-    assert(key.int_value.value.limbs.len > 0);
-    return key.int_value.value;
+    const big = key.int.storage.toBigInt(space);
+    assert(big.limbs.len > 0);
+    return big;
 }
 
 fn resolveRef(sema: *Sema, ref: Zir.Inst.Ref) Error!Value {

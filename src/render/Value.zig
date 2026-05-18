@@ -18,7 +18,11 @@ pub fn render(
 
     const key = pool.get(value.index);
     return switch (key) {
-        .int_value => |iv| writer.print("{f}\n", .{iv.value}),
+        .int => |iv| {
+            var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+            const big = iv.storage.toBigInt(&space);
+            return writer.print("{f}\n", .{big});
+        },
         .simple_value => |sv| writer.print("{s}\n", .{simpleValueText(sv)}),
         .type_value => |ty_idx| renderTypeRef(ty_idx, pool, writer),
         // A bare type Key viewed as a value identifies the type itself

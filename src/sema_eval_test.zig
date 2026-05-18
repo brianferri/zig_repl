@@ -35,9 +35,11 @@ fn expectEvalDecimal(
     var diag_buf: [4096]u8 = undefined;
     const value = try evalSource(gpa, intern_pool, source, &diag_buf);
     const key = intern_pool.get(value.index);
-    try testing.expect(key == .int_value);
+    try testing.expect(key == .int);
 
-    const decimal = try key.int_value.value.toStringAlloc(gpa, 10, .lower);
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const big = key.int.storage.toBigInt(&space);
+    const decimal = try big.toStringAlloc(gpa, 10, .lower);
     defer gpa.free(decimal);
     try testing.expectEqualStrings(expected, decimal);
 }
@@ -201,10 +203,12 @@ fn expectEvalTypedDecimal(
     var diag_buf: [4096]u8 = undefined;
     const value = try evalSource(gpa, intern_pool, source, &diag_buf);
     const key = intern_pool.get(value.index);
-    try testing.expect(key == .int_value);
-    try testing.expectEqual(expected_type, key.int_value.ty);
+    try testing.expect(key == .int);
+    try testing.expectEqual(expected_type, key.int.ty);
 
-    const decimal = try key.int_value.value.toStringAlloc(gpa, 10, .lower);
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const big = key.int.storage.toBigInt(&space);
+    const decimal = try big.toStringAlloc(gpa, 10, .lower);
     defer gpa.free(decimal);
     try testing.expectEqualStrings(expected_decimal, decimal);
 }
