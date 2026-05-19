@@ -73,7 +73,7 @@ fn renderTypeRef(
 /// `std.fmt`'s `{d}` strips the trailing decimal for integral values
 /// (`4.0` -> "4"), which is ambiguous next to integers in REPL output.
 /// We restore the `.0` when the printed form has no decimal exponent or
-/// dot — but leave NaN / inf / -inf untouched.
+/// dot -- but leave NaN / inf / -inf untouched.
 fn renderFloat(
     float: InternPool.Key.Float,
     writer: *std.Io.Writer,
@@ -92,7 +92,7 @@ fn renderFloat(
 }
 
 /// True iff `text` is a finite-magnitude float printed without a decimal
-/// point or exponent (e.g. "4", "-7") — in which case appending ".0"
+/// point or exponent (e.g. "4", "-7") -- in which case appending ".0"
 /// keeps the value visually distinct from an integer. NaN / inf / -inf
 /// start with a non-digit and are left alone.
 fn needsTrailingDecimal(text: []const u8) bool {

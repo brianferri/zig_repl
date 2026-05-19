@@ -711,7 +711,7 @@ test "fixed-width int peer resolution across widths and signedness" {
     try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 5) + @as(i16, 100)", .i16_type, "105");
 
     // Mixed signedness, unsigned strictly wider: unsigned wins (compiler
-    // legacy compat — both operands here are comptime-known).
+    // legacy compat -- both operands here are comptime-known).
     try expectEvalTypedDecimal(gpa, &pool, "@as(u16, 5) + @as(i8, 100)", .u16_type, "105");
 }
 

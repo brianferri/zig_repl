@@ -178,7 +178,7 @@ fn evalInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// `usize` and needs `@alignOf(usize)` alignment to read safely
 /// (misaligned reads are UB on stricter architectures and trip Zig's
 /// safety checks). The fix would be aligning the limb runs in
-/// `string_bytes` upstream so we could reinterpret in place — neither
+/// `string_bytes` upstream so we could reinterpret in place -- neither
 /// AstGen nor the compiler's Sema do this yet. Until that lands we eat
 /// one `gpa.alloc` + `@memcpy` per `int_big` instruction. Worth
 /// revisiting if `int_big` ever shows up in REPL profiling.
@@ -250,7 +250,7 @@ fn evalPassthroughUnNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// Binary arith dispatcher (`add/sub/mul/div(_*)?/mod/rem`). Picks int
 /// vs float kernels by operand type. When one operand is `comptime_int`
 /// and the other is `comptime_float`, the int side is promoted via
-/// `BigIntConst.toFloat(f128, .nearest_even)` — peer-type resolution as
+/// `BigIntConst.toFloat(f128, .nearest_even)` -- peer-type resolution as
 /// the compiler does for these specific types. Fixed-width arithmetic
 /// and full peer-type resolution land with their coercion handlers.
 ///
@@ -291,13 +291,13 @@ fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?
 }
 
 /// Peer-type resolution for two int operands. Returns the common int
-/// type plus both operand Keys (unchanged — the kernel does the bignum
+/// type plus both operand Keys (unchanged -- the kernel does the bignum
 /// arithmetic and re-fits afterwards), or `null` if the pair isn't a
 /// resolvable int-int combination (mixed signedness with no winner, a
 /// non-`.int_type` fixed-width like `usize` or `c_int`, or a non-int
 /// operand).
 ///
-/// Common-type rules — `src/Sema.zig` `resolvePeerTypesInner` for the
+/// Common-type rules -- `src/Sema.zig` `resolvePeerTypesInner` for the
 /// `.fixed_int` strategy:
 ///   * Both comptime_int -> comptime_int.
 ///   * comptime_int + fixed-width int -> the fixed-width int (the
@@ -321,7 +321,7 @@ fn resolveNumericPairToInt(
     const rhs_info: ?std.builtin.Type.Int = if (rhs_is_cti) null else intTypeInfo(pool, rhs_int.ty);
 
     // Bail on int types we don't yet support as a peer target (usize,
-    // c_int, etc. — separate target-aware axis).
+    // c_int, etc. -- separate target-aware axis).
     if (!lhs_is_cti and lhs_info == null) return null;
     if (!rhs_is_cti and rhs_info == null) return null;
 
@@ -343,7 +343,7 @@ fn resolveNumericPairToInt(
     // branch (`any_comptime_known` is always true for us, since every
     // value reaching here is comptime-known): wider unsigned wins, or
     // if signed_bits >= unsigned_bits, the earlier operand wins. Since
-    // we don't track source order, we use lhs as the fallback —
+    // we don't track source order, we use lhs as the fallback --
     // matches the compiler in practice.
     const signed_ty = if (li.signedness == .signed) lhs_int.ty else rhs_int.ty;
     const signed_bits = if (li.signedness == .signed) li.bits else ri.bits;
@@ -359,7 +359,7 @@ fn resolveNumericPairToInt(
 }
 
 /// Pull `(signedness, bits)` for any Zig int type Index. Covers
-/// `int_type` (uN/iN), `comptime_int`-rejected (returns null — peer
+/// `int_type` (uN/iN), `comptime_int`-rejected (returns null -- peer
 /// resolution treats it separately), and the target-conditioned
 /// family (`usize`, `isize`, `c_char` ... `c_ulonglong`) whose widths
 /// come from `@typeInfo(T).int` against the host.
@@ -390,7 +390,7 @@ fn intTypeInfo(pool: *const InternPool, ty: InternPool.Index) ?std.builtin.Type.
 /// then diagnoses; pairs the int-arith arm would handle also return
 /// null here).
 ///
-/// Common-type rules — matched against the compiler's `resolvePeerTypes`
+/// Common-type rules -- matched against the compiler's `resolvePeerTypes`
 /// strategy lattice for the int/float subset:
 ///   * Both sides fixed-width float -> the wider one
 ///     (`f32 + f64` -> f64, etc.)
@@ -453,7 +453,7 @@ fn floatTypeBits(ty: InternPool.Index) u16 {
 
 /// Coerce a numeric Key to a `Key.Float` at `target_ty`, or `null` if
 /// the coercion is invalid for that target. The only invalid combo is
-/// fixed-width int operand with comptime_float target — Zig requires
+/// fixed-width int operand with comptime_float target -- Zig requires
 /// an explicit cast there.
 fn coerceToTargetFloat(
     key: InternPool.Key,
@@ -471,7 +471,7 @@ fn coerceToTargetFloat(
 
 /// Widen a numeric Key (any int or any float) to f128, then narrow to
 /// the storage variant for `target_ty`. Uses `BigIntConst.toFloat(f128,
-/// .nearest_even)` for ints (IEEE-754 default) — the same helper the
+/// .nearest_even)` for ints (IEEE-754 default) -- the same helper the
 /// compiler's `Value.toFloat` calls. Callers must have ensured the
 /// coercion is valid (see `coerceToTargetFloat`).
 fn coerceNumericToFloat(
@@ -542,8 +542,12 @@ fn evalBinaryArithInt(
 }
 
 const WrapSatKind = enum {
-    add_wrap, sub_wrap, mul_wrap,
-    add_sat, sub_sat, mul_sat,
+    add_wrap,
+    sub_wrap,
+    mul_wrap,
+    add_sat,
+    sub_sat,
+    mul_sat,
 };
 
 fn wrapSatKernel(tag: Zir.Inst.Tag) ?WrapSatKind {
@@ -744,7 +748,7 @@ const ShiftKernel = *const fn (
 ) arith.ShiftError!InternPool.Index;
 
 /// `block` / `block_inline`: evaluate an inner ZIR body and yield the value
-/// it breaks with. Sema's existing `evalBody` already does this — `block`
+/// it breaks with. Sema's existing `evalBody` already does this -- `block`
 /// here is just an `evalInst` arm that exposes the inner body's break
 /// value as the instruction's own result.
 ///
@@ -769,7 +773,7 @@ fn evalBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// else body, recursively evalBody on the chosen one. The picked body
 /// terminates with `break_inline` to its enclosing block, which exits the
 /// recursive `evalBody` call here. Treated as a terminator by the outer
-/// `evalBody` because it always transfers control — never falls through.
+/// `evalBody` because it always transfers control -- never falls through.
 ///
 /// Compiler reference: src/Sema.zig:zirCondbr.
 fn evalCondbr(sema: *Sema, inst: Zir.Inst.Index) Error!Value {
@@ -824,7 +828,7 @@ fn evalBoolNot(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// Short-circuiting `and` / `or`. `lhs` is a bool Ref; the rhs is a ZIR
 /// body the compiler emits to evaluate the right operand only when the
-/// short-circuit doesn't fire. First nested-body path in Sema — the body
+/// short-circuit doesn't fire. First nested-body path in Sema -- the body
 /// is just a sub-sequence of `Zir.Inst.Index` and `evalBody` already does
 /// the right thing. `tag` distinguishes the two variants directly via
 /// `Zir.Inst.Tag` rather than a parallel local enum.
@@ -897,7 +901,7 @@ fn evalTypeofLog2IntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// `as_node` / `as_shift_operand`: coerce `operand` to `dest_type`.
 /// Currently supported:
-///   * identity (operand type == dest type) — free passthrough.
+///   * identity (operand type == dest type) -- free passthrough.
 ///   * comptime_int -> any fixed-width int: range-checked via stdlib's
 ///     `BigIntConst.fitsInTwosComp`; failure raises a runtime-style
 ///     "value does not fit" diagnostic and returns AnalysisFail.
@@ -1048,8 +1052,8 @@ fn evalIntFromFloat(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// Truncate a finite f128 toward zero and intern the result at the
 /// requested destination type. `BigIntMutable.setFloat(.trunc)` writes
 /// the integer part; `std.math.big.int.calcLimbLen` sizes the buffer to
-/// exactly what this specific value needs (1–2 limbs for normal-sized
-/// values, up to ~257 only for f128 near the max exponent — matching
+/// exactly what this specific value needs (1-2 limbs for normal-sized
+/// values, up to ~257 only for f128 near the max exponent -- matching
 /// the compiler's `intFromFloatScalar`).
 fn materialiseIntFromFloat(
     sema: *Sema,
@@ -1094,8 +1098,8 @@ fn materialiseIntFromFloat(
 
 /// `@floatFromInt(DestType, x)`: integer-to-float conversion. The int is
 /// rounded to nearest-even (IEEE-754 default) at the destination width.
-/// Operands of any int type are accepted — including comptime_int with
-/// arbitrary magnitude — because `BigIntConst.toFloat` handles the
+/// Operands of any int type are accepted -- including comptime_int with
+/// arbitrary magnitude -- because `BigIntConst.toFloat` handles the
 /// rounding.
 ///
 /// Compiler reference: src/Sema.zig:zirFloatFromInt.
@@ -1242,7 +1246,7 @@ fn numericBitSize(pool: *const InternPool, ty: InternPool.Index) ?u16 {
 
 /// Numeric `@bitCast` worker: route the operand bits through the dest
 /// type's storage. Supports int <-> int (same bit width but different
-/// signedness — uses stdlib's `truncate` for two's-complement view)
+/// signedness -- uses stdlib's `truncate` for two's-complement view)
 /// and int <-> float of matching width (bit pattern reinterpret).
 fn reinterpretBitCast(
     sema: *Sema,
@@ -1381,7 +1385,7 @@ fn floatToF128(source: InternPool.Key.Float) f128 {
 
 /// Narrow (or pass through) an f128 to the storage variant matching
 /// `dest_ty`. Caller must have checked `isFloatTypeIndex(dest_ty)`.
-/// `c_longdouble_type` stores as f128 — see InternPool's emitFloat for
+/// `c_longdouble_type` stores as f128 -- see InternPool's emitFloat for
 /// the matching tag selection (the f80/f128 split is taken there).
 fn narrowF128ToFloatStorage(value: f128, dest_ty: InternPool.Index) InternPool.Key.Float.Storage {
     return switch (dest_ty) {
@@ -1395,15 +1399,13 @@ fn narrowF128ToFloatStorage(value: f128, dest_ty: InternPool.Index) InternPool.K
     };
 }
 
-
-
 /// `shl / shr`. Same operand shape as the other binary ops, but `rhs` is a
-/// shift amount that must fit in `usize` and be non-negative — the kernel's
+/// shift amount that must fit in `usize` and be non-negative -- the kernel's
 /// stdlib-named `ConvertError.NegativeIntoUnsigned` /
 /// `ConvertError.TargetTooSmall` flow through here and become runtime-style
 /// diagnostics + `AnalysisFail`.
 ///
-/// `shl_exact` / `shr_exact` land alongside fixed-width int support — the
+/// `shl_exact` / `shr_exact` land alongside fixed-width int support -- the
 /// "no bits lost" check is meaningful only when the operand has a width.
 ///
 /// Compiler reference: src/Sema.zig:zirShl / zirShr.
@@ -1551,7 +1553,7 @@ fn runShlSat(
 }
 
 /// `bit_and / bit_or / xor`. Uses the same `resolveNumericPairToInt`
-/// peer resolution as the arith dispatcher — so fixed-width int
+/// peer resolution as the arith dispatcher -- so fixed-width int
 /// operands work and the result is range-checked back into the dest
 /// type. For comptime_int operands, the bignum result is canonical.
 ///
@@ -1620,7 +1622,7 @@ fn evalComparison(
     const rhs_key = ip.indexToKey(rhs_value.index);
 
     // Comparison doesn't need to re-fit, so it only cares that peer
-    // resolution found a common int type — the bignum values compare
+    // resolution found a common int type -- the bignum values compare
     // exactly across signedness and width.
     if (resolveNumericPairToInt(ip, lhs_key, rhs_key)) |triple| {
         var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
@@ -1767,7 +1769,7 @@ fn resolveRef(sema: *Sema, ref: Zir.Inst.Ref) Error!Value {
     return error.AnalysisFail;
 }
 
-/// Refs the compiler hands out as pre-typed constants —
+/// Refs the compiler hands out as pre-typed constants --
 /// `zero_u8` / `one_u8` / `one_usize` / `undef_bool` / etc. We intern
 /// them on demand rather than reserving well-known slots, since they
 /// fold into the pool's normal int / undef storage with no special
@@ -1816,7 +1818,7 @@ fn internTypedWellKnownRef(sema: *Sema, ref: Zir.Inst.Ref) Error!?Value {
 /// lock-step. A non-instruction Ref *is* the matching InternPool index,
 /// by construction. Pure integer identity, no lookup.
 ///
-/// Our parity is partial — the type-prefix of `Index` through
+/// Our parity is partial -- the type-prefix of `Index` through
 /// `enum_literal_type` (positions 0..44) mirrors the compiler's
 /// `Index` enum exactly, so we use the compiler's identity pattern
 /// directly for that range. Positions beyond it diverge until further

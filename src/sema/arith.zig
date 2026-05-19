@@ -138,8 +138,8 @@ pub fn internNegate(
     assert(operand.limbs.len > 0);
 
     // operand.limbs may alias the pool's big_int_limbs buffer; InternPool's
-    // aliasing guard handles the copy. negate is sign-only — magnitude
-    // limbs are unchanged — so the result limb count equals the operand's.
+    // aliasing guard handles the copy. negate is sign-only -- magnitude
+    // limbs are unchanged -- so the result limb count equals the operand's.
     const operand_len = operand.limbs.len;
 
     const idx = if (operand.eqlZero())
@@ -289,7 +289,7 @@ fn runBitwise(
 /// Error set for the shift kernels. `ConvertError` is reused from
 /// `std.math.big.int.Const` so a negative-shift surfaces as
 /// `error.NegativeIntoUnsigned` and a shift-too-big-for-usize surfaces as
-/// `error.TargetTooSmall` — the same names stdlib gives those conditions
+/// `error.TargetTooSmall` -- the same names stdlib gives those conditions
 /// when extracting via `BigIntConst.toInt`. `ShiftAmountTooLarge` is the
 /// one project-specific addition: our soft cap on workspace size.
 pub const ShiftError =
@@ -369,7 +369,7 @@ fn runShift(
     return idx;
 }
 
-/// Integer comparison. Result is a plain `bool` (no intern needed —
+/// Integer comparison. Result is a plain `bool` (no intern needed --
 /// callers map to `Index.bool_true` / `Index.bool_false`). Sign and
 /// magnitude are handled by `BigIntConst.order`; the `Order.compare`
 /// helper translates that to the requested operator.
@@ -573,10 +573,10 @@ test "internMod and internRem differ in sign for negative dividend" {
 
     var a = [_]Limb{7};
     var b = [_]Limb{2};
-    // @mod: result has sign of divisor → +1
+    // @mod: result has sign of divisor -> +1
     const mod_idx = try internMod(gpa, &pool, constLimbs(&a, false), constLimbs(&b, true));
     try expectInternedDecimal(gpa, &pool, mod_idx, "1");
-    // @rem: result has sign of dividend → -1
+    // @rem: result has sign of dividend -> -1
     const rem_idx = try internRem(gpa, &pool, constLimbs(&a, false), constLimbs(&b, true));
     try expectInternedDecimal(gpa, &pool, rem_idx, "-1");
 }

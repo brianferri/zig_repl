@@ -35,7 +35,7 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
         .undef => |ty| .{ .index = ty },
         .type_value => .type_type,
         // A bare type Key (the slot a type lives in) doubles as the value
-        // of type `type` with that type as its payload — the compiler's
+        // of type `type` with that type as its payload -- the compiler's
         // `Ref.X_type` directly identifies an Index that's both. So when
         // such an index is used as a value, its type is `type`.
         .simple_type, .int_type, .anyframe_type => .type_type,

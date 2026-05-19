@@ -7,7 +7,7 @@
 //! `Item.Tag` naming mirror the compiler so the port reads against it
 //! directly. Compiler-internal markers (`adhoc_inferred_error_set`,
 //! `generic_poison`) plus the convenience pointer/slice/vector well-knowns
-//! are deliberately deferred — they need Key variants (`ptr_type`,
+//! are deliberately deferred -- they need Key variants (`ptr_type`,
 //! `vector_type`, etc.) that land alongside their handlers.
 
 const std = @import("std");
@@ -175,13 +175,13 @@ pub const Key = union(enum) {
     anyframe_type: Index,
     /// An integer value tagged with its type. Mirrors the compiler's
     /// `Key.int`: storage holds the value as the narrowest variant that
-    /// fits — inline `u64`/`i64` for small magnitudes, `big_int` for
+    /// fits -- inline `u64`/`i64` for small magnitudes, `big_int` for
     /// arbitrary precision. For `big_int`, the limbs slice borrows from
     /// the pool's arena and is valid for the pool's lifetime.
     int: Int,
     /// A floating-point value tagged with its type. Mirrors the compiler's
     /// `Key.float`. The storage variant must match the type's bit width,
-    /// except for `c_longdouble_type` (storage may be any width — promoted
+    /// except for `c_longdouble_type` (storage may be any width -- promoted
     /// to f128 on emit unless f80) and `comptime_float_type` (always
     /// f128).
     float: Float,
@@ -243,7 +243,7 @@ pub const Key = union(enum) {
     /// (e.g. `struct_type`) whose canonical form requires pool lookup;
     /// today's variants ignore it. Storage variants of `int` are
     /// normalised to `BigIntConst` before hashing so that
-    /// `.{ .u64 = 5 }` and `.{ .big_int = +5 }` hash identically — the
+    /// `.{ .u64 = 5 }` and `.{ .big_int = +5 }` hash identically -- the
     /// read-side compresses limbs back to inline storage so the pool's
     /// canonical form is stable, but a freshly constructed Key may
     /// arrive in any variant. Same canonicalisation in `eql`.
@@ -594,7 +594,7 @@ const static_keys: [first_dynamic_index]Key = .{
     .{ .simple_type = .undefined },
     .{ .simple_type = .enum_literal },
 
-    // Untyped `undefined` — same shape as the compiler.
+    // Untyped `undefined` -- same shape as the compiler.
     .{ .undef = .undefined_type },
     .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 0 } } },
     .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 1 } } },
@@ -657,7 +657,7 @@ fn appendAnyframeType(pool: *InternPool, child: Index) void {
 /// Invariant: `map` and `items` are appended in lockstep, so the map's
 /// insertion-order `gop.index` equals the `items.len` at the time of
 /// the miss (and the resulting `Item`'s position). This is what makes
-/// the bare-`void` map sound — the adapter reconstructs the existing
+/// the bare-`void` map sound -- the adapter reconstructs the existing
 /// Key from the position alone via `indexToKey`.
 pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
     const adapter: KeyAdapter = .{ .pool = pool };
@@ -813,7 +813,7 @@ fn intBigFromArena(pool: *const InternPool, limb_index: u32, positive: bool) Key
 
 /// Intern a fixed-width integer type. Well-known widths dedup to their
 /// reserved well-known `Index` through the `get` map. Zig permits
-/// `u0`..`u65535` / `i0`..`i65535` — the language limit is the `u16`
+/// `u0`..`u65535` / `i0`..`i65535` -- the language limit is the `u16`
 /// width of `std.builtin.Type.Int.bits`.
 pub fn internIntType(
     pool: *InternPool,
@@ -828,7 +828,7 @@ pub fn internIntType(
 /// labelled-block switch on `ty` for the type-specialised inline tags,
 /// then a fallthrough switch on `storage` for `int_small` or
 /// `int_positive` / `int_negative`. Callers must have ensured one item
-/// of capacity — only reachable from `get`'s miss path.
+/// of capacity -- only reachable from `get`'s miss path.
 fn emitInt(pool: *InternPool, int: Key.Int) Allocator.Error!void {
     assert(isIntegerType(pool, int.ty));
     const ty = int.ty;
@@ -974,9 +974,9 @@ pub fn internInt(pool: *InternPool, int: Key.Int) Allocator.Error!Index {
 /// Emit the `Item` (and any extra) for a `Key.float`. Mirrors the
 /// `.float =>` arm of the compiler's `intern` (`src/InternPool.zig`):
 /// outer switch on `float.ty`; the c_longdouble arm picks a tag based
-/// on storage variant (f80 → its own tag, otherwise promoted to f128);
+/// on storage variant (f80 -> its own tag, otherwise promoted to f128);
 /// comptime_float always stores as f128. Callers must have ensured one
-/// item of capacity — only reachable from `get`'s miss path.
+/// item of capacity -- only reachable from `get`'s miss path.
 fn emitFloat(pool: *InternPool, float: Key.Float) Allocator.Error!void {
     assert(isFloatType(float.ty));
     switch (float.ty) {
@@ -1221,8 +1221,8 @@ test "i0_type and anyframe_type slots match compiler ordering" {
     try std.testing.expectEqual(std.builtin.Signedness.signed, pool.indexToKey(.i0_type).int_type.signedness);
     // internIntType for (.signed, 0) returns the well-known slot, no fresh item.
     const items_before = pool.itemCount();
-    const @"i0_idx" = try pool.internIntType(.signed, 0);
-    try std.testing.expectEqual(Index.i0_type, @"i0_idx");
+    const signed_zero_idx = try pool.internIntType(.signed, 0);
+    try std.testing.expectEqual(Index.i0_type, signed_zero_idx);
     try std.testing.expectEqual(items_before, pool.itemCount());
 
     // anyframe_type with .none child (untyped anyframe) at the position
@@ -1380,7 +1380,7 @@ test "undef Key variant: well-known slot and typed undef" {
     defer pool.deinit();
 
     // The well-known `Index.undef` slot is untyped undef, i.e. undef
-    // whose carrier type is `.undefined_type` — compiler-exact shape.
+    // whose carrier type is `.undefined_type` -- compiler-exact shape.
     const untyped = pool.indexToKey(.undef).undef;
     try std.testing.expectEqual(Index.undefined_type, untyped);
 
@@ -1399,7 +1399,7 @@ test "interning identical keys dedups to a single Index" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    // Dynamic int_type — hits the dedup map on the second call.
+    // Dynamic int_type -- hits the dedup map on the second call.
     const items_before = pool.itemCount();
     const u17_a = try pool.internIntType(.unsigned, 17);
     const u17_b = try pool.internIntType(.unsigned, 17);
@@ -1426,7 +1426,7 @@ test "big comptime int round-trips through int_positive limbs" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    // 2^@bitSizeOf(Limb) — guaranteed multi-limb, doesn't fit in u64
+    // 2^@bitSizeOf(Limb) -- guaranteed multi-limb, doesn't fit in u64
     // on any host (where Limb >= u32, two limbs always exceed u64).
     var limbs = [_]std.math.big.Limb{ 0, 1 };
     const value: BigIntConst = .{ .limbs = &limbs, .positive = true };

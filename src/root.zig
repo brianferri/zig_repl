@@ -30,4 +30,5 @@ test {
     _ = @import("sema/Sema.zig");
     _ = @import("sema/arith.zig");
     _ = @import("sema_eval_test.zig");
+    _ = @import("zig_compliance_test.zig");
 }
