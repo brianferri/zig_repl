@@ -265,3 +265,15 @@ test "compliance: @as(type, [*]i32) is identity on type-of-type" {
 test "compliance: @as(type, *const *const u32) recurses correctly" {
     try expectMatchesZig(testing.allocator, "@as(type, *const *const u32)");
 }
+
+test "compliance: var mutation through alloc/store/load" {
+    try expectMatchesZig(testing.allocator, "blk: { var x: u8 = 0; x = x + 1; break :blk x; }");
+}
+
+test "compliance: wrap arith through a stored var" {
+    try expectMatchesZig(testing.allocator, "blk: { var x: u8 = 200; x = x +% 100; break :blk x; }");
+}
+
+test "compliance: two independent var slots do not alias" {
+    try expectMatchesZig(testing.allocator, "blk: { var a: u8 = 1; var b: u8 = 2; a = 10; b = 20; break :blk a + b; }");
+}

@@ -198,7 +198,7 @@ pub const Key = union(enum) {
     /// needs and widen with each stage.
     ptr_type: PtrType,
     /// A pointer value. Mirrors the compiler's `Key.Ptr`. `base_addr`
-    /// today only has `.alloc_slot` -- enough for REPL session
+    /// today only has `.comptime_alloc` -- enough for REPL session
     /// allocations; `.nav` / `.uav` / `.int` etc. land alongside their
     /// dependent stages.
     ptr: Ptr,
@@ -274,20 +274,28 @@ pub const Key = union(enum) {
 
     /// Pointer value. `ty` is the pointer's type (always a `ptr_type`
     /// Index). `base_addr` identifies the storage region; `byte_offset`
-    /// is the offset within that region. Stage 2 ships `.alloc_slot`
-    /// only; later stages add `.nav` (declarations), `.uav` (anonymous
-    /// addressable values), `.int` (`@ptrFromInt`), `.eu_payload`,
-    /// `.opt_payload`, `.comptime_field`, etc. as their dependent ZIR
-    /// tags land.
+    /// is the offset within that region. Stage 2 ships
+    /// `.comptime_alloc` only; later stages add `.nav` (declarations),
+    /// `.uav` (anonymous addressable values), `.int` (`@ptrFromInt`),
+    /// `.eu_payload`, `.opt_payload`, `.comptime_field`, etc. as their
+    /// dependent ZIR tags land. Variant naming mirrors the compiler's
+    /// `Key.Ptr.BaseAddr` (`src/InternPool.zig`).
     pub const Ptr = struct {
         ty: Index,
         base_addr: BaseAddr,
         byte_offset: u64,
 
         pub const BaseAddr = union(enum) {
-            alloc_slot: u32,
+            comptime_alloc: ComptimeAllocIndex,
         };
     };
+
+    /// Opaque handle into `Sema.comptime_allocs`. Mirrors the compiler's
+    /// `InternPool.ComptimeAllocIndex` -- the alloc's mutable state
+    /// lives in Sema, not in the pool; this Index is the stable
+    /// reference shared by every interned `Key.Ptr` pointing at the
+    /// alloc.
+    pub const ComptimeAllocIndex = enum(u32) { _ };
 
     /// Stable hash for dedup. `pool` is reserved for future Key variants
     /// (e.g. `struct_type`) whose canonical form requires pool lookup;
@@ -339,7 +347,7 @@ pub const Key = union(enum) {
                 const BaseTag = @typeInfo(Ptr.BaseAddr).@"union".tag_type.?;
                 std.hash.autoHash(&hasher, @as(BaseTag, p.base_addr));
                 switch (p.base_addr) {
-                    .alloc_slot => |slot| std.hash.autoHash(&hasher, slot),
+                    .comptime_alloc => |slot| std.hash.autoHash(&hasher, slot),
                 }
             },
         }
@@ -407,7 +415,7 @@ pub const Key = union(enum) {
                 const BaseTag = @typeInfo(Ptr.BaseAddr).@"union".tag_type.?;
                 if (@as(BaseTag, x.base_addr) != @as(BaseTag, y.base_addr)) break :blk false;
                 break :blk switch (x.base_addr) {
-                    .alloc_slot => |slot| slot == y.base_addr.alloc_slot,
+                    .comptime_alloc => |slot| slot == y.base_addr.comptime_alloc,
                 };
             },
         };
@@ -467,11 +475,11 @@ const Item = struct {
         // child, sentinel, flags). Mirrors the compiler's
         // `Item.Tag.type_pointer`.
         type_pointer,
-        // Pointer value with `BaseAddr.alloc_slot`. data = extra index
-        // of PtrAllocRepr (4 u32 slots: ty, slot, byte_offset_lo,
-        // byte_offset_hi). Mirrors the role of the compiler's
-        // `ptr_comptime_alloc` for our REPL session allocations.
-        ptr_alloc,
+        // Pointer value with `BaseAddr.comptime_alloc`. data = extra
+        // index of PtrComptimeAllocRepr (4 u32 slots: ty,
+        // comptime_alloc index, byte_offset_lo, byte_offset_hi).
+        // Mirrors the compiler's `Item.Tag.ptr_comptime_alloc`.
+        ptr_comptime_alloc,
     };
 };
 
@@ -497,13 +505,13 @@ const PtrTypeRepr = extern struct {
     flags: u32,
 };
 
-/// Extra-arena payload for `Item.Tag.ptr_alloc`. Four u32 slots: ty,
-/// alloc-slot index, and the 64-bit byte_offset split into lo/hi u32s.
-/// Mirrors the compiler's `Tag.PtrComptimeAlloc` (allocations born in
-/// Sema rather than backed by a declaration).
-const PtrAllocRepr = extern struct {
+/// Extra-arena payload for `Item.Tag.ptr_comptime_alloc`. Four u32
+/// slots: ty, comptime-alloc index, and the 64-bit byte_offset split
+/// into lo/hi u32s. Mirrors the compiler's `Tag.PtrComptimeAlloc` --
+/// allocations born in Sema rather than backed by a declaration.
+const PtrComptimeAllocRepr = extern struct {
     ty: u32,
-    alloc_slot: u32,
+    alloc_index: u32,
     byte_offset_lo: u32,
     byte_offset_hi: u32,
 };
@@ -871,7 +879,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .undef => .{ .undef = @enumFromInt(item.data) },
         .type_value => .{ .type_value = @enumFromInt(item.data) },
         .type_pointer => ptrTypeFromExtra(pool, item.data),
-        .ptr_alloc => ptrAllocFromExtra(pool, item.data),
+        .ptr_comptime_alloc => ptrComptimeAllocFromExtra(pool, item.data),
     };
 }
 
@@ -887,14 +895,14 @@ fn ptrTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
     } };
 }
 
-fn ptrAllocFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const fields = comptime @divExact(@sizeOf(PtrAllocRepr), @sizeOf(u32));
+fn ptrComptimeAllocFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const fields = comptime @divExact(@sizeOf(PtrComptimeAllocRepr), @sizeOf(u32));
     assert(extra_index + fields <= pool.extra.items.len);
     const slice = pool.extra.items[extra_index..][0..fields];
     const byte_offset = (@as(u64, slice[3]) << 32) | @as(u64, slice[2]);
     return .{ .ptr = .{
         .ty = @enumFromInt(slice[0]),
-        .base_addr = .{ .alloc_slot = slice[1] },
+        .base_addr = .{ .comptime_alloc = @enumFromInt(slice[1]) },
         .byte_offset = byte_offset,
     } };
 }
@@ -1207,19 +1215,20 @@ fn emitPtrType(pool: *InternPool, pt: Key.PtrType) Allocator.Error!void {
 }
 
 /// Emit a `ptr_alloc` Item for a `Key.ptr` whose base address is an
-/// `alloc_slot`. Four u32 slots: ty, alloc_slot, byte_offset (lo/hi).
+/// `comptime_alloc`. Four u32 slots: ty, alloc_index, byte_offset
+/// (lo/hi).
 fn emitPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!void {
     assert(p.ty != .none);
     switch (p.base_addr) {
-        .alloc_slot => |slot| {
+        .comptime_alloc => |idx| {
             const extra_index: u32 = @intCast(pool.extra.items.len);
             try pool.extra.appendSlice(pool.gpa, &.{
                 @intFromEnum(p.ty),
-                slot,
+                @intFromEnum(idx),
                 @as(u32, @truncate(p.byte_offset)),
                 @as(u32, @truncate(p.byte_offset >> 32)),
             });
-            pool.items.appendAssumeCapacity(.{ .tag = .ptr_alloc, .data = extra_index });
+            pool.items.appendAssumeCapacity(.{ .tag = .ptr_comptime_alloc, .data = extra_index });
         },
     }
 }
@@ -1659,18 +1668,18 @@ test "ptr value round-trip and dedup by base_addr + offset" {
 
     const p0 = try pool.internPtr(.{
         .ty = ptr_ty,
-        .base_addr = .{ .alloc_slot = 7 },
+        .base_addr = .{ .comptime_alloc = @enumFromInt(7) },
         .byte_offset = 16,
     });
     const round = pool.indexToKey(p0).ptr;
     try std.testing.expectEqual(ptr_ty, round.ty);
     try std.testing.expectEqual(@as(u64, 16), round.byte_offset);
-    try std.testing.expectEqual(@as(u32, 7), round.base_addr.alloc_slot);
+    try std.testing.expectEqual(@as(Key.ComptimeAllocIndex, @enumFromInt(7)), round.base_addr.comptime_alloc);
 
     // Same {ty, slot, offset} dedups to the same Index.
     const p_dup = try pool.internPtr(.{
         .ty = ptr_ty,
-        .base_addr = .{ .alloc_slot = 7 },
+        .base_addr = .{ .comptime_alloc = @enumFromInt(7) },
         .byte_offset = 16,
     });
     try std.testing.expectEqual(p0, p_dup);
@@ -1679,7 +1688,7 @@ test "ptr value round-trip and dedup by base_addr + offset" {
     // Different offset (or slot) is a distinct value.
     const p_other_offset = try pool.internPtr(.{
         .ty = ptr_ty,
-        .base_addr = .{ .alloc_slot = 7 },
+        .base_addr = .{ .comptime_alloc = @enumFromInt(7) },
         .byte_offset = 24,
     });
     try std.testing.expect(p_other_offset != p0);
@@ -1693,7 +1702,7 @@ test "ptr byte_offset survives the 32-bit boundary" {
     const huge: u64 = (@as(u64, 1) << 40) + 0xdead;
     const p = try pool.internPtr(.{
         .ty = ptr_ty,
-        .base_addr = .{ .alloc_slot = 0 },
+        .base_addr = .{ .comptime_alloc = @enumFromInt(0) },
         .byte_offset = huge,
     });
     try std.testing.expectEqual(huge, pool.indexToKey(p).ptr.byte_offset);

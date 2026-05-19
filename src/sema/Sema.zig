@@ -19,17 +19,13 @@ const Limb = std.math.big.Limb;
 const InternPool = @import("InternPool.zig");
 const Value = @import("Value.zig");
 const arith = @import("arith.zig");
+const InputShape = @import("../front/InputShape.zig");
 
 const Sema = @This();
 
 pub const Error = Allocator.Error || std.Io.Writer.Error || error{
     AnalysisFail,
 };
-
-/// The REPL's `front/InputShape` wraps every expression line as
-/// `const __repl_input = (<expr>);`, so Sema always looks for this decl in
-/// the root struct to find the body to evaluate.
-const repl_input_decl_name: []const u8 = "__repl_input";
 
 gpa: Allocator,
 intern_pool: *InternPool,
@@ -38,6 +34,23 @@ writer: *std.Io.Writer,
 /// Per-instruction Value results within the body currently being walked.
 /// Cleared between bodies; not shared across REPL inputs.
 results: std.AutoHashMapUnmanaged(Zir.Inst.Index, Value),
+/// Backing storage for `alloc` / `alloc_mut` / `alloc_comptime_mut`.
+/// Each alloc reserves a fresh entry whose `value` starts as a typed
+/// undef. `store_node` writes into the entry; `load` reads it back.
+/// `Key.ptr { base_addr = .comptime_alloc = idx }` is the only
+/// interned reference to the entry, so the table lifetime exactly
+/// matches one body evaluation. Mirrors the compiler's
+/// `Sema.comptime_allocs: std.ArrayList(ComptimeAlloc)` field
+/// (`src/Sema.zig`); `is_const` lets `store_node` reject writes
+/// through a const pointer with the same error vocabulary the
+/// compiler uses ("cannot assign to constant").
+comptime_allocs: std.ArrayListUnmanaged(ComptimeAlloc),
+
+pub const ComptimeAlloc = struct {
+    ty: InternPool.Index,
+    val: Value,
+    is_const: bool,
+};
 
 /// Walks the ZIR produced by AstGen for a single REPL line and returns its
 /// resulting Value, or null when there is no `__repl_input` decl (e.g. raw
@@ -49,7 +62,12 @@ pub fn analyze(
     zir: Zir,
     writer: *std.Io.Writer,
 ) Error!?Value {
-    assert(!zir.hasCompileErrors());
+    // Zir may carry compile-error items that the front-end Pipeline
+    // classifies as non-actionable (see `front/ZirErrors.zig`).
+    // Pipeline gates Sema entry via `hasZirErrors`; Sema itself
+    // walks only the `__repl_input` body and is unaffected by the
+    // suppressed items, so the stronger `!hasCompileErrors()`
+    // assertion has been intentionally relaxed.
     assert(@intFromPtr(intern_pool) != 0);
     assert(zir.instructions.len > 0);
 
@@ -59,8 +77,10 @@ pub fn analyze(
         .zir = zir,
         .writer = writer,
         .results = .empty,
+        .comptime_allocs = .empty,
     };
     defer sema.results.deinit(gpa);
+    defer sema.comptime_allocs.deinit(gpa);
 
     const body = findReplInputBody(zir) orelse return null;
     return try sema.evalBody(body);
@@ -71,7 +91,7 @@ fn findReplInputBody(zir: Zir) ?[]const Zir.Inst.Index {
         const unwrapped = zir.getDeclaration(decl_inst);
         if (unwrapped.name == .empty) continue;
         const name = zir.nullTerminatedString(unwrapped.name);
-        if (std.mem.eql(u8, name, repl_input_decl_name)) {
+        if (std.mem.eql(u8, name, InputShape.expression_decl_name)) {
             return unwrapped.value_body;
         }
     }
@@ -149,6 +169,10 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .negate, .negate_wrap => sema.evalNegate(inst, tag),
         .bit_not => sema.evalBitNot(inst),
         .ptr_type => sema.evalPtrType(inst),
+        .alloc => sema.evalAlloc(inst, true),
+        .alloc_mut, .alloc_comptime_mut => sema.evalAlloc(inst, false),
+        .store_node => sema.evalStoreNode(inst),
+        .load => sema.evalLoad(inst),
         .dbg_stmt => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
         inline else => |unhandled| sema.reportUnsupportedTag(unhandled),
@@ -924,42 +948,7 @@ fn evalAsNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const dest_type_index = try sema.resolveDestType(as.dest_type, "as");
 
     const operand_value = try sema.resolveRef(as.operand);
-    const operand_type = Value.typeOf(operand_value, sema.intern_pool);
-
-    // Identity coercion is always safe.
-    if (dest_type_index == operand_type.index) return operand_value;
-
-    // `@as(T, undefined)`: re-tag the undef value as having type T.
-    // The compiler handles this in `analyzeCoerce` via the undef
-    // shortcut; our `Key.undef` already carries the type slot, so
-    // re-interning at `dest_type_index` is the same operation.
-    const op_key_for_undef = sema.intern_pool.indexToKey(operand_value.index);
-    if (op_key_for_undef == .undef) {
-        assert(dest_type_index != .none);
-        const idx = try sema.intern_pool.get(.{ .undef = dest_type_index });
-        return .{ .index = idx };
-    }
-
-    // comptime_int -> fixed-width int: re-fit via the same helper the
-    // arith dispatcher uses for fixed-width int results.
-    if (operand_type.index == .comptime_int_type and intTypeInfo(sema.intern_pool, dest_type_index) != null) {
-        return try sema.refitIntToFixedWidth(operand_value.index, dest_type_index, "@as");
-    }
-
-    // Float destination: any numeric operand (int OR float, fixed OR
-    // comptime) coerces via the same f128-intermediate path, with the
-    // single Zig rule that fixed-width int -> comptime_float requires
-    // an explicit cast (handled inside `coerceToTargetFloat`).
-    if (isFloatTypeIndex(dest_type_index)) {
-        const op_key = sema.intern_pool.indexToKey(operand_value.index);
-        if (coerceToTargetFloat(op_key, dest_type_index)) |coerced| {
-            const idx = try sema.intern_pool.internFloat(coerced);
-            return .{ .index = idx };
-        }
-    }
-
-    try sema.writer.writeAll("as: this coercion is not yet supported\n");
-    return error.AnalysisFail;
+    return try sema.coerceValueToType(operand_value, dest_type_index, "@as");
 }
 
 /// Resolve a `Zir.Inst.Ref` that should identify a type. Accepts both
@@ -1794,6 +1783,167 @@ fn evalPtrType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         },
     });
     return .{ .index = idx };
+}
+
+/// `alloc` / `alloc_mut` / `alloc_comptime_mut`: reserve a fresh
+/// entry in `comptime_allocs`, initialise to a typed `undef`, and
+/// return a `Key.ptr` whose `BaseAddr = .comptime_alloc = index`.
+///
+/// Compiler reference: src/Sema.zig:zirAlloc (~3723) /
+/// src/Sema.zig:zirAllocMut (~3755) / analyzeComptimeAlloc (~33069).
+/// The compiler distinguishes `alloc` (const) from `alloc_mut` via
+/// the resulting pointer type's `is_const` flag -- not via a separate
+/// runtime instruction. We do the same: both paths reach `evalAlloc`
+/// with `is_const` set; the only behavioural difference is whether
+/// `store_node` will accept writes through the resulting pointer.
+/// Modelled as `bool` to match `std.builtin.Type.Pointer.is_const`
+/// and `Zir.Inst.alloc.is_const` rather than introduce a REPL-local
+/// two-state enum.
+fn evalAlloc(sema: *Sema, inst: Zir.Inst.Index, is_const: bool) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
+
+    const child_ty = try sema.resolveDestType(un_node.operand, "alloc");
+
+    const ip = sema.intern_pool;
+    const undef_idx = try ip.get(.{ .undef = child_ty });
+    const alloc_index: u32 = @intCast(sema.comptime_allocs.items.len);
+    try sema.comptime_allocs.append(sema.gpa, .{
+        .ty = child_ty,
+        .val = .{ .index = undef_idx },
+        .is_const = is_const,
+    });
+
+    const ptr_ty = try ip.internPtrType(.{
+        .child = child_ty,
+        .flags = .{ .size = .one, .is_const = is_const },
+    });
+    const ptr_idx = try ip.internPtr(.{
+        .ty = ptr_ty,
+        .base_addr = .{ .comptime_alloc = @enumFromInt(alloc_index) },
+        .byte_offset = 0,
+    });
+    return .{ .index = ptr_idx };
+}
+
+/// `store_node ptr, value`: deref `ptr` to find its `comptime_alloc`
+/// entry, coerce `value` to the entry's stored type, and overwrite.
+/// Mirrors `storePtr2` -> `coerceExtra` -> `coerceInMemory` from the
+/// compiler (`src/Sema.zig`). Writes through a `*const T` pointer
+/// surface "cannot assign to constant" -- same vocabulary the
+/// compiler uses.
+fn evalStoreNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    assert(bin.lhs != .none);
+    assert(bin.rhs != .none);
+
+    const ip = sema.intern_pool;
+    const ptr_value = try sema.resolveRef(bin.lhs);
+    const ptr_key = ip.indexToKey(ptr_value.index);
+    if (ptr_key != .ptr) {
+        try sema.writer.writeAll("store: lhs is not a pointer\n");
+        return error.AnalysisFail;
+    }
+
+    const ptr_ty_key = ip.indexToKey(ptr_key.ptr.ty);
+    assert(ptr_ty_key == .ptr_type);
+    if (ptr_ty_key.ptr_type.flags.is_const) {
+        try sema.writer.writeAll("cannot assign to constant\n");
+        return error.AnalysisFail;
+    }
+
+    const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr, "store");
+    const rhs_value = try sema.resolveRef(bin.rhs);
+    const coerced = try sema.coerceValueToType(rhs_value, alloc.ty, "store");
+    alloc.val = coerced;
+    return .{ .index = .void_value };
+}
+
+/// `load ptr`: deref `ptr` to find its `comptime_alloc` entry and
+/// return the entry's current value. Compiler reference:
+/// src/Sema.zig:zirLoad (~15173) -> analyzeLoad (~30040) ->
+/// pointerDeref (~33154).
+fn evalLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
+
+    const ptr_value = try sema.resolveRef(un_node.operand);
+    const ptr_key = sema.intern_pool.indexToKey(ptr_value.index);
+    if (ptr_key != .ptr) {
+        try sema.writer.writeAll("load: operand is not a pointer\n");
+        return error.AnalysisFail;
+    }
+    const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr, "load");
+    return alloc.val;
+}
+
+/// Locate the `ComptimeAlloc` entry referenced by a `Key.Ptr`. Returns
+/// a pointer into `comptime_allocs` so the caller can mutate `val`
+/// (for store) or read it (for load) without copying. The `byte_offset`
+/// is asserted to be zero -- field/element pointers (non-zero offsets)
+/// arrive with Stage 4 aggregates.
+fn lookupComptimeAlloc(
+    sema: *Sema,
+    ptr: InternPool.Key.Ptr,
+    op_name: []const u8,
+) Error!*ComptimeAlloc {
+    assert(@intFromPtr(sema) != 0);
+    assert(op_name.len > 0);
+
+    if (ptr.byte_offset != 0) {
+        try sema.writer.print("{s}: pointer offset not yet supported\n", .{op_name});
+        return error.AnalysisFail;
+    }
+    const idx: u32 = @intFromEnum(ptr.base_addr.comptime_alloc);
+    assert(idx < sema.comptime_allocs.items.len);
+    return &sema.comptime_allocs.items[idx];
+}
+
+/// Coerce a Value to a destination type using the same paths
+/// `evalAsNode` follows: identity, comptime_int -> fixed-width int,
+/// any-numeric -> fixed-width float / comptime_float, `undef` re-tag.
+/// Mirrors the compiler's `coerceExtra` -> `coerceInMemory` ->
+/// `pt.getCoerced` chain.
+fn coerceValueToType(
+    sema: *Sema,
+    value: Value,
+    dest_ty: InternPool.Index,
+    op_name: []const u8,
+) Error!Value {
+    assert(dest_ty != .none);
+    assert(value.index != .none);
+
+    const ip = sema.intern_pool;
+    const value_type = Value.typeOf(value, ip);
+    if (value_type.index == dest_ty) return value;
+
+    const key = ip.indexToKey(value.index);
+
+    if (key == .undef) {
+        const idx = try ip.get(.{ .undef = dest_ty });
+        return .{ .index = idx };
+    }
+
+    if (value_type.index == .comptime_int_type and intTypeInfo(ip, dest_ty) != null) {
+        return try sema.refitIntToFixedWidth(value.index, dest_ty, op_name);
+    }
+
+    if (isFloatTypeIndex(dest_ty)) {
+        if (coerceToTargetFloat(key, dest_ty)) |coerced| {
+            const idx = try ip.internFloat(coerced);
+            return .{ .index = idx };
+        }
+    }
+
+    try sema.writer.print("{s}: cannot coerce value to destination type\n", .{op_name});
+    return error.AnalysisFail;
 }
 
 /// `~x`: bitwise NOT. For comptime_int the identity `~x = -(x + 1)` is

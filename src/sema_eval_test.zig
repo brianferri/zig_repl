@@ -983,3 +983,55 @@ test "mixed comptime_int + comptime_float promotes via peer-type resolution" {
     try expectEvalBool(gpa, &pool, "2.5 > 2", true);
     try expectEvalBool(gpa, &pool, "1 == 1.0", true);
 }
+
+test "alloc/store/load: var read after init" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    // The REPL suppresses AstGen's "local variable is never mutated"
+    // diagnostic at the front-end boundary (front/ZirErrors.zig), so a
+    // never-mutated `var` is accepted; mutability is enforced at Sema
+    // store time, not at parse time.
+    try expectEvalTypedDecimal(gpa, &pool, "blk: { var x: u8 = 7; break :blk x; }", .u8_type, "7");
+}
+
+test "alloc/store/load: var initialised then overwritten" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    try expectEvalTypedDecimal(gpa, &pool, "blk: { var x: u8 = 7; x = 9; break :blk x; }", .u8_type, "9");
+}
+
+test "alloc/store/load: var mutation flows through load" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    try expectEvalTypedDecimal(gpa, &pool, "blk: { var x: u8 = 0; x = x + 1; break :blk x; }", .u8_type, "1");
+    try expectEvalTypedDecimal(gpa, &pool, "blk: { var y: i32 = 100; y = y - 50; break :blk y; }", .i32_type, "50");
+}
+
+test "alloc/store/load: independent slots do not alias" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    try expectEvalTypedDecimal(
+        gpa,
+        &pool,
+        "blk: { var a: u8 = 0; var b: u8 = 0; a = 1; b = 2; break :blk a + b; }",
+        .u8_type,
+        "3",
+    );
+}
+
+test "alloc/store/load: wrap arith through a stored var" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    try expectEvalTypedDecimal(
+        gpa,
+        &pool,
+        "blk: { var x: u8 = 200; x = x +% 100; break :blk x; }",
+        .u8_type,
+        "44",
+    );
+}

@@ -6,12 +6,35 @@ pub const Shape = enum { expression, declaration };
 pub const Wrapped = struct {
     text: [:0]u8,
     shape: Shape,
+    /// Byte offset in `text` where the original user input begins.
+    /// For `.expression` shape, equals `expression_prefix.len`.
+    /// For `.declaration` shape, zero.
+    user_offset: u32,
+    /// Byte length of the original user input region inside `text`.
+    user_len: u32,
 
     pub fn deinit(wrapped: *Wrapped, gpa: std.mem.Allocator) void {
         gpa.free(wrapped.text);
         wrapped.* = undefined;
     }
+
+    /// Slice of `text` corresponding to what the user actually typed.
+    /// Diagnostic renderers anchor line/column math against this so
+    /// the wrap is invisible to the user.
+    pub fn userText(wrapped: *const Wrapped) []const u8 {
+        assert(wrapped.user_offset + wrapped.user_len <= wrapped.text.len);
+        return wrapped.text[wrapped.user_offset..][0..wrapped.user_len];
+    }
 };
+
+/// Decl name the expression wrap exposes. Sema imports this so it
+/// can find the produced decl in the analysed Zir without
+/// re-stating the name independently -- a typo in one place would
+/// otherwise silently desynchronise the producer from the consumer.
+pub const expression_decl_name: []const u8 = "__repl_input";
+
+const expression_prefix: []const u8 = "const " ++ expression_decl_name ++ " = (";
+const expression_suffix: []const u8 = ");\n";
 
 pub const max_input_bytes: u32 = 16 * 1024;
 
@@ -47,11 +70,19 @@ pub fn wrap(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!W
 
     const sentinel_input = try gpa.dupeZ(u8, input);
     const shape = classify(sentinel_input);
-    if (shape == .declaration) {
-        return .{ .text = sentinel_input, .shape = shape };
-    }
+    if (shape == .declaration) return .{
+        .text = sentinel_input,
+        .shape = shape,
+        .user_offset = 0,
+        .user_len = @intCast(input.len),
+    };
     defer gpa.free(sentinel_input);
-    return .{ .text = try wrapExpression(gpa, input), .shape = shape };
+    return .{
+        .text = try wrapExpression(gpa, input),
+        .shape = shape,
+        .user_offset = @intCast(expression_prefix.len),
+        .user_len = @intCast(input.len),
+    };
 }
 
 fn wrapExpression(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![:0]u8 {
@@ -60,8 +91,8 @@ fn wrapExpression(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.E
 
     return std.fmt.allocPrintSentinel(
         gpa,
-        "const __repl_input = ({s});\n",
-        .{input},
+        "{s}{s}{s}",
+        .{ expression_prefix, input, expression_suffix },
         0,
     );
 }

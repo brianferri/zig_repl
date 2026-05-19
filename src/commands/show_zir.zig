@@ -29,7 +29,7 @@ fn run(session: *Session, argument: []const u8, stdout: *std.Io.Writer) anyerror
     defer result.deinit(session.gpa);
 
     if (result.hasParseErrors()) {
-        try Diagnostic.renderParseErrors(result.tree, stdout);
+        try Diagnostic.renderParseErrors(result.tree, result.userView(), stdout);
         return;
     }
     if (result.hasZirErrors()) {
@@ -37,7 +37,7 @@ fn run(session: *Session, argument: []const u8, stdout: *std.Io.Writer) anyerror
             session.gpa,
             result.zir,
             result.tree,
-            result.source(),
+            result.userView(),
             stdout,
         );
         return;
