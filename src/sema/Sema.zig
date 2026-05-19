@@ -921,26 +921,24 @@ fn evalAsNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(as.dest_type != .none);
     assert(as.operand != .none);
 
-    const dest_value = try sema.resolveRef(as.dest_type);
-    const dest_key = sema.intern_pool.indexToKey(dest_value.index);
-    // The destination may be either a `type_value` wrapping a type
-    // (the dynamic case for synthesized types), or the bare type slot
-    // itself when it came in via a well-known `Ref.X_type` (which Sema
-    // treats as the value-of-type-type identifying that slot directly).
-    const dest_type_index: InternPool.Index = switch (dest_key) {
-        .type_value => |t| t,
-        .simple_type, .int_type => dest_value.index,
-        else => {
-            try sema.writer.writeAll("as: destination is not a type\n");
-            return error.AnalysisFail;
-        },
-    };
+    const dest_type_index = try sema.resolveDestType(as.dest_type, "as");
 
     const operand_value = try sema.resolveRef(as.operand);
     const operand_type = Value.typeOf(operand_value, sema.intern_pool);
 
     // Identity coercion is always safe.
     if (dest_type_index == operand_type.index) return operand_value;
+
+    // `@as(T, undefined)`: re-tag the undef value as having type T.
+    // The compiler handles this in `analyzeCoerce` via the undef
+    // shortcut; our `Key.undef` already carries the type slot, so
+    // re-interning at `dest_type_index` is the same operation.
+    const op_key_for_undef = sema.intern_pool.indexToKey(operand_value.index);
+    if (op_key_for_undef == .undef) {
+        assert(dest_type_index != .none);
+        const idx = try sema.intern_pool.get(.{ .undef = dest_type_index });
+        return .{ .index = idx };
+    }
 
     // comptime_int -> fixed-width int: re-fit via the same helper the
     // arith dispatcher uses for fixed-width int results.
@@ -964,10 +962,19 @@ fn evalAsNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return error.AnalysisFail;
 }
 
-/// Resolve a `Zir.Inst.Ref` that should identify a type. Both a
-/// `type_value` (the dynamic case) and a bare `simple_type` / `int_type`
-/// Ref (well-known) are accepted, matching the convention in `evalAsNode`.
-/// Used by every cast builtin to unpack the destination-type operand.
+/// Resolve a `Zir.Inst.Ref` that should identify a type. Accepts both
+/// shapes the pool uses to represent "this value names a type":
+///
+///   * A `type_value` Key wrapping the target Index (the dynamic case
+///     for synthesized types).
+///   * A bare type Key whose own Index is the type slot --
+///     `simple_type` / `int_type` / `ptr_type` / `anyframe_type`. Per
+///     `Value.typeOf`, these surface a value of type `type`, so the
+///     Index itself doubles as the type identifier.
+///
+/// Used by every cast builtin (`@as` / `@floatCast` / `@intCast` /
+/// `@truncate` / `@bitCast` / `@intFromFloat` / `@floatFromInt`) to
+/// unpack the destination-type operand into a single Index.
 fn resolveDestType(
     sema: *Sema,
     ref: Zir.Inst.Ref,
@@ -975,10 +982,9 @@ fn resolveDestType(
 ) Error!InternPool.Index {
     assert(ref != .none);
     const dest_value = try sema.resolveRef(ref);
-    const dest_key = sema.intern_pool.indexToKey(dest_value.index);
-    return switch (dest_key) {
+    return switch (sema.intern_pool.indexToKey(dest_value.index)) {
         .type_value => |t| t,
-        .simple_type, .int_type => dest_value.index,
+        .simple_type, .int_type, .ptr_type, .anyframe_type => dest_value.index,
         else => blk: {
             try sema.writer.print("{s}: destination is not a type\n", .{op_name});
             break :blk error.AnalysisFail;

@@ -885,6 +885,41 @@ test "ptr_type: each size + qualifier renders the Zig surface name" {
     try expectEvalTypeName(gpa, &pool, "*const *const u32", "*const *const u32");
 }
 
+test "ptr_type integrates with @as as a destination type" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // `@as(type, *const u8)` is the identity coercion: the operand is
+    // already a value of type `type`, so we get back the same Index.
+    try expectEvalTypeName(gpa, &pool, "@as(type, *const u8)", "*const u8");
+    try expectEvalTypeName(gpa, &pool, "@as(type, [*]i32)", "[*]i32");
+
+    // `@as(*const u8, undefined)` re-tags the untyped undef as a typed
+    // undef of `*const u8`. The resulting Key.undef carries the
+    // ptr_type Index.
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, &pool, "@as(*const u8, undefined)", &diag_buf);
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .undef);
+    const ty_key = pool.indexToKey(key.undef);
+    try testing.expect(ty_key == .ptr_type);
+    try testing.expectEqual(InternPool.Index.u8_type, ty_key.ptr_type.child);
+}
+
+test "cast builtins reject ptr_type destinations with their own diagnostic" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // Each builtin uses `resolveDestType` so a ptr_type dest is now
+    // *accepted* as a type Index -- the kind-specific check inside
+    // the handler is what rejects the mismatch. Each one names its
+    // own kind in the diagnostic, not "destination is not a type".
+    try expectEvalFails(gpa, &pool, "@as(*const u8, @intCast(5))", "destination is not a supported int type");
+    try expectEvalFails(gpa, &pool, "@as(*u8, @bitCast(@as(u64, 0)))", "operands must be fixed-width numeric types");
+}
+
 test "ptr_type: extensions we do not yet support fail with a structured diagnostic" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);

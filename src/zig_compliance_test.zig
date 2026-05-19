@@ -253,3 +253,15 @@ test "compliance: ptr_type []i32 renders as Zig prints" {
 test "compliance: ptr_type nested *const *const u32 renders identically" {
     try expectMatchesZig(testing.allocator, "*const *const u32");
 }
+
+test "compliance: @as(type, *const u8) is identity on type-of-type" {
+    try expectMatchesZig(testing.allocator, "@as(type, *const u8)");
+}
+
+test "compliance: @as(type, [*]i32) is identity on type-of-type" {
+    try expectMatchesZig(testing.allocator, "@as(type, [*]i32)");
+}
+
+test "compliance: @as(type, *const *const u32) recurses correctly" {
+    try expectMatchesZig(testing.allocator, "@as(type, *const *const u32)");
+}
