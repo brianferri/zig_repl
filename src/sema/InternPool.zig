@@ -830,7 +830,7 @@ pub fn internIntType(
 /// `int_positive` / `int_negative`. Callers must have ensured one item
 /// of capacity — only reachable from `get`'s miss path.
 fn emitInt(pool: *InternPool, int: Key.Int) Allocator.Error!void {
-    assert(isIntegerType(int.ty));
+    assert(isIntegerType(pool, int.ty));
     const ty = int.ty;
 
     b: {
@@ -1073,7 +1073,7 @@ fn isFloatType(ty: Index) bool {
 /// True if `ty` identifies a Zig integer type: any int_type slot, any
 /// fixed-width int, comptime_int, usize / isize, or the c_* family.
 /// Mirrors the compiler's `isIntegerType`.
-fn isIntegerType(ty: Index) bool {
+fn isIntegerType(pool: *const InternPool, ty: Index) bool {
     return switch (ty) {
         .comptime_int_type,
         .usize_type,
@@ -1088,7 +1088,10 @@ fn isIntegerType(ty: Index) bool {
         .c_longlong_type,
         .c_ulonglong_type,
         => true,
-        else => isWellKnownFixedWidthIntType(ty),
+        else => switch (pool.indexToKey(ty)) {
+            .int_type => true,
+            else => isWellKnownFixedWidthIntType(ty),
+        },
     };
 }
 

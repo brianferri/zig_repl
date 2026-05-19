@@ -726,6 +726,105 @@ test "fixed-width int comparison across widths" {
     try expectEvalBool(gpa, &pool, "@as(u8, 5) == @as(i32, 5)", true);
 }
 
+test "wrapping arith on fixed-width ints" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 200) +% @as(u8, 100)", .u8_type, "44");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 10) -% @as(u8, 20)", .u8_type, "246");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 100) *% @as(u8, 5)", .u8_type, "244");
+    // Signed wrap matches two's-complement.
+    try expectEvalTypedDecimal(gpa, &pool, "@as(i8, 127) +% @as(i8, 1)", .i8_type, "-128");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(i8, -128) -% @as(i8, 1)", .i8_type, "127");
+}
+
+test "saturating arith on fixed-width ints" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 200) +| @as(u8, 100)", .u8_type, "255");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 10) -| @as(u8, 20)", .u8_type, "0");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 100) *| @as(u8, 5)", .u8_type, "255");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(i8, 100) +| @as(i8, 100)", .i8_type, "127");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(i8, -100) -| @as(i8, 100)", .i8_type, "-128");
+}
+
+test "fixed-width bitwise on fixed-width ints" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u16, 1000) & @as(u16, 0xff)", .u16_type, "232");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 0xf0) | @as(u8, 0x0f)", .u8_type, "255");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 0xff) ^ @as(u8, 0x0f)", .u8_type, "240");
+}
+
+test "fixed-width shifts and shift variants" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 1) << 7", .u8_type, "128");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 0xff) >> 4", .u8_type, "15");
+    // Saturating shl: 1 << 8 would overflow u8; sat clamps to 255.
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 1) <<| 8", .u8_type, "255");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 1) <<| 7", .u8_type, "128");
+}
+
+test "target-conditioned int types participate in peer resolution" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // usize + comptime_int -> usize; the int operand range-checks
+    // against the host's pointer width via @typeInfo(usize).
+    try expectEvalTypedDecimal(gpa, &pool, "@as(usize, 100) + 1", .usize_type, "101");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(c_int, 5) * 2", .c_int_type, "10");
+    try expectEvalBool(gpa, &pool, "@as(usize, 100) > @as(c_int, 50)", true);
+}
+
+test "@intCast widens and narrows with range checks" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u32, @intCast(@as(u8, 200)))", .u32_type, "200");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, @intCast(@as(u32, 200)))", .u8_type, "200");
+    try expectEvalFails(gpa, &pool, "@as(u8, @intCast(@as(u32, 500)))", "does not fit in u8");
+}
+
+test "@truncate keeps low bits" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, @truncate(@as(u32, 0x1234)))", .u8_type, "52");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u16, @truncate(@as(u32, 0x12345678)))", .u16_type, "22136");
+    // u29 is a well-known Index so we can compare against it; truncate
+    // keeps the low 29 bits of 0xffff_ffff which is 0x1fff_ffff.
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u29, @truncate(@as(u32, 0xffffffff)))", .u29_type, "536870911");
+}
+
+test "@bitCast reinterprets matching-width bits" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // f32 1.5 bit pattern is 0x3FC00000.
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u32, @bitCast(@as(f32, 1.5)))", .u32_type, "1069547520");
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f32, @bitCast(@as(u32, 0x3fc00000)))",
+        .f32_type,
+        @as(u32, @bitCast(@as(f32, 1.5))),
+    );
+    // i8 -1 (two's-complement 0xff) re-tags as u8 255.
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, @bitCast(@as(i8, -1)))", .u8_type, "255");
+}
+
 test "mixed comptime_int + comptime_float promotes via peer-type resolution" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);

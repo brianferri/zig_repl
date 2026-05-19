@@ -325,7 +325,7 @@ pub fn internShr(
     return runShift(gpa, intern_pool, lhs, shift, lhs.limbs.len, .right);
 }
 
-fn shiftAmount(rhs: BigIntConst) ShiftError!usize {
+pub fn shiftAmount(rhs: BigIntConst) ShiftError!usize {
     assert(rhs.limbs.len > 0);
     // Stdlib's `toInt` short-circuits negative-into-unsigned through
     // `TargetTooSmall` (its sign check happens before the explicit

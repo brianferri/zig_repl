@@ -110,6 +110,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .float => sema.evalFloat(inst),
         .float128 => sema.evalFloat128(inst),
         .add,
+        .add_unsafe,
         .sub,
         .mul,
         .div,
@@ -118,15 +119,23 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .div_trunc,
         .mod,
         .rem,
+        .addwrap,
+        .subwrap,
+        .mulwrap,
+        .add_sat,
+        .sub_sat,
+        .mul_sat,
         => sema.evalBinaryArith(inst, tag),
         .bit_and, .bit_or, .xor => sema.evalBitwise(inst, tag),
-        .shl => sema.evalShift(inst, "shl", arith.internShl),
-        .shr => sema.evalShift(inst, "shr", arith.internShr),
+        .shl, .shr, .shl_exact, .shr_exact, .shl_sat => sema.evalShift(inst, tag),
         .typeof_log2_int_type => sema.evalTypeofLog2IntType(inst),
         .as_node, .as_shift_operand => sema.evalAsNode(inst),
         .float_cast => sema.evalFloatCast(inst),
         .int_from_float => sema.evalIntFromFloat(inst),
         .float_from_int => sema.evalFloatFromInt(inst),
+        .int_cast => sema.evalIntCast(inst),
+        .truncate => sema.evalTruncate(inst),
+        .bitcast => sema.evalBitCast(inst),
         .bool_not => sema.evalBoolNot(inst),
         .bool_br_and => sema.evalBoolBr(inst, .bool_br_and),
         .bool_br_or => sema.evalBoolBr(inst, .bool_br_or),
@@ -349,14 +358,29 @@ fn resolveNumericPairToInt(
     return .{ .ty = lhs_int.ty, .lhs = lhs_int, .rhs = rhs_int };
 }
 
-/// Pull `(signedness, bits)` for a fixed-width int Index by reading the
-/// `.int_type` Key from the pool. Returns `null` for non-`.int_type`
-/// keys (`comptime_int`, target-conditioned widths like `usize`).
+/// Pull `(signedness, bits)` for any Zig int type Index. Covers
+/// `int_type` (uN/iN), `comptime_int`-rejected (returns null — peer
+/// resolution treats it separately), and the target-conditioned
+/// family (`usize`, `isize`, `c_char` ... `c_ulonglong`) whose widths
+/// come from `@typeInfo(T).int` against the host.
 fn intTypeInfo(pool: *const InternPool, ty: InternPool.Index) ?std.builtin.Type.Int {
-    const key = pool.indexToKey(ty);
-    return switch (key) {
-        .int_type => |it| it,
-        else => null,
+    return switch (ty) {
+        .usize_type => @typeInfo(usize).int,
+        .isize_type => @typeInfo(isize).int,
+        .c_char_type => @typeInfo(c_char).int,
+        .c_short_type => @typeInfo(c_short).int,
+        .c_ushort_type => @typeInfo(c_ushort).int,
+        .c_int_type => @typeInfo(c_int).int,
+        .c_uint_type => @typeInfo(c_uint).int,
+        .c_long_type => @typeInfo(c_long).int,
+        .c_ulong_type => @typeInfo(c_ulong).int,
+        .c_longlong_type => @typeInfo(c_longlong).int,
+        .c_ulonglong_type => @typeInfo(c_ulonglong).int,
+        .comptime_int_type => null,
+        else => switch (pool.indexToKey(ty)) {
+            .int_type => |it| it,
+            else => null,
+        },
     };
 }
 
@@ -486,10 +510,25 @@ fn evalBinaryArithInt(
 
     const ip = sema.intern_pool;
     const gpa = sema.gpa;
+
+    // Wrap / sat tags carry destination-width semantics in stdlib's
+    // `BigIntMutable.addWrap` family. For comptime_int destinations the
+    // wrap/sat tags fall back to regular arith (matches `zig run`:
+    // `200 +% 100` on two comptime_int operands is 300, not 44).
+    const dest_info = intTypeInfo(ip, dest_ty);
+    if (dest_info) |info| {
+        if (wrapSatKernel(tag)) |kind| {
+            return try sema.runIntWrapSat(kind, lhs, rhs, dest_ty, info);
+        }
+    }
+
     const tmp_idx = switch (tag) {
-        .add => try arith.internAdd(gpa, ip, lhs, rhs),
+        .add, .add_unsafe => try arith.internAdd(gpa, ip, lhs, rhs),
         .sub => try arith.internSub(gpa, ip, lhs, rhs),
         .mul => try arith.internMul(gpa, ip, lhs, rhs),
+        .addwrap, .add_sat => try arith.internAdd(gpa, ip, lhs, rhs),
+        .subwrap, .sub_sat => try arith.internSub(gpa, ip, lhs, rhs),
+        .mulwrap, .mul_sat => try arith.internMul(gpa, ip, lhs, rhs),
         .div, .div_trunc => try sema.unwrapDivResult(arith.internDivTrunc(gpa, ip, lhs, rhs), "/"),
         .div_exact => try sema.unwrapDivResult(arith.internDivExact(gpa, ip, lhs, rhs), "@divExact"),
         .div_floor => try sema.unwrapDivResult(arith.internDivFloor(gpa, ip, lhs, rhs), "@divFloor"),
@@ -500,6 +539,68 @@ fn evalBinaryArithInt(
 
     if (dest_ty == .comptime_int_type) return .{ .index = tmp_idx };
     return try sema.refitIntToFixedWidth(tmp_idx, dest_ty, @tagName(tag));
+}
+
+const WrapSatKind = enum {
+    add_wrap, sub_wrap, mul_wrap,
+    add_sat, sub_sat, mul_sat,
+};
+
+fn wrapSatKernel(tag: Zir.Inst.Tag) ?WrapSatKind {
+    return switch (tag) {
+        .addwrap => .add_wrap,
+        .subwrap => .sub_wrap,
+        .mulwrap => .mul_wrap,
+        .add_sat => .add_sat,
+        .sub_sat => .sub_sat,
+        .mul_sat => .mul_sat,
+        else => null,
+    };
+}
+
+/// Run a wrap or saturating int kernel via stdlib's
+/// `BigIntMutable.{addWrap, addSat, subWrap, subSat, mulWrap, mulSat}`.
+/// The `mul_sat` case has no direct stdlib helper, so we mul first and
+/// then `saturate` to the destination range.
+fn runIntWrapSat(
+    sema: *Sema,
+    kind: WrapSatKind,
+    lhs: std.math.big.int.Const,
+    rhs: std.math.big.int.Const,
+    dest_ty: InternPool.Index,
+    dest_info: std.builtin.Type.Int,
+) Error!?Value {
+    const limb_bits: usize = @bitSizeOf(std.math.big.Limb);
+    // Worst-case `mul` output is `lhs.limbs.len + rhs.limbs.len`; add /
+    // sub need `max + 1`. One worst-case buffer fits everything plus
+    // one cushion limb for `saturate` to write its sentinel.
+    const max_op_limbs = @max(lhs.limbs.len + rhs.limbs.len, @max(lhs.limbs.len, rhs.limbs.len) + 1);
+    const dest_limbs = (@as(usize, dest_info.bits) + limb_bits - 1) / limb_bits + 1;
+    const workspace = try sema.gpa.alloc(std.math.big.Limb, @max(max_op_limbs, dest_limbs));
+    defer sema.gpa.free(workspace);
+
+    var mutable: std.math.big.int.Mutable = .{
+        .limbs = workspace,
+        .len = undefined,
+        .positive = undefined,
+    };
+    switch (kind) {
+        .add_wrap => _ = mutable.addWrap(lhs, rhs, dest_info.signedness, dest_info.bits),
+        .sub_wrap => _ = mutable.subWrap(lhs, rhs, dest_info.signedness, dest_info.bits),
+        // Workspace is gpa-allocated; lhs/rhs live in the pool's arena,
+        // so mulWrapNoAlias's no-alias precondition holds and the
+        // separate temp buffer mulWrap would need is unnecessary.
+        .mul_wrap => mutable.mulWrapNoAlias(lhs, rhs, dest_info.signedness, dest_info.bits, sema.gpa),
+        .add_sat => mutable.addSat(lhs, rhs, dest_info.signedness, dest_info.bits),
+        .sub_sat => mutable.subSat(lhs, rhs, dest_info.signedness, dest_info.bits),
+        .mul_sat => {
+            mutable.mulNoAlias(lhs, rhs, sema.gpa);
+            const product = mutable.toConst();
+            mutable.saturate(product, dest_info.signedness, dest_info.bits);
+        },
+    }
+    const idx = try sema.intern_pool.internIntValue(dest_ty, mutable.toConst());
+    return .{ .index = idx };
 }
 
 /// Re-intern a comptime_int result at the given fixed-width int type,
@@ -1025,6 +1126,235 @@ fn evalFloatFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = idx };
 }
 
+/// `@intCast(x)`: cast int to int with range check. Destination type
+/// from result-location; ZIR-side same `pl_node + Bin` shape as the
+/// other casts.
+///
+/// Compiler reference: src/Sema.zig:zirIntCast.
+fn evalIntCast(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+
+    const dest_type_index = try sema.resolveDestType(bin.lhs, "@intCast");
+    const operand_value = try sema.resolveRef(bin.rhs);
+    const operand_key = sema.intern_pool.indexToKey(operand_value.index);
+    if (operand_key != .int) {
+        try sema.writer.writeAll("@intCast: operand is not an int\n");
+        return error.AnalysisFail;
+    }
+    // comptime_int destination is identity at comptime.
+    if (dest_type_index == .comptime_int_type) return operand_value;
+    return try sema.refitIntToFixedWidth(operand_value.index, dest_type_index, "@intCast");
+}
+
+/// `@truncate(x)`: take low bits of operand, ignoring high. Destination
+/// type must be an int strictly narrower than (or equal to) the source.
+/// Uses stdlib's `BigIntMutable.truncate` for two's-complement
+/// reduction.
+///
+/// Compiler reference: src/Sema.zig:zirTruncate.
+fn evalTruncate(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+
+    const dest_type_index = try sema.resolveDestType(bin.lhs, "@truncate");
+    const dest_info = intTypeInfo(sema.intern_pool, dest_type_index) orelse {
+        try sema.writer.writeAll("@truncate: destination is not a fixed-width int\n");
+        return error.AnalysisFail;
+    };
+
+    const operand_value = try sema.resolveRef(bin.rhs);
+    const operand_key = sema.intern_pool.indexToKey(operand_value.index);
+    if (operand_key != .int) {
+        try sema.writer.writeAll("@truncate: operand is not an int\n");
+        return error.AnalysisFail;
+    }
+
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const operand_big = operand_key.int.storage.toBigInt(&space);
+
+    const limb_bits: usize = @bitSizeOf(std.math.big.Limb);
+    const workspace_limbs: usize = (@as(usize, dest_info.bits) + limb_bits - 1) / limb_bits + 1;
+    const workspace = try sema.gpa.alloc(std.math.big.Limb, workspace_limbs);
+    defer sema.gpa.free(workspace);
+
+    var mutable: std.math.big.int.Mutable = .{
+        .limbs = workspace,
+        .len = undefined,
+        .positive = undefined,
+    };
+    mutable.truncate(operand_big, dest_info.signedness, dest_info.bits);
+    const idx = try sema.intern_pool.internIntValue(dest_type_index, mutable.toConst());
+    return .{ .index = idx };
+}
+
+/// `@bitCast(x)`: reinterpret operand's bit pattern as another type of
+/// the same size. We cover the numeric cases the REPL actually hits:
+/// fixed-width int <-> fixed-width float of matching bit width.
+///
+/// Compiler reference: src/Sema.zig:zirBitCast.
+fn evalBitCast(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+
+    const dest_type_index = try sema.resolveDestType(bin.lhs, "@bitCast");
+    const operand_value = try sema.resolveRef(bin.rhs);
+    const operand_type = Value.typeOf(operand_value, sema.intern_pool);
+    if (dest_type_index == operand_type.index) return operand_value;
+
+    const operand_key = sema.intern_pool.indexToKey(operand_value.index);
+    const operand_bits = numericBitSize(sema.intern_pool, operand_type.index);
+    const dest_bits = numericBitSize(sema.intern_pool, dest_type_index);
+    if (operand_bits == null or dest_bits == null) {
+        try sema.writer.writeAll("@bitCast: operands must be fixed-width numeric types\n");
+        return error.AnalysisFail;
+    }
+    if (operand_bits.? != dest_bits.?) {
+        try sema.writer.print(
+            "@bitCast: type sizes differ ({d} vs {d} bits)\n",
+            .{ operand_bits.?, dest_bits.? },
+        );
+        return error.AnalysisFail;
+    }
+
+    return try sema.reinterpretBitCast(operand_key, dest_type_index, dest_bits.?);
+}
+
+/// Bit-width of a fixed-width numeric type, or `null` for comptime /
+/// target-conditioned types we don't handle in `@bitCast` yet.
+fn numericBitSize(pool: *const InternPool, ty: InternPool.Index) ?u16 {
+    if (intTypeInfo(pool, ty)) |info| return info.bits;
+    return switch (ty) {
+        .f16_type => 16,
+        .f32_type => 32,
+        .f64_type => 64,
+        .f80_type => 80,
+        .f128_type => 128,
+        else => null,
+    };
+}
+
+/// Numeric `@bitCast` worker: route the operand bits through the dest
+/// type's storage. Supports int <-> int (same bit width but different
+/// signedness — uses stdlib's `truncate` for two's-complement view)
+/// and int <-> float of matching width (bit pattern reinterpret).
+fn reinterpretBitCast(
+    sema: *Sema,
+    operand_key: InternPool.Key,
+    dest_ty: InternPool.Index,
+    bits: u16,
+) Error!Value {
+    const ip = sema.intern_pool;
+    const dest_int = intTypeInfo(ip, dest_ty);
+
+    switch (operand_key) {
+        .int => |int| {
+            if (dest_int) |info| {
+                // Reinterpret same-width int: truncate gives the two's-
+                // complement view at the destination signedness.
+                var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+                const big = int.storage.toBigInt(&space);
+                const limb_bits: usize = @bitSizeOf(std.math.big.Limb);
+                const workspace_limbs: usize = (@as(usize, info.bits) + limb_bits - 1) / limb_bits + 1;
+                const workspace = try sema.gpa.alloc(std.math.big.Limb, workspace_limbs);
+                defer sema.gpa.free(workspace);
+                var mutable: std.math.big.int.Mutable = .{
+                    .limbs = workspace,
+                    .len = undefined,
+                    .positive = undefined,
+                };
+                mutable.truncate(big, info.signedness, info.bits);
+                const idx = try ip.internIntValue(dest_ty, mutable.toConst());
+                return .{ .index = idx };
+            }
+            // int -> float of the same width.
+            const bits_u128 = try intBitsAsU128(int, bits);
+            return try sema.internBitsAsFloat(bits_u128, dest_ty);
+        },
+        .float => |float| {
+            const bits_u128 = floatBitsAsU128(float);
+            if (dest_int) |info| {
+                return try sema.internBitsAsInt(bits_u128, dest_ty, info);
+            }
+            // float -> float of the same width: identity bit pattern.
+            return try sema.internBitsAsFloat(bits_u128, dest_ty);
+        },
+        else => {
+            try sema.writer.writeAll("@bitCast: operand kind not supported\n");
+            return error.AnalysisFail;
+        },
+    }
+}
+
+/// Read an int value's `bits` low bits as a `u128`. Used by `@bitCast`
+/// when forwarding an int's bit pattern into a same-width float.
+fn intBitsAsU128(int: InternPool.Key.Int, bits: u16) Error!u128 {
+    assert(bits > 0);
+    assert(bits <= 128);
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const big = int.storage.toBigInt(&space);
+    // toInt(u128) sign-checks; we want the two's-complement view. The
+    // limbs already hold the magnitude; flip the sign bit explicitly
+    // for negative values to land at the right u128 pattern.
+    if (big.positive) return big.toInt(u128) catch unreachable;
+    const magnitude: u128 = big.toInt(u128) catch unreachable;
+    const mask: u128 = if (bits == 128) ~@as(u128, 0) else (@as(u128, 1) << @intCast(bits)) - 1;
+    return (~magnitude + 1) & mask;
+}
+
+fn floatBitsAsU128(float: InternPool.Key.Float) u128 {
+    return switch (float.storage) {
+        .f16 => |v| @as(u16, @bitCast(v)),
+        .f32 => |v| @as(u32, @bitCast(v)),
+        .f64 => |v| @as(u64, @bitCast(v)),
+        .f80 => |v| @as(u80, @bitCast(v)),
+        .f128 => |v| @as(u128, @bitCast(v)),
+    };
+}
+
+fn internBitsAsFloat(sema: *Sema, bits: u128, dest_ty: InternPool.Index) Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (dest_ty) {
+        .f16_type => .{ .f16 = @bitCast(@as(u16, @intCast(bits))) },
+        .f32_type => .{ .f32 = @bitCast(@as(u32, @intCast(bits))) },
+        .f64_type => .{ .f64 = @bitCast(@as(u64, @intCast(bits))) },
+        .f80_type => .{ .f80 = @bitCast(@as(u80, @intCast(bits))) },
+        .f128_type => .{ .f128 = @bitCast(bits) },
+        else => unreachable,
+    };
+    const idx = try sema.intern_pool.internFloat(.{ .ty = dest_ty, .storage = storage });
+    return .{ .index = idx };
+}
+
+fn internBitsAsInt(
+    sema: *Sema,
+    bits: u128,
+    dest_ty: InternPool.Index,
+    dest_info: std.builtin.Type.Int,
+) Error!Value {
+    var limbs_buf: [(128 + @bitSizeOf(std.math.big.Limb) - 1) / @bitSizeOf(std.math.big.Limb) + 1]std.math.big.Limb = undefined;
+    var mutable: std.math.big.int.Mutable = .{
+        .limbs = &limbs_buf,
+        .len = undefined,
+        .positive = undefined,
+    };
+    mutable.set(bits);
+    var work_buf: [limbs_buf.len]std.math.big.Limb = undefined;
+    var work: std.math.big.int.Mutable = .{
+        .limbs = &work_buf,
+        .len = undefined,
+        .positive = undefined,
+    };
+    work.truncate(mutable.toConst(), dest_info.signedness, dest_info.bits);
+    const idx = try sema.intern_pool.internIntValue(dest_ty, work.toConst());
+    return .{ .index = idx };
+}
+
 fn isFixedWidthFloatType(ty: InternPool.Index) bool {
     return switch (ty) {
         .f16_type, .f32_type, .f64_type, .f80_type, .f128_type => true,
@@ -1077,27 +1407,73 @@ fn narrowF128ToFloatStorage(value: f128, dest_ty: InternPool.Index) InternPool.K
 /// "no bits lost" check is meaningful only when the operand has a width.
 ///
 /// Compiler reference: src/Sema.zig:zirShl / zirShr.
+/// `shl / shr / shl_exact / shr_exact / shl_sat`. Operand shape is
+/// `pl_node + Bin`; LHS may be any int type, RHS is the pre-coerced
+/// shift amount (typeof_log2_int_type). For fixed-width LHS, the
+/// result is computed in arbitrary precision and re-fit; `_exact`
+/// variants reject any bit-loss, `_sat` clamps via stdlib's
+/// `shiftLeftSat`.
 fn evalShift(
     sema: *Sema,
     inst: Zir.Inst.Index,
-    op_name: []const u8,
-    kernel: ShiftKernel,
+    tag: Zir.Inst.Tag,
 ) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
-    assert(op_name.len > 0);
 
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
+    const op_name: []const u8 = @tagName(tag);
+    const ip = sema.intern_pool;
+    const lhs_value = try sema.resolveRef(bin.lhs);
+    const rhs_value = try sema.resolveRef(bin.rhs);
+    const lhs_key = ip.indexToKey(lhs_value.index);
+    const rhs_key = ip.indexToKey(rhs_value.index);
+
+    if (lhs_key != .int or rhs_key != .int) {
+        try sema.writer.print("{s}: non-int operand\n", .{op_name});
+        return error.AnalysisFail;
+    }
+
     var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name, &lhs_space);
-    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name, &rhs_space);
+    const lhs = lhs_key.int.storage.toBigInt(&lhs_space);
+    const rhs = rhs_key.int.storage.toBigInt(&rhs_space);
+    const dest_ty = lhs_key.int.ty;
 
-    const idx = kernel(sema.gpa, sema.intern_pool, lhs, rhs) catch |err| switch (err) {
+    // shl_sat needs the destination signedness / bit count up front;
+    // the bignum kernel handles the rest.
+    if (tag == .shl_sat) {
+        const dest_info = intTypeInfo(ip, dest_ty) orelse {
+            try sema.writer.print("{s}: saturating shift requires a fixed-width int operand\n", .{op_name});
+            return error.AnalysisFail;
+        };
+        const idx = try sema.runShlSat(lhs, rhs, dest_ty, dest_info, op_name);
+        return .{ .index = idx };
+    }
+
+    const kernel: ShiftKernel = switch (tag) {
+        .shl, .shl_exact => arith.internShl,
+        .shr, .shr_exact => arith.internShr,
+        else => unreachable,
+    };
+    const tmp_idx = kernel(sema.gpa, ip, lhs, rhs) catch |err|
+        return sema.reportShiftAmountError(err, op_name);
+
+    // `_exact`: confirm the inverse shift round-trips, i.e. no bits
+    // were lost. Compares lhs against (result <<-> shift_amount).
+    if (tag == .shl_exact or tag == .shr_exact) {
+        try sema.checkShiftExact(tag, lhs, rhs, tmp_idx, op_name);
+    }
+
+    if (dest_ty == .comptime_int_type) return .{ .index = tmp_idx };
+    return try sema.refitIntToFixedWidth(tmp_idx, dest_ty, op_name);
+}
+
+fn reportShiftAmountError(sema: *Sema, err: arith.ShiftError, op_name: []const u8) Error {
+    switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.NegativeIntoUnsigned => {
             try sema.writer.print("error: {s}: shift amount is negative\n", .{op_name});
@@ -1108,16 +1484,76 @@ fn evalShift(
             return error.AnalysisFail;
         },
         error.ShiftAmountTooLarge => {
-            try sema.writer.print("error: {s}: shift amount exceeds {d} bits\n", .{ op_name, arith.max_shift_bits });
+            try sema.writer.print(
+                "error: {s}: shift amount exceeds {d} bits\n",
+                .{ op_name, arith.max_shift_bits },
+            );
             return error.AnalysisFail;
         },
-    };
-    return .{ .index = idx };
+    }
 }
 
-/// `bit_and / bit_or / xor`. Same operand shape as `evalBinaryArith`
-/// (pl_node + Bin); routes to a per-op `arith.internBit*` kernel keyed
-/// on the captured Zir.Inst.Tag.
+/// `_exact` shift safety: re-shift the result the opposite direction
+/// and confirm it matches the original LHS bit-for-bit. Mirrors the
+/// compiler's `zirShlExact` / `zirShrExact` post-checks.
+fn checkShiftExact(
+    sema: *Sema,
+    tag: Zir.Inst.Tag,
+    lhs: std.math.big.int.Const,
+    rhs: std.math.big.int.Const,
+    result_idx: InternPool.Index,
+    op_name: []const u8,
+) Error!void {
+    assert(tag == .shl_exact or tag == .shr_exact);
+    const ip = sema.intern_pool;
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const result = ip.indexToKey(result_idx).int.storage.toBigInt(&space);
+
+    const inverse_kernel: ShiftKernel = if (tag == .shl_exact) arith.internShr else arith.internShl;
+    const round_trip = inverse_kernel(sema.gpa, ip, result, rhs) catch |err|
+        return sema.reportShiftAmountError(err, op_name);
+
+    var rt_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const round_trip_big = ip.indexToKey(round_trip).int.storage.toBigInt(&rt_space);
+    if (!round_trip_big.eql(lhs)) {
+        try sema.writer.print("error: {s}: exact shift lost bits\n", .{op_name});
+        return error.AnalysisFail;
+    }
+}
+
+/// `shl_sat`: shift left and saturate to the destination width's
+/// `[minInt, maxInt]` range via stdlib's `shiftLeftSat`. Buffer
+/// sized for the worst-case bit-shift output, matching the compiler
+/// in `Sema/arith.zig:shlSat`.
+fn runShlSat(
+    sema: *Sema,
+    lhs: std.math.big.int.Const,
+    rhs: std.math.big.int.Const,
+    dest_ty: InternPool.Index,
+    dest_info: std.builtin.Type.Int,
+    op_name: []const u8,
+) Error!InternPool.Index {
+    const shift_amount = arith.shiftAmount(rhs) catch |err|
+        return sema.reportShiftAmountError(err, op_name);
+
+    const limb_bits: usize = @bitSizeOf(std.math.big.Limb);
+    const max_limbs: usize = (@as(usize, dest_info.bits) + limb_bits - 1) / limb_bits + 1;
+    const workspace = try sema.gpa.alloc(std.math.big.Limb, max_limbs);
+    defer sema.gpa.free(workspace);
+
+    var mutable: std.math.big.int.Mutable = .{
+        .limbs = workspace,
+        .len = undefined,
+        .positive = undefined,
+    };
+    mutable.shiftLeftSat(lhs, shift_amount, dest_info.signedness, dest_info.bits);
+    return try sema.intern_pool.internIntValue(dest_ty, mutable.toConst());
+}
+
+/// `bit_and / bit_or / xor`. Uses the same `resolveNumericPairToInt`
+/// peer resolution as the arith dispatcher — so fixed-width int
+/// operands work and the result is range-checked back into the dest
+/// type. For comptime_int operands, the bignum result is canonical.
 ///
 /// Compiler reference: src/Sema.zig:zirBitBinOp -> src/Sema/arith.zig.
 fn evalBitwise(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
@@ -1130,20 +1566,31 @@ fn evalBitwise(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Valu
     assert(bin.rhs != .none);
 
     const op_name: []const u8 = @tagName(tag);
+    const ip = sema.intern_pool;
+    const lhs_value = try sema.resolveRef(bin.lhs);
+    const rhs_value = try sema.resolveRef(bin.rhs);
+    const lhs_key = ip.indexToKey(lhs_value.index);
+    const rhs_key = ip.indexToKey(rhs_value.index);
+
+    const triple = resolveNumericPairToInt(ip, lhs_key, rhs_key) orelse {
+        try sema.writer.print("{s}: non-int or incompatible operands\n", .{op_name});
+        return error.AnalysisFail;
+    };
+
     var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const lhs = try sema.resolveComptimeInt(bin.lhs, op_name, &lhs_space);
-    const rhs = try sema.resolveComptimeInt(bin.rhs, op_name, &rhs_space);
+    const lhs = triple.lhs.storage.toBigInt(&lhs_space);
+    const rhs = triple.rhs.storage.toBigInt(&rhs_space);
 
-    const ip = sema.intern_pool;
     const gpa = sema.gpa;
-    const idx = switch (tag) {
+    const tmp_idx = switch (tag) {
         .bit_and => try arith.internBitAnd(gpa, ip, lhs, rhs),
         .bit_or => try arith.internBitOr(gpa, ip, lhs, rhs),
         .xor => try arith.internXor(gpa, ip, lhs, rhs),
         else => unreachable,
     };
-    return .{ .index = idx };
+    if (triple.ty == .comptime_int_type) return .{ .index = tmp_idx };
+    return try sema.refitIntToFixedWidth(tmp_idx, triple.ty, op_name);
 }
 
 /// `cmp_lt / cmp_lte / cmp_eq / cmp_gte / cmp_gt / cmp_neq`. Same operand
@@ -1314,10 +1761,49 @@ fn resolveRef(sema: *Sema, ref: Zir.Inst.Ref) Error!Value {
         return error.AnalysisFail;
     }
 
-    return wellKnownRefToValue(ref) orelse {
-        try sema.writer.print("unsupported ZIR ref: {s}\n", .{@tagName(ref)});
-        return error.AnalysisFail;
+    if (wellKnownRefToValue(ref)) |value| return value;
+    if (try sema.internTypedWellKnownRef(ref)) |value| return value;
+    try sema.writer.print("unsupported ZIR ref: {s}\n", .{@tagName(ref)});
+    return error.AnalysisFail;
+}
+
+/// Refs the compiler hands out as pre-typed constants —
+/// `zero_u8` / `one_u8` / `one_usize` / `undef_bool` / etc. We intern
+/// them on demand rather than reserving well-known slots, since they
+/// fold into the pool's normal int / undef storage with no special
+/// shape. Mirrors the compiler's well-known table layout in
+/// `src/InternPool.zig`.
+fn internTypedWellKnownRef(sema: *Sema, ref: Zir.Inst.Ref) Error!?Value {
+    const TypedInt = struct { ty: InternPool.Index, value: u64 };
+    const typed_int: ?TypedInt = switch (ref) {
+        .zero_usize => .{ .ty = .usize_type, .value = 0 },
+        .zero_u1 => .{ .ty = .u1_type, .value = 0 },
+        .zero_u8 => .{ .ty = .u8_type, .value = 0 },
+        .one_usize => .{ .ty = .usize_type, .value = 1 },
+        .one_u1 => .{ .ty = .u1_type, .value = 1 },
+        .one_u8 => .{ .ty = .u8_type, .value = 1 },
+        .four_u8 => .{ .ty = .u8_type, .value = 4 },
+        else => null,
     };
+    if (typed_int) |t| {
+        const idx = try sema.intern_pool.internInt(.{
+            .ty = t.ty,
+            .storage = .{ .u64 = t.value },
+        });
+        return .{ .index = idx };
+    }
+
+    const undef_ty: ?InternPool.Index = switch (ref) {
+        .undef_bool => .bool_type,
+        .undef_usize => .usize_type,
+        .undef_u1 => .u1_type,
+        else => null,
+    };
+    if (undef_ty) |ty| {
+        const idx = try sema.intern_pool.get(.{ .undef = ty });
+        return .{ .index = idx };
+    }
+    return null;
 }
 
 /// Maps a static ZIR `Ref` to the corresponding interned Value.
