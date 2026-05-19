@@ -825,6 +825,75 @@ test "@bitCast reinterprets matching-width bits" {
     try expectEvalTypedDecimal(gpa, &pool, "@as(u8, @bitCast(@as(i8, -1)))", .u8_type, "255");
 }
 
+/// Drive a type-expression through the full Pipeline + Sema + render,
+/// asserting that the rendered name matches `expected`. Used for
+/// ptr_type and (later) aggregate / function types.
+fn expectEvalTypeName(
+    gpa: std.mem.Allocator,
+    intern_pool: *InternPool,
+    source: []const u8,
+    expected: []const u8,
+) !void {
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, intern_pool, source, &diag_buf);
+
+    var render_buf: [256]u8 = undefined;
+    var render_writer = std.Io.Writer.fixed(&render_buf);
+    try @import("render/Value.zig").render(value, intern_pool, &render_writer);
+
+    const rendered_raw = render_buf[0 .. render_writer.buffer.len - render_writer.unusedCapacityLen()];
+    const rendered = std.mem.trimEnd(u8, rendered_raw, "\n");
+    try testing.expectEqualStrings(expected, rendered);
+}
+
+test "ptr_type: e2e through Pipeline produces interned Key.ptr_type" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // Drive the expression through the full front end and confirm the
+    // pool returns the expected Key shape, not just a rendered string.
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, &pool, "*const u8", &diag_buf);
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .ptr_type);
+    try testing.expectEqual(InternPool.Index.u8_type, key.ptr_type.child);
+    try testing.expectEqual(true, key.ptr_type.flags.is_const);
+    try testing.expectEqual(InternPool.Key.PtrType.Size.one, key.ptr_type.flags.size);
+
+    // Stage 1 dedup check at the e2e layer: same source twice gives
+    // the same Index.
+    const second = try evalSource(gpa, &pool, "*const u8", &diag_buf);
+    try testing.expectEqual(value.index, second.index);
+}
+
+test "ptr_type: each size + qualifier renders the Zig surface name" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypeName(gpa, &pool, "*u8", "*u8");
+    try expectEvalTypeName(gpa, &pool, "*const u8", "*const u8");
+    try expectEvalTypeName(gpa, &pool, "*volatile u32", "*volatile u32");
+    try expectEvalTypeName(gpa, &pool, "[*]u8", "[*]u8");
+    try expectEvalTypeName(gpa, &pool, "[*]const u8", "[*]const u8");
+    try expectEvalTypeName(gpa, &pool, "[]i32", "[]i32");
+    try expectEvalTypeName(gpa, &pool, "[]const i32", "[]const i32");
+    try expectEvalTypeName(gpa, &pool, "[*c]u8", "[*c]u8");
+    // Nested pointer recurses through writeTypeName.
+    try expectEvalTypeName(gpa, &pool, "*const [*]u8", "*const [*]u8");
+    try expectEvalTypeName(gpa, &pool, "*const *const u32", "*const *const u32");
+}
+
+test "ptr_type: extensions we do not yet support fail with a structured diagnostic" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalFails(gpa, &pool, "[*:0]const u8", "sentinel-terminated pointers not yet supported");
+    try expectEvalFails(gpa, &pool, "*align(8) u32", "align / address_space / bit_range not yet supported");
+}
+
 test "bit_not on fixed-width ints" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);

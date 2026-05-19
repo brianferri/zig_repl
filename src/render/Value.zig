@@ -29,7 +29,8 @@ pub fn render(
         .type_value => |ty_idx| renderTypeRef(ty_idx, pool, writer),
         // A bare type Key viewed as a value identifies the type itself
         // (Sema's value-of-type-type convention; see Value.typeOf).
-        .simple_type, .int_type, .anyframe_type => renderTypeRef(value.index, pool, writer),
+        .simple_type, .int_type, .anyframe_type, .ptr_type => renderTypeRef(value.index, pool, writer),
+        .ptr => |p| writer.print("ptr@{d}+{d}\n", .{ @intFromEnum(p.ty), p.byte_offset }),
     };
 }
 
@@ -43,15 +44,35 @@ fn simpleValueText(sv: InternPool.SimpleValue) []const u8 {
     };
 }
 
+/// Render a type Index as its Zig surface-syntax name with a trailing
+/// newline (the REPL-line terminator). Used both by the top-level
+/// `render` for type-valued results and as a recursion entry point;
+/// the inner `writeTypeName` writes without the newline so it can
+/// nest inside container-type names (`*const u8`, etc.) without
+/// emitting embedded newlines.
 fn renderTypeRef(
     type_index: InternPool.Index,
     pool: *const InternPool,
     writer: *std.Io.Writer,
 ) std.Io.Writer.Error!void {
-    const key = pool.indexToKey(type_index);
-    return switch (key) {
-        .simple_type => |st| writer.print("{s}\n", .{@tagName(st)}),
-        .int_type => |it| writer.print("{c}{d}\n", .{
+    try writeTypeName(type_index, pool, writer);
+    try writer.writeAll("\n");
+}
+
+/// Write a type Index's Zig surface-syntax name (no trailing newline).
+/// Recurses on pointer / anyframe children. Matches the canonical
+/// print form used by the compiler's `Type.print` for the cases
+/// Stage 2 ships (no sentinel, no align, no address_space prefix,
+/// no vector_index, no bit_range).
+fn writeTypeName(
+    type_index: InternPool.Index,
+    pool: *const InternPool,
+    writer: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    assert(type_index != .none);
+    switch (pool.indexToKey(type_index)) {
+        .simple_type => |st| try writer.print("{s}", .{@tagName(st)}),
+        .int_type => |it| try writer.print("{c}{d}", .{
             @as(u8, switch (it.signedness) {
                 .signed => 'i',
                 .unsigned => 'u',
@@ -59,11 +80,32 @@ fn renderTypeRef(
             it.bits,
         }),
         .anyframe_type => |child| if (child == .none)
-            writer.writeAll("anyframe\n")
-        else
-            renderAnyframeChild(child, pool, writer),
-        else => writer.writeAll("<type>\n"),
-    };
+            try writer.writeAll("anyframe")
+        else {
+            try writer.writeAll("anyframe->");
+            try writeTypeName(child, pool, writer);
+        },
+        .ptr_type => |pt| try writePtrTypeName(pt, pool, writer),
+        else => try writer.writeAll("<type>"),
+    }
+}
+
+fn writePtrTypeName(
+    pt: InternPool.Key.PtrType,
+    pool: *const InternPool,
+    writer: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    assert(pt.child != .none);
+    try writer.writeAll(switch (pt.flags.size) {
+        .one => "*",
+        .many => "[*]",
+        .slice => "[]",
+        .c => "[*c]",
+    });
+    if (pt.flags.is_allowzero and pt.flags.size != .c) try writer.writeAll("allowzero ");
+    if (pt.flags.is_const) try writer.writeAll("const ");
+    if (pt.flags.is_volatile) try writer.writeAll("volatile ");
+    try writeTypeName(pt.child, pool, writer);
 }
 
 /// Print each float-storage variant in its native precision. f80 has no
@@ -101,13 +143,4 @@ fn needsTrailingDecimal(text: []const u8) bool {
     const start: usize = if (text[0] == '-' or text[0] == '+') 1 else 0;
     if (start >= text.len) return false;
     return std.ascii.isDigit(text[start]);
-}
-
-fn renderAnyframeChild(
-    child: InternPool.Index,
-    pool: *const InternPool,
-    writer: *std.Io.Writer,
-) std.Io.Writer.Error!void {
-    try writer.writeAll("anyframe->");
-    try renderTypeRef(child, pool, writer);
 }

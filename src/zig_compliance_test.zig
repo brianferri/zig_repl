@@ -237,3 +237,19 @@ test "compliance: negate_wrap on signed min" {
 test "compliance: negate on fixed-width int" {
     try expectMatchesZig(testing.allocator, "-@as(i32, 100)");
 }
+
+test "compliance: ptr_type *const u8 renders as Zig prints" {
+    try expectMatchesZig(testing.allocator, "*const u8");
+}
+
+test "compliance: ptr_type [*]u32 renders as Zig prints" {
+    try expectMatchesZig(testing.allocator, "[*]u32");
+}
+
+test "compliance: ptr_type []i32 renders as Zig prints" {
+    try expectMatchesZig(testing.allocator, "[]i32");
+}
+
+test "compliance: ptr_type nested *const *const u32 renders identically" {
+    try expectMatchesZig(testing.allocator, "*const *const u32");
+}

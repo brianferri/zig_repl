@@ -192,6 +192,16 @@ pub const Key = union(enum) {
     /// A value whose runtime type is `type` and whose payload is the
     /// interned type itself.
     type_value: Index,
+    /// A pointer type (`*T`, `*const T`, `[*]T`, `[]T`, etc.). Mirrors
+    /// the compiler's `Key.PtrType` -- the same shape but a subset of
+    /// the flag set; we start with what Stage 2's alloc/store/load
+    /// needs and widen with each stage.
+    ptr_type: PtrType,
+    /// A pointer value. Mirrors the compiler's `Key.Ptr`. `base_addr`
+    /// today only has `.alloc_slot` -- enough for REPL session
+    /// allocations; `.nav` / `.uav` / `.int` etc. land alongside their
+    /// dependent stages.
+    ptr: Ptr,
 
     pub const Int = struct {
         ty: Index,
@@ -239,6 +249,46 @@ pub const Key = union(enum) {
         };
     };
 
+    /// Pointer type. Stage 2's minimal subset of the compiler's
+    /// `Key.PtrType` -- shape matches but the flag field carries only
+    /// what `alloc` / `store` / `load` need (size, is_const, address
+    /// space). Sentinel and alignment will be wired alongside Stage 4
+    /// aggregates.
+    pub const PtrType = struct {
+        child: Index,
+        sentinel: Index = .none,
+        flags: Flags = .{},
+
+        pub const Flags = packed struct(u32) {
+            size: Size = .one,
+            is_const: bool = false,
+            is_volatile: bool = false,
+            is_allowzero: bool = false,
+            address_space: AddressSpace = .generic,
+            _reserved: u25 = 0,
+        };
+
+        pub const Size = enum(u2) { one, many, slice, c };
+        pub const AddressSpace = enum(u2) { generic, gs, fs, ss };
+    };
+
+    /// Pointer value. `ty` is the pointer's type (always a `ptr_type`
+    /// Index). `base_addr` identifies the storage region; `byte_offset`
+    /// is the offset within that region. Stage 2 ships `.alloc_slot`
+    /// only; later stages add `.nav` (declarations), `.uav` (anonymous
+    /// addressable values), `.int` (`@ptrFromInt`), `.eu_payload`,
+    /// `.opt_payload`, `.comptime_field`, etc. as their dependent ZIR
+    /// tags land.
+    pub const Ptr = struct {
+        ty: Index,
+        base_addr: BaseAddr,
+        byte_offset: u64,
+
+        pub const BaseAddr = union(enum) {
+            alloc_slot: u32,
+        };
+    };
+
     /// Stable hash for dedup. `pool` is reserved for future Key variants
     /// (e.g. `struct_type`) whose canonical form requires pool lookup;
     /// today's variants ignore it. Storage variants of `int` are
@@ -278,6 +328,20 @@ pub const Key = union(enum) {
             },
             .undef => |ty| std.hash.autoHash(&hasher, ty),
             .type_value => |t| std.hash.autoHash(&hasher, t),
+            .ptr_type => |pt| {
+                std.hash.autoHash(&hasher, pt.child);
+                std.hash.autoHash(&hasher, pt.sentinel);
+                std.hash.autoHash(&hasher, @as(u32, @bitCast(pt.flags)));
+            },
+            .ptr => |p| {
+                std.hash.autoHash(&hasher, p.ty);
+                std.hash.autoHash(&hasher, p.byte_offset);
+                const BaseTag = @typeInfo(Ptr.BaseAddr).@"union".tag_type.?;
+                std.hash.autoHash(&hasher, @as(BaseTag, p.base_addr));
+                switch (p.base_addr) {
+                    .alloc_slot => |slot| std.hash.autoHash(&hasher, slot),
+                }
+            },
         }
         return hasher.final();
     }
@@ -330,6 +394,22 @@ pub const Key = union(enum) {
             },
             .undef => |x| x == b.undef,
             .type_value => |x| x == b.type_value,
+            .ptr_type => |x| blk: {
+                const y = b.ptr_type;
+                if (x.child != y.child) break :blk false;
+                if (x.sentinel != y.sentinel) break :blk false;
+                break :blk @as(u32, @bitCast(x.flags)) == @as(u32, @bitCast(y.flags));
+            },
+            .ptr => |x| blk: {
+                const y = b.ptr;
+                if (x.ty != y.ty) break :blk false;
+                if (x.byte_offset != y.byte_offset) break :blk false;
+                const BaseTag = @typeInfo(Ptr.BaseAddr).@"union".tag_type.?;
+                if (@as(BaseTag, x.base_addr) != @as(BaseTag, y.base_addr)) break :blk false;
+                break :blk switch (x.base_addr) {
+                    .alloc_slot => |slot| slot == y.base_addr.alloc_slot,
+                };
+            },
         };
     }
 };
@@ -383,6 +463,15 @@ const Item = struct {
         float_comptime_float, // ty = .comptime_float_type; data = extra index of Float128
         undef, // data = Index of the value's type (`undefined_type` for untyped)
         type_value, // data = Index of the interned type
+        // Pointer type. data = extra index of PtrTypeRepr (3 u32 slots:
+        // child, sentinel, flags). Mirrors the compiler's
+        // `Item.Tag.type_pointer`.
+        type_pointer,
+        // Pointer value with `BaseAddr.alloc_slot`. data = extra index
+        // of PtrAllocRepr (4 u32 slots: ty, slot, byte_offset_lo,
+        // byte_offset_hi). Mirrors the role of the compiler's
+        // `ptr_comptime_alloc` for our REPL session allocations.
+        ptr_alloc,
     };
 };
 
@@ -395,6 +484,28 @@ const Item = struct {
 const IntSmall = extern struct {
     ty: u32,
     value: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.type_pointer`. Three u32 slots:
+/// child, sentinel, and the bit-packed `Key.PtrType.Flags`. Mirrors
+/// the compiler's `Tag.TypePointer` storage shape (smaller because we
+/// haven't ported `packed_offset` yet -- adds when Stage 4's
+/// host-int-backed slice machinery needs it).
+const PtrTypeRepr = extern struct {
+    child: u32,
+    sentinel: u32,
+    flags: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.ptr_alloc`. Four u32 slots: ty,
+/// alloc-slot index, and the 64-bit byte_offset split into lo/hi u32s.
+/// Mirrors the compiler's `Tag.PtrComptimeAlloc` (allocations born in
+/// Sema rather than backed by a declaration).
+const PtrAllocRepr = extern struct {
+    ty: u32,
+    alloc_slot: u32,
+    byte_offset_lo: u32,
+    byte_offset_hi: u32,
 };
 
 /// Header for `Item.Tag.int_positive` / `Item.Tag.int_negative`. Lives at
@@ -688,6 +799,8 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         },
         .int => |i| try emitInt(pool, i),
         .float => |f| try emitFloat(pool, f),
+        .ptr_type => |pt| try emitPtrType(pool, pt),
+        .ptr => |p| try emitPtr(pool, p),
     }
 
     assert(pool.items.len == gop.index + 1);
@@ -757,7 +870,33 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         } },
         .undef => .{ .undef = @enumFromInt(item.data) },
         .type_value => .{ .type_value = @enumFromInt(item.data) },
+        .type_pointer => ptrTypeFromExtra(pool, item.data),
+        .ptr_alloc => ptrAllocFromExtra(pool, item.data),
     };
+}
+
+fn ptrTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const fields = comptime @divExact(@sizeOf(PtrTypeRepr), @sizeOf(u32));
+    assert(extra_index + fields <= pool.extra.items.len);
+    const slice = pool.extra.items[extra_index..][0..fields];
+    const repr: PtrTypeRepr = .{ .child = slice[0], .sentinel = slice[1], .flags = slice[2] };
+    return .{ .ptr_type = .{
+        .child = @enumFromInt(repr.child),
+        .sentinel = @enumFromInt(repr.sentinel),
+        .flags = @bitCast(repr.flags),
+    } };
+}
+
+fn ptrAllocFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const fields = comptime @divExact(@sizeOf(PtrAllocRepr), @sizeOf(u32));
+    assert(extra_index + fields <= pool.extra.items.len);
+    const slice = pool.extra.items[extra_index..][0..fields];
+    const byte_offset = (@as(u64, slice[3]) << 32) | @as(u64, slice[2]);
+    return .{ .ptr = .{
+        .ty = @enumFromInt(slice[0]),
+        .base_addr = .{ .alloc_slot = slice[1] },
+        .byte_offset = byte_offset,
+    } };
 }
 
 /// Reconstruct a packed `Float64` / `Float80` / `Float128` from `extra`.
@@ -1052,6 +1191,47 @@ fn addFloatExtra(pool: *InternPool, value: anytype) Allocator.Error!u32 {
 /// Intern a float value with any storage form.
 pub fn internFloat(pool: *InternPool, float: Key.Float) Allocator.Error!Index {
     return pool.get(.{ .float = float });
+}
+
+/// Emit a `type_pointer` Item. Three u32 slots in extra:
+/// child Index, sentinel Index, packed-flags as u32.
+fn emitPtrType(pool: *InternPool, pt: Key.PtrType) Allocator.Error!void {
+    assert(pt.child != .none);
+    const extra_index: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.appendSlice(pool.gpa, &.{
+        @intFromEnum(pt.child),
+        @intFromEnum(pt.sentinel),
+        @as(u32, @bitCast(pt.flags)),
+    });
+    pool.items.appendAssumeCapacity(.{ .tag = .type_pointer, .data = extra_index });
+}
+
+/// Emit a `ptr_alloc` Item for a `Key.ptr` whose base address is an
+/// `alloc_slot`. Four u32 slots: ty, alloc_slot, byte_offset (lo/hi).
+fn emitPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!void {
+    assert(p.ty != .none);
+    switch (p.base_addr) {
+        .alloc_slot => |slot| {
+            const extra_index: u32 = @intCast(pool.extra.items.len);
+            try pool.extra.appendSlice(pool.gpa, &.{
+                @intFromEnum(p.ty),
+                slot,
+                @as(u32, @truncate(p.byte_offset)),
+                @as(u32, @truncate(p.byte_offset >> 32)),
+            });
+            pool.items.appendAssumeCapacity(.{ .tag = .ptr_alloc, .data = extra_index });
+        },
+    }
+}
+
+/// Intern a pointer type.
+pub fn internPtrType(pool: *InternPool, pt: Key.PtrType) Allocator.Error!Index {
+    return pool.get(.{ .ptr_type = pt });
+}
+
+/// Intern a pointer value.
+pub fn internPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!Index {
+    return pool.get(.{ .ptr = p });
 }
 
 /// True iff `ty` identifies a Zig float type. Mirrors the compiler's
@@ -1439,4 +1619,82 @@ test "big comptime int round-trips through int_positive limbs" {
     try std.testing.expectEqual(@as(usize, 2), big.limbs.len);
     try std.testing.expectEqual(@as(std.math.big.Limb, 0), big.limbs[0]);
     try std.testing.expectEqual(@as(std.math.big.Limb, 1), big.limbs[1]);
+}
+
+test "ptr_type round-trip and dedup" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const items_before = pool.itemCount();
+    const ty_const_u8 = try pool.internPtrType(.{
+        .child = .u8_type,
+        .flags = .{ .size = .one, .is_const = true },
+    });
+    const round = pool.indexToKey(ty_const_u8).ptr_type;
+    try std.testing.expectEqual(Index.u8_type, round.child);
+    try std.testing.expectEqual(true, round.flags.is_const);
+    try std.testing.expectEqual(Key.PtrType.Size.one, round.flags.size);
+
+    // Same shape dedups; differing flag bits intern separately.
+    const dedup = try pool.internPtrType(.{
+        .child = .u8_type,
+        .flags = .{ .size = .one, .is_const = true },
+    });
+    try std.testing.expectEqual(ty_const_u8, dedup);
+    try std.testing.expectEqual(items_before + 1, pool.itemCount());
+
+    const ty_mut_u8 = try pool.internPtrType(.{
+        .child = .u8_type,
+        .flags = .{ .size = .one, .is_const = false },
+    });
+    try std.testing.expect(ty_mut_u8 != ty_const_u8);
+}
+
+test "ptr value round-trip and dedup by base_addr + offset" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const ptr_ty = try pool.internPtrType(.{ .child = .u32_type });
+    const items_before = pool.itemCount();
+
+    const p0 = try pool.internPtr(.{
+        .ty = ptr_ty,
+        .base_addr = .{ .alloc_slot = 7 },
+        .byte_offset = 16,
+    });
+    const round = pool.indexToKey(p0).ptr;
+    try std.testing.expectEqual(ptr_ty, round.ty);
+    try std.testing.expectEqual(@as(u64, 16), round.byte_offset);
+    try std.testing.expectEqual(@as(u32, 7), round.base_addr.alloc_slot);
+
+    // Same {ty, slot, offset} dedups to the same Index.
+    const p_dup = try pool.internPtr(.{
+        .ty = ptr_ty,
+        .base_addr = .{ .alloc_slot = 7 },
+        .byte_offset = 16,
+    });
+    try std.testing.expectEqual(p0, p_dup);
+    try std.testing.expectEqual(items_before + 1, pool.itemCount());
+
+    // Different offset (or slot) is a distinct value.
+    const p_other_offset = try pool.internPtr(.{
+        .ty = ptr_ty,
+        .base_addr = .{ .alloc_slot = 7 },
+        .byte_offset = 24,
+    });
+    try std.testing.expect(p_other_offset != p0);
+}
+
+test "ptr byte_offset survives the 32-bit boundary" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const ptr_ty = try pool.internPtrType(.{ .child = .u8_type });
+    const huge: u64 = (@as(u64, 1) << 40) + 0xdead;
+    const p = try pool.internPtr(.{
+        .ty = ptr_ty,
+        .base_addr = .{ .alloc_slot = 0 },
+        .byte_offset = huge,
+    });
+    try std.testing.expectEqual(huge, pool.indexToKey(p).ptr.byte_offset);
 }

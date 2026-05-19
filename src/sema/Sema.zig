@@ -148,6 +148,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .cmp_neq => sema.evalComparison(inst, .neq),
         .negate, .negate_wrap => sema.evalNegate(inst, tag),
         .bit_not => sema.evalBitNot(inst),
+        .ptr_type => sema.evalPtrType(inst),
         .dbg_stmt => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
         inline else => |unhandled| sema.reportUnsupportedTag(unhandled),
@@ -1736,6 +1737,57 @@ fn evalNegate(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value
 
     try sema.writer.print("{s}: non-numeric operand\n", .{op_name});
     return error.AnalysisFail;
+}
+
+/// `ptr_type`: evaluate a `*T` / `*const T` / `[*]T` / `[]T` / `[*c]T`
+/// type expression to an interned `Key.ptr_type` value. Sentinel,
+/// align, address_space, and bit_range extensions trail the payload
+/// via additional `Ref` slots in extra; Stage 2 handles only the
+/// base case (none of the optional extensions). Compiler reference:
+/// `src/Sema.zig:zirPtrType`.
+fn evalPtrType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const inst_data = sema.zir.instructions.items(.data)[@intFromEnum(inst)].ptr_type;
+    if (inst_data.flags.has_sentinel) {
+        try sema.writer.writeAll("ptr_type: sentinel-terminated pointers not yet supported\n");
+        return error.AnalysisFail;
+    }
+    if (inst_data.flags.has_align or inst_data.flags.has_addrspace or inst_data.flags.has_bit_range) {
+        try sema.writer.writeAll("ptr_type: align / address_space / bit_range not yet supported\n");
+        return error.AnalysisFail;
+    }
+
+    const payload = sema.zir.extraData(Zir.Inst.PtrType, inst_data.payload_index).data;
+    assert(payload.elem_type != .none);
+
+    const elem_value = try sema.resolveRef(payload.elem_type);
+    const child_ty: InternPool.Index = switch (sema.intern_pool.indexToKey(elem_value.index)) {
+        .type_value => |t| t,
+        .simple_type, .int_type, .anyframe_type, .ptr_type => elem_value.index,
+        else => {
+            try sema.writer.writeAll("ptr_type: element is not a type\n");
+            return error.AnalysisFail;
+        },
+    };
+    assert(child_ty != .none);
+
+    const idx = try sema.intern_pool.internPtrType(.{
+        .child = child_ty,
+        .flags = .{
+            .size = switch (inst_data.size) {
+                .one => .one,
+                .many => .many,
+                .slice => .slice,
+                .c => .c,
+            },
+            .is_const = !inst_data.flags.is_mutable,
+            .is_volatile = inst_data.flags.is_volatile,
+            .is_allowzero = inst_data.flags.is_allowzero,
+            .address_space = .generic,
+        },
+    });
+    return .{ .index = idx };
 }
 
 /// `~x`: bitwise NOT. For comptime_int the identity `~x = -(x + 1)` is
