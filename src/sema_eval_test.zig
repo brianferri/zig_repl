@@ -443,6 +443,289 @@ test "@as coerces comptime_float to fixed-width float and stores the type" {
     try expectEvalTypedFloat(gpa, &pool, "@as(f128, 1.5)", .f128_type, @as(u128, @bitCast(@as(f128, 1.5))));
 }
 
+test "fixed-width float arithmetic at every width" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // f32 path
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f32, 1.5) + @as(f32, 2.5)",
+        .f32_type,
+        @as(u32, @bitCast(@as(f32, 4.0))),
+    );
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f32, 10.0) - @as(f32, 3.5)",
+        .f32_type,
+        @as(u32, @bitCast(@as(f32, 6.5))),
+    );
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f32, 7.5) / @as(f32, 2.5)",
+        .f32_type,
+        @as(u32, @bitCast(@as(f32, 3.0))),
+    );
+
+    // f64 path
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f64, 2.0) * @as(f64, 3.5)",
+        .f64_type,
+        @as(u64, @bitCast(@as(f64, 7.0))),
+    );
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@divTrunc(@as(f64, 7.5), @as(f64, 2.5))",
+        .f64_type,
+        @as(u64, @bitCast(@as(f64, 3.0))),
+    );
+
+    // f128 path
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f128, 1.0) + @as(f128, 1.0)",
+        .f128_type,
+        @as(u128, @bitCast(@as(f128, 2.0))),
+    );
+}
+
+test "fixed-width float comparison and negation" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalBool(gpa, &pool, "@as(f32, 1.5) < @as(f32, 2.5)", true);
+    try expectEvalBool(gpa, &pool, "@as(f64, 3.14) == @as(f64, 3.14)", true);
+    try expectEvalBool(gpa, &pool, "@as(f32, 1.0) != @as(f32, 1.0)", false);
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "-@as(f32, 1.5)",
+        .f32_type,
+        @as(u32, @bitCast(@as(f32, -1.5))),
+    );
+}
+
+test "@floatCast widens and narrows between float widths" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // Comptime_float -> any fixed-width
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f32, @floatCast(1.5))",
+        .f32_type,
+        @as(u32, @bitCast(@as(f32, 1.5))),
+    );
+
+    // f32 -> f64 (lossless widening)
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f64, @floatCast(@as(f32, 1.5)))",
+        .f64_type,
+        @as(u64, @bitCast(@as(f64, @as(f32, 1.5)))),
+    );
+
+    // f64 -> f32 (narrowing, precision loss permitted). The expected
+    // bits are computed via `@floatCast` rather than `@as` because Zig's
+    // comptime guard would reject the latter for a value f32 cannot
+    // represent exactly.
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f32, @floatCast(@as(f64, 3.14)))",
+        .f32_type,
+        @as(u32, @bitCast(@as(f32, @floatCast(@as(f64, 3.14))))),
+    );
+}
+
+test "@intFromFloat truncates toward zero and range-checks" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypedDecimal(gpa, &pool, "@as(i32, @intFromFloat(3.7))", .i32_type, "3");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(i32, @intFromFloat(-3.7))", .i32_type, "-3");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, @intFromFloat(255.999))", .u8_type, "255");
+    try expectEvalDecimal(gpa, &pool, "@as(comptime_int, @intFromFloat(1234567890.5))", "1234567890");
+
+    try expectEvalFails(gpa, &pool, "@as(u8, @intFromFloat(256.0))", "does not fit in u8");
+    try expectEvalFails(gpa, &pool, "@as(i32, @intFromFloat(1.0e30))", "does not fit in i32");
+}
+
+test "@floatFromInt rounds to nearest-even at the destination width" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f32, @floatFromInt(5))",
+        .f32_type,
+        @as(u32, @bitCast(@as(f32, 5.0))),
+    );
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f64, @floatFromInt(-100))",
+        .f64_type,
+        @as(u64, @bitCast(@as(f64, -100.0))),
+    );
+    // 16777217 (= 2^24 + 1) is not representable exactly in f32 (24-bit
+    // mantissa); nearest-even rounds to 16777216 (= 2^24).
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f32, @floatFromInt(16777217))",
+        .f32_type,
+        @as(u32, @bitCast(@as(f32, 16777216.0))),
+    );
+}
+
+test "mixed-width float arith widens to the wider float type" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // f32 + f64 -> f64 (compiler: `resolvePeerTypes` picks the wider).
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f32, 1.5) + @as(f64, 2.5)",
+        .f64_type,
+        @as(u64, @bitCast(@as(f64, 4.0))),
+    );
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f64, 1.0) - @as(f32, 0.5)",
+        .f64_type,
+        @as(u64, @bitCast(@as(f64, 0.5))),
+    );
+}
+
+test "fixed-width int + fixed-width float resolves to the fixed-width float" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // `@as(f32, 1.5) + @as(i32, 2)` -> 3.5 f32 in real Zig: peer
+    // resolution picks `fixed_float`, coerces the i32 to f32, computes.
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f32, 1.5) + @as(i32, 2)",
+        .f32_type,
+        @as(u32, @bitCast(@as(f32, 3.5))),
+    );
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(i32, 2) + @as(f32, 1.5)",
+        .f32_type,
+        @as(u32, @bitCast(@as(f32, 3.5))),
+    );
+}
+
+test "@as fixed-width int to fixed-width float is permitted" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f32, @as(i32, 5))",
+        .f32_type,
+        @as(u32, @bitCast(@as(f32, 5.0))),
+    );
+    try expectEvalTypedFloat(
+        gpa,
+        &pool,
+        "@as(f64, @as(i32, 1000000))",
+        .f64_type,
+        @as(u64, @bitCast(@as(f64, 1000000.0))),
+    );
+}
+
+test "fixed-width int + comptime_float is rejected" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // Real Zig: "incompatible types: 'i32' and 'comptime_float'". Our
+    // diagnostic groups this with the still-pending fixed-width-int
+    // arith axis.
+    try expectEvalFails(gpa, &pool, "@as(i32, 5) + 1.5", "incompatible numeric operands");
+    try expectEvalFails(gpa, &pool, "1.5 + @as(i32, 5)", "incompatible numeric operands");
+}
+
+test "fixed-width int arithmetic same width" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypedDecimal(gpa, &pool, "@as(i32, 1) + @as(i32, 2)", .i32_type, "3");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u32, 10) - @as(u32, 3)", .u32_type, "7");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(i32, 5) * @as(i32, 6)", .i32_type, "30");
+    try expectEvalTypedDecimal(gpa, &pool, "@divTrunc(@as(i32, 7), @as(i32, 2))", .i32_type, "3");
+}
+
+test "fixed-width int + comptime_int range-checks via peer resolution" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypedDecimal(gpa, &pool, "@as(i32, 5) + 1", .i32_type, "6");
+    try expectEvalTypedDecimal(gpa, &pool, "1 + @as(i32, 5)", .i32_type, "6");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 100) + 50", .u8_type, "150");
+
+    // Overflow at the fixed width is a comptime error in real Zig
+    // ("overflow of integer type 'u8' with value '300'"); we surface
+    // the same condition via the post-arith range check.
+    try expectEvalFails(gpa, &pool, "@as(u8, 200) + @as(u8, 100)", "does not fit in u8");
+}
+
+test "fixed-width int peer resolution across widths and signedness" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // Same signedness: wider wins.
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 5) + @as(u16, 10)", .u16_type, "15");
+    try expectEvalTypedDecimal(gpa, &pool, "@as(i8, 5) + @as(i16, 100)", .i16_type, "105");
+
+    // Mixed signedness, signed strictly wider: signed wins.
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 5) + @as(i16, 100)", .i16_type, "105");
+
+    // Mixed signedness, unsigned strictly wider: unsigned wins (compiler
+    // legacy compat — both operands here are comptime-known).
+    try expectEvalTypedDecimal(gpa, &pool, "@as(u16, 5) + @as(i8, 100)", .u16_type, "105");
+}
+
+test "fixed-width int comparison across widths" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalBool(gpa, &pool, "@as(i32, 5) < @as(i32, 10)", true);
+    try expectEvalBool(gpa, &pool, "@as(u16, 1000) > @as(u8, 200)", true);
+    try expectEvalBool(gpa, &pool, "@as(i32, -3) == -3", true);
+    try expectEvalBool(gpa, &pool, "@as(u8, 5) == @as(i32, 5)", true);
+}
+
 test "mixed comptime_int + comptime_float promotes via peer-type resolution" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
