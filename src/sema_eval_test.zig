@@ -825,6 +825,41 @@ test "@bitCast reinterprets matching-width bits" {
     try expectEvalTypedDecimal(gpa, &pool, "@as(u8, @bitCast(@as(i8, -1)))", .u8_type, "255");
 }
 
+test "bit_not on fixed-width ints" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypedDecimal(gpa, &pool, "~@as(u8, 5)", .u8_type, "250");
+    try expectEvalTypedDecimal(gpa, &pool, "~@as(u8, 0)", .u8_type, "255");
+    try expectEvalTypedDecimal(gpa, &pool, "~@as(i8, 0)", .i8_type, "-1");
+    try expectEvalTypedDecimal(gpa, &pool, "~@as(i32, 100)", .i32_type, "-101");
+    try expectEvalTypedDecimal(gpa, &pool, "~@as(u16, 0xff00)", .u16_type, "255");
+}
+
+test "negate_wrap on fixed-width ints" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // i8 -128 has no positive counterpart; -% wraps back to -128.
+    try expectEvalTypedDecimal(gpa, &pool, "-%@as(i8, -128)", .i8_type, "-128");
+    try expectEvalTypedDecimal(gpa, &pool, "-%@as(i8, 127)", .i8_type, "-127");
+    try expectEvalTypedDecimal(gpa, &pool, "-%@as(u8, 200)", .u8_type, "56");
+    try expectEvalTypedDecimal(gpa, &pool, "-%@as(i32, 0)", .i32_type, "0");
+}
+
+test "negate on fixed-width int now refits + overflows cleanly" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypedDecimal(gpa, &pool, "-@as(i32, 100)", .i32_type, "-100");
+    // -minInt(i8) = 128 which overflows i8 (matches the compiler's
+    // comptime overflow error).
+    try expectEvalFails(gpa, &pool, "-@as(i8, -128)", "value does not fit in i8");
+}
+
 test "mixed comptime_int + comptime_float promotes via peer-type resolution" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);

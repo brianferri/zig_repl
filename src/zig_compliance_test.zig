@@ -221,3 +221,19 @@ test "compliance: @intFromFloat truncate" {
 test "compliance: @floatFromInt rounding" {
     try expectMatchesZig(testing.allocator, "@as(f32, @floatFromInt(16777217))");
 }
+
+test "compliance: bit_not on fixed-width int" {
+    try expectMatchesZig(testing.allocator, "~@as(u8, 5)");
+}
+
+test "compliance: bit_not on signed int" {
+    try expectMatchesZig(testing.allocator, "~@as(i32, 100)");
+}
+
+test "compliance: negate_wrap on signed min" {
+    try expectMatchesZig(testing.allocator, "-%@as(i8, -128)");
+}
+
+test "compliance: negate on fixed-width int" {
+    try expectMatchesZig(testing.allocator, "-@as(i32, 100)");
+}

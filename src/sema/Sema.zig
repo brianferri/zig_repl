@@ -146,7 +146,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .cmp_gte => sema.evalComparison(inst, .gte),
         .cmp_gt => sema.evalComparison(inst, .gt),
         .cmp_neq => sema.evalComparison(inst, .neq),
-        .negate => sema.evalNegate(inst),
+        .negate, .negate_wrap => sema.evalNegate(inst, tag),
+        .bit_not => sema.evalBitNot(inst),
         .dbg_stmt => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
         inline else => |unhandled| sema.reportUnsupportedTag(unhandled),
@@ -1672,13 +1673,15 @@ fn compareFloatStorage(
     }
 }
 
-/// Compiler reference: src/Sema.zig:zirNegate -> src/Sema/arith.zig:negate.
-/// AstGen lowers `-x` as `negate(x)`; constant-folded literals like `-1` /
-/// `-1.5` instead come through as well-known Refs or as a single signed
-/// literal and never reach here. Routes to the int or float kernel by
-/// operand type.
-fn evalNegate(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
+/// `negate` / `negate_wrap`. AstGen lowers `-x` as `negate(x)`; constant-
+/// folded literals like `-1` / `-1.5` come through as well-known Refs or
+/// as a single signed literal and never reach here. `negate_wrap` is the
+/// `-%x` form, valid only on fixed-width int operands.
+///
+/// Compiler reference: src/Sema.zig:zirNegate (~13858) /
+/// src/Sema.zig:zirNegateWrap (~13896).
+fn evalNegate(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
+    assert(tag == .negate or tag == .negate_wrap);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
@@ -1687,8 +1690,13 @@ fn evalNegate(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const operand_value = try sema.resolveRef(un_node.operand);
     const operand_key = ip.indexToKey(operand_value.index);
+    const op_name: []const u8 = @tagName(tag);
 
     if (operand_key == .float) {
+        if (tag == .negate_wrap) {
+            try sema.writer.writeAll("negate_wrap: not valid on float operand\n");
+            return error.AnalysisFail;
+        }
         if (operand_key.float.ty != .comptime_float_type and !isFixedWidthFloatType(operand_key.float.ty)) {
             try sema.writer.writeAll("negate: float type not yet supported\n");
             return error.AnalysisFail;
@@ -1701,54 +1709,144 @@ fn evalNegate(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             ),
         };
         const idx = try ip.internFloat(.{ .ty = operand_key.float.ty, .storage = out_storage });
-        assert(idx != .none);
         return .{ .index = idx };
     }
 
     if (operand_key == .int) {
-        if (operand_key.int.ty != .comptime_int_type) {
-            try sema.writer.writeAll("negate: fixed-width int negation not yet supported\n");
+        if (operand_key.int.ty == .comptime_int_type) {
+            // Wrap is meaningless at infinite precision: both forms reduce
+            // to a plain negate of a comptime_int.
+            var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+            const operand = operand_key.int.storage.toBigInt(&space);
+            const idx = try arith.internNegate(sema.gpa, ip, operand);
+            return .{ .index = idx };
+        }
+        const dest_info = intTypeInfo(ip, operand_key.int.ty) orelse {
+            try sema.writer.print("{s}: int type not yet supported\n", .{op_name});
             return error.AnalysisFail;
+        };
+        if (tag == .negate_wrap) {
+            return try sema.runIntNegateWrap(operand_key.int, operand_key.int.ty, dest_info);
         }
         var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
         const operand = operand_key.int.storage.toBigInt(&space);
-        const idx = try arith.internNegate(sema.gpa, ip, operand);
-        assert(idx != .none);
-        return .{ .index = idx };
+        const tmp_idx = try arith.internNegate(sema.gpa, ip, operand);
+        return try sema.refitIntToFixedWidth(tmp_idx, operand_key.int.ty, op_name);
     }
 
-    try sema.writer.writeAll("negate: non-numeric operand\n");
+    try sema.writer.print("{s}: non-numeric operand\n", .{op_name});
     return error.AnalysisFail;
 }
 
-/// Resolve a Ref and require it to be a `comptime_int` value. Reports the
-/// op-specific diagnostic and returns `error.AnalysisFail` for any
-/// non-integer or fixed-width-int operand until those land.
-fn resolveComptimeInt(
+/// `~x`: bitwise NOT. For comptime_int the identity `~x = -(x + 1)` is
+/// applied at arbitrary precision via `addScalar` + sign flip. For
+/// fixed-width int operands stdlib's `BigIntMutable.bitNotWrap` flips
+/// the bits within the type's width and `refitIntToFixedWidth` re-
+/// interns at the operand's type.
+///
+/// Compiler reference: src/Sema.zig:zirBitNot (~13302).
+fn evalBitNot(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
+
+    const ip = sema.intern_pool;
+    const operand_value = try sema.resolveRef(un_node.operand);
+    const operand_key = ip.indexToKey(operand_value.index);
+
+    if (operand_key != .int) {
+        try sema.writer.writeAll("bit_not: operand is not an int\n");
+        return error.AnalysisFail;
+    }
+
+    if (operand_key.int.ty == .comptime_int_type) {
+        return try sema.runComptimeIntBitNot(operand_key.int);
+    }
+
+    const dest_info = intTypeInfo(ip, operand_key.int.ty) orelse {
+        try sema.writer.writeAll("bit_not: int type not yet supported\n");
+        return error.AnalysisFail;
+    };
+    return try sema.runFixedWidthBitNot(operand_key.int, operand_key.int.ty, dest_info);
+}
+
+/// Compute `~x` on a `comptime_int` operand via the
+/// `~x = -(x + 1)` identity. Workspace is one limb larger than the
+/// operand because `addScalar` can carry.
+fn runComptimeIntBitNot(sema: *Sema, operand_int: InternPool.Key.Int) Error!Value {
+    assert(operand_int.ty == .comptime_int_type);
+    var op_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const operand_big = operand_int.storage.toBigInt(&op_space);
+
+    const workspace_limbs = operand_big.limbs.len + 1;
+    const workspace = try sema.gpa.alloc(std.math.big.Limb, workspace_limbs);
+    defer sema.gpa.free(workspace);
+
+    var mutable: std.math.big.int.Mutable = .{
+        .limbs = workspace,
+        .len = undefined,
+        .positive = undefined,
+    };
+    mutable.addScalar(operand_big, 1);
+    const plus_one = mutable.toConst();
+
+    const idx = try sema.intern_pool.internComptimeInt(plus_one.negate());
+    return .{ .index = idx };
+}
+
+/// Compute `~x` on a fixed-width int via stdlib's `bitNotWrap`. Buffer
+/// sized to `calcTwosCompLimbCount(bits)` plus a one-limb cushion (the
+/// stdlib helper internally adds before the wrap).
+fn runFixedWidthBitNot(
     sema: *Sema,
-    ref: Zir.Inst.Ref,
-    op_name: []const u8,
-    space: *InternPool.Key.Int.Storage.BigIntSpace,
-) Error!std.math.big.int.Const {
-    assert(@intFromPtr(sema) != 0);
-    assert(ref != .none);
-    assert(op_name.len > 0);
+    operand_int: InternPool.Key.Int,
+    dest_ty: InternPool.Index,
+    dest_info: std.builtin.Type.Int,
+) Error!Value {
+    var op_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const operand_big = operand_int.storage.toBigInt(&op_space);
 
-    const value = try sema.resolveRef(ref);
-    assert(value.index != .none);
+    const limb_bits: usize = @bitSizeOf(std.math.big.Limb);
+    const workspace_limbs: usize = (@as(usize, dest_info.bits) + limb_bits - 1) / limb_bits + 1;
+    const workspace = try sema.gpa.alloc(std.math.big.Limb, workspace_limbs);
+    defer sema.gpa.free(workspace);
 
-    const key = sema.intern_pool.indexToKey(value.index);
-    if (key != .int) {
-        try sema.writer.print("{s}: non-integer operand not yet supported\n", .{op_name});
-        return error.AnalysisFail;
-    }
-    if (key.int.ty != .comptime_int_type) {
-        try sema.writer.print("{s}: fixed-width int arithmetic not yet supported\n", .{op_name});
-        return error.AnalysisFail;
-    }
-    const big = key.int.storage.toBigInt(space);
-    assert(big.limbs.len > 0);
-    return big;
+    var mutable: std.math.big.int.Mutable = .{
+        .limbs = workspace,
+        .len = undefined,
+        .positive = undefined,
+    };
+    mutable.bitNotWrap(operand_big, dest_info.signedness, dest_info.bits);
+    const idx = try sema.intern_pool.internIntValue(dest_ty, mutable.toConst());
+    return .{ .index = idx };
+}
+
+/// Compute `-%x` on a fixed-width int via stdlib's `subWrap(0, x, ...)`.
+/// Wrap semantics: `-%@as(i8, -128)` is `-128` (overflow wraps).
+fn runIntNegateWrap(
+    sema: *Sema,
+    operand_int: InternPool.Key.Int,
+    dest_ty: InternPool.Index,
+    dest_info: std.builtin.Type.Int,
+) Error!Value {
+    var op_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const operand_big = operand_int.storage.toBigInt(&op_space);
+
+    const limb_bits: usize = @bitSizeOf(std.math.big.Limb);
+    const workspace_limbs: usize = (@as(usize, dest_info.bits) + limb_bits - 1) / limb_bits + 1;
+    const workspace = try sema.gpa.alloc(std.math.big.Limb, workspace_limbs);
+    defer sema.gpa.free(workspace);
+
+    var mutable: std.math.big.int.Mutable = .{
+        .limbs = workspace,
+        .len = undefined,
+        .positive = undefined,
+    };
+    const zero: std.math.big.int.Const = .{ .limbs = &.{0}, .positive = true };
+    _ = mutable.subWrap(zero, operand_big, dest_info.signedness, dest_info.bits);
+    const idx = try sema.intern_pool.internIntValue(dest_ty, mutable.toConst());
+    return .{ .index = idx };
 }
 
 fn resolveRef(sema: *Sema, ref: Zir.Inst.Ref) Error!Value {
