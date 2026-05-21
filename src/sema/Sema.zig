@@ -25,6 +25,14 @@ const Sema = @This();
 
 pub const Error = Allocator.Error || std.Io.Writer.Error || error{
     AnalysisFail,
+    /// Non-local control transfer from `break` / `break_inline`.
+    /// The break instruction's own ZIR index is stashed in
+    /// `sema.comptime_break_inst`; the receiver (`resolveInlineBody`)
+    /// reads the `Zir.Inst.Break` extra payload to recover the
+    /// target block_inst and the operand ref. Mirrors the compiler
+    /// at src/Sema.zig:1685 (`zirBreak` arm) +
+    /// src/Sema.zig:1062 (`analyzeInlineBody`).
+    ComptimeBreak,
 };
 
 gpa: Allocator,
@@ -49,6 +57,23 @@ comptime_allocs: std.ArrayListUnmanaged(ComptimeAlloc),
 /// a session; REPL passes the session-root index so `evalDeclVal`
 /// can resolve cross-line names via the parent chain.
 namespace: ?InternPool.NamespaceIndex,
+/// Populated when returning `error.ComptimeBreak`. Used to
+/// communicate the break instruction up the stack to find the
+/// corresponding block. The receiver reads the break's
+/// `Zir.Inst.Break` extra to get the target block_inst and
+/// recovers the value via `resolveRef(operand)`. Mirrors the
+/// compiler's `comptime_break_inst` field (src/Sema.zig:81).
+comptime_break_inst: Zir.Inst.Index = undefined,
+/// Backwards-branch quota, mirroring the compiler at
+/// src/Sema.zig:77. Each `repeat` / `repeat_inline` increments
+/// `branch_count`; when it exceeds `branch_quota`, Sema fails with
+/// the same "evaluation exceeded N backwards branches" diagnostic
+/// AstGen emits. The user-facing knob is `@setEvalBranchQuota`
+/// (Stage 7 builtin coverage).
+branch_quota: u32 = default_branch_quota,
+branch_count: u32 = 0,
+
+pub const default_branch_quota: u32 = 1000;
 
 pub const ComptimeAlloc = struct {
     ty: InternPool.Index,
@@ -101,48 +126,130 @@ pub fn analyze(
     defer sema.results.deinit(gpa);
     defer sema.comptime_allocs.deinit(gpa);
 
-    if (findReplInputBody(zir)) |body| {
-        return try sema.evalBody(body);
+    if (findReplInputBody(zir)) |bound| {
+        return try sema.resolveInlineBody(bound.body, bound.decl_inst);
     }
     if (namespace != null) try sema.bindDecls();
     return null;
 }
 
-fn findReplInputBody(zir: Zir) ?[]const Zir.Inst.Index {
+const ReplInputBody = struct {
+    decl_inst: Zir.Inst.Index,
+    body: []const Zir.Inst.Index,
+};
+
+fn findReplInputBody(zir: Zir) ?ReplInputBody {
     for (zir.typeDecls(.main_struct_inst)) |decl_inst| {
         const unwrapped = zir.getDeclaration(decl_inst);
         if (unwrapped.name == .empty) continue;
         const name = zir.nullTerminatedString(unwrapped.name);
         if (std.mem.eql(u8, name, InputShape.expression_decl_name)) {
-            return unwrapped.value_body;
+            // AstGen's wrapping `break_inline` for the decl body
+            // targets the declaration instruction itself.
+            return .{ .decl_inst = decl_inst, .body = unwrapped.value_body orelse return null };
         }
     }
     return null;
 }
 
+/// Walk a ZIR body, evaluating each instruction. Mirrors the
+/// compiler's `analyzeBodyInner` (`src/Sema.zig:1125`):
+///
+///   * `while (true)` -- no `i < body.len` upper bound. The only
+///     exit is `return` from a terminator arm. AstGen guarantees
+///     every body ends in a `noreturn`-class instruction
+///     (`break_inline` / `condbr` / etc.), so the loop ALWAYS
+///     terminates via a return.
+///   * `assert(i < body.len)` at the top -- fast crash on
+///     malformed input rather than UB from out-of-bounds indexing.
+///   * `.repeat` / `.repeat_inline`: `i = 0; continue;` to restart
+///     at the body's first instruction, gated by
+///     `emitBackwardBranch` which enforces `branch_quota` exactly
+///     as the compiler does (src/Sema.zig:1698).
 fn evalBody(sema: *Sema, body: []const Zir.Inst.Index) Error!Value {
     assert(body.len > 0);
 
     const tags = sema.zir.instructions.items(.tag);
-    const datas = sema.zir.instructions.items(.data);
 
-    for (body) |inst| {
+    var i: u32 = 0;
+    while (true) {
+        assert(i < body.len);
+        const inst = body[i];
         const tag = tags[@intFromEnum(inst)];
         switch (tag) {
             .break_inline, .@"break" => {
-                const operand = datas[@intFromEnum(inst)].@"break".operand;
-                return sema.resolveRef(operand);
+                sema.comptime_break_inst = inst;
+                return error.ComptimeBreak;
             },
             .condbr, .condbr_inline => return sema.evalCondbr(inst),
+            .repeat, .repeat_inline => {
+                try sema.emitBackwardBranch();
+                i = 0;
+                continue;
+            },
             else => {
                 if (try sema.evalInst(inst, tag)) |result| {
                     try sema.results.put(sema.gpa, inst, result);
                 }
             },
         }
+        i += 1;
     }
-    try sema.writer.writeAll("internal error: body did not terminate with break\n");
-    return error.AnalysisFail;
+}
+
+/// Mirrors src/Sema.zig:emitBackwardBranch at src/Sema.zig:25436.
+/// Increments `branch_count`; on overflow past `branch_quota`,
+/// emits the same diagnostic AstGen does and aborts via
+/// `error.AnalysisFail`. Raise the limit at runtime through
+/// `@setEvalBranchQuota` (Stage 7).
+fn emitBackwardBranch(sema: *Sema) Error!void {
+    sema.branch_count += 1;
+    if (sema.branch_count > sema.branch_quota) {
+        try sema.writer.print(
+            "evaluation exceeded {d} backwards branches\n",
+            .{sema.branch_quota},
+        );
+        try sema.writer.print(
+            "use @setEvalBranchQuota() to raise the branch limit from {d}\n",
+            .{sema.branch_quota},
+        );
+        return error.AnalysisFail;
+    }
+}
+
+/// Walk `body`. If a `break_inline` / `@"break"` raises
+/// `error.ComptimeBreak` and its `block_inst` matches `break_target`,
+/// consume the transfer and return the break's operand resolved.
+/// Otherwise re-raise so an outer receiver can handle it.
+///
+/// This is the runtime-only analog of the compiler's
+/// `Sema.analyzeInlineBody` (src/Sema.zig:1062): the compiler
+/// distinguishes "this body broke runtime-style" (returns null) from
+/// "this body broke at comptime" (consumes via this path or
+/// re-raises). With the comptime-coupling stripped, every body
+/// resolves through this single path -- AstGen always emits
+/// `break_inline` for the wrap, and `@"break"` raises the same error
+/// because Sema is entirely comptime.
+fn resolveInlineBody(
+    sema: *Sema,
+    body: []const Zir.Inst.Index,
+    break_target: Zir.Inst.Index,
+) Error!Value {
+    if (sema.evalBody(body)) |val| {
+        // A body normally terminates via `break` which raises
+        // `error.ComptimeBreak` -- this `if` branch only fires when
+        // a non-break terminator (e.g. `condbr`) returned a value
+        // directly. Surface that value as the body's result.
+        return val;
+    } else |err| switch (err) {
+        error.ComptimeBreak => {},
+        else => |e| return e,
+    }
+    const datas = sema.zir.instructions.items(.data);
+    const break_data = datas[@intFromEnum(sema.comptime_break_inst)].@"break";
+    const extra = sema.zir.extraData(Zir.Inst.Break, break_data.payload_index);
+    if (extra.data.block_inst != break_target) return error.ComptimeBreak;
+    return try sema.resolveRef(break_data.operand);
 }
 
 fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
@@ -202,6 +309,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .err_union_code => sema.evalErrUnionCode(inst),
         .err_union_payload_unsafe => sema.evalErrUnionPayloadUnsafe(inst),
         .is_non_err => sema.evalIsNonErr(inst),
+        .loop => sema.evalLoop(inst),
+        .extended => sema.evalExtended(inst),
         .dbg_stmt => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
         inline else => |unhandled| sema.reportUnsupportedTag(unhandled),
@@ -821,7 +930,7 @@ fn evalBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.Block, pl_node.payload_index);
     const body = sema.zir.bodySlice(extra.end, extra.data.body_len);
-    return try sema.evalBody(body);
+    return try sema.resolveInlineBody(body, inst);
 }
 
 /// `condbr` / `condbr_inline`: resolve a bool condition, pick the then or
@@ -917,7 +1026,7 @@ fn evalBoolBr(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value
     if (short_circuited) return lhs_value;
 
     const body = sema.zir.bodySlice(extra.end, bool_br.body_len);
-    return try sema.evalBody(body);
+    return try sema.resolveInlineBody(body, inst);
 }
 
 /// `typeof_log2_int_type`: returns the type whose values are valid as the
@@ -2343,7 +2452,7 @@ fn bindOneDecl(
     if (try sema.lookupName(ns_idx, name)) |_| return;
 
     switch (unwrapped.kind) {
-        .@"const", .@"var" => try sema.bindValueDecl(ns_idx, name, unwrapped),
+        .@"const", .@"var" => try sema.bindValueDecl(ns_idx, name, decl_inst, unwrapped),
         .@"test", .decltest => try sema.bindTestDecl(ns_idx, name, decl_inst, unwrapped),
         .@"comptime", .unnamed_test => unreachable, // routed above
     }
@@ -2353,6 +2462,7 @@ fn bindValueDecl(
     sema: *Sema,
     ns_idx: InternPool.NamespaceIndex,
     name: InternPool.NullTerminatedString,
+    decl_inst: Zir.Inst.Index,
     unwrapped: std.zig.Zir.Inst.Declaration.Unwrapped,
 ) Error!void {
     const value_body = unwrapped.value_body orelse {
@@ -2367,10 +2477,11 @@ fn bindValueDecl(
     // annotation (`const x: T = ...`), AstGen emits a `type_body`
     // that resolves T, and we coerce the value to it. Otherwise we
     // keep the value's natural type (typically `comptime_int` /
-    // `comptime_float` for unannotated literals).
-    const raw_value = try sema.evalBody(value_body);
+    // `comptime_float` for unannotated literals). Both bodies use
+    // the declaration instruction as their break_inline target.
+    const raw_value = try sema.resolveInlineBody(value_body, decl_inst);
     const declared_type: ?InternPool.Index = if (unwrapped.type_body) |tb|
-        (try sema.evalBody(tb)).index
+        (try sema.resolveInlineBody(tb, decl_inst)).index
     else
         null;
     const final_value = if (declared_type) |dest_ty|
@@ -2600,6 +2711,61 @@ fn evalIsNonErr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .payload => Value.bool_true,
         .err_name => Value.bool_false,
     };
+}
+
+/// `loop`: read the `pl_node + Block` payload, extract the body
+/// slice, delegate to `evalBody`. The body itself terminates via a
+/// `break_inline` whose target is this loop instruction (returning
+/// the loop's value) or via `repeat` (handled internally by
+/// `evalBody`'s i=0 restart). Mirrors the compiler's `zirLoop`
+/// (`src/Sema.zig:5102`).
+fn evalLoop(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.Block, pl_node.payload_index);
+    const body = sema.zir.bodySlice(extra.end, extra.data.body_len);
+    return try sema.resolveInlineBody(body, inst);
+}
+
+/// Sub-dispatcher for the `.extended` ZIR tag. The data union arm
+/// carries `(opcode, small, operand)`; each `Zir.Inst.Extended`
+/// opcode names a distinct builtin / construct. Mirrors the
+/// compiler's `.extended => ext: { switch (opcode) ... }` at
+/// src/Sema.zig:1382. Implemented today:
+///
+///   * `dbg_empty_stmt`, `breakpoint`, `disable_instrumentation`,
+///     `disable_intrinsics`, `branch_hint`, `set_float_mode`,
+///     `restore_err_ret_index` -- no-ops at our level (no AIR, no
+///     instrumentation, no error-return-trace machinery yet).
+///   * `in_comptime` -- honest `false`; we have no comptime/runtime
+///     bifurcation so the spec branch is the runtime one.
+///
+/// Every other opcode surfaces a structured
+/// "unsupported extended opcode: <name>" diagnostic; the `inline
+/// else` expansion ensures stdlib adding a new Opcode variant
+/// keeps compiling but routes through the same fallback.
+fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const extended = sema.zir.instructions.items(.data)[@intFromEnum(inst)].extended;
+    switch (extended.opcode) {
+        .dbg_empty_stmt,
+        .breakpoint,
+        .disable_instrumentation,
+        .disable_intrinsics,
+        .branch_hint,
+        .set_float_mode,
+        .restore_err_ret_index,
+        => return null,
+
+        .in_comptime => return Value.bool_false,
+
+        inline else => |op| {
+            try sema.writer.print("unsupported extended ZIR opcode: {s}\n", .{@tagName(op)});
+            return error.AnalysisFail;
+        },
+    }
 }
 
 fn reportUnsupportedTag(sema: *Sema, comptime tag: Zir.Inst.Tag) Error!?Value {
