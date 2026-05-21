@@ -1291,3 +1291,90 @@ test "decl: cross-line rebind preserves the original binding (silent-drop limita
     const resolved = pool.getNav(nav_idx).resolved.?;
     try testing.expectEqual(@as(u64, 1), pool.indexToKey(resolved.value).int.storage.u64);
 }
+
+test "error_set: error{Foo, Bar} interns as a sorted set type" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, &pool, "error{Foo, Bar}", &diag_buf);
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .error_set_type);
+    try testing.expectEqual(@as(usize, 2), key.error_set_type.names.len);
+
+    // Names are sorted by their interned-string integer value, not
+    // by lexicographic order or source order.
+    const a = key.error_set_type.names[0];
+    const b = key.error_set_type.names[1];
+    try testing.expect(@intFromEnum(a) < @intFromEnum(b));
+}
+
+test "error_set: same membership dedups regardless of source ordering" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var diag_buf: [4096]u8 = undefined;
+    const v1 = try evalSource(gpa, &pool, "error{Foo, Bar}", &diag_buf);
+    const v2 = try evalSource(gpa, &pool, "error{Bar, Foo}", &diag_buf);
+    try testing.expectEqual(v1.index, v2.index);
+}
+
+test "error_set: distinct membership produces distinct indices" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var diag_buf: [4096]u8 = undefined;
+    const v1 = try evalSource(gpa, &pool, "error{Foo, Bar}", &diag_buf);
+    const v2 = try evalSource(gpa, &pool, "error{Foo, Baz}", &diag_buf);
+    try testing.expect(v1.index != v2.index);
+}
+
+test "error_value: error.Foo creates singleton set + err value" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, &pool, "error.Foo", &diag_buf);
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .err);
+
+    // The value's type is a singleton error set containing only "Foo".
+    const ty_key = pool.indexToKey(key.err.ty);
+    try testing.expect(ty_key == .error_set_type);
+    try testing.expectEqual(@as(usize, 1), ty_key.error_set_type.names.len);
+    try testing.expectEqual(ty_key.error_set_type.names[0], key.err.name);
+
+    // The name round-trips back to "Foo".
+    try testing.expectEqualStrings("Foo", pool.stringSlice(key.err.name));
+}
+
+test "error_value: same name interns to the same Index across calls" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var diag_buf: [4096]u8 = undefined;
+    const v1 = try evalSource(gpa, &pool, "error.Foo", &diag_buf);
+    const v2 = try evalSource(gpa, &pool, "error.Foo", &diag_buf);
+    try testing.expectEqual(v1.index, v2.index);
+}
+
+test "error_set: cross-line const E = error{...} binds the type" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = (try evalSessionLines(gpa, &pool, ns, &.{
+        "const E = error{Bad, Worse};",
+        "E",
+    }, &diag_buf)).?;
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .error_set_type);
+    try testing.expectEqual(@as(usize, 2), key.error_set_type.names.len);
+}

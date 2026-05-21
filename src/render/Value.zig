@@ -9,11 +9,17 @@ const assert = std.debug.assert;
 const InternPool = @import("../sema/InternPool.zig");
 const Value = @import("../sema/Value.zig");
 
+/// Error union for renderers. Includes Writer.Error for the I/O
+/// path plus Allocator.Error for renderers that need a scratch
+/// buffer (currently only `writeErrorSetTypeName`, which dupes the
+/// names slice for an alphabetical sort).
+pub const Error = std.Io.Writer.Error || std.mem.Allocator.Error;
+
 pub fn render(
     value: Value,
     pool: *const InternPool,
     writer: *std.Io.Writer,
-) std.Io.Writer.Error!void {
+) Error!void {
     assert(value.index != .none);
 
     const key = pool.indexToKey(value.index);
@@ -29,8 +35,9 @@ pub fn render(
         .type_value => |ty_idx| renderTypeRef(ty_idx, pool, writer),
         // A bare type Key viewed as a value identifies the type itself
         // (Sema's value-of-type-type convention; see Value.typeOf).
-        .simple_type, .int_type, .anyframe_type, .ptr_type => renderTypeRef(value.index, pool, writer),
+        .simple_type, .int_type, .anyframe_type, .ptr_type, .error_set_type => renderTypeRef(value.index, pool, writer),
         .ptr => |p| writer.print("ptr@{d}+{d}\n", .{ @intFromEnum(p.ty), p.byte_offset }),
+        .err => |e| writer.print("error.{s}\n", .{pool.stringSlice(e.name)}),
     };
 }
 
@@ -54,7 +61,7 @@ fn renderTypeRef(
     type_index: InternPool.Index,
     pool: *const InternPool,
     writer: *std.Io.Writer,
-) std.Io.Writer.Error!void {
+) Error!void {
     try writeTypeName(type_index, pool, writer);
     try writer.writeAll("\n");
 }
@@ -68,7 +75,7 @@ pub fn writeTypeName(
     type_index: InternPool.Index,
     pool: *const InternPool,
     writer: *std.Io.Writer,
-) std.Io.Writer.Error!void {
+) Error!void {
     assert(type_index != .none);
     switch (pool.indexToKey(type_index)) {
         .simple_type => |st| try writer.print("{s}", .{@tagName(st)}),
@@ -86,15 +93,41 @@ pub fn writeTypeName(
             try writeTypeName(child, pool, writer);
         },
         .ptr_type => |pt| try writePtrTypeName(pt, pool, writer),
+        .error_set_type => |es| try writeErrorSetTypeName(es, pool, writer),
         else => try writer.writeAll("<type>"),
     }
+}
+
+fn writeErrorSetTypeName(
+    es: InternPool.Key.ErrorSetType,
+    pool: *const InternPool,
+    writer: *std.Io.Writer,
+) Error!void {
+    const sorted = try pool.gpa.dupe(InternPool.NullTerminatedString, es.names);
+    defer pool.gpa.free(sorted);
+    std.mem.sortUnstable(InternPool.NullTerminatedString, sorted, pool, lessThanByBytes);
+
+    try writer.writeAll("error{");
+    for (sorted, 0..) |name, i| {
+        if (i != 0) try writer.writeAll(",");
+        try writer.writeAll(pool.stringSlice(name));
+    }
+    try writer.writeAll("}");
+}
+
+fn lessThanByBytes(
+    pool: *const InternPool,
+    a: InternPool.NullTerminatedString,
+    b: InternPool.NullTerminatedString,
+) bool {
+    return std.mem.lessThan(u8, pool.stringSlice(a), pool.stringSlice(b));
 }
 
 fn writePtrTypeName(
     pt: InternPool.Key.PtrType,
     pool: *const InternPool,
     writer: *std.Io.Writer,
-) std.Io.Writer.Error!void {
+) Error!void {
     assert(pt.child != .none);
     try writer.writeAll(switch (pt.flags.size) {
         .one => "*",
@@ -119,7 +152,7 @@ fn writePtrTypeName(
 fn renderFloat(
     float: InternPool.Key.Float,
     writer: *std.Io.Writer,
-) std.Io.Writer.Error!void {
+) Error!void {
     var buf: [128]u8 = undefined;
     const text = switch (float.storage) {
         .f16 => |v| std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable,

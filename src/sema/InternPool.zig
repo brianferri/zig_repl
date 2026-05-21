@@ -499,6 +499,18 @@ pub const Key = union(enum) {
     /// allocations; `.nav` / `.uav` / `.int` etc. land alongside their
     /// dependent stages.
     ptr: Ptr,
+    /// An error set type (`error{Foo, Bar}`). The compiler keeps
+    /// names sorted for deterministic dedup; we do the same. Names
+    /// are interned via `getOrPutString` so two error-set types
+    /// sharing the same name set hash and compare equal.
+    error_set_type: ErrorSetType,
+    /// An error value (`error.Foo`). Mirrors the compiler's
+    /// `Key.err`: `ty` is the error-set type the value inhabits,
+    /// `name` is the interned error name. The compiler's
+    /// `zirErrorValue` constructs a *singleton* set per `error.X`
+    /// expression so the value has a precise type, then composite
+    /// sets get formed via union / coercion. We do the same.
+    err: Err,
 
     pub const Int = struct {
         ty: Index,
@@ -598,6 +610,28 @@ pub const Key = union(enum) {
     /// alloc.
     pub const ComptimeAllocIndex = enum(u32) { _ };
 
+    /// Sorted, deduped list of error names. Mirrors the compiler's
+    /// `Key.ErrorSetType` (`src/InternPool.zig`): the canonical
+    /// representation is name-sorted so two sets with the same
+    /// membership intern to the same `Index` regardless of source
+    /// ordering. `names` borrows from the pool's extra arena and is
+    /// valid for the pool's lifetime.
+    pub const ErrorSetType = struct {
+        names: []const NullTerminatedString,
+    };
+
+    /// An error value. `ty` is always an `error_set_type` Index --
+    /// the most precise type the value inhabits, typically a
+    /// singleton set created at the `error.X` source site. `name`
+    /// is the interned identifier and is what global error-id
+    /// comparison ultimately keys on (matching the compiler's global
+    /// error table contract: `error.Foo` from two different sets
+    /// share the same name interning).
+    pub const Err = struct {
+        ty: Index,
+        name: NullTerminatedString,
+    };
+
     /// Stable hash for dedup. `pool` is reserved for future Key variants
     /// (e.g. `struct_type`) whose canonical form requires pool lookup;
     /// today's variants ignore it. Storage variants of `int` are
@@ -650,6 +684,14 @@ pub const Key = union(enum) {
                 switch (p.base_addr) {
                     .comptime_alloc => |slot| std.hash.autoHash(&hasher, slot),
                 }
+            },
+            .error_set_type => |es| {
+                std.hash.autoHash(&hasher, @as(u32, @intCast(es.names.len)));
+                for (es.names) |name| std.hash.autoHash(&hasher, name);
+            },
+            .err => |e| {
+                std.hash.autoHash(&hasher, e.ty);
+                std.hash.autoHash(&hasher, e.name);
             },
         }
         return hasher.final();
@@ -719,6 +761,16 @@ pub const Key = union(enum) {
                     .comptime_alloc => |slot| slot == y.base_addr.comptime_alloc,
                 };
             },
+            .error_set_type => |x| blk: {
+                const y = b.error_set_type;
+                if (x.names.len != y.names.len) break :blk false;
+                for (x.names, y.names) |xn, yn| if (xn != yn) break :blk false;
+                break :blk true;
+            },
+            .err => |x| blk: {
+                const y = b.err;
+                break :blk x.ty == y.ty and x.name == y.name;
+            },
         };
     }
 };
@@ -781,6 +833,14 @@ const Item = struct {
         // comptime_alloc index, byte_offset_lo, byte_offset_hi).
         // Mirrors the compiler's `Item.Tag.ptr_comptime_alloc`.
         ptr_comptime_alloc,
+        // Error set type. data = extra index of `[names_len, name0,
+        // name1, ...]` -- one u32 length followed by `names_len`
+        // interned-string handles. Mirrors the compiler's
+        // `Item.Tag.type_error_set`.
+        type_error_set,
+        // Error value. data = extra index of ErrRepr (2 u32 slots:
+        // ty, name). Mirrors the compiler's `Item.Tag.err`.
+        err,
     };
 };
 
@@ -815,6 +875,14 @@ const PtrComptimeAllocRepr = extern struct {
     alloc_index: u32,
     byte_offset_lo: u32,
     byte_offset_hi: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.err`. Two u32 slots: the
+/// error-set type Index and the interned error-name handle. Mirrors
+/// the compiler's `Tag.Err` shape.
+const ErrRepr = extern struct {
+    ty: u32,
+    name: u32,
 };
 
 /// Header for `Item.Tag.int_positive` / `Item.Tag.int_negative`. Lives at
@@ -1356,6 +1424,8 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .float => |f| try emitFloat(pool, f),
         .ptr_type => |pt| try emitPtrType(pool, pt),
         .ptr => |p| try emitPtr(pool, p),
+        .error_set_type => |es| try emitErrorSetType(pool, es),
+        .err => |e| try emitErr(pool, e),
     }
 
     assert(pool.items.len == gop.index + 1);
@@ -1427,6 +1497,8 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .type_value => .{ .type_value = @enumFromInt(item.data) },
         .type_pointer => ptrTypeFromExtra(pool, item.data),
         .ptr_comptime_alloc => ptrComptimeAllocFromExtra(pool, item.data),
+        .type_error_set => errorSetTypeFromExtra(pool, item.data),
+        .err => errFromExtra(pool, item.data),
     };
 }
 
@@ -1439,6 +1511,31 @@ fn ptrTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .child = @enumFromInt(repr.child),
         .sentinel = @enumFromInt(repr.sentinel),
         .flags = @bitCast(repr.flags),
+    } };
+}
+
+fn errorSetTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    assert(extra_index < pool.extra.items.len);
+    const names_len = pool.extra.items[extra_index];
+    assert(extra_index + 1 + names_len <= pool.extra.items.len);
+
+    const raw_names = pool.extra.items[extra_index + 1 ..][0..names_len];
+    return .{ .error_set_type = .{
+        // Reinterpret the u32 slice as a `[]const NullTerminatedString`
+        // slice -- the enum's backing type is u32 and storage is
+        // identity, so this `@ptrCast` shares the pool's extra arena
+        // for the slice's lifetime.
+        .names = @ptrCast(raw_names),
+    } };
+}
+
+fn errFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const fields = comptime @divExact(@sizeOf(ErrRepr), @sizeOf(u32));
+    assert(extra_index + fields <= pool.extra.items.len);
+    const slice = pool.extra.items[extra_index..][0..fields];
+    return .{ .err = .{
+        .ty = @enumFromInt(slice[0]),
+        .name = @enumFromInt(slice[1]),
     } };
 }
 
@@ -1780,6 +1877,32 @@ fn emitPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!void {
     }
 }
 
+/// Emit a `type_error_set` Item. Layout in `extra`:
+/// `[names_len, name0, name1, ...]` -- a u32 length followed by
+/// `names_len` interned-string handles. Caller must have already
+/// sorted+deduped `names` (see `internErrorSetType`).
+fn emitErrorSetType(pool: *InternPool, es: Key.ErrorSetType) Allocator.Error!void {
+    assert(es.names.len <= std.math.maxInt(u32));
+
+    const extra_index: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.ensureUnusedCapacity(pool.gpa, 1 + es.names.len);
+    pool.extra.appendAssumeCapacity(@intCast(es.names.len));
+    for (es.names) |name| pool.extra.appendAssumeCapacity(@intFromEnum(name));
+    pool.items.appendAssumeCapacity(.{ .tag = .type_error_set, .data = extra_index });
+}
+
+/// Emit an `err` Item. Two u32 slots: `ty`, `name`.
+fn emitErr(pool: *InternPool, e: Key.Err) Allocator.Error!void {
+    assert(e.ty != .none);
+
+    const extra_index: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.appendSlice(pool.gpa, &.{
+        @intFromEnum(e.ty),
+        @intFromEnum(e.name),
+    });
+    pool.items.appendAssumeCapacity(.{ .tag = .err, .data = extra_index });
+}
+
 /// Intern a pointer type.
 pub fn internPtrType(pool: *InternPool, pt: Key.PtrType) Allocator.Error!Index {
     return pool.get(.{ .ptr_type = pt });
@@ -1788,6 +1911,44 @@ pub fn internPtrType(pool: *InternPool, pt: Key.PtrType) Allocator.Error!Index {
 /// Intern a pointer value.
 pub fn internPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!Index {
     return pool.get(.{ .ptr = p });
+}
+
+/// Intern an error-set type from `names`. Sorts the names by their
+/// `NullTerminatedString` integer value first so two sets sharing
+/// the same membership intern to the same `Index` regardless of
+/// source ordering -- mirrors the compiler's
+/// `errorSetFromUnsortedNames` discipline. Caller-provided `names`
+/// is not mutated; sorting happens on a fresh copy.
+pub fn internErrorSetType(
+    pool: *InternPool,
+    names: []const NullTerminatedString,
+) Allocator.Error!Index {
+    assert(@intFromPtr(pool) != 0);
+
+    const sorted = try pool.gpa.dupe(NullTerminatedString, names);
+    defer pool.gpa.free(sorted);
+    std.mem.sortUnstable(NullTerminatedString, sorted, {}, lessThanString);
+    return pool.get(.{ .error_set_type = .{ .names = sorted } });
+}
+
+fn lessThanString(_: void, a: NullTerminatedString, b: NullTerminatedString) bool {
+    return @intFromEnum(a) < @intFromEnum(b);
+}
+
+/// Convenience: intern the singleton error-set `error{<name>}`.
+/// Matches the compiler's `pt.singleErrorSetType(name)` -- used by
+/// `evalErrorValue` to give each `error.X` expression its most
+/// precise type.
+pub fn singletonErrorSetType(
+    pool: *InternPool,
+    name: NullTerminatedString,
+) Allocator.Error!Index {
+    return pool.internErrorSetType(&.{name});
+}
+
+/// Intern an error value.
+pub fn internErr(pool: *InternPool, e: Key.Err) Allocator.Error!Index {
+    return pool.get(.{ .err = e });
 }
 
 /// True iff `ty` identifies a Zig float type. Mirrors the compiler's
@@ -2498,6 +2659,66 @@ test "Namespace.lookupNav: pub_decls takes precedence over priv_decls" {
     _ = try ns.priv_decls.getOrPutContext(pool.gpa, nav_priv, ctx);
     _ = try ns.pub_decls.getOrPutContext(pool.gpa, nav_pub, ctx);
     try std.testing.expectEqual(@as(?Nav.Index, nav_pub), ns.lookupNav(&pool, x));
+}
+
+test "error_set_type: round-trip + sort discipline" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const foo = try pool.getOrPutString(pool.gpa, "Foo");
+    const bar = try pool.getOrPutString(pool.gpa, "Bar");
+    const baz = try pool.getOrPutString(pool.gpa, "Baz");
+
+    // Names provided unsorted; intern sorts by NullTerminatedString
+    // integer value so dedup is canonical regardless of source order.
+    const idx_a = try pool.internErrorSetType(&.{ baz, foo, bar });
+    const idx_b = try pool.internErrorSetType(&.{ foo, bar, baz });
+    try std.testing.expectEqual(idx_a, idx_b);
+
+    const round = pool.indexToKey(idx_a).error_set_type;
+    try std.testing.expectEqual(@as(usize, 3), round.names.len);
+    try std.testing.expect(@intFromEnum(round.names[0]) <= @intFromEnum(round.names[1]));
+    try std.testing.expect(@intFromEnum(round.names[1]) <= @intFromEnum(round.names[2]));
+}
+
+test "error_set_type: distinct membership produces distinct indices" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const foo = try pool.getOrPutString(pool.gpa, "Foo");
+    const bar = try pool.getOrPutString(pool.gpa, "Bar");
+    const baz = try pool.getOrPutString(pool.gpa, "Baz");
+
+    const fb = try pool.internErrorSetType(&.{ foo, bar });
+    const fz = try pool.internErrorSetType(&.{ foo, baz });
+    try std.testing.expect(fb != fz);
+}
+
+test "singletonErrorSetType: one-name set round-trips" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const foo = try pool.getOrPutString(pool.gpa, "Foo");
+    const idx = try pool.singletonErrorSetType(foo);
+
+    const round = pool.indexToKey(idx).error_set_type;
+    try std.testing.expectEqual(@as(usize, 1), round.names.len);
+    try std.testing.expectEqual(foo, round.names[0]);
+}
+
+test "internErr: same {ty, name} dedups" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const foo = try pool.getOrPutString(pool.gpa, "Foo");
+    const ty = try pool.singletonErrorSetType(foo);
+    const a = try pool.internErr(.{ .ty = ty, .name = foo });
+    const b = try pool.internErr(.{ .ty = ty, .name = foo });
+    try std.testing.expectEqual(a, b);
+
+    const round = pool.indexToKey(a).err;
+    try std.testing.expectEqual(ty, round.ty);
+    try std.testing.expectEqual(foo, round.name);
 }
 
 test "ComptimeUnit: createComptimeUnit + getComptimeUnit round-trip" {

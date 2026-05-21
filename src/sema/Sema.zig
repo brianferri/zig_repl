@@ -196,6 +196,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .store_node => sema.evalStoreNode(inst),
         .load => sema.evalLoad(inst),
         .decl_val => sema.evalDeclVal(inst),
+        .error_set_decl => sema.evalErrorSetDecl(inst),
+        .error_value => sema.evalErrorValue(inst),
         .dbg_stmt => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
         inline else => |unhandled| sema.reportUnsupportedTag(unhandled),
@@ -996,7 +998,7 @@ fn resolveDestType(
     const dest_value = try sema.resolveRef(ref);
     return switch (sema.intern_pool.indexToKey(dest_value.index)) {
         .type_value => |t| t,
-        .simple_type, .int_type, .ptr_type, .anyframe_type => dest_value.index,
+        .simple_type, .int_type, .ptr_type, .anyframe_type, .error_set_type => dest_value.index,
         else => blk: {
             try sema.writer.print("{s}: destination is not a type\n", .{op_name});
             break :blk error.AnalysisFail;
@@ -2394,6 +2396,52 @@ fn bindAnonymousDecl(
         },
         else => unreachable,
     }
+}
+
+/// `error_set_decl`: lower an `error{Foo, Bar}` literal. The
+/// `pl_node` payload points at an `ErrorSetDecl { fields_len }`
+/// followed by `fields_len` interned name handles in the Zir extra
+/// arena. We intern each name into our pool's string table, then
+/// `pool.internErrorSetType` sorts + dedupes the names so the
+/// resulting `Index` is canonical for the set's membership.
+///
+/// Compiler reference: src/Sema.zig:zirErrorSetDecl (~2990).
+fn evalErrorSetDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.ErrorSetDecl, pl_node.payload_index);
+    const fields_len = extra.data.fields_len;
+
+    const names = try sema.gpa.alloc(InternPool.NullTerminatedString, fields_len);
+    defer sema.gpa.free(names);
+
+    var extra_index: u32 = @intCast(extra.end);
+    for (names) |*slot| {
+        const zir_name_idx: std.zig.Zir.NullTerminatedString = @enumFromInt(sema.zir.extra[extra_index]);
+        const name_bytes = sema.zir.nullTerminatedString(zir_name_idx);
+        slot.* = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes);
+        extra_index += 1;
+    }
+
+    const ty_idx = try sema.intern_pool.internErrorSetType(names);
+    return .{ .index = ty_idx };
+}
+
+/// `error_value`: lower an `error.Foo` literal. The `str_tok` payload
+/// is the error's identifier. We intern the name globally (shared
+/// across all sets containing it), build a singleton `error{Foo}`
+/// type for the most precise value type, and intern the `err` value
+/// pointing at it. Mirrors compiler `zirErrorValue` (~7578).
+fn evalErrorValue(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const data = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok;
+    const name_bytes = data.get(sema.zir);
+    const name = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes);
+    const ty_idx = try sema.intern_pool.singletonErrorSetType(name);
+    const err_idx = try sema.intern_pool.internErr(.{ .ty = ty_idx, .name = name });
+    return .{ .index = err_idx };
 }
 
 fn reportUnsupportedTag(sema: *Sema, comptime tag: Zir.Inst.Tag) Error!?Value {

@@ -277,3 +277,22 @@ test "compliance: wrap arith through a stored var" {
 test "compliance: two independent var slots do not alias" {
     try expectMatchesZig(testing.allocator, "blk: { var a: u8 = 1; var b: u8 = 2; a = 10; b = 20; break :blk a + b; }");
 }
+
+test "compliance: error value prints identically to zig" {
+    try expectMatchesZig(testing.allocator, "error.Foo");
+}
+
+test "compliance: error set type prints alphabetically (matches @typeName)" {
+    try expectMatchesZig(testing.allocator, "error{Foo, Bar}");
+}
+
+test "compliance: error set sorts independently of source order" {
+    try expectMatchesZig(testing.allocator, "error{Charlie, Alpha, Bravo}");
+}
+
+test "compliance: large error set renders without truncation" {
+    try expectMatchesZig(
+        testing.allocator,
+        "error{Z,Y,X,W,V,U,T,S,R,Q,P,O,N,M,L,K,J,I,H,G,F,E,D,C,B,A}",
+    );
+}
