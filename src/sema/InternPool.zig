@@ -24,9 +24,12 @@ const InternPool = @This();
 /// Ordering mirrors the compiler's enum so `SimpleType`/`SimpleValue` can
 /// pin variant values to the corresponding Index via `@intFromEnum`.
 pub const Index = enum(u32) {
-    // Fixed-width integer types (Key.int_type).
+    // Fixed-width integer types (Key.int_type). Slot ordering and
+    // membership mirrors `std.zig.Zir.Inst.Ref` so a Zir ref's
+    // integer value can be used as an `Index` directly for
+    // well-known slots -- the identity in `Sema.wellKnownRefToValue`
+    // depends on this 1:1 alignment.
     u0_type,
-    i0_type,
     u1_type,
     u8_type,
     i8_type,
@@ -169,7 +172,7 @@ pub const Key = union(enum) {
     simple_type: SimpleType,
     simple_value: SimpleValue,
     /// Concrete fixed-width integer type. Shape matches `@typeInfo(T).int`.
-    int_type: std.builtin.Type.Int,
+    int_type: std.lang.Type.Int,
     /// Payload is `.none` for untyped `anyframe`, or the child type's
     /// Index for `anyframe->T`.
     anyframe_type: Index,
@@ -265,11 +268,15 @@ pub const Key = union(enum) {
             is_volatile: bool = false,
             is_allowzero: bool = false,
             address_space: AddressSpace = .generic,
-            _reserved: u25 = 0,
+            _reserved: u22 = 0,
         };
 
-        pub const Size = enum(u2) { one, many, slice, c };
-        pub const AddressSpace = enum(u2) { generic, gs, fs, ss };
+        // Reuse stdlib's enums verbatim -- same shape as the compiler's
+        // `Key.PtrType.{Size,AddressSpace}` aliases at
+        // `src/InternPool.zig:2093-2094`. Saves duplicating the variant
+        // lists and stays in sync if stdlib adds CPU/GPU address spaces.
+        pub const Size = std.lang.Type.Pointer.Size;
+        pub const AddressSpace = std.lang.AddressSpace;
     };
 
     /// Pointer value. `ty` is the pointer's type (always a `ptr_type`
@@ -329,7 +336,7 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, f.ty);
                 switch (f.storage) {
                     inline else => |v| {
-                        const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(v)));
+                        const Bits = @Int(.unsigned, @bitSizeOf(@TypeOf(v)));
                         std.hash.autoHash(&hasher, @as(Bits, @bitCast(v)));
                     },
                 }
@@ -394,7 +401,7 @@ pub const Key = union(enum) {
                 if (@as(StorageTag, x.storage) != @as(StorageTag, y.storage)) break :blk false;
                 break :blk switch (x.storage) {
                     inline else => |xv, tag| eq: {
-                        const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(xv)));
+                        const Bits = @Int(.unsigned, @bitSizeOf(@TypeOf(xv)));
                         const yv = @field(y.storage, @tagName(tag));
                         break :eq @as(Bits, @bitCast(xv)) == @as(Bits, @bitCast(yv));
                     },
@@ -665,7 +672,6 @@ pub fn deinit(pool: *InternPool) void {
 /// position; `populateWellKnown` iterates and dispatches per Key variant.
 const static_keys: [first_dynamic_index]Key = .{
     .{ .int_type = .{ .signedness = .unsigned, .bits = 0 } },
-    .{ .int_type = .{ .signedness = .signed, .bits = 0 } },
     .{ .int_type = .{ .signedness = .unsigned, .bits = 1 } },
     .{ .int_type = .{ .signedness = .unsigned, .bits = 8 } },
     .{ .int_type = .{ .signedness = .signed, .bits = 8 } },
@@ -739,7 +745,7 @@ fn populateWellKnown(pool: *InternPool) Allocator.Error!void {
     }
 }
 
-fn appendIntType(pool: *InternPool, signedness: std.builtin.Signedness, bits: u16) void {
+fn appendIntType(pool: *InternPool, signedness: std.lang.Signedness, bits: u16) void {
     const tag: Item.Tag = switch (signedness) {
         .unsigned => .type_int_unsigned,
         .signed => .type_int_signed,
@@ -961,10 +967,10 @@ fn intBigFromArena(pool: *const InternPool, limb_index: u32, positive: bool) Key
 /// Intern a fixed-width integer type. Well-known widths dedup to their
 /// reserved well-known `Index` through the `get` map. Zig permits
 /// `u0`..`u65535` / `i0`..`i65535` -- the language limit is the `u16`
-/// width of `std.builtin.Type.Int.bits`.
+/// width of `std.lang.Type.Int.bits`.
 pub fn internIntType(
     pool: *InternPool,
-    signedness: std.builtin.Signedness,
+    signedness: std.lang.Signedness,
     bits: u16,
 ) Allocator.Error!Index {
     return pool.get(.{ .int_type = .{ .signedness = signedness, .bits = bits } });
@@ -1287,7 +1293,6 @@ fn isIntegerType(pool: *const InternPool, ty: Index) bool {
 fn isWellKnownFixedWidthIntType(ty: Index) bool {
     return switch (ty) {
         .u0_type,
-        .i0_type,
         .u1_type,
         .u8_type,
         .i8_type,
@@ -1393,7 +1398,7 @@ test "well-known types have expected keys" {
 
     try std.testing.expectEqual(@as(u16, 8), pool.indexToKey(.u8_type).int_type.bits);
     try std.testing.expectEqual(@as(u16, 32), pool.indexToKey(.u32_type).int_type.bits);
-    try std.testing.expectEqual(std.builtin.Signedness.signed, pool.indexToKey(.i32_type).int_type.signedness);
+    try std.testing.expectEqual(std.lang.Signedness.signed, pool.indexToKey(.i32_type).int_type.signedness);
 
     try std.testing.expectEqual(SimpleType.usize, pool.indexToKey(.usize_type).simple_type);
     try std.testing.expectEqual(SimpleType.c_int, pool.indexToKey(.c_int_type).simple_type);
@@ -1405,14 +1410,15 @@ test "i0_type and anyframe_type slots match compiler ordering" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    // i0_type lives at compiler position 1, between u0_type and u1_type.
-    try std.testing.expectEqual(@as(u16, 0), pool.indexToKey(.i0_type).int_type.bits);
-    try std.testing.expectEqual(std.builtin.Signedness.signed, pool.indexToKey(.i0_type).int_type.signedness);
-    // internIntType for (.signed, 0) returns the well-known slot, no fresh item.
+    // Zir.Inst.Ref has no i0_type slot, so our Index doesn't either.
+    // `internIntType(.signed, 0)` therefore allocates a fresh dynamic
+    // item rather than landing on a well-known slot.
     const items_before = pool.itemCount();
     const signed_zero_idx = try pool.internIntType(.signed, 0);
-    try std.testing.expectEqual(Index.i0_type, signed_zero_idx);
-    try std.testing.expectEqual(items_before, pool.itemCount());
+    try std.testing.expect(@intFromEnum(signed_zero_idx) >= first_dynamic_index);
+    try std.testing.expectEqual(items_before + 1, pool.itemCount());
+    try std.testing.expectEqual(@as(u16, 0), pool.indexToKey(signed_zero_idx).int_type.bits);
+    try std.testing.expectEqual(std.lang.Signedness.signed, pool.indexToKey(signed_zero_idx).int_type.signedness);
 
     // anyframe_type with .none child (untyped anyframe) at the position
     // between noreturn_type and null_type.
@@ -1458,7 +1464,7 @@ test "arbitrary-width int types intern dynamically" {
     const u17_idx = try pool.internIntType(.unsigned, 17);
     try std.testing.expect(!Index.isWellKnownType(u17_idx));
     const @"u17" = pool.indexToKey(u17_idx).int_type;
-    try std.testing.expectEqual(std.builtin.Signedness.unsigned, @"u17".signedness);
+    try std.testing.expectEqual(std.lang.Signedness.unsigned, @"u17".signedness);
     try std.testing.expectEqual(@as(u16, 17), @"u17".bits);
 
     const u65535_idx = try pool.internIntType(.unsigned, std.math.maxInt(u16));

@@ -68,7 +68,8 @@ pub fn wrap(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!W
     assert(input.len > 0);
     assert(input.len <= max_input_bytes);
 
-    const sentinel_input = try gpa.dupeZ(u8, input);
+    const sentinel_input = try gpa.allocSentinel(u8, input.len, 0);
+    @memcpy(sentinel_input, input);
     const shape = classify(sentinel_input);
     if (shape == .declaration) return .{
         .text = sentinel_input,

@@ -343,8 +343,8 @@ fn resolveNumericPairToInt(
 
     const lhs_is_cti = lhs_int.ty == .comptime_int_type;
     const rhs_is_cti = rhs_int.ty == .comptime_int_type;
-    const lhs_info: ?std.builtin.Type.Int = if (lhs_is_cti) null else intTypeInfo(pool, lhs_int.ty);
-    const rhs_info: ?std.builtin.Type.Int = if (rhs_is_cti) null else intTypeInfo(pool, rhs_int.ty);
+    const lhs_info: ?std.lang.Type.Int = if (lhs_is_cti) null else intTypeInfo(pool, lhs_int.ty);
+    const rhs_info: ?std.lang.Type.Int = if (rhs_is_cti) null else intTypeInfo(pool, rhs_int.ty);
 
     // Bail on int types we don't yet support as a peer target (usize,
     // c_int, etc. -- separate target-aware axis).
@@ -389,7 +389,7 @@ fn resolveNumericPairToInt(
 /// resolution treats it separately), and the target-conditioned
 /// family (`usize`, `isize`, `c_char` ... `c_ulonglong`) whose widths
 /// come from `@typeInfo(T).int` against the host.
-fn intTypeInfo(pool: *const InternPool, ty: InternPool.Index) ?std.builtin.Type.Int {
+fn intTypeInfo(pool: *const InternPool, ty: InternPool.Index) ?std.lang.Type.Int {
     return switch (ty) {
         .usize_type => @typeInfo(usize).int,
         .isize_type => @typeInfo(isize).int,
@@ -598,7 +598,7 @@ fn runIntWrapSat(
     lhs: std.math.big.int.Const,
     rhs: std.math.big.int.Const,
     dest_ty: InternPool.Index,
-    dest_info: std.builtin.Type.Int,
+    dest_info: std.lang.Type.Int,
 ) Error!?Value {
     const limb_bits: usize = @bitSizeOf(std.math.big.Limb);
     // Worst-case `mul` output is `lhs.limbs.len + rhs.limbs.len`; add /
@@ -1336,7 +1336,7 @@ fn internBitsAsInt(
     sema: *Sema,
     bits: u128,
     dest_ty: InternPool.Index,
-    dest_info: std.builtin.Type.Int,
+    dest_info: std.lang.Type.Int,
 ) Error!Value {
     var limbs_buf: [(128 + @bitSizeOf(std.math.big.Limb) - 1) / @bitSizeOf(std.math.big.Limb) + 1]std.math.big.Limb = undefined;
     var mutable: std.math.big.int.Mutable = .{
@@ -1529,7 +1529,7 @@ fn runShlSat(
     lhs: std.math.big.int.Const,
     rhs: std.math.big.int.Const,
     dest_ty: InternPool.Index,
-    dest_info: std.builtin.Type.Int,
+    dest_info: std.lang.Type.Int,
     op_name: []const u8,
 ) Error!InternPool.Index {
     const shift_amount = arith.shiftAmount(rhs) catch |err|
@@ -1796,7 +1796,7 @@ fn evalPtrType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// runtime instruction. We do the same: both paths reach `evalAlloc`
 /// with `is_const` set; the only behavioural difference is whether
 /// `store_node` will accept writes through the resulting pointer.
-/// Modelled as `bool` to match `std.builtin.Type.Pointer.is_const`
+/// Modelled as `bool` to match `std.lang.Type.Pointer.is_const`
 /// and `Zir.Inst.alloc.is_const` rather than introduce a REPL-local
 /// two-state enum.
 fn evalAlloc(sema: *Sema, inst: Zir.Inst.Index, is_const: bool) Error!?Value {
@@ -2010,7 +2010,7 @@ fn runFixedWidthBitNot(
     sema: *Sema,
     operand_int: InternPool.Key.Int,
     dest_ty: InternPool.Index,
-    dest_info: std.builtin.Type.Int,
+    dest_info: std.lang.Type.Int,
 ) Error!Value {
     var op_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const operand_big = operand_int.storage.toBigInt(&op_space);
@@ -2036,7 +2036,7 @@ fn runIntNegateWrap(
     sema: *Sema,
     operand_int: InternPool.Key.Int,
     dest_ty: InternPool.Index,
-    dest_info: std.builtin.Type.Int,
+    dest_info: std.lang.Type.Int,
 ) Error!Value {
     var op_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const operand_big = operand_int.storage.toBigInt(&op_space);
