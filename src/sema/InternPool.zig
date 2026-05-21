@@ -165,6 +165,118 @@ pub const OptionalNullTerminatedString = enum(u32) {
     }
 };
 
+/// Navigable declaration. Mirrors the compiler's `InternPool.Nav`
+/// (`src/InternPool.zig` ~544): a named decl whose value may or may
+/// not be resolved. `Nav.Index` is the stable handle interned in
+/// `pool.navs`.
+///
+/// Known deviations from full compiler shape, each documented at
+/// its field site:
+///
+///   * `analysis.zir_index` is a `Zir.Inst.Index`, not a
+///     `TrackedInst.Index`. `TrackedInst` is the compiler's
+///     incremental-compilation bookkeeping (a ZIR instruction
+///     tracked across edits between recompiles). The REPL re-parses
+///     each line; there is no incremental mode. Porting `TrackedInst`
+///     would drag in `src/Zcu/PerThread.zig` and the change-tracking
+///     subsystem for zero runtime gain.
+///   * `analysis` is always `null` in REPL today. We evaluate
+///     eagerly in `bindDecls` and populate `resolved` directly;
+///     the field is preserved so the type matches the compiler's
+///     exactly, but flipping it to non-`null` is the hook for any
+///     future lazy mode.
+///   * Backing storage is `ArrayListUnmanaged(Nav)` rather than the
+///     compiler's `MultiArrayList(Repr)` with pack/unpack. The
+///     compiler's column layout pays off in its multi-threaded
+///     resize-hot path; the REPL's single-threaded usage doesn't
+///     benefit, and the pack/unpack indirection costs readability.
+///     Migration is internal -- public API (`getNav` / `navPtr` /
+///     `createNav`) is identical to the compiler's.
+pub const Nav = struct {
+    /// Unqualified name of this Nav (the identifier under which a
+    /// namespace lookup would find it).
+    name: NullTerminatedString,
+    /// Fully-qualified name, including any parent-namespace prefix.
+    /// For the session root the parent prefix is empty, so `fqn` and
+    /// `name` typically agree.
+    fqn: NullTerminatedString,
+    /// Populated iff this Nav is resolved by semantic analysis. The
+    /// compiler uses `analysis != null` to mean "Nav exists but not
+    /// yet analysed; Sema will analyse on demand". REPL evaluates
+    /// eagerly so this is always `null` today.
+    analysis: ?struct {
+        namespace: NamespaceIndex,
+        zir_index: std.zig.Zir.Inst.Index,
+        wanted: bool,
+    },
+    /// `null` iff semantic analysis has not yet resolved this Nav.
+    /// In REPL `bindDecls` populates it eagerly, so non-Stage-7
+    /// flows always see `resolved != null`.
+    resolved: ?Resolved,
+
+    pub const Resolved = struct {
+        /// Resolved type of the Nav. Never `.none` -- if the type
+        /// isn't known the whole `Resolved` is `null`.
+        type: InternPool.Index,
+        @"align": Alignment,
+        @"linksection": OptionalNullTerminatedString,
+        @"addrspace": std.lang.AddressSpace,
+        @"const": bool,
+        @"threadlocal": bool,
+        /// True iff this Nav is the binding for an `extern` decl.
+        /// Stage 5/8 sets it; Stage 2 leaves it false.
+        is_extern_decl: bool,
+        /// The decl's value. Compiler shape: `.none` is the
+        /// "type resolved but value not yet" sentinel -- NOT an
+        /// optional. Stage 2's eager evaluator always populates it
+        /// with a real index for `.@"const"` / `.@"var"` kinds.
+        value: InternPool.Index,
+    };
+
+    /// Stable handle into `pool.navs`. Opaque integer so callers
+    /// cannot confuse it with `InternPool.Index` or arithmetic-into
+    /// the storage array.
+    pub const Index = enum(u32) { _ };
+};
+
+/// Stable handle into `pool.namespaces`. Defined here so `Nav`'s
+/// `analysis.namespace` field can reference it without forward-
+/// declaration acrobatics; the storage and methods land in commit 3.
+pub const NamespaceIndex = enum(u32) { _ };
+
+pub const OptionalNamespaceIndex = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+
+    pub fn init(maybe_ns: ?NamespaceIndex) OptionalNamespaceIndex {
+        const ns = maybe_ns orelse return .none;
+        return @enumFromInt(@intFromEnum(ns));
+    }
+
+    pub fn unwrap(opt: OptionalNamespaceIndex) ?NamespaceIndex {
+        if (opt == .none) return null;
+        return @enumFromInt(@intFromEnum(opt));
+    }
+};
+
+/// Power-of-two alignment with an explicit `none` sentinel for
+/// "implicit / use the type's natural alignment". Mirrors the
+/// compiler's `Alignment` (`src/InternPool.zig` ~5793). Stdlib's
+/// `std.mem.Alignment` covers the same power-of-two values but
+/// without the `.none` sentinel that decl-attribute handling needs;
+/// the compiler re-defines its own for that reason and so do we.
+pub const Alignment = enum(u6) {
+    @"1" = 0,
+    @"2" = 1,
+    @"4" = 2,
+    @"8" = 3,
+    @"16" = 4,
+    @"32" = 5,
+    @"64" = 6,
+    none = std.math.maxInt(u6),
+    _,
+};
+
 /// Mirrors compiler `InternPool.SimpleType`. Each variant's integer value is
 /// the corresponding `Index`, so converting between the two is identity.
 pub const SimpleType = enum(u32) {
@@ -684,6 +796,12 @@ string_starts: std.ArrayListUnmanaged(u32),
 /// `NullTerminatedString`'s integer value. Lookup goes through
 /// `StringAdapter` (raw bytes -> existing index) for `getOrPutString`.
 string_map: std.AutoArrayHashMapUnmanaged(void, void),
+/// Backing store for `Nav.Index`. Append-only -- a Nav, once
+/// created, never moves and is referenced for the lifetime of the
+/// pool. The compiler uses `MultiArrayList(Nav.Repr)` for column-
+/// access density; we use the simpler flat layout (see the
+/// `Nav.Index` doc comment for why).
+navs: std.ArrayListUnmanaged(Nav),
 
 /// Adapter for `string_map.getOrPutAdapted(bytes, StringAdapter)`:
 /// hashes / compares against the byte content reachable through
@@ -729,6 +847,7 @@ pub fn init(gpa: Allocator) Allocator.Error!InternPool {
         .string_bytes = .empty,
         .string_starts = .empty,
         .string_map = .empty,
+        .navs = .empty,
     };
     errdefer pool.deinit();
 
@@ -747,6 +866,7 @@ pub fn deinit(pool: *InternPool) void {
     pool.string_bytes.deinit(pool.gpa);
     pool.string_starts.deinit(pool.gpa);
     pool.string_map.deinit(pool.gpa);
+    pool.navs.deinit(pool.gpa);
     pool.big_int_limbs.deinit(pool.gpa);
     pool.map.deinit(pool.gpa);
     pool.* = undefined;
@@ -820,6 +940,52 @@ pub fn stringSlice(pool: *const InternPool, string: NullTerminatedString) [:0]co
     const end = pool.string_starts.items[raw + 1] - 1;
     assert(pool.string_bytes.items[end] == 0);
     return pool.string_bytes.items[start..end :0];
+}
+
+/// Append a fresh Nav with the given `name` and `fqn`. The Nav is
+/// created with `analysis = null` and `resolved = null`; the caller
+/// (typically `Sema.bindDecls`) populates `resolved` immediately
+/// after evaluating the decl's value body. Mirrors the compiler's
+/// `createNav` for the non-extern path (`src/InternPool.zig` ~11041)
+/// minus the multi-threaded acquire/release plumbing.
+pub fn createNav(
+    pool: *InternPool,
+    gpa: Allocator,
+    name: NullTerminatedString,
+    fqn: NullTerminatedString,
+) Allocator.Error!Nav.Index {
+    assert(@intFromPtr(pool) != 0);
+
+    const new_index_raw: u32 = @intCast(pool.navs.items.len);
+    try pool.navs.append(gpa, .{
+        .name = name,
+        .fqn = fqn,
+        .analysis = null,
+        .resolved = null,
+    });
+    assert(pool.navs.items.len == new_index_raw + 1);
+    return @enumFromInt(new_index_raw);
+}
+
+/// Read a Nav by handle. Returns by value because Nav is small and
+/// callers typically read one or two fields; mutable access goes
+/// through `navPtr` instead.
+pub fn getNav(pool: *const InternPool, index: Nav.Index) Nav {
+    assert(@intFromPtr(pool) != 0);
+    const raw: u32 = @intFromEnum(index);
+    assert(raw < pool.navs.items.len);
+    return pool.navs.items[raw];
+}
+
+/// Mutable handle into the Nav storage. Used by `bindDecls` to set
+/// `resolved` after evaluating the value body. The returned pointer
+/// is valid until the next `createNav` that triggers a resize --
+/// keep the dereference local.
+pub fn navPtr(pool: *InternPool, index: Nav.Index) *Nav {
+    assert(@intFromPtr(pool) != 0);
+    const raw: u32 = @intFromEnum(index);
+    assert(raw < pool.navs.items.len);
+    return &pool.navs.items[raw];
 }
 
 /// Comptime well-known table mirroring the compiler's `static_keys` array
@@ -1942,4 +2108,60 @@ test "string interning: many names round-trip and dedup correctly" {
     try std.testing.expectEqual(handles[2], try pool.getOrPutString(pool.gpa, "gamma"));
     try std.testing.expectEqual(handles[0], try pool.getOrPutString(pool.gpa, "alpha"));
     try std.testing.expectEqual(handles[4], try pool.getOrPutString(pool.gpa, "epsilon"));
+}
+
+test "Nav: createNav appends with analysis = null and resolved = null" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const name = try pool.getOrPutString(pool.gpa, "foo");
+    const fqn = name;
+    const idx = try pool.createNav(pool.gpa, name, fqn);
+
+    const nav = pool.getNav(idx);
+    try std.testing.expectEqual(name, nav.name);
+    try std.testing.expectEqual(fqn, nav.fqn);
+    try std.testing.expect(nav.analysis == null);
+    try std.testing.expect(nav.resolved == null);
+}
+
+test "Nav: navPtr lets bindDecls populate Resolved in place" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const name = try pool.getOrPutString(pool.gpa, "answer");
+    const idx = try pool.createNav(pool.gpa, name, name);
+
+    pool.navPtr(idx).resolved = .{
+        .type = .u32_type,
+        .@"align" = .none,
+        .@"linksection" = .none,
+        .@"addrspace" = .generic,
+        .@"const" = true,
+        .@"threadlocal" = false,
+        .is_extern_decl = false,
+        .value = .one,
+    };
+
+    const round_trip = pool.getNav(idx).resolved.?;
+    try std.testing.expectEqual(Index.u32_type, round_trip.type);
+    try std.testing.expectEqual(Index.one, round_trip.value);
+    try std.testing.expect(round_trip.@"const");
+    try std.testing.expect(!round_trip.@"threadlocal");
+    try std.testing.expect(!round_trip.is_extern_decl);
+}
+
+test "Nav: createNav allocates a fresh handle each call (no dedup)" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    // Same name twice: createNav is *not* dedup-by-name -- a name
+    // collision is a namespace concern (the upcoming pub_decls map),
+    // not a pool concern. createNav blindly appends.
+    const name = try pool.getOrPutString(pool.gpa, "x");
+    const first = try pool.createNav(pool.gpa, name, name);
+    const second = try pool.createNav(pool.gpa, name, name);
+    try std.testing.expect(first != second);
+    try std.testing.expectEqual(name, pool.getNav(first).name);
+    try std.testing.expectEqual(name, pool.getNav(second).name);
 }
