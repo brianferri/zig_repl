@@ -8,6 +8,7 @@ pub const registry = [_]Spec{
     @import("commands/help.zig").spec,
     @import("commands/quit.zig").spec,
     @import("commands/show_zir.zig").spec,
+    @import("commands/dump.zig").spec,
 };
 
 const max_name_bytes: u32 = 64;
