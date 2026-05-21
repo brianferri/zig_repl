@@ -35,10 +35,28 @@ pub fn render(
         .type_value => |ty_idx| renderTypeRef(ty_idx, pool, writer),
         // A bare type Key viewed as a value identifies the type itself
         // (Sema's value-of-type-type convention; see Value.typeOf).
-        .simple_type, .int_type, .anyframe_type, .ptr_type, .error_set_type => renderTypeRef(value.index, pool, writer),
+        .simple_type,
+        .int_type,
+        .anyframe_type,
+        .ptr_type,
+        .error_set_type,
+        .error_union_type,
+        => renderTypeRef(value.index, pool, writer),
         .ptr => |p| writer.print("ptr@{d}+{d}\n", .{ @intFromEnum(p.ty), p.byte_offset }),
         .err => |e| writer.print("error.{s}\n", .{pool.stringSlice(e.name)}),
+        .error_union => |eu| renderErrorUnion(eu, pool, writer),
     };
+}
+
+fn renderErrorUnion(
+    eu: InternPool.Key.ErrorUnion,
+    pool: *const InternPool,
+    writer: *std.Io.Writer,
+) Error!void {
+    switch (eu.val) {
+        .err_name => |name| try writer.print("error.{s}\n", .{pool.stringSlice(name)}),
+        .payload => |idx| try render(.{ .index = idx }, pool, writer),
+    }
 }
 
 fn simpleValueText(sv: InternPool.SimpleValue) []const u8 {
@@ -94,8 +112,19 @@ pub fn writeTypeName(
         },
         .ptr_type => |pt| try writePtrTypeName(pt, pool, writer),
         .error_set_type => |es| try writeErrorSetTypeName(es, pool, writer),
+        .error_union_type => |eu| try writeErrorUnionTypeName(eu, pool, writer),
         else => try writer.writeAll("<type>"),
     }
+}
+
+fn writeErrorUnionTypeName(
+    eu: InternPool.Key.ErrorUnionType,
+    pool: *const InternPool,
+    writer: *std.Io.Writer,
+) Error!void {
+    try writeTypeName(eu.error_set_type, pool, writer);
+    try writer.writeAll("!");
+    try writeTypeName(eu.payload_type, pool, writer);
 }
 
 fn writeErrorSetTypeName(
@@ -166,7 +195,7 @@ fn renderFloat(
     try writer.writeAll("\n");
 }
 
-/// True iff `text` is a finite-magnitude float printed without a decimal
+/// True IFF `text` is a finite-magnitude float printed without a decimal
 /// point or exponent (e.g. "4", "-7") -- in which case appending ".0"
 /// keeps the value visually distinct from an integer. NaN / inf / -inf
 /// start with a non-digit and are left alone.

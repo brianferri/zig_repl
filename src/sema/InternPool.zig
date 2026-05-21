@@ -200,7 +200,7 @@ pub const Nav = struct {
     /// For the session root the parent prefix is empty, so `fqn` and
     /// `name` typically agree.
     fqn: NullTerminatedString,
-    /// Populated iff this Nav is resolved by semantic analysis. The
+    /// Populated IFF this Nav is resolved by semantic analysis. The
     /// compiler uses `analysis != null` to mean "Nav exists but not
     /// yet analysed; Sema will analyse on demand". REPL evaluates
     /// eagerly so this is always `null` today.
@@ -209,7 +209,7 @@ pub const Nav = struct {
         zir_index: std.zig.Zir.Inst.Index,
         wanted: bool,
     },
-    /// `null` iff semantic analysis has not yet resolved this Nav.
+    /// `null` IFF semantic analysis has not yet resolved this Nav.
     /// In REPL `bindDecls` populates it eagerly, so non-Stage-7
     /// flows always see `resolved != null`.
     resolved: ?Resolved,
@@ -223,7 +223,7 @@ pub const Nav = struct {
         @"addrspace": std.lang.AddressSpace,
         @"const": bool,
         @"threadlocal": bool,
-        /// True iff this Nav is the binding for an `extern` decl.
+        /// True IFF this Nav is the binding for an `extern` decl.
         /// Stage 5/8 sets it; Stage 2 leaves it false.
         is_extern_decl: bool,
         /// The decl's value. Compiler shape: `.none` is the
@@ -510,7 +510,18 @@ pub const Key = union(enum) {
     /// `zirErrorValue` constructs a *singleton* set per `error.X`
     /// expression so the value has a precise type, then composite
     /// sets get formed via union / coercion. We do the same.
-    err: Err,
+    err: Error,
+    /// An error-union type (`E!T`). Mirrors the compiler's
+    /// `Key.ErrorUnionType`: the pair of an error-set type and a
+    /// payload type. Two error-union types are equal IFF both
+    /// component Indices match -- error_set sub-typing / supersetting
+    /// is a coercion-time concern, not a Key-identity concern.
+    error_union_type: ErrorUnionType,
+    /// A value of an error-union type. Either an error (carrying
+    /// just the name; the error-set type lives in `ty`'s payload)
+    /// or a payload value of the union's payload type. Mirrors
+    /// `Key.ErrorUnion` (`src/InternPool.zig` ~2382).
+    error_union: ErrorUnion,
 
     pub const Int = struct {
         ty: Index,
@@ -627,9 +638,33 @@ pub const Key = union(enum) {
     /// comparison ultimately keys on (matching the compiler's global
     /// error table contract: `error.Foo` from two different sets
     /// share the same name interning).
-    pub const Err = struct {
+    pub const Error = struct {
         ty: Index,
         name: NullTerminatedString,
+    };
+
+    /// Type-side `E!T`. Pair of (error_set type Index, payload type
+    /// Index). Mirrors `Key.ErrorUnionType` (`src/InternPool.zig`
+    /// ~2035), including the `extern struct` layout discipline.
+    /// Identity is structural: two unions are equal IFF both halves
+    /// are equal Indices.
+    pub const ErrorUnionType = extern struct {
+        error_set_type: Index,
+        payload_type: Index,
+    };
+
+    /// Value of an error-union type. Either the `.err` arm
+    /// (carrying the interned error name) or the `.payload` arm
+    /// (carrying the payload Value's Index). `ty` is always an
+    /// `error_union_type` Index. Mirrors `Key.ErrorUnion`.
+    pub const ErrorUnion = struct {
+        ty: Index,
+        val: Value,
+
+        pub const Value = union(enum) {
+            err_name: NullTerminatedString,
+            payload: Index,
+        };
     };
 
     /// Stable hash for dedup. `pool` is reserved for future Key variants
@@ -693,6 +728,19 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, e.ty);
                 std.hash.autoHash(&hasher, e.name);
             },
+            .error_union_type => |eu| {
+                std.hash.autoHash(&hasher, eu.error_set_type);
+                std.hash.autoHash(&hasher, eu.payload_type);
+            },
+            .error_union => |eu| {
+                std.hash.autoHash(&hasher, eu.ty);
+                const ValueTag = @typeInfo(ErrorUnion.Value).@"union".tag_type.?;
+                std.hash.autoHash(&hasher, @as(ValueTag, eu.val));
+                switch (eu.val) {
+                    .err_name => |name| std.hash.autoHash(&hasher, name),
+                    .payload => |idx| std.hash.autoHash(&hasher, idx),
+                }
+            },
         }
         return hasher.final();
     }
@@ -722,7 +770,7 @@ pub const Key = union(enum) {
                 // c_longdouble may be stored as any width and is promoted to
                 // f128 on emit (except f80, which has its own tag). Two
                 // c_longdouble Keys with different storage widths compare
-                // equal iff they round-trip to the same f128 bit-pattern.
+                // equal IFF they round-trip to the same f128 bit-pattern.
                 // Mirrors the compiler's `Key.eql` branch.
                 if (x.ty == .c_longdouble_type and x.storage != .f80) {
                     const a_bits: u128 = switch (x.storage) {
@@ -770,6 +818,21 @@ pub const Key = union(enum) {
             .err => |x| blk: {
                 const y = b.err;
                 break :blk x.ty == y.ty and x.name == y.name;
+            },
+            .error_union_type => |x| blk: {
+                const y = b.error_union_type;
+                break :blk x.error_set_type == y.error_set_type and
+                    x.payload_type == y.payload_type;
+            },
+            .error_union => |x| blk: {
+                const y = b.error_union;
+                if (x.ty != y.ty) break :blk false;
+                const ValueTag = @typeInfo(ErrorUnion.Value).@"union".tag_type.?;
+                if (@as(ValueTag, x.val) != @as(ValueTag, y.val)) break :blk false;
+                break :blk switch (x.val) {
+                    .err_name => |name| name == y.val.err_name,
+                    .payload => |idx| idx == y.val.payload,
+                };
             },
         };
     }
@@ -839,8 +902,18 @@ const Item = struct {
         // `Item.Tag.type_error_set`.
         type_error_set,
         // Error value. data = extra index of ErrRepr (2 u32 slots:
-        // ty, name). Mirrors the compiler's `Item.Tag.err`.
-        err,
+        // ty, name). Mirrors the compiler's `Item.Tag.error_set_error`.
+        error_set_error,
+        // Error-union type (`E!T`). data = extra index of
+        // ErrorUnionTypeRepr (2 u32 slots: error_set, payload).
+        // Mirrors `Item.Tag.type_error_union`.
+        type_error_union,
+        // Error-union value carrying an error. data = extra index of
+        // ErrorUnionErrRepr (2 u32 slots: ty, err_name).
+        error_union_error,
+        // Error-union value carrying a payload. data = extra index of
+        // ErrorUnionPayloadRepr (2 u32 slots: ty, payload).
+        error_union_payload,
     };
 };
 
@@ -877,12 +950,33 @@ const PtrComptimeAllocRepr = extern struct {
     byte_offset_hi: u32,
 };
 
-/// Extra-arena payload for `Item.Tag.err`. Two u32 slots: the
+/// Extra-arena payload for `Item.Tag.error_set_error`. Two u32 slots: the
 /// error-set type Index and the interned error-name handle. Mirrors
 /// the compiler's `Tag.Err` shape.
 const ErrRepr = extern struct {
     ty: u32,
     name: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.type_error_union`. Two u32
+/// slots: the error-set type Index and the payload type Index.
+const ErrorUnionTypeRepr = extern struct {
+    error_set: u32,
+    payload: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.error_union_error`. Two u32
+/// slots: the error-union type Index and the interned error name.
+const ErrorUnionErrRepr = extern struct {
+    ty: u32,
+    err_name: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.error_union_payload`. Two u32
+/// slots: the error-union type Index and the payload value Index.
+const ErrorUnionPayloadRepr = extern struct {
+    ty: u32,
+    payload: u32,
 };
 
 /// Header for `Item.Tag.int_positive` / `Item.Tag.int_negative`. Lives at
@@ -1426,6 +1520,8 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .ptr => |p| try emitPtr(pool, p),
         .error_set_type => |es| try emitErrorSetType(pool, es),
         .err => |e| try emitErr(pool, e),
+        .error_union_type => |eu| try emitErrorUnionType(pool, eu),
+        .error_union => |eu| try emitErrorUnion(pool, eu),
     }
 
     assert(pool.items.len == gop.index + 1);
@@ -1498,7 +1594,10 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .type_pointer => ptrTypeFromExtra(pool, item.data),
         .ptr_comptime_alloc => ptrComptimeAllocFromExtra(pool, item.data),
         .type_error_set => errorSetTypeFromExtra(pool, item.data),
-        .err => errFromExtra(pool, item.data),
+        .error_set_error => errFromExtra(pool, item.data),
+        .type_error_union => errorUnionTypeFromExtra(pool, item.data),
+        .error_union_error => errorUnionErrFromExtra(pool, item.data),
+        .error_union_payload => errorUnionPayloadFromExtra(pool, item.data),
     };
 }
 
@@ -1520,13 +1619,15 @@ fn errorSetTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
     assert(extra_index + 1 + names_len <= pool.extra.items.len);
 
     const raw_names = pool.extra.items[extra_index + 1 ..][0..names_len];
-    return .{ .error_set_type = .{
-        // Reinterpret the u32 slice as a `[]const NullTerminatedString`
-        // slice -- the enum's backing type is u32 and storage is
-        // identity, so this `@ptrCast` shares the pool's extra arena
-        // for the slice's lifetime.
-        .names = @ptrCast(raw_names),
-    } };
+    return .{
+        .error_set_type = .{
+            // Reinterpret the u32 slice as a `[]const NullTerminatedString`
+            // slice -- the enum's backing type is u32 and storage is
+            // identity, so this `@ptrCast` shares the pool's extra arena
+            // for the slice's lifetime.
+            .names = @ptrCast(raw_names),
+        },
+    };
 }
 
 fn errFromExtra(pool: *const InternPool, extra_index: u32) Key {
@@ -1536,6 +1637,36 @@ fn errFromExtra(pool: *const InternPool, extra_index: u32) Key {
     return .{ .err = .{
         .ty = @enumFromInt(slice[0]),
         .name = @enumFromInt(slice[1]),
+    } };
+}
+
+fn errorUnionTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const fields = comptime @divExact(@sizeOf(ErrorUnionTypeRepr), @sizeOf(u32));
+    assert(extra_index + fields <= pool.extra.items.len);
+    const slice = pool.extra.items[extra_index..][0..fields];
+    return .{ .error_union_type = .{
+        .error_set_type = @enumFromInt(slice[0]),
+        .payload_type = @enumFromInt(slice[1]),
+    } };
+}
+
+fn errorUnionErrFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const fields = comptime @divExact(@sizeOf(ErrorUnionErrRepr), @sizeOf(u32));
+    assert(extra_index + fields <= pool.extra.items.len);
+    const slice = pool.extra.items[extra_index..][0..fields];
+    return .{ .error_union = .{
+        .ty = @enumFromInt(slice[0]),
+        .val = .{ .err_name = @enumFromInt(slice[1]) },
+    } };
+}
+
+fn errorUnionPayloadFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const fields = comptime @divExact(@sizeOf(ErrorUnionPayloadRepr), @sizeOf(u32));
+    assert(extra_index + fields <= pool.extra.items.len);
+    const slice = pool.extra.items[extra_index..][0..fields];
+    return .{ .error_union = .{
+        .ty = @enumFromInt(slice[0]),
+        .val = .{ .payload = @enumFromInt(slice[1]) },
     } };
 }
 
@@ -1892,7 +2023,7 @@ fn emitErrorSetType(pool: *InternPool, es: Key.ErrorSetType) Allocator.Error!voi
 }
 
 /// Emit an `err` Item. Two u32 slots: `ty`, `name`.
-fn emitErr(pool: *InternPool, e: Key.Err) Allocator.Error!void {
+fn emitErr(pool: *InternPool, e: Key.Error) Allocator.Error!void {
     assert(e.ty != .none);
 
     const extra_index: u32 = @intCast(pool.extra.items.len);
@@ -1900,7 +2031,44 @@ fn emitErr(pool: *InternPool, e: Key.Err) Allocator.Error!void {
         @intFromEnum(e.ty),
         @intFromEnum(e.name),
     });
-    pool.items.appendAssumeCapacity(.{ .tag = .err, .data = extra_index });
+    pool.items.appendAssumeCapacity(.{ .tag = .error_set_error, .data = extra_index });
+}
+
+/// Emit a `type_error_union` Item. Two u32 slots: `error_set`, `payload`.
+fn emitErrorUnionType(pool: *InternPool, eu: Key.ErrorUnionType) Allocator.Error!void {
+    assert(eu.error_set_type != .none);
+    assert(eu.payload_type != .none);
+
+    const extra_index: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.appendSlice(pool.gpa, &.{
+        @intFromEnum(eu.error_set_type),
+        @intFromEnum(eu.payload_type),
+    });
+    pool.items.appendAssumeCapacity(.{ .tag = .type_error_union, .data = extra_index });
+}
+
+/// Emit an error-union value. Two tags discriminate the `.err` vs
+/// `.payload` variants; each carries (ty, payload_u32).
+fn emitErrorUnion(pool: *InternPool, eu: Key.ErrorUnion) Allocator.Error!void {
+    assert(eu.ty != .none);
+
+    const extra_index: u32 = @intCast(pool.extra.items.len);
+    switch (eu.val) {
+        .err_name => |name| {
+            try pool.extra.appendSlice(pool.gpa, &.{
+                @intFromEnum(eu.ty),
+                @intFromEnum(name),
+            });
+            pool.items.appendAssumeCapacity(.{ .tag = .error_union_error, .data = extra_index });
+        },
+        .payload => |idx| {
+            try pool.extra.appendSlice(pool.gpa, &.{
+                @intFromEnum(eu.ty),
+                @intFromEnum(idx),
+            });
+            pool.items.appendAssumeCapacity(.{ .tag = .error_union_payload, .data = extra_index });
+        },
+    }
 }
 
 /// Intern a pointer type.
@@ -1947,11 +2115,21 @@ pub fn singletonErrorSetType(
 }
 
 /// Intern an error value.
-pub fn internErr(pool: *InternPool, e: Key.Err) Allocator.Error!Index {
+pub fn internErr(pool: *InternPool, e: Key.Error) Allocator.Error!Index {
     return pool.get(.{ .err = e });
 }
 
-/// True iff `ty` identifies a Zig float type. Mirrors the compiler's
+/// Intern an error-union type (`E!T`).
+pub fn internErrorUnionType(pool: *InternPool, eu: Key.ErrorUnionType) Allocator.Error!Index {
+    return pool.get(.{ .error_union_type = eu });
+}
+
+/// Intern an error-union value.
+pub fn internErrorUnion(pool: *InternPool, eu: Key.ErrorUnion) Allocator.Error!Index {
+    return pool.get(.{ .error_union = eu });
+}
+
+/// True IFF `ty` identifies a Zig float type. Mirrors the compiler's
 /// `isFloatType`.
 fn isFloatType(ty: Index) bool {
     return switch (ty) {
@@ -2719,6 +2897,50 @@ test "internErr: same {ty, name} dedups" {
     const round = pool.indexToKey(a).err;
     try std.testing.expectEqual(ty, round.ty);
     try std.testing.expectEqual(foo, round.name);
+}
+
+test "error_union_type: round-trip + dedup by (error_set, payload)" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const bad = try pool.getOrPutString(pool.gpa, "Bad");
+    const es = try pool.singletonErrorSetType(bad);
+
+    const eu_a = try pool.internErrorUnionType(.{ .error_set_type = es, .payload_type = .u32_type });
+    const eu_b = try pool.internErrorUnionType(.{ .error_set_type = es, .payload_type = .u32_type });
+    try std.testing.expectEqual(eu_a, eu_b);
+
+    const eu_c = try pool.internErrorUnionType(.{ .error_set_type = es, .payload_type = .i32_type });
+    try std.testing.expect(eu_a != eu_c);
+
+    const round = pool.indexToKey(eu_a).error_union_type;
+    try std.testing.expectEqual(es, round.error_set_type);
+    try std.testing.expectEqual(Index.u32_type, round.payload_type);
+}
+
+test "error_union value: both arms round-trip and dedup independently" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const bad = try pool.getOrPutString(pool.gpa, "Bad");
+    const es = try pool.singletonErrorSetType(bad);
+    const eu_ty = try pool.internErrorUnionType(.{ .error_set_type = es, .payload_type = .u32_type });
+
+    const err_val = try pool.internErrorUnion(.{ .ty = eu_ty, .val = .{ .err_name = bad } });
+    const err_dup = try pool.internErrorUnion(.{ .ty = eu_ty, .val = .{ .err_name = bad } });
+    try std.testing.expectEqual(err_val, err_dup);
+
+    const payload_inner = try pool.get(.{ .int = .{ .ty = .u32_type, .storage = .{ .u64 = 42 } } });
+    const payload_val = try pool.internErrorUnion(.{ .ty = eu_ty, .val = .{ .payload = payload_inner } });
+    try std.testing.expect(payload_val != err_val);
+
+    const round_err = pool.indexToKey(err_val).error_union;
+    try std.testing.expect(round_err.val == .err_name);
+    try std.testing.expectEqual(bad, round_err.val.err_name);
+
+    const round_payload = pool.indexToKey(payload_val).error_union;
+    try std.testing.expect(round_payload.val == .payload);
+    try std.testing.expectEqual(payload_inner, round_payload.val.payload);
 }
 
 test "ComptimeUnit: createComptimeUnit + getComptimeUnit round-trip" {

@@ -198,6 +198,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .decl_val => sema.evalDeclVal(inst),
         .error_set_decl => sema.evalErrorSetDecl(inst),
         .error_value => sema.evalErrorValue(inst),
+        .error_union_type => sema.evalErrorUnionType(inst),
         .dbg_stmt => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
         inline else => |unhandled| sema.reportUnsupportedTag(unhandled),
@@ -355,7 +356,7 @@ fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?
 ///     comptime side is range-checked when the kernel re-fits).
 ///   * Both fixed-width int, same signedness -> the wider one.
 ///   * Both fixed-width int, mixed signedness -> the signed type
-///     iff its bits strictly exceed the unsigned type's bits; else no
+///     IFF its bits strictly exceed the unsigned type's bits; else no
 ///     common type (conflict).
 fn resolveNumericPairToInt(
     pool: *const InternPool,
@@ -389,7 +390,7 @@ fn resolveNumericPairToInt(
         return .{ .ty = wider_ty, .lhs = lhs_int, .rhs = rhs_int };
     }
 
-    // Mixed signedness. Signed wins iff its bits strictly exceed the
+    // Mixed signedness. Signed wins IFF its bits strictly exceed the
     // unsigned width. Otherwise we hit the compiler's legacy-compat
     // branch (`any_comptime_known` is always true for us, since every
     // value reaching here is comptime-known): wider unsigned wins, or
@@ -998,7 +999,13 @@ fn resolveDestType(
     const dest_value = try sema.resolveRef(ref);
     return switch (sema.intern_pool.indexToKey(dest_value.index)) {
         .type_value => |t| t,
-        .simple_type, .int_type, .ptr_type, .anyframe_type, .error_set_type => dest_value.index,
+        .simple_type,
+        .int_type,
+        .ptr_type,
+        .anyframe_type,
+        .error_set_type,
+        .error_union_type,
+        => dest_value.index,
         else => blk: {
             try sema.writer.print("{s}: destination is not a type\n", .{op_name});
             break :blk error.AnalysisFail;
@@ -1967,8 +1974,47 @@ fn coerceValueToType(
         }
     }
 
+    // Coercion into an error-union type: an error value becomes the
+    // `.err` arm; any other value coerces to the payload type and
+    // becomes the `.payload` arm. Same shape as the compiler's
+    // `coerceExtra` error-union branch.
+    if (ip.indexToKey(dest_ty) == .error_union_type) {
+        return try sema.coerceToErrorUnion(value, dest_ty, op_name);
+    }
+
     try sema.writer.print("{s}: cannot coerce value to destination type\n", .{op_name});
     return error.AnalysisFail;
+}
+
+fn coerceToErrorUnion(
+    sema: *Sema,
+    value: Value,
+    dest_ty: InternPool.Index,
+    op_name: []const u8,
+) Error!Value {
+    const ip = sema.intern_pool;
+    const eu_type = ip.indexToKey(dest_ty).error_union_type;
+    const value_key = ip.indexToKey(value.index);
+
+    // An error value of any error-set type coerces in by name --
+    // the compiler verifies the name is a member of the destination
+    // error set. Stage 3 ships the name carry; set-membership
+    // checking lands when error-union narrowing handlers do.
+    if (value_key == .err) {
+        const idx = try ip.internErrorUnion(.{
+            .ty = dest_ty,
+            .val = .{ .err_name = value_key.err.name },
+        });
+        return .{ .index = idx };
+    }
+
+    // Anything else: coerce to the payload type, then wrap.
+    const payload_value = try sema.coerceValueToType(value, eu_type.payload_type, op_name);
+    const idx = try ip.internErrorUnion(.{
+        .ty = dest_ty,
+        .val = .{ .payload = payload_value.index },
+    });
+    return .{ .index = idx };
 }
 
 /// `~x`: bitwise NOT. For comptime_int the identity `~x = -(x + 1)` is
@@ -2442,6 +2488,28 @@ fn evalErrorValue(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ty_idx = try sema.intern_pool.singletonErrorSetType(name);
     const err_idx = try sema.intern_pool.internErr(.{ .ty = ty_idx, .name = name });
     return .{ .index = err_idx };
+}
+
+/// `error_union_type`: `pl_node + Bin` whose lhs is the error-set
+/// type expression and rhs is the payload type expression. Both
+/// must resolve to types; `resolveDestType` enforces this. Mirrors
+/// the compiler's handler (`src/Sema.zig:zirErrorUnionType`).
+fn evalErrorUnionType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    assert(bin.lhs != .none);
+    assert(bin.rhs != .none);
+
+    const error_set = try sema.resolveDestType(bin.lhs, "error_union_type");
+    const payload = try sema.resolveDestType(bin.rhs, "error_union_type");
+
+    const ty_idx = try sema.intern_pool.internErrorUnionType(.{
+        .error_set_type = error_set,
+        .payload_type = payload,
+    });
+    return .{ .index = ty_idx };
 }
 
 fn reportUnsupportedTag(sema: *Sema, comptime tag: Zir.Inst.Tag) Error!?Value {

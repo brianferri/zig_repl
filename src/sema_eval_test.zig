@@ -1363,6 +1363,84 @@ test "error_value: same name interns to the same Index across calls" {
     try testing.expectEqual(v1.index, v2.index);
 }
 
+test "error_union_type: bare E!T evaluates to a union type" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, &pool, "error{Bad}!u32", &diag_buf);
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .error_union_type);
+    try testing.expectEqual(InternPool.Index.u32_type, key.error_union_type.payload_type);
+
+    const es = pool.indexToKey(key.error_union_type.error_set_type).error_set_type;
+    try testing.expectEqual(@as(usize, 1), es.names.len);
+    try testing.expectEqualStrings("Bad", pool.stringSlice(es.names[0]));
+}
+
+test "error_union_value: @as(E!T, error.X) wraps as .err arm" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, &pool, "@as(error{Bad}!u32, error.Bad)", &diag_buf);
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .error_union);
+    try testing.expect(key.error_union.val == .err_name);
+    try testing.expectEqualStrings("Bad", pool.stringSlice(key.error_union.val.err_name));
+}
+
+test "error_union_value: @as(E!T, payload) wraps as .payload arm" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, &pool, "@as(error{Bad}!u32, 42)", &diag_buf);
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .error_union);
+    try testing.expect(key.error_union.val == .payload);
+
+    // The wrapped payload is the coerced int value.
+    const payload_key = pool.indexToKey(key.error_union.val.payload);
+    try testing.expect(payload_key == .int);
+    try testing.expectEqual(InternPool.Index.u32_type, payload_key.int.ty);
+    try testing.expectEqual(@as(u64, 42), payload_key.int.storage.u64);
+}
+
+test "error_union_type: dedups by (error_set, payload) pair" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var diag_buf: [4096]u8 = undefined;
+    const v1 = try evalSource(gpa, &pool, "error{Bad}!u32", &diag_buf);
+    const v2 = try evalSource(gpa, &pool, "error{Bad}!u32", &diag_buf);
+    try testing.expectEqual(v1.index, v2.index);
+
+    const v3 = try evalSource(gpa, &pool, "error{Bad}!i32", &diag_buf);
+    try testing.expect(v1.index != v3.index);
+}
+
+test "error_union_type: cross-line E!T via const-bound error set" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = (try evalSessionLines(gpa, &pool, ns, &.{
+        "const E = error{Oops};",
+        "const EU = E!u8;",
+        "@as(EU, error.Oops)",
+    }, &diag_buf)).?;
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .error_union);
+    try testing.expect(key.error_union.val == .err_name);
+}
+
 test "error_set: cross-line const E = error{...} binds the type" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
