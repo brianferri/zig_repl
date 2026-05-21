@@ -126,6 +126,45 @@ pub const Index = enum(u32) {
 
 const first_dynamic_index: u32 = @intFromEnum(Index.bool_false) + 1;
 
+/// Stable handle to an interned, null-terminated string. Mirrors the
+/// compiler's `InternPool.NullTerminatedString` (`src/InternPool.zig`
+/// ~1798): zero is the sentinel for the empty string; every other
+/// value is an opaque index into the pool's string table that only
+/// the pool itself decodes.
+///
+/// Known deviations from the compiler shape (single-threaded REPL):
+///
+///   * No thread-local sharding (`Zcu.PerThread.Id`) -- one storage.
+///   * No `Slice` subtype yet -- the compiler exposes it for
+///     `error_set_type.names` etc.; we add when a `Key` variant needs it.
+pub const NullTerminatedString = enum(u32) {
+    empty = 0,
+    _,
+
+    pub fn toOptional(string: NullTerminatedString) OptionalNullTerminatedString {
+        return @enumFromInt(@intFromEnum(string));
+    }
+};
+
+/// Optional version of `NullTerminatedString`. Sentinel `none` is
+/// `maxInt(u32)`, matching the compiler's `OptionalNullTerminatedString`
+/// (`src/InternPool.zig` ~1902) so a caller can `@bitCast` /
+/// `@enumFromInt` between the two enums.
+pub const OptionalNullTerminatedString = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+
+    pub fn init(maybe_string: ?NullTerminatedString) OptionalNullTerminatedString {
+        const string = maybe_string orelse return .none;
+        return string.toOptional();
+    }
+
+    pub fn unwrap(opt: OptionalNullTerminatedString) ?NullTerminatedString {
+        if (opt == .none) return null;
+        return @enumFromInt(@intFromEnum(opt));
+    }
+};
+
 /// Mirrors compiler `InternPool.SimpleType`. Each variant's integer value is
 /// the corresponding `Index`, so converting between the two is identity.
 pub const SimpleType = enum(u32) {
@@ -625,6 +664,45 @@ big_int_limbs: std.ArrayListUnmanaged(std.math.big.Limb),
 /// Single-shard equivalent of the compiler's sharded `getOrPutKey`.
 map: std.AutoArrayHashMapUnmanaged(void, void),
 
+/// Raw bytes of every interned string, each followed by a `0` sentinel.
+/// Mirrors the compiler's `string_bytes` (`src/InternPool.zig`). Byte
+/// `0` is the lone sentinel for `NullTerminatedString.empty`, so
+/// `string_starts.items[0]` is always `0` and the first dynamic
+/// string begins at offset `1`.
+string_bytes: std.ArrayListUnmanaged(u8),
+/// One-past-each-string offsets into `string_bytes`. The string
+/// referenced by `NullTerminatedString = N` occupies
+/// `string_bytes[string_starts.items[N] .. string_starts.items[N + 1] - 1 :0]`
+/// (the `- 1` strips the sentinel; the `:0` keeps it as the slice's
+/// terminator). `string_starts.items.len` is always `N + 1` where
+/// `N` is the number of interned strings, so the final entry is the
+/// one-past-end cursor for the next append.
+string_starts: std.ArrayListUnmanaged(u32),
+/// Dedup map keyed by `NullTerminatedString`. Like the canonical `map`,
+/// the key is `void`; entries are appended in lockstep with
+/// `string_starts` so the map's insertion-order index is the
+/// `NullTerminatedString`'s integer value. Lookup goes through
+/// `StringAdapter` (raw bytes -> existing index) for `getOrPutString`.
+string_map: std.AutoArrayHashMapUnmanaged(void, void),
+
+/// Adapter for `string_map.getOrPutAdapted(bytes, StringAdapter)`:
+/// hashes / compares against the byte content reachable through
+/// `pool.stringSlice(idx)`. The pool pointer must outlive every
+/// `getOrPut` call, but `string_bytes` only grows (never shrinks)
+/// so reads through it stay valid across appends.
+const StringAdapter = struct {
+    pool: *const InternPool,
+
+    pub fn hash(_: StringAdapter, key: []const u8) u32 {
+        return @truncate(std.hash.Wyhash.hash(0, key));
+    }
+
+    pub fn eql(self: StringAdapter, key: []const u8, _: void, b_index: usize) bool {
+        const existing = self.pool.stringSlice(@enumFromInt(@as(u32, @intCast(b_index))));
+        return std.mem.eql(u8, key, existing);
+    }
+};
+
 /// Adapter that lets `getOrPutAdapted` hash and compare a `Key` against
 /// entries stored as bare `Index`es. Mirrors the role of the compiler's
 /// `KeyAdapter`.
@@ -648,11 +726,15 @@ pub fn init(gpa: Allocator) Allocator.Error!InternPool {
         .extra = .empty,
         .big_int_limbs = .empty,
         .map = .empty,
+        .string_bytes = .empty,
+        .string_starts = .empty,
+        .string_map = .empty,
     };
     errdefer pool.deinit();
 
     try pool.items.ensureTotalCapacity(gpa, first_dynamic_index);
     try pool.map.ensureTotalCapacity(gpa, first_dynamic_index);
+    try pool.seedEmptyString();
     try populateWellKnown(&pool);
     assert(pool.items.len == first_dynamic_index);
     assert(pool.map.count() == first_dynamic_index);
@@ -662,9 +744,82 @@ pub fn init(gpa: Allocator) Allocator.Error!InternPool {
 pub fn deinit(pool: *InternPool) void {
     pool.items.deinit(pool.gpa);
     pool.extra.deinit(pool.gpa);
+    pool.string_bytes.deinit(pool.gpa);
+    pool.string_starts.deinit(pool.gpa);
+    pool.string_map.deinit(pool.gpa);
     pool.big_int_limbs.deinit(pool.gpa);
     pool.map.deinit(pool.gpa);
     pool.* = undefined;
+}
+
+/// Seed `NullTerminatedString.empty` so a handle of `0` always
+/// decodes as `""`. The book-keeping otherwise shared with
+/// `getOrPutString` is expressed directly here because the empty-key
+/// case sidesteps the dedup adapter -- an empty `key` would compare
+/// equal to every other empty query, which `getOrPutAdapted` has no
+/// need to handle separately.
+fn seedEmptyString(pool: *InternPool) Allocator.Error!void {
+    assert(pool.string_bytes.items.len == 0);
+    assert(pool.string_starts.items.len == 0);
+    assert(pool.string_map.count() == 0);
+
+    try pool.string_bytes.append(pool.gpa, 0);
+    try pool.string_starts.append(pool.gpa, 0);
+    try pool.string_starts.append(pool.gpa, 1);
+    try pool.string_map.put(pool.gpa, {}, {});
+
+    assert(pool.string_starts.items.len == 2);
+    assert(pool.string_map.count() == 1);
+}
+
+/// Intern `bytes` and return its stable `NullTerminatedString` handle.
+/// Mirrors the compiler's `getOrPutString` (`src/InternPool.zig`
+/// ~11255) collapsed to single-threaded shape: the compiler's
+/// implementation appends bytes, then dedups via a sharded map; we do
+/// the same with one map. The dedup-hit rollback is identical -- the
+/// trailing append simply leaves dead bytes that nothing references.
+///
+/// Asserts there are no embedded `0` bytes. Stage 2 callers (decl
+/// names, type names) cannot legally contain them. When a `Key`
+/// variant eventually needs embedded-null content (e.g. error names),
+/// add an `EmbeddedNulls` policy parameter mirroring the compiler's
+/// `getOrPutString` signature.
+pub fn getOrPutString(
+    pool: *InternPool,
+    gpa: Allocator,
+    bytes: []const u8,
+) Allocator.Error!NullTerminatedString {
+    assert(@intFromPtr(pool) != 0);
+    assert(std.mem.indexOfScalar(u8, bytes, 0) == null);
+
+    if (bytes.len == 0) return .empty;
+
+    const gop = try pool.string_map.getOrPutAdapted(gpa, bytes, StringAdapter{ .pool = pool });
+    if (gop.found_existing) return @enumFromInt(@as(u32, @intCast(gop.index)));
+
+    try pool.string_bytes.ensureUnusedCapacity(gpa, bytes.len + 1);
+    pool.string_bytes.appendSliceAssumeCapacity(bytes);
+    pool.string_bytes.appendAssumeCapacity(0);
+    try pool.string_starts.append(gpa, @intCast(pool.string_bytes.items.len));
+
+    const new_index: u32 = @intCast(gop.index);
+    assert(new_index + 1 == pool.string_starts.items.len - 1);
+    return @enumFromInt(new_index);
+}
+
+/// Read back the bytes referenced by `string` as a sentinel-
+/// terminated slice. Asserts the handle is in range; safe to call on
+/// `.empty` (returns the zero-length slice).
+pub fn stringSlice(pool: *const InternPool, string: NullTerminatedString) [:0]const u8 {
+    assert(@intFromPtr(pool) != 0);
+
+    const raw = @intFromEnum(string);
+    assert(raw + 1 < pool.string_starts.items.len);
+
+    const start = pool.string_starts.items[raw];
+    const end = pool.string_starts.items[raw + 1] - 1;
+    assert(pool.string_bytes.items[end] == 0);
+    return pool.string_bytes.items[start..end :0];
 }
 
 /// Comptime well-known table mirroring the compiler's `static_keys` array
@@ -1712,4 +1867,79 @@ test "ptr byte_offset survives the 32-bit boundary" {
         .byte_offset = huge,
     });
     try std.testing.expectEqual(huge, pool.indexToKey(p).ptr.byte_offset);
+}
+
+test "string interning: empty handle is the well-known sentinel" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    try std.testing.expectEqual(NullTerminatedString.empty, try pool.getOrPutString(pool.gpa, ""));
+    try std.testing.expectEqualStrings("", pool.stringSlice(.empty));
+}
+
+test "string interning: round-trip a single name" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const handle = try pool.getOrPutString(pool.gpa, "decl_name");
+    try std.testing.expectEqualStrings("decl_name", pool.stringSlice(handle));
+}
+
+test "string interning: identical bytes dedup to the same handle" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const first = try pool.getOrPutString(pool.gpa, "x");
+    const second = try pool.getOrPutString(pool.gpa, "x");
+    try std.testing.expectEqual(first, second);
+
+    // The second intern should not have grown string_bytes (rollback
+    // path: the adapter found the existing key before we appended).
+    const bytes_after_first = pool.string_bytes.items.len;
+    _ = try pool.getOrPutString(pool.gpa, "x");
+    try std.testing.expectEqual(bytes_after_first, pool.string_bytes.items.len);
+}
+
+test "string interning: distinct names occupy distinct handles" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const foo = try pool.getOrPutString(pool.gpa, "foo");
+    const bar = try pool.getOrPutString(pool.gpa, "bar");
+    try std.testing.expect(foo != bar);
+    try std.testing.expectEqualStrings("foo", pool.stringSlice(foo));
+    try std.testing.expectEqualStrings("bar", pool.stringSlice(bar));
+}
+
+test "string interning: OptionalNullTerminatedString round-trips" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const handle = try pool.getOrPutString(pool.gpa, "thing");
+    const opt = handle.toOptional();
+    try std.testing.expect(opt != .none);
+    try std.testing.expectEqual(handle, opt.unwrap().?);
+
+    const none: OptionalNullTerminatedString = .init(null);
+    try std.testing.expect(none == .none);
+    try std.testing.expect(none.unwrap() == null);
+}
+
+test "string interning: many names round-trip and dedup correctly" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const names = [_][]const u8{ "alpha", "beta", "gamma", "delta", "epsilon" };
+    var handles: [names.len]NullTerminatedString = undefined;
+    for (names, &handles) |name, *out| out.* = try pool.getOrPutString(pool.gpa, name);
+
+    // Round-trip every name via its stored handle.
+    for (handles, names) |handle, expected| {
+        try std.testing.expectEqualStrings(expected, pool.stringSlice(handle));
+    }
+
+    // Re-interning yields the same handle, regardless of order.
+    try std.testing.expectEqual(handles[2], try pool.getOrPutString(pool.gpa, "gamma"));
+    try std.testing.expectEqual(handles[0], try pool.getOrPutString(pool.gpa, "alpha"));
+    try std.testing.expectEqual(handles[4], try pool.getOrPutString(pool.gpa, "epsilon"));
 }
