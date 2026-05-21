@@ -363,3 +363,45 @@ test "compliance: cross-line bound int decl evaluates in expression" {
         "x + 5",
     });
 }
+
+test "compliance: catch on .err arm returns the error" {
+    try expectMatchesZig(testing.allocator, &.{
+        "@as(error{Bad}!u32, error.Bad) catch |e| e",
+    });
+}
+
+test "compliance: catch on .err arm with default returns the default" {
+    try expectMatchesZig(testing.allocator, &.{
+        "@as(error{Bad}!u32, error.Bad) catch @as(u32, 0)",
+    });
+}
+
+test "compliance: catch on .payload arm returns the payload" {
+    try expectMatchesZig(testing.allocator, &.{
+        "@as(error{Bad}!u32, 99) catch @as(u32, 0)",
+    });
+}
+
+test "compliance: catch on .payload arm with capture returns the payload" {
+    try expectMatchesZig(testing.allocator, &.{
+        "@as(error{Bad}!u32, 99) catch |e| e",
+    });
+}
+
+test "compliance: cross-line catch on .err arm" {
+    try expectMatchesZig(testing.allocator, &.{
+        "const E = error{Bad};",
+        "const EU = E!u32;",
+        "const x: EU = error.Bad;",
+        "x catch |e| e",
+    });
+}
+
+test "compliance: cross-line catch on .payload arm" {
+    try expectMatchesZig(testing.allocator, &.{
+        "const E = error{Bad};",
+        "const EU = E!u32;",
+        "const y: EU = 42;",
+        "y catch @as(u32, 0)",
+    });
+}

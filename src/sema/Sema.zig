@@ -199,6 +199,9 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .error_set_decl => sema.evalErrorSetDecl(inst),
         .error_value => sema.evalErrorValue(inst),
         .error_union_type => sema.evalErrorUnionType(inst),
+        .err_union_code => sema.evalErrUnionCode(inst),
+        .err_union_payload_unsafe => sema.evalErrUnionPayloadUnsafe(inst),
+        .is_non_err => sema.evalIsNonErr(inst),
         .dbg_stmt => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
         inline else => |unhandled| sema.reportUnsupportedTag(unhandled),
@@ -2510,6 +2513,93 @@ fn evalErrorUnionType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .payload_type = payload,
     });
     return .{ .index = ty_idx };
+}
+
+/// `err_union_code operand`: extract the error code from an error
+/// union value. The operand must be an `error_union` Key whose
+/// variant is `.err_name`. The result is an `err` value of the
+/// union's error-set type. Mirrors the compiler's
+/// `zirErrUnionCode` / `analyzeErrUnionCode` (`src/Sema.zig:8247`).
+/// On a `.payload` operand the compiler emits `unreachable_value`
+/// at compile time; we surface a diagnostic since hitting it via
+/// REPL input means the AstGen lowering guaranteed the wrong shape.
+fn evalErrUnionCode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
+
+    const ip = sema.intern_pool;
+    const operand_value = try sema.resolveRef(un_node.operand);
+    const operand_key = ip.indexToKey(operand_value.index);
+    if (operand_key != .error_union) {
+        try sema.writer.print("err_union_code: operand is not an error union\n", .{});
+        return error.AnalysisFail;
+    }
+
+    const eu_type = ip.indexToKey(operand_key.error_union.ty).error_union_type;
+    switch (operand_key.error_union.val) {
+        .err_name => |name| {
+            const err_idx = try ip.internErr(.{ .ty = eu_type.error_set_type, .name = name });
+            return .{ .index = err_idx };
+        },
+        .payload => {
+            try sema.writer.print("err_union_code: operand carries a payload, not an error\n", .{});
+            return error.AnalysisFail;
+        },
+    }
+}
+
+/// `err_union_payload_unsafe operand`: extract the payload from an
+/// error union value, asserting the variant is `.payload`. "Unsafe"
+/// in the compiler means "the runtime safety check was already done
+/// by an earlier branch"; at REPL eval time we work with concrete
+/// values and can surface a diagnostic if the variant is `.err_name`
+/// rather than crashing. Mirrors `zirErrUnionPayload`
+/// (`src/Sema.zig:8092`).
+fn evalErrUnionPayloadUnsafe(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
+
+    const operand_value = try sema.resolveRef(un_node.operand);
+    const operand_key = sema.intern_pool.indexToKey(operand_value.index);
+    if (operand_key != .error_union) {
+        try sema.writer.print("err_union_payload: operand is not an error union\n", .{});
+        return error.AnalysisFail;
+    }
+
+    switch (operand_key.error_union.val) {
+        .payload => |payload_idx| return .{ .index = payload_idx },
+        .err_name => {
+            try sema.writer.print("err_union_payload: operand carries an error, not a payload\n", .{});
+            return error.AnalysisFail;
+        },
+    }
+}
+
+/// `is_non_err operand`: boolean predicate, true IFF the union's
+/// variant is `.payload`. Used by AstGen-lowered control flow
+/// (`if (x) |v| ... else |e| ...` and friends). Mirrors
+/// `zirIsNonErr` (`src/Sema.zig:17225`).
+fn evalIsNonErr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
+
+    const operand_value = try sema.resolveRef(un_node.operand);
+    const operand_key = sema.intern_pool.indexToKey(operand_value.index);
+    if (operand_key != .error_union) {
+        try sema.writer.print("is_non_err: operand is not an error union\n", .{});
+        return error.AnalysisFail;
+    }
+
+    return switch (operand_key.error_union.val) {
+        .payload => Value.bool_true,
+        .err_name => Value.bool_false,
+    };
 }
 
 fn reportUnsupportedTag(sema: *Sema, comptime tag: Zir.Inst.Tag) Error!?Value {
