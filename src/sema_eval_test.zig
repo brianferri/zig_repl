@@ -22,7 +22,7 @@ fn evalSource(
     try testing.expect(!result.hasZirErrors());
 
     var writer = std.Io.Writer.fixed(diag_buf);
-    const maybe_value = try Sema.analyze(gpa, intern_pool, result.zir, &writer);
+    const maybe_value = try Sema.analyze(gpa, intern_pool, result.zir, &writer, null);
     return maybe_value orelse error.NoValue;
 }
 
@@ -224,7 +224,7 @@ fn expectEvalFails(
 
     var diag_buf: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&diag_buf);
-    const sema_result = Sema.analyze(gpa, intern_pool, result.zir, &writer);
+    const sema_result = Sema.analyze(gpa, intern_pool, result.zir, &writer, null);
     try testing.expectError(error.AnalysisFail, sema_result);
 
     const written = diag_buf[0 .. writer.buffer.len - writer.unusedCapacityLen()];
@@ -1034,4 +1034,260 @@ test "alloc/store/load: wrap arith through a stored var" {
         .u8_type,
         "44",
     );
+}
+
+/// Multi-input session harness: runs each line through
+/// Pipeline.runWithInjection + Sema.analyze, persisting bindings in
+/// the supplied namespace. Returns the final line's evaluated Value
+/// or null when the final line was a declaration.
+fn evalSessionLines(
+    gpa: std.mem.Allocator,
+    pool: *InternPool,
+    namespace: InternPool.NamespaceIndex,
+    inputs: []const []const u8,
+    diag_buf: []u8,
+) !?Value {
+    var last_value: ?Value = null;
+    for (inputs) |source| {
+        var result = try Pipeline.runWithInjection(gpa, source, pool, .init(namespace));
+        defer result.deinit(gpa);
+
+        try testing.expect(!result.hasParseErrors());
+        try testing.expect(!result.hasZirErrors());
+
+        var writer = std.Io.Writer.fixed(diag_buf);
+        last_value = try Sema.analyze(gpa, pool, result.zir, &writer, namespace);
+    }
+    return last_value;
+}
+
+test "decl: top-level const binds and is readable on the next line" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = (try evalSessionLines(gpa, &pool, ns, &.{
+        "const x = 10;",
+        "x",
+    }, &diag_buf)).?;
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .int);
+    try testing.expectEqual(@as(u64, 10), key.int.storage.u64);
+}
+
+test "decl: typed binding survives + participates in arith" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = (try evalSessionLines(gpa, &pool, ns, &.{
+        "const y: i32 = 100;",
+        "y + 5",
+    }, &diag_buf)).?;
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .int);
+    try testing.expectEqual(InternPool.Index.i32_type, key.int.ty);
+    try testing.expectEqual(@as(i64, 105), key.int.storage.i64);
+}
+
+test "decl: multiple bindings across lines compose" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = (try evalSessionLines(gpa, &pool, ns, &.{
+        "const a = 1;",
+        "const b = 2;",
+        "const c = 3;",
+        "a + b + c",
+    }, &diag_buf)).?;
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .int);
+    try testing.expectEqual(@as(u64, 6), key.int.storage.u64);
+}
+
+test "decl: declaration-shape input returns null (no value to print)" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSessionLines(gpa, &pool, ns, &.{
+        "const x = 10;",
+    }, &diag_buf);
+    try testing.expect(value == null);
+}
+
+test "decl: bindDecls populates the namespace with the right resolved value" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns_idx = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    _ = try evalSessionLines(gpa, &pool, ns_idx, &.{
+        "const x: u32 = 42;",
+    }, &diag_buf);
+
+    // Top-level `const` without an explicit `pub` lives in
+    // priv_decls (Zig file-scope semantics). lookupNav walks both
+    // pub_decls and priv_decls so callers don't care which.
+    const ns = pool.namespacePtr(ns_idx);
+    const x_name = try pool.getOrPutString(gpa, "x");
+    const nav_idx = ns.lookupNav(&pool, x_name).?;
+
+    const nav = pool.getNav(nav_idx);
+    try testing.expectEqual(x_name, nav.name);
+    const resolved = nav.resolved.?;
+    try testing.expectEqual(InternPool.Index.u32_type, resolved.type);
+    try testing.expect(resolved.@"const");
+    try testing.expectEqual(@as(u64, 42), pool.indexToKey(resolved.value).int.storage.u64);
+}
+
+test "decl: rebinding the same name fails with duplicate-member error" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    // First line binds successfully.
+    _ = try evalSessionLines(gpa, &pool, ns, &.{"const x = 10;"}, &diag_buf);
+
+    // Second line tries to rebind x; wrap-injection re-emits the
+    // first binding, so AstGen rejects the new one with "duplicate
+    // struct member name".
+    var result = try Pipeline.runWithInjection(gpa, "const x = 20;", &pool, .init(ns));
+    defer result.deinit(gpa);
+    try testing.expect(result.hasZirErrors());
+}
+
+test "decl: a test decl binds into test_decls, not pub_decls" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns_idx = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    _ = try evalSessionLines(gpa, &pool, ns_idx, &.{
+        "test \"addition is sound\" { return; }",
+    }, &diag_buf);
+
+    const ns = pool.namespacePtr(ns_idx);
+    try testing.expectEqual(@as(usize, 0), ns.pub_decls.count());
+    try testing.expectEqual(@as(usize, 1), ns.test_decls.items.len);
+
+    const nav = pool.getNav(ns.test_decls.items[0]);
+    try testing.expect(nav.resolved == null);
+    try testing.expect(nav.analysis != null);
+}
+
+test "decl: comptime block binds into comptime_decls" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns_idx = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    _ = try evalSessionLines(gpa, &pool, ns_idx, &.{
+        "comptime { }",
+    }, &diag_buf);
+
+    const ns = pool.namespacePtr(ns_idx);
+    try testing.expectEqual(@as(usize, 1), ns.comptime_decls.items.len);
+}
+
+const Diagnostic = @import("render/Diagnostic.zig");
+
+/// Run `source` through the same Pipeline + Diagnostic path the
+/// REPL uses, capturing whatever the ZIR-error renderer would
+/// surface to the user. The session is supplied by the caller so a
+/// preceding line can establish a binding before this line tries to
+/// shadow / rebind it.
+fn renderZirDiagnostic(
+    gpa: std.mem.Allocator,
+    pool: *InternPool,
+    namespace: InternPool.NamespaceIndex,
+    source: []const u8,
+    out_buf: []u8,
+) ![]const u8 {
+    var result = try Pipeline.runWithInjection(gpa, source, pool, .init(namespace));
+    defer result.deinit(gpa);
+
+    try testing.expect(result.hasZirErrors());
+
+    var writer = std.Io.Writer.fixed(out_buf);
+    try Diagnostic.renderZirErrors(gpa, result.zir, result.tree, result.userView(), &writer);
+
+    return out_buf[0 .. writer.buffer.len - writer.unusedCapacityLen()];
+}
+
+test "diagnostic: shadow rejection renders main error in user frame" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    // Establish `w` in the session namespace.
+    var diag_buf: [4096]u8 = undefined;
+    _ = try evalSessionLines(gpa, &pool, ns, &.{"const w = 10;"}, &diag_buf);
+
+    // Next line tries to shadow `w` inside a block. AstGen rejects
+    // with "local constant shadows declaration"; the note that
+    // would normally point at the original declaration ("declared
+    // here") anchors on the wrap-injected `const w: comptime_int =
+    // undefined;` line. UserView.translate returns null for that
+    // anchor and the note is suppressed -- the main error stands.
+    var out_buf: [4096]u8 = undefined;
+    const rendered = try renderZirDiagnostic(
+        gpa,
+        &pool,
+        ns,
+        "blk: { const w = 20; break :blk w; }",
+        &out_buf,
+    );
+
+    try testing.expect(std.mem.indexOf(u8, rendered, "local constant shadows declaration") != null);
+    // No misleading "declared here" note pointing at the wrap-injected
+    // line -- our injection-anchor suppression dropped it.
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, rendered, "declared here"));
+}
+
+test "decl: cross-line rebind preserves the original binding (silent-drop limitation)" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    _ = try evalSessionLines(gpa, &pool, ns, &.{"const z = 1;"}, &diag_buf);
+
+    // Known Stage-2 limitation: cross-line rebind via wrap-injection
+    // produces a ZIR "duplicate struct member name" error whose main
+    // span anchors on the *injected* `const z: ... = undefined;`
+    // line (the original occurrence from AstGen's perspective).
+    // `UserView.translate` drops that span, so the whole error item
+    // is discarded. The Diagnostic renderer surfaces a fallback
+    // line so the user doesn't see silent failure; the semantic
+    // contract is also pinned -- the original binding survives the
+    // attempted rebind.
+    var out_buf: [4096]u8 = undefined;
+    const rendered = try renderZirDiagnostic(gpa, &pool, ns, "const z = 2;", &out_buf);
+
+    // Fallback message surfaces -- no silent drop.
+    try testing.expect(std.mem.indexOf(u8, rendered, "could not be located") != null);
+
+    // Original binding still intact at value 1 -- AstGen rejected
+    // the new decl, bindDecls never ran on it.
+    const z_name = try pool.getOrPutString(gpa, "z");
+    const nav_idx = pool.namespacePtr(ns).lookupNav(&pool, z_name).?;
+    const resolved = pool.getNav(nav_idx).resolved.?;
+    try testing.expectEqual(@as(u64, 1), pool.indexToKey(resolved.value).int.storage.u64);
 }

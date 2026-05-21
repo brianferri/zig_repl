@@ -51,9 +51,20 @@ pub fn run(repl: *Repl) !void {
             error.ReadFailed => return err,
         };
         const line = maybe_line orelse break;
+        try echoInput(repl.session.is_interactive, line, stdout);
         try repl.dispatch(line, stdout);
     }
     try stdout.flush();
+}
+
+/// Piped stdin doesn't echo to the terminal -- mirror what the user
+/// "typed" so transcripts read like an interactive session.
+/// Interactive stdin already echoes via the kernel's line
+/// discipline. `takeDelimiter` strips the `\n`, so this restores
+/// it.
+fn echoInput(is_interactive: bool, line: []const u8, writer: *std.Io.Writer) !void {
+    if (is_interactive) return;
+    try writer.print("{s}\n", .{line});
 }
 
 fn dispatch(repl: *Repl, raw_line: []const u8, stdout: *std.Io.Writer) !void {
@@ -69,7 +80,12 @@ fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
     assert(input.len > 0);
     assert(input.len <= input_buffer_bytes);
 
-    var result = Pipeline.run(repl.session.gpa, input) catch |err| {
+    var result = Pipeline.runWithInjection(
+        repl.session.gpa,
+        input,
+        &repl.session.intern_pool,
+        .init(repl.session.root_namespace),
+    ) catch |err| {
         try stdout.print("front-end failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -93,12 +109,40 @@ fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
         &repl.session.intern_pool,
         result.zir,
         stdout,
+        repl.session.root_namespace,
     ) catch |err| switch (err) {
         error.AnalysisFail => return, // diagnostic already written
         else => |e| return e,
     }) |value| {
         try renderValue(value, &repl.session.intern_pool, stdout);
-    } else {
+        return;
+    }
+
+    if (result.wrapped.shape == .expression) {
+        // Expression shape with no result is a Sema-side gap.
         try stdout.writeAll("(no value)\n");
     }
+}
+
+test "echoInput: interactive mode writes nothing (tty echoes via line discipline)" {
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try echoInput(true, "1 + 2", &writer);
+    try std.testing.expectEqual(@as(usize, 0), writer.buffer.len - writer.unusedCapacityLen());
+}
+
+test "echoInput: piped mode mirrors the input with a trailing newline" {
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try echoInput(false, "const x = 10;", &writer);
+    const written = buf[0 .. writer.buffer.len - writer.unusedCapacityLen()];
+    try std.testing.expectEqualStrings("const x = 10;\n", written);
+}
+
+test "echoInput: piped mode preserves the input verbatim (no trimming)" {
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try echoInput(false, "  leading spaces", &writer);
+    const written = buf[0 .. writer.buffer.len - writer.unusedCapacityLen()];
+    try std.testing.expectEqualStrings("  leading spaces\n", written);
 }

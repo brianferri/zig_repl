@@ -65,35 +65,66 @@ pub fn classify(input: [:0]const u8) Shape {
 }
 
 pub fn wrap(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!Wrapped {
+    return wrapWithInjection(gpa, "", input);
+}
+
+/// Like `wrap`, but prepends `injection_prefix` to the produced
+/// text. The prefix is emitted verbatim at file scope so AstGen
+/// sees the named decls in scope -- the REPL uses this to project
+/// session-namespace bindings into every input's scope via
+/// `const <name>: <type> = undefined;` lines. `user_offset` shifts
+/// past the prefix so diagnostics still land in the user's frame.
+pub fn wrapWithInjection(
+    gpa: std.mem.Allocator,
+    injection_prefix: []const u8,
+    input: []const u8,
+) std.mem.Allocator.Error!Wrapped {
     assert(input.len > 0);
     assert(input.len <= max_input_bytes);
 
     const sentinel_input = try gpa.allocSentinel(u8, input.len, 0);
+    defer gpa.free(sentinel_input);
     @memcpy(sentinel_input, input);
     const shape = classify(sentinel_input);
-    if (shape == .declaration) return .{
-        .text = sentinel_input,
-        .shape = shape,
-        .user_offset = 0,
-        .user_len = @intCast(input.len),
-    };
-    defer gpa.free(sentinel_input);
-    return .{
-        .text = try wrapExpression(gpa, input),
-        .shape = shape,
-        .user_offset = @intCast(expression_prefix.len),
-        .user_len = @intCast(input.len),
+
+    return switch (shape) {
+        .declaration => .{
+            .text = try wrapDeclaration(gpa, injection_prefix, input),
+            .shape = shape,
+            .user_offset = @intCast(injection_prefix.len),
+            .user_len = @intCast(input.len),
+        },
+        .expression => .{
+            .text = try wrapExpression(gpa, injection_prefix, input),
+            .shape = shape,
+            .user_offset = @intCast(injection_prefix.len + expression_prefix.len),
+            .user_len = @intCast(input.len),
+        },
     };
 }
 
-fn wrapExpression(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![:0]u8 {
-    assert(input.len > 0);
-    assert(input.len <= max_input_bytes);
-
+fn wrapExpression(
+    gpa: std.mem.Allocator,
+    injection_prefix: []const u8,
+    input: []const u8,
+) std.mem.Allocator.Error![:0]u8 {
     return std.fmt.allocPrintSentinel(
         gpa,
-        "{s}{s}{s}",
-        .{ expression_prefix, input, expression_suffix },
+        "{s}{s}{s}{s}",
+        .{ injection_prefix, expression_prefix, input, expression_suffix },
+        0,
+    );
+}
+
+fn wrapDeclaration(
+    gpa: std.mem.Allocator,
+    injection_prefix: []const u8,
+    input: []const u8,
+) std.mem.Allocator.Error![:0]u8 {
+    return std.fmt.allocPrintSentinel(
+        gpa,
+        "{s}{s}",
+        .{ injection_prefix, input },
         0,
     );
 }

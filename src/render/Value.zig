@@ -64,7 +64,7 @@ fn renderTypeRef(
 /// print form used by the compiler's `Type.print` for the cases
 /// Stage 2 ships (no sentinel, no align, no address_space prefix,
 /// no vector_index, no bit_range).
-fn writeTypeName(
+pub fn writeTypeName(
     type_index: InternPool.Index,
     pool: *const InternPool,
     writer: *std.Io.Writer,

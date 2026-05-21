@@ -22,10 +22,15 @@
 //! fingerprint for "this diagnostic anchors on a var-decl name" --
 //! insensitive to AstGen rewording, sensitive only to grammar shape.
 //!
-//! Mirrors the per-item walk in
-//! `std.zig.ErrorBundle.Wip.addZirErrorMessages` (~line 502) so the
-//! span / source-location / notes plumbing stays bit-identical to
-//! what `zig` itself would render.
+//! All wrap-shape knowledge -- where the user's text begins, which
+//! spans anchor in synthesized wrap-injection bytes -- lives in
+//! `Pipeline.UserView`. This module asks `view.translate(span)` and
+//! drops or emits based on the answer, never inspecting wrap
+//! offsets directly.
+//!
+//! Per-item walk mirrors `std.zig.ErrorBundle.Wip.addZirErrorMessages`
+//! (~line 502) so span / source-location / notes plumbing stays
+//! bit-identical to what `zig` itself would render.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -33,6 +38,7 @@ const assert = std.debug.assert;
 const Zir = std.zig.Zir;
 const ErrorBundle = std.zig.ErrorBundle;
 const Ast = std.zig.Ast;
+const Pipeline = @import("Pipeline.zig");
 
 /// True if `item` is a REPL-advisory diagnostic we drop. Currently:
 /// any error anchored on a var-decl name identifier (covers both
@@ -67,28 +73,18 @@ pub fn countActionable(zir: Zir, tree: Ast) u32 {
 /// `ErrorBundle` the same way the compiler does (via `Wip`), skipping
 /// suppressed items entirely so they neither block nor surface.
 ///
-/// `user_text` + `user_offset` provide the user-frame translation:
-/// the front-end wraps expressions as `const __repl_input = (..);`
-/// before parsing, but the user must not see those bytes. Spans
-/// originate as offsets into the wrapped source; we translate them
-/// to offsets into `user_text` and pass `user_text` as the source
-/// string to `findLineColumn` so line/col land in the user's frame.
-/// Spans outside `[user_offset, user_offset+user_text.len)` clamp
-/// to the nearest user-frame boundary.
+/// `view` provides the user-frame translation: all wrap-shape
+/// knowledge (where the user's text starts inside the wrapped
+/// source, which spans anchor in injection bytes) lives there.
 pub fn renderActionable(
     gpa: std.mem.Allocator,
     zir: Zir,
     tree: Ast,
-    user_text: []const u8,
-    user_offset: u32,
+    view: Pipeline.UserView,
     src_path: []const u8,
     writer: *std.Io.Writer,
-) !void {
-    assert(user_text.len > 0);
-
-    const user_text_z = try gpa.allocSentinel(u8, user_text.len, 0);
-    defer gpa.free(user_text_z);
-    @memcpy(user_text_z, user_text);
+) !u32 {
+    assert(view.text.len > 0);
 
     var wip: ErrorBundle.Wip = undefined;
     try wip.init(gpa);
@@ -102,36 +98,38 @@ pub fn renderActionable(
             const item = zir.extraData(Zir.Inst.CompileErrors.Item, extra_index);
             extra_index = item.end;
             if (isSuppressed(tree, item.data)) continue;
-            try appendItem(&wip, zir, tree, user_text_z, user_offset, src_path, item.data);
+            try appendItem(&wip, zir, tree, view, src_path, item.data);
         }
     }
 
     var bundle = try wip.toOwnedBundle("");
     defer bundle.deinit(gpa);
     try bundle.renderToWriter(.{}, writer);
+    return bundle.errorMessageCount();
 }
 
-/// Append a single CompileErrors.Item (plus its notes) to `wip`.
-/// Span / source-location math mirrors
-/// `addZirErrorMessages` in `std/zig/ErrorBundle.zig:502`, with the
-/// extra step of translating wrapped-source spans into the user
-/// frame before they reach `wip` so the user-visible line/col land
-/// in their input rather than the wrap.
+/// Append a single CompileErrors.Item (plus its actionable notes)
+/// to `wip`. An item whose span anchors entirely in the injection
+/// prefix is dropped (`view.translate` returns null) -- the main
+/// error message has no place to render in the user's frame.
 fn appendItem(
     wip: *ErrorBundle.Wip,
     zir: Zir,
     tree: Ast,
-    user_text: [:0]const u8,
-    user_offset: u32,
+    view: Pipeline.UserView,
     src_path: []const u8,
     item: Zir.Inst.CompileErrors.Item,
 ) !void {
-    assert(user_text.len > 0);
+    assert(view.text.len > 0);
     assert(src_path.len > 0);
 
-    const span = translateSpan(spanOf(tree, item.node, item.token, item.byte_offset), user_offset, @intCast(user_text.len));
-    const loc = std.zig.findLineColumn(user_text, span.main);
-    const notes_len = item.notesLen(zir);
+    const raw_span = spanOf(tree, item.node, item.token, item.byte_offset);
+    const span = view.translate(raw_span) orelse return;
+    const loc = view.findLoc(span.main);
+    const actionable_notes = if (item.notes != 0)
+        countActionableNotes(zir, tree, view, item)
+    else
+        0;
     try wip.addRootErrorMessage(.{
         .msg = try wip.addString(zir.nullTerminatedString(item.msg)),
         .src_loc = try wip.addSourceLocation(.{
@@ -143,32 +141,52 @@ fn appendItem(
             .column = @intCast(loc.column),
             .source_line = try wip.addString(loc.source_line),
         }),
-        .notes_len = notes_len,
+        .notes_len = actionable_notes,
     });
-    if (item.notes != 0) try appendNotes(wip, zir, tree, user_text, user_offset, src_path, item, loc);
+    if (actionable_notes != 0) try appendNotes(wip, zir, tree, view, src_path, item, loc);
+}
+
+fn countActionableNotes(
+    zir: Zir,
+    tree: Ast,
+    view: Pipeline.UserView,
+    item: Zir.Inst.CompileErrors.Item,
+) u32 {
+    const block = zir.extraData(Zir.Inst.Block, item.notes);
+    const body = zir.extra[block.end..][0..block.data.body_len];
+    var count: u32 = 0;
+    for (body) |body_elem| {
+        const note_item = zir.extraData(Zir.Inst.CompileErrors.Item, body_elem);
+        const raw_span = spanOf(tree, note_item.data.node, note_item.data.token, note_item.data.byte_offset);
+        if (view.translate(raw_span) != null) count += 1;
+    }
+    return count;
 }
 
 fn appendNotes(
     wip: *ErrorBundle.Wip,
     zir: Zir,
     tree: Ast,
-    user_text: [:0]const u8,
-    user_offset: u32,
+    view: Pipeline.UserView,
     src_path: []const u8,
     item: Zir.Inst.CompileErrors.Item,
     err_loc: std.zig.Loc,
 ) !void {
-    assert(user_text.len > 0);
+    assert(view.text.len > 0);
     assert(item.notes != 0);
 
-    const notes_start = try wip.reserveNotes(item.notesLen(zir));
+    const actionable = countActionableNotes(zir, tree, view, item);
+    if (actionable == 0) return;
+
+    const notes_start = try wip.reserveNotes(actionable);
     const block = zir.extraData(Zir.Inst.Block, item.notes);
     const body = zir.extra[block.end..][0..block.data.body_len];
-    const user_len: u32 = @intCast(user_text.len);
-    for (notes_start.., body) |note_i, body_elem| {
+    var write_cursor: u32 = notes_start;
+    for (body) |body_elem| {
         const note_item = zir.extraData(Zir.Inst.CompileErrors.Item, body_elem);
-        const span = translateSpan(spanOf(tree, note_item.data.node, note_item.data.token, note_item.data.byte_offset), user_offset, user_len);
-        const loc = std.zig.findLineColumn(user_text, span.main);
+        const raw_span = spanOf(tree, note_item.data.node, note_item.data.token, note_item.data.byte_offset);
+        const span = view.translate(raw_span) orelse continue;
+        const loc = view.findLoc(span.main);
         const note_index = @intFromEnum(try wip.addErrorMessage(.{
             .msg = try wip.addString(zir.nullTerminatedString(note_item.data.msg)),
             .src_loc = try wip.addSourceLocation(.{
@@ -182,8 +200,10 @@ fn appendNotes(
             }),
             .notes_len = 0,
         }));
-        wip.extra.items[note_i] = note_index;
+        wip.extra.items[write_cursor] = note_index;
+        write_cursor += 1;
     }
+    assert(write_cursor == notes_start + actionable);
 }
 
 fn spanOf(
@@ -197,25 +217,4 @@ fn spanOf(
     const start = tree.tokenStart(t) + byte_offset;
     const end = start + @as(u32, @intCast(tree.tokenSlice(t).len)) - byte_offset;
     return .{ .start = start, .end = end, .main = start };
-}
-
-/// Map a wrapped-source span into the user frame. Each coordinate
-/// `clamp(wrapped - user_offset, 0, user_len)`. A span entirely in
-/// the prefix collapses to `{0,0,0}` (start of user input); a span
-/// entirely in the suffix collapses to `{user_len, user_len,
-/// user_len}` (end of user input). Spans straddling a boundary clip
-/// to the user range -- the diagnostic still points at "where the
-/// user can see it" rather than at synthetic wrap bytes.
-fn translateSpan(span: Ast.Span, user_offset: u32, user_len: u32) Ast.Span {
-    return .{
-        .start = mapPos(span.start, user_offset, user_len),
-        .main = mapPos(span.main, user_offset, user_len),
-        .end = mapPos(span.end, user_offset, user_len),
-    };
-}
-
-fn mapPos(wrapped_pos: u32, user_offset: u32, user_len: u32) u32 {
-    if (wrapped_pos < user_offset) return 0;
-    const rel = wrapped_pos - user_offset;
-    return @min(rel, user_len);
 }

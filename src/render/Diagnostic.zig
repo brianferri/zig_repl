@@ -79,9 +79,11 @@ fn renderOneParseError(
     try writer.writeAll("\n");
 }
 
-/// Render ZIR errors via `ZirErrors.renderActionable`, which both
-/// filters AstGen advisories and translates spans into the user
-/// frame against `view`.
+/// Render ZIR errors via `ZirErrors.renderActionable`. When every
+/// diagnostic anchors on a wrap-injected line (cross-line rebind
+/// is the canonical case), `renderActionable` emits nothing -- so
+/// surface a fallback line, otherwise the user sees a silent
+/// success indistinguishable from a clean declaration.
 pub fn renderZirErrors(
     gpa: std.mem.Allocator,
     zir: std.zig.Zir,
@@ -92,5 +94,12 @@ pub fn renderZirErrors(
     assert(zir.hasCompileErrors());
     assert(view.text.len > 0);
 
-    try ZirErrors.renderActionable(gpa, zir, tree, view.text, view.offset_in_source, repl_source_path, writer);
+    const emitted = try ZirErrors.renderActionable(gpa, zir, tree, view, repl_source_path, writer);
+    if (emitted == 0) {
+        try writer.print(
+            "{s}: error: a compile error was reported but could not be located" ++
+                " in your input (likely a conflict with a prior session binding)\n",
+            .{repl_source_path},
+        );
+    }
 }

@@ -45,6 +45,10 @@ results: std.AutoHashMapUnmanaged(Zir.Inst.Index, Value),
 /// through a const pointer with the same error vocabulary the
 /// compiler uses ("cannot assign to constant").
 comptime_allocs: std.ArrayListUnmanaged(ComptimeAlloc),
+/// Current lookup scope. `null` for test paths that don't construct
+/// a session; REPL passes the session-root index so `evalDeclVal`
+/// can resolve cross-line names via the parent chain.
+namespace: ?InternPool.NamespaceIndex,
 
 pub const ComptimeAlloc = struct {
     ty: InternPool.Index,
@@ -52,22 +56,36 @@ pub const ComptimeAlloc = struct {
     is_const: bool,
 };
 
-/// Walks the ZIR produced by AstGen for a single REPL line and returns its
-/// resulting Value, or null when there is no `__repl_input` decl (e.g. raw
-/// declarations whose body shape we don't yet evaluate). Diagnostics for
-/// unhandled tags are written to `writer`.
+/// Walks the ZIR produced by AstGen for a single REPL line.
+///
+/// Two control-flow modes depending on what AstGen produced:
+///
+///   1. The line was wrapped as `const __repl_input = (<expr>);`.
+///      `findReplInputBody` locates that decl and evaluates its
+///      body. The result is the Value returned to the REPL prompt.
+///   2. The line is a raw declaration (`const x = ...;` etc.).
+///      `bindDecls` walks every top-level decl in the root struct,
+///      evaluates the value bodies, and binds them into the session
+///      namespace via `createNav` + `pub_decls.put`. Returns `null`
+///      because declarations don't produce a value-to-print.
+///
+/// `namespace` is the session-root NamespaceIndex (or `null` for
+/// test paths without session state -- `evalDeclVal` errors and
+/// `bindDecls` is a no-op in that mode).
 pub fn analyze(
     gpa: Allocator,
     intern_pool: *InternPool,
     zir: Zir,
     writer: *std.Io.Writer,
+    namespace: ?InternPool.NamespaceIndex,
 ) Error!?Value {
     // Zir may carry compile-error items that the front-end Pipeline
     // classifies as non-actionable (see `front/ZirErrors.zig`).
     // Pipeline gates Sema entry via `hasZirErrors`; Sema itself
-    // walks only the `__repl_input` body and is unaffected by the
-    // suppressed items, so the stronger `!hasCompileErrors()`
-    // assertion has been intentionally relaxed.
+    // walks only the `__repl_input` body (or the namespace
+    // bindDecls path) and is unaffected by the suppressed items, so
+    // the stronger `!hasCompileErrors()` assertion has been
+    // intentionally relaxed.
     assert(@intFromPtr(intern_pool) != 0);
     assert(zir.instructions.len > 0);
 
@@ -78,12 +96,16 @@ pub fn analyze(
         .writer = writer,
         .results = .empty,
         .comptime_allocs = .empty,
+        .namespace = namespace,
     };
     defer sema.results.deinit(gpa);
     defer sema.comptime_allocs.deinit(gpa);
 
-    const body = findReplInputBody(zir) orelse return null;
-    return try sema.evalBody(body);
+    if (findReplInputBody(zir)) |body| {
+        return try sema.evalBody(body);
+    }
+    if (namespace != null) try sema.bindDecls();
+    return null;
 }
 
 fn findReplInputBody(zir: Zir) ?[]const Zir.Inst.Index {
@@ -173,6 +195,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .alloc_mut, .alloc_comptime_mut => sema.evalAlloc(inst, false),
         .store_node => sema.evalStoreNode(inst),
         .load => sema.evalLoad(inst),
+        .decl_val => sema.evalDeclVal(inst),
         .dbg_stmt => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
         inline else => |unhandled| sema.reportUnsupportedTag(unhandled),
@@ -2151,6 +2174,226 @@ fn wellKnownRefToValue(ref: Zir.Inst.Ref) ?Value {
         }
     }
     return null;
+}
+
+/// `decl_val`: read the value bound to a name in the current scope.
+/// Walks `sema.namespace`'s parent chain via `pool.namespacePtr` ->
+/// `Namespace.NameAdapter`, returning `nav.resolved.?.value` when
+/// found. Surfaces a structured diagnostic when the name binds to a
+/// non-value kind (test / comptime block / extern decl whose value
+/// hasn't yet been resolved by linkage).
+///
+/// Compiler reference: `src/Sema.zig:zirDeclVal` (~5900) ->
+/// `lookupIdentifier` (~5920) -> `analyzeNavVal`. The compiler's
+/// `lookupIdentifier` asserts `unreachable` on a missing name
+/// because AstGen pre-checks identifier resolution; our Sema-side
+/// check is defense-in-depth -- the wrap-injection ensures session
+/// names are in scope before AstGen runs, so a missing name would
+/// be a structural bug in wrap-injection itself.
+fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const data = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok;
+    const name_bytes = data.get(sema.zir);
+    const name = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes);
+
+    const ns_idx = sema.namespace orelse {
+        try sema.writer.print("decl_val '{s}': no namespace in scope\n", .{name_bytes});
+        return error.AnalysisFail;
+    };
+
+    if (try sema.lookupName(ns_idx, name)) |nav_idx| {
+        const nav = sema.intern_pool.getNav(nav_idx);
+        const resolved = nav.resolved orelse {
+            try sema.writer.print(
+                "decl_val '{s}': binding recorded but value not resolved (test / comptime / extern)\n",
+                .{name_bytes},
+            );
+            return error.AnalysisFail;
+        };
+        if (resolved.value == .none) {
+            try sema.writer.print("decl_val '{s}': type resolved but value not yet\n", .{name_bytes});
+            return error.AnalysisFail;
+        }
+        return Value{ .index = resolved.value };
+    }
+
+    try sema.writer.print("decl_val '{s}': not found in scope\n", .{name_bytes});
+    return error.AnalysisFail;
+}
+
+/// Walk `ns_idx`'s parent chain and return the first Nav.Index whose
+/// interned name equals `name`. Each per-namespace lookup goes
+/// through `Namespace.lookupNav` (pub_decls then priv_decls);
+/// bounded by `max_namespace_chain` so a malformed parent cycle
+/// can't hang. Same shape as the compiler's `lookupIdentifier`
+/// (`src/Sema.zig:5920`).
+fn lookupName(
+    sema: *Sema,
+    ns_idx: InternPool.NamespaceIndex,
+    name: InternPool.NullTerminatedString,
+) Error!?InternPool.Nav.Index {
+    assert(@intFromPtr(sema) != 0);
+
+    var current: ?InternPool.NamespaceIndex = ns_idx;
+    var depth: u32 = 0;
+    while (current) |idx| : (depth += 1) {
+        assert(depth < max_namespace_chain);
+        const ns = sema.intern_pool.namespacePtr(idx);
+        if (ns.lookupNav(sema.intern_pool, name)) |nav_idx| return nav_idx;
+        current = ns.parent.unwrap();
+    }
+    return null;
+}
+
+const max_namespace_chain: u32 = 1024;
+
+/// Walk every top-level decl in the input's main_struct_inst and
+/// register each one in `sema.namespace`. Mirrors the compiler's
+/// per-decl analysis loop in `Zcu.PerThread.analyzeFile` collapsed
+/// to single-namespace eager evaluation. Idempotent against
+/// wrap-injected predecessors: a name already bound in the namespace
+/// is skipped (the injection appears in every line's ZIR so the user
+/// can reference prior decls).
+fn bindDecls(sema: *Sema) Error!void {
+    assert(@intFromPtr(sema) != 0);
+    assert(sema.namespace != null);
+
+    const ns_idx = sema.namespace.?;
+    for (sema.zir.typeDecls(.main_struct_inst)) |decl_inst| {
+        try sema.bindOneDecl(ns_idx, decl_inst);
+    }
+}
+
+fn bindOneDecl(
+    sema: *Sema,
+    ns_idx: InternPool.NamespaceIndex,
+    decl_inst: Zir.Inst.Index,
+) Error!void {
+    const unwrapped = sema.zir.getDeclaration(decl_inst);
+    if (unwrapped.kind == .@"comptime" or unwrapped.kind == .unnamed_test) {
+        return sema.bindAnonymousDecl(ns_idx, decl_inst, unwrapped);
+    }
+
+    assert(unwrapped.name != .empty);
+    const name_bytes = sema.zir.nullTerminatedString(unwrapped.name);
+
+    // Skip the auto-generated REPL expression decl; `analyze`
+    // already routes that through `evalBody` directly.
+    if (std.mem.eql(u8, name_bytes, InputShape.expression_decl_name)) return;
+
+    const name = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes);
+
+    // Skip wrap-injected predecessors: a name already in pub_decls
+    // (or priv_decls) was bound by a prior REPL line and is being
+    // re-emitted by wrap-injection so AstGen sees it in scope. The
+    // user can't legally rebind it within a single input -- AstGen
+    // would reject with "duplicate struct member name" first.
+    if (try sema.lookupName(ns_idx, name)) |_| return;
+
+    switch (unwrapped.kind) {
+        .@"const", .@"var" => try sema.bindValueDecl(ns_idx, name, unwrapped),
+        .@"test", .decltest => try sema.bindTestDecl(ns_idx, name, decl_inst, unwrapped),
+        .@"comptime", .unnamed_test => unreachable, // routed above
+    }
+}
+
+fn bindValueDecl(
+    sema: *Sema,
+    ns_idx: InternPool.NamespaceIndex,
+    name: InternPool.NullTerminatedString,
+    unwrapped: std.zig.Zir.Inst.Declaration.Unwrapped,
+) Error!void {
+    const value_body = unwrapped.value_body orelse {
+        try sema.writer.print(
+            "bindDecls '{s}': no value_body (extern decl, Stage 5/8)\n",
+            .{sema.intern_pool.stringSlice(name)},
+        );
+        return error.AnalysisFail;
+    };
+
+    // Evaluate the value body first; if the decl has a type
+    // annotation (`const x: T = ...`), AstGen emits a `type_body`
+    // that resolves T, and we coerce the value to it. Otherwise we
+    // keep the value's natural type (typically `comptime_int` /
+    // `comptime_float` for unannotated literals).
+    const raw_value = try sema.evalBody(value_body);
+    const declared_type: ?InternPool.Index = if (unwrapped.type_body) |tb|
+        (try sema.evalBody(tb)).index
+    else
+        null;
+    const final_value = if (declared_type) |dest_ty|
+        try sema.coerceValueToType(raw_value, dest_ty, "decl")
+    else
+        raw_value;
+    const final_type = if (declared_type) |dest_ty|
+        dest_ty
+    else
+        Value.typeOf(final_value, sema.intern_pool).index;
+
+    const nav_idx = try sema.intern_pool.createNav(sema.gpa, name, name);
+    sema.intern_pool.navPtr(nav_idx).resolved = .{
+        .type = final_type,
+        .@"align" = .none,
+        .@"linksection" = .none,
+        .@"addrspace" = .generic,
+        .@"const" = unwrapped.kind == .@"const",
+        .@"threadlocal" = unwrapped.is_threadlocal,
+        .is_extern_decl = unwrapped.linkage == .@"extern",
+        .value = final_value.index,
+    };
+
+    const ns = sema.intern_pool.namespacePtr(ns_idx);
+    const ctx: InternPool.Namespace.NavNameContext = .{ .pool = sema.intern_pool };
+    const target_map = if (unwrapped.is_pub) &ns.pub_decls else &ns.priv_decls;
+    _ = try target_map.getOrPutContext(sema.gpa, nav_idx, ctx);
+}
+
+fn bindTestDecl(
+    sema: *Sema,
+    ns_idx: InternPool.NamespaceIndex,
+    name: InternPool.NullTerminatedString,
+    decl_inst: Zir.Inst.Index,
+    unwrapped: std.zig.Zir.Inst.Declaration.Unwrapped,
+) Error!void {
+    _ = unwrapped;
+    const nav_idx = try sema.intern_pool.createNav(sema.gpa, name, name);
+    // Test bodies stay unevaluated until Stage 6 brings std.testing;
+    // the Nav carries the name for `:test <name>` listing later.
+    sema.intern_pool.navPtr(nav_idx).analysis = .{
+        .namespace = ns_idx,
+        .zir_index = decl_inst,
+        .wanted = false,
+    };
+    try sema.intern_pool.namespacePtr(ns_idx).test_decls.append(sema.gpa, nav_idx);
+}
+
+fn bindAnonymousDecl(
+    sema: *Sema,
+    ns_idx: InternPool.NamespaceIndex,
+    decl_inst: Zir.Inst.Index,
+    unwrapped: std.zig.Zir.Inst.Declaration.Unwrapped,
+) Error!void {
+    switch (unwrapped.kind) {
+        .@"comptime" => {
+            const id = try sema.intern_pool.createComptimeUnit(sema.gpa, ns_idx, decl_inst);
+            try sema.intern_pool.namespacePtr(ns_idx).comptime_decls.append(sema.gpa, id);
+        },
+        .unnamed_test => {
+            // Stored alongside named tests; the namespace's test_decls
+            // is name-blind so listing iterates Navs and reads the name
+            // from each.
+            const synthesized = try sema.intern_pool.getOrPutString(sema.gpa, "");
+            const nav_idx = try sema.intern_pool.createNav(sema.gpa, synthesized, synthesized);
+            sema.intern_pool.navPtr(nav_idx).analysis = .{
+                .namespace = ns_idx,
+                .zir_index = decl_inst,
+                .wanted = false,
+            };
+            try sema.intern_pool.namespacePtr(ns_idx).test_decls.append(sema.gpa, nav_idx);
+        },
+        else => unreachable,
+    }
 }
 
 fn reportUnsupportedTag(sema: *Sema, comptime tag: Zir.Inst.Tag) Error!?Value {

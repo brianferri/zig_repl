@@ -30,7 +30,7 @@ fn runViaRepl(gpa: std.mem.Allocator, expr: []const u8) ![]u8 {
 
     var diag_buf: [4096]u8 = undefined;
     var diag_writer = Io.Writer.fixed(&diag_buf);
-    const maybe_value = try Sema.analyze(gpa, &pool, result.zir, &diag_writer);
+    const maybe_value = try Sema.analyze(gpa, &pool, result.zir, &diag_writer, null);
     const value = maybe_value orelse return error.NoValue;
 
     var out_buf: [512]u8 = undefined;

@@ -402,6 +402,22 @@ pub const Namespace = struct {
             return a_name == ctx.pool.getNav(b_nav).name;
         }
     };
+
+    /// Look up `name` in this namespace's `pub_decls` then `priv_decls`.
+    /// Does NOT walk the parent chain -- that's `Sema.lookupName`'s
+    /// job. Returns null when the name is absent from both maps.
+    /// Mirrors the `lookupInNamespace` step inside the compiler's
+    /// `lookupIdentifier` (`src/Sema.zig:5920`), which walks the
+    /// pub/priv split via two separate `getKeyAdapted` calls.
+    pub fn lookupNav(
+        ns: *const Namespace,
+        pool: *const InternPool,
+        name: NullTerminatedString,
+    ) ?Nav.Index {
+        const adapter: NameAdapter = .{ .pool = pool };
+        if (ns.pub_decls.getKeyAdapted(name, adapter)) |nav_idx| return nav_idx;
+        return ns.priv_decls.getKeyAdapted(name, adapter);
+    }
 };
 
 /// Mirrors compiler `InternPool.SimpleType`. Each variant's integer value is
@@ -2437,6 +2453,51 @@ test "Namespace: NameAdapter looks up Nav.Index by interned name" {
 
     const missing = try pool.getOrPutString(pool.gpa, "missing");
     try std.testing.expectEqual(@as(?Nav.Index, null), ns.pub_decls.getKeyAdapted(missing, adapter));
+}
+
+test "Namespace.lookupNav: walks pub_decls then priv_decls, no parent chain" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const x = try pool.getOrPutString(pool.gpa, "x");
+    const y = try pool.getOrPutString(pool.gpa, "y");
+    const missing = try pool.getOrPutString(pool.gpa, "z");
+    const nav_x = try pool.createNav(pool.gpa, x, x);
+    const nav_y = try pool.createNav(pool.gpa, y, y);
+
+    const ns_idx = try pool.createNamespace(pool.gpa, .none);
+    const ns = pool.namespacePtr(ns_idx);
+    const ctx: Namespace.NavNameContext = .{ .pool = &pool };
+    // x lives in pub_decls (e.g. `pub const x = ...`).
+    _ = try ns.pub_decls.getOrPutContext(pool.gpa, nav_x, ctx);
+    // y lives in priv_decls (top-level `const y = ...` without `pub`).
+    _ = try ns.priv_decls.getOrPutContext(pool.gpa, nav_y, ctx);
+
+    // lookupNav finds both regardless of which map they live in.
+    try std.testing.expectEqual(@as(?Nav.Index, nav_x), ns.lookupNav(&pool, x));
+    try std.testing.expectEqual(@as(?Nav.Index, nav_y), ns.lookupNav(&pool, y));
+    try std.testing.expectEqual(@as(?Nav.Index, null), ns.lookupNav(&pool, missing));
+}
+
+test "Namespace.lookupNav: pub_decls takes precedence over priv_decls" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const x = try pool.getOrPutString(pool.gpa, "x");
+    const nav_pub = try pool.createNav(pool.gpa, x, x);
+    const nav_priv = try pool.createNav(pool.gpa, x, x);
+
+    const ns_idx = try pool.createNamespace(pool.gpa, .none);
+    const ns = pool.namespacePtr(ns_idx);
+    const ctx: Namespace.NavNameContext = .{ .pool = &pool };
+
+    // Both maps hold a Nav with name "x" (different Nav.Index values).
+    // In real Sema this wouldn't happen (AstGen rejects duplicate names)
+    // but the lookup precedence is a contract we want to pin: pub
+    // wins, matching the compiler's lookupInNamespace order.
+    _ = try ns.priv_decls.getOrPutContext(pool.gpa, nav_priv, ctx);
+    _ = try ns.pub_decls.getOrPutContext(pool.gpa, nav_pub, ctx);
+    try std.testing.expectEqual(@as(?Nav.Index, nav_pub), ns.lookupNav(&pool, x));
 }
 
 test "ComptimeUnit: createComptimeUnit + getComptimeUnit round-trip" {
