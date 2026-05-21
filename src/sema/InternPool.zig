@@ -259,6 +259,34 @@ pub const OptionalNamespaceIndex = enum(u32) {
     }
 };
 
+/// Stable handle into a file table that lands with Stage 6 (modules).
+/// Defined here so `Namespace.file_scope` matches the compiler's
+/// `Zcu.File.Index` type today; the actual file storage is empty
+/// until the loader exists. Same shape as `src/Zcu.zig:1232`.
+pub const FileIndex = enum(u32) { _ };
+
+/// Optional `FileIndex`. The REPL session-root namespace uses `.none`
+/// because there is no on-disk file backing it; Stage 6 module
+/// loading populates real file indices for loaded modules. Stdlib's
+/// compiler keeps `Namespace.file_scope` non-optional because every
+/// compiler namespace originates from a parsed file -- we deviate to
+/// `Optional` so the session root has a place to live without a
+/// synthetic "<repl>" file entry.
+pub const OptionalFileIndex = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+
+    pub fn init(maybe_file: ?FileIndex) OptionalFileIndex {
+        const file = maybe_file orelse return .none;
+        return @enumFromInt(@intFromEnum(file));
+    }
+
+    pub fn unwrap(opt: OptionalFileIndex) ?FileIndex {
+        if (opt == .none) return null;
+        return @enumFromInt(@intFromEnum(opt));
+    }
+};
+
 /// Power-of-two alignment with an explicit `none` sentinel for
 /// "implicit / use the type's natural alignment". Mirrors the
 /// compiler's `Alignment` (`src/InternPool.zig` ~5793). Stdlib's
@@ -275,6 +303,105 @@ pub const Alignment = enum(u6) {
     @"64" = 6,
     none = std.math.maxInt(u6),
     _,
+};
+
+/// A `comptime { ... }` top-level block. Mirrors the compiler's
+/// `InternPool.ComptimeUnit` (`src/InternPool.zig` ~498). Stage 2
+/// records these so `bindDecls` can register them in a namespace's
+/// `comptime_decls` list; execution lands when Sema gains a
+/// comptime evaluator (Stage 7).
+///
+/// Known deviation: `zir_index` is `Zir.Inst.Index`, not
+/// `TrackedInst.Index` (see `Nav.analysis.zir_index` for the
+/// reasoning).
+pub const ComptimeUnit = struct {
+    zir_index: std.zig.Zir.Inst.Index,
+    namespace: NamespaceIndex,
+
+    pub const Id = enum(u32) { _ };
+};
+
+/// A lookup scope. Mirrors the compiler's `Zcu.Namespace`
+/// (`src/Zcu.zig` ~844): a parent-chained map of named decls plus
+/// side lists for tests and comptime blocks. Every field present in
+/// the compiler's struct lives here too, even when Stage 2 leaves
+/// it at a sentinel default -- the vestigial fields make Stage 4 /
+/// 6 / 8 additive rather than schema-changing.
+pub const Namespace = struct {
+    parent: OptionalNamespaceIndex,
+    /// The file backing this namespace. `.none` for the session-root
+    /// namespace; Stage 6's module loader populates real file
+    /// indices for loaded modules. Stdlib keeps this non-optional
+    /// because every compiler namespace originates from a parsed
+    /// file -- we use `Optional` to give the session root a home.
+    file_scope: OptionalFileIndex,
+    /// Bumped each time the namespace is re-resolved during
+    /// incremental compilation. REPL re-parses each line outright
+    /// and has no incremental mode, so this stays `0`. Kept so a
+    /// future incremental layer can flip it without a schema
+    /// change.
+    generation: u32,
+    /// The struct / enum / union / opaque whose `Key` owns this
+    /// namespace. `.none` for the session root; Stage 4 aggregates
+    /// set it on inner namespaces created by `struct_decl` /
+    /// `union_decl` / `enum_decl` / `opaque_decl`.
+    owner_type: Index,
+    /// Members of the namespace which are marked `pub`. Ordered for
+    /// stable `:scope` enumeration and matches the compiler's choice
+    /// of `ArrayHashMapUnmanaged(..., true)` (the `true` is
+    /// `store_hash`, which preserves insertion order).
+    pub_decls: std.ArrayHashMapUnmanaged(Nav.Index, void, NavNameContext, true),
+    /// Members of the namespace which are *not* marked `pub`.
+    priv_decls: std.ArrayHashMapUnmanaged(Nav.Index, void, NavNameContext, true),
+    /// Tests in this namespace, in declaration order. Separate from
+    /// `pub_decls` because tests don't participate in name lookup
+    /// (the test runner enumerates them, the user can't reference
+    /// them by name).
+    test_decls: std.ArrayListUnmanaged(Nav.Index),
+    /// `comptime { ... }` blocks in this namespace, in declaration
+    /// order. Indices into `pool.comptime_units` rather than `Nav`
+    /// because comptime blocks have no name / fqn / value-binding
+    /// surface.
+    comptime_decls: std.ArrayListUnmanaged(ComptimeUnit.Id),
+
+    /// Hashmap context that keys `Nav.Index` entries by the bound
+    /// nav's interned name. Holds `*const InternPool` so `hash` /
+    /// `eql` can re-fetch the Nav on every probe -- the pool pointer
+    /// is stable, but the Nav storage may relocate on resize, so
+    /// holding a `*Nav` would dangle. Same shape as the compiler's
+    /// `NavNameContext` (`src/Zcu.zig:864`).
+    pub const NavNameContext = struct {
+        pool: *const InternPool,
+
+        pub fn hash(ctx: NavNameContext, nav: Nav.Index) u32 {
+            const name = ctx.pool.getNav(nav).name;
+            return std.hash.int(@intFromEnum(name));
+        }
+
+        pub fn eql(ctx: NavNameContext, a_nav: Nav.Index, b_nav: Nav.Index, b_index: usize) bool {
+            _ = b_index;
+            const a_name = ctx.pool.getNav(a_nav).name;
+            const b_name = ctx.pool.getNav(b_nav).name;
+            return a_name == b_name;
+        }
+    };
+
+    /// Adapter that lets `pub_decls.getKeyAdapted(name, NameAdapter)`
+    /// look up by an interned name without a sentinel Nav.Index.
+    /// `bindDecls` uses this to check "does this name already exist
+    /// in the namespace?" before inserting.
+    pub const NameAdapter = struct {
+        pool: *const InternPool,
+
+        pub fn hash(_: NameAdapter, name: NullTerminatedString) u32 {
+            return std.hash.int(@intFromEnum(name));
+        }
+
+        pub fn eql(ctx: NameAdapter, a_name: NullTerminatedString, b_nav: Nav.Index, b_index: usize) bool {
+            _ = b_index;
+            return a_name == ctx.pool.getNav(b_nav).name;
+        }
+    };
 };
 
 /// Mirrors compiler `InternPool.SimpleType`. Each variant's integer value is
@@ -802,6 +929,10 @@ string_map: std.AutoArrayHashMapUnmanaged(void, void),
 /// access density; we use the simpler flat layout (see the
 /// `Nav.Index` doc comment for why).
 navs: std.ArrayListUnmanaged(Nav),
+/// Backing store for `NamespaceIndex`. Append-only.
+namespaces: std.ArrayListUnmanaged(Namespace),
+/// Backing store for `ComptimeUnit.Id`. Append-only.
+comptime_units: std.ArrayListUnmanaged(ComptimeUnit),
 
 /// Adapter for `string_map.getOrPutAdapted(bytes, StringAdapter)`:
 /// hashes / compares against the byte content reachable through
@@ -848,6 +979,8 @@ pub fn init(gpa: Allocator) Allocator.Error!InternPool {
         .string_starts = .empty,
         .string_map = .empty,
         .navs = .empty,
+        .namespaces = .empty,
+        .comptime_units = .empty,
     };
     errdefer pool.deinit();
 
@@ -866,6 +999,14 @@ pub fn deinit(pool: *InternPool) void {
     pool.string_bytes.deinit(pool.gpa);
     pool.string_starts.deinit(pool.gpa);
     pool.string_map.deinit(pool.gpa);
+    for (pool.namespaces.items) |*ns| {
+        ns.pub_decls.deinit(pool.gpa);
+        ns.priv_decls.deinit(pool.gpa);
+        ns.test_decls.deinit(pool.gpa);
+        ns.comptime_decls.deinit(pool.gpa);
+    }
+    pool.namespaces.deinit(pool.gpa);
+    pool.comptime_units.deinit(pool.gpa);
     pool.navs.deinit(pool.gpa);
     pool.big_int_limbs.deinit(pool.gpa);
     pool.map.deinit(pool.gpa);
@@ -986,6 +1127,69 @@ pub fn navPtr(pool: *InternPool, index: Nav.Index) *Nav {
     const raw: u32 = @intFromEnum(index);
     assert(raw < pool.navs.items.len);
     return &pool.navs.items[raw];
+}
+
+/// Create a fresh empty namespace whose `parent` chain begins at
+/// `parent` (or `.none` for the session root). All four side maps
+/// start empty; the caller's `bindDecls` populates them.
+pub fn createNamespace(
+    pool: *InternPool,
+    gpa: Allocator,
+    parent: OptionalNamespaceIndex,
+) Allocator.Error!NamespaceIndex {
+    assert(@intFromPtr(pool) != 0);
+
+    const new_index_raw: u32 = @intCast(pool.namespaces.items.len);
+    try pool.namespaces.append(gpa, .{
+        .parent = parent,
+        .file_scope = .none,
+        .generation = 0,
+        .owner_type = .none,
+        .pub_decls = .empty,
+        .priv_decls = .empty,
+        .test_decls = .empty,
+        .comptime_decls = .empty,
+    });
+    assert(pool.namespaces.items.len == new_index_raw + 1);
+    return @enumFromInt(new_index_raw);
+}
+
+/// Mutable handle into the namespace storage. Decl insertion
+/// (`pub_decls.put` / `test_decls.append`) goes through this pointer.
+/// Valid until the next `createNamespace`-induced resize.
+pub fn namespacePtr(pool: *InternPool, index: NamespaceIndex) *Namespace {
+    assert(@intFromPtr(pool) != 0);
+    const raw: u32 = @intFromEnum(index);
+    assert(raw < pool.namespaces.items.len);
+    return &pool.namespaces.items[raw];
+}
+
+/// Record a `comptime { ... }` block. Returns its stable `Id` so
+/// the namespace's `comptime_decls` list can reference it. Execution
+/// is deferred to Stage 7 (`@comptime` evaluator).
+pub fn createComptimeUnit(
+    pool: *InternPool,
+    gpa: Allocator,
+    namespace: NamespaceIndex,
+    zir_index: std.zig.Zir.Inst.Index,
+) Allocator.Error!ComptimeUnit.Id {
+    assert(@intFromPtr(pool) != 0);
+
+    const new_index_raw: u32 = @intCast(pool.comptime_units.items.len);
+    try pool.comptime_units.append(gpa, .{
+        .zir_index = zir_index,
+        .namespace = namespace,
+    });
+    assert(pool.comptime_units.items.len == new_index_raw + 1);
+    return @enumFromInt(new_index_raw);
+}
+
+/// Read a recorded `ComptimeUnit` by id.
+pub fn getComptimeUnit(pool: *const InternPool, id: ComptimeUnit.Id) ComptimeUnit {
+    assert(@intFromPtr(pool) != 0);
+    const raw: u32 = @intFromEnum(id);
+    assert(raw < pool.comptime_units.items.len);
+    return pool.comptime_units.items[raw];
 }
 
 /// Comptime well-known table mirroring the compiler's `static_keys` array
@@ -2164,4 +2368,86 @@ test "Nav: createNav allocates a fresh handle each call (no dedup)" {
     try std.testing.expect(first != second);
     try std.testing.expectEqual(name, pool.getNav(first).name);
     try std.testing.expectEqual(name, pool.getNav(second).name);
+}
+
+test "Namespace: createNamespace seeds an empty parent-less scope" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const ns_idx = try pool.createNamespace(pool.gpa, .none);
+    const ns = pool.namespacePtr(ns_idx);
+
+    // Parent-chain + vestigial fields default to "session root":
+    // no parent, no file backing, generation = 0, no owner type.
+    try std.testing.expectEqual(OptionalNamespaceIndex.none, ns.parent);
+    try std.testing.expectEqual(OptionalFileIndex.none, ns.file_scope);
+    try std.testing.expectEqual(@as(u32, 0), ns.generation);
+    try std.testing.expectEqual(Index.none, ns.owner_type);
+
+    // All four decl containers start empty.
+    try std.testing.expectEqual(@as(usize, 0), ns.pub_decls.count());
+    try std.testing.expectEqual(@as(usize, 0), ns.priv_decls.count());
+    try std.testing.expectEqual(@as(usize, 0), ns.test_decls.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ns.comptime_decls.items.len);
+}
+
+test "Namespace: NavNameContext dedups Nav.Index entries by interned name" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const x = try pool.getOrPutString(pool.gpa, "x");
+    const y = try pool.getOrPutString(pool.gpa, "y");
+    const first_x = try pool.createNav(pool.gpa, x, x);
+    const second_x = try pool.createNav(pool.gpa, x, x);
+    const just_y = try pool.createNav(pool.gpa, y, y);
+
+    const ns_idx = try pool.createNamespace(pool.gpa, .none);
+    const ns = pool.namespacePtr(ns_idx);
+    const ctx: Namespace.NavNameContext = .{ .pool = &pool };
+
+    // Insert two distinct-name Navs.
+    const gop_x = try ns.pub_decls.getOrPutContext(pool.gpa, first_x, ctx);
+    try std.testing.expect(!gop_x.found_existing);
+    const gop_y = try ns.pub_decls.getOrPutContext(pool.gpa, just_y, ctx);
+    try std.testing.expect(!gop_y.found_existing);
+
+    // Same-name Nav re-insertion finds the existing entry.
+    const gop_x_again = try ns.pub_decls.getOrPutContext(pool.gpa, second_x, ctx);
+    try std.testing.expect(gop_x_again.found_existing);
+    try std.testing.expectEqual(first_x, gop_x_again.key_ptr.*);
+
+    try std.testing.expectEqual(@as(usize, 2), ns.pub_decls.count());
+}
+
+test "Namespace: NameAdapter looks up Nav.Index by interned name" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const x = try pool.getOrPutString(pool.gpa, "x");
+    const nav_x = try pool.createNav(pool.gpa, x, x);
+
+    const ns_idx = try pool.createNamespace(pool.gpa, .none);
+    const ns = pool.namespacePtr(ns_idx);
+    const ctx: Namespace.NavNameContext = .{ .pool = &pool };
+    _ = try ns.pub_decls.getOrPutContext(pool.gpa, nav_x, ctx);
+
+    const adapter: Namespace.NameAdapter = .{ .pool = &pool };
+    const found_x = ns.pub_decls.getKeyAdapted(x, adapter);
+    try std.testing.expectEqual(@as(?Nav.Index, nav_x), found_x);
+
+    const missing = try pool.getOrPutString(pool.gpa, "missing");
+    try std.testing.expectEqual(@as(?Nav.Index, null), ns.pub_decls.getKeyAdapted(missing, adapter));
+}
+
+test "ComptimeUnit: createComptimeUnit + getComptimeUnit round-trip" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const ns_idx = try pool.createNamespace(pool.gpa, .none);
+    const zir_inst: std.zig.Zir.Inst.Index = @enumFromInt(42);
+    const id = try pool.createComptimeUnit(pool.gpa, ns_idx, zir_inst);
+
+    const unit = pool.getComptimeUnit(id);
+    try std.testing.expectEqual(zir_inst, unit.zir_index);
+    try std.testing.expectEqual(ns_idx, unit.namespace);
 }
