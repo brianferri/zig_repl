@@ -1,28 +1,4 @@
-//! `:dump <expr>` -- diagnostic dump of AST + ZIR for any input.
-//!
-//! Used to investigate what AstGen actually emits when implementing
-//! new Sema handlers. The per-instruction summary dispatches over
-//! `Zir.Inst.Tag` exhaustively -- if stdlib adds a new tag the
-//! switch will fail to compile, forcing this file to be updated in
-//! lockstep. Per-arm formats match the data union layout in
-//! `std/zig/Zir.zig:Inst.Data` so the dump shape is stable across
-//! stdlib bumps as long as the arms themselves do not change.
-//!
-//! The ZIR section is rendered as a tree: we start at each
-//! top-level declaration via `zir.typeDecls(.main_struct_inst)`,
-//! print its metadata, and recurse into its body slices
-//! (`type_body`, `align_body`, `linksection_body`, `addrspace_body`,
-//! `value_body`). Body-bearing instructions inside the bodies
-//! recurse further -- the body shape per tag mirrors
-//! `src/print_zir.zig`'s `writeBlock`/`writeCondBr`/`writeTry`/
-//! `writeBoolBr`/`writeFunc`/`writeDefer` helpers in the compiler.
-//!
-//! Stdlib has no built-in tree-printer; the canonical Zig idiom
-//! is a `indent: u32` field on the writer plus
-//! `stream.splatByteAll(' ', indent)` before each line. We follow
-//! that pattern.
-//!
-//! Compiler reference: src/print_zir.zig.
+//! `:dump <expr>` -- AST + tree-walked ZIR listing.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -74,7 +50,6 @@ fn run(session: *Session, argument: []const u8, stdout: *std.Io.Writer) anyerror
 fn dumpSource(result: Pipeline.Result, stdout: *std.Io.Writer) !void {
     try stdout.print("source (wrapped, {d} bytes):\n  ", .{result.wrapped.text.len});
     try stdout.writeAll(result.wrapped.text);
-    try stdout.writeAll("\n");
 }
 
 fn dumpAst(tree: Ast, stdout: *std.Io.Writer) !void {
@@ -102,8 +77,6 @@ fn astDeclName(tree: Ast, node: Ast.Node.Index, tag: Ast.Node.Tag) ?[]const u8 {
         .local_var_decl,
         .aligned_var_decl,
         => name: {
-            // For `const X = ...;` the main token is `const` / `var`;
-            // the identifier follows.
             const main_token = tree.nodeMainToken(node);
             break :name tree.tokenSlice(main_token + 1);
         },
@@ -123,8 +96,10 @@ fn dumpZir(zir: Zir, stdout: *std.Io.Writer) !void {
     for (decl_insts) |decl_inst| try dumper.declaration(decl_inst);
 }
 
-/// Tree-walking dumper. `indent` tracks the current column for the
-/// leading whitespace of every line written.
+const idx_col_width: u32 = 7;
+const summary_col: u32 = 40;
+const indent_step: u32 = 4;
+
 const Dumper = struct {
     zir: Zir,
     stdout: *std.Io.Writer,
@@ -134,38 +109,41 @@ const Dumper = struct {
         for (slice) |inst| try self.instruction(inst);
     }
 
-    /// Print one instruction line with its per-arm data summary,
-    /// then recurse into any body slices the instruction owns.
     fn instruction(self: *Dumper, inst: Zir.Inst.Index) anyerror!void {
-        try self.stdout.splatByteAll(' ', self.indent);
         const idx: u32 = @intFromEnum(inst);
         const tag = self.zir.instructions.items(.tag)[idx];
         const data = self.zir.instructions.items(.data)[idx];
 
         var idx_buf: [16]u8 = undefined;
         const idx_str = std.fmt.bufPrint(&idx_buf, "%{d}", .{idx}) catch unreachable;
-        try self.stdout.print("{s:<6}{s:<22}", .{ idx_str, @tagName(tag) });
+        try self.stdout.writeAll(idx_str);
+        try self.stdout.splatByteAll(' ', idx_col_width - @as(u32, @intCast(idx_str.len)));
+        try self.stdout.splatByteAll(' ', self.indent);
+        const tag_name = @tagName(tag);
+        try self.stdout.writeAll(tag_name);
+        const written: u32 = idx_col_width + self.indent + @as(u32, @intCast(tag_name.len));
+        if (written < summary_col) {
+            try self.stdout.splatByteAll(' ', summary_col - written);
+        } else {
+            try self.stdout.writeByte(' ');
+        }
         try writeDataSummary(self.zir, tag, data, self.stdout);
         try self.stdout.writeAll("\n");
 
         try self.recurseBodies(inst, tag, data);
     }
 
-    /// Walk a labelled body slice nested one indent step deeper.
-    /// Skips empty bodies so the listing stays compact.
     fn section(self: *Dumper, label: []const u8, slice: []const Zir.Inst.Index) anyerror!void {
         if (slice.len == 0) return;
-        try self.stdout.splatByteAll(' ', self.indent + 2);
+        try self.stdout.splatByteAll(' ', idx_col_width + self.indent);
         try self.stdout.print("{s}:\n", .{label});
-        self.indent += 4;
-        defer self.indent -= 4;
+        self.indent += indent_step;
+        defer self.indent -= indent_step;
         try self.body(slice);
     }
 
-    /// Top-level declaration entry: prints `decl <name>` metadata,
-    /// then recurses into every body the declaration carries.
     fn declaration(self: *Dumper, decl_inst: Zir.Inst.Index) anyerror!void {
-        try self.stdout.splatByteAll(' ', self.indent);
+        try self.stdout.splatByteAll(' ', idx_col_width + self.indent);
         const u = self.zir.getDeclaration(decl_inst);
         const name = if (u.name == .empty)
             "<unnamed>"
@@ -175,8 +153,8 @@ const Dumper = struct {
             "decl %{d} {s}  kind={s}  linkage={s}  pub={}\n",
             .{ @intFromEnum(decl_inst), name, @tagName(u.kind), @tagName(u.linkage), u.is_pub },
         );
-        self.indent += 2;
-        defer self.indent -= 2;
+        self.indent += indent_step;
+        defer self.indent -= indent_step;
         if (u.type_body) |b| try self.section("type_body", b);
         if (u.align_body) |b| try self.section("align_body", b);
         if (u.linksection_body) |b| try self.section("linksection_body", b);
@@ -184,15 +162,6 @@ const Dumper = struct {
         if (u.value_body) |b| try self.section("value_body", b);
     }
 
-    /// Per-tag body-slice descent. Covers the body-bearing payload
-    /// shapes (`Block`, `BlockComptime`, `CondBr`, `Try`, `BoolBr`,
-    /// `Defer`, `Func`, `FuncFancy`). Tags whose payload also carries
-    /// a body but whose accessor is more involved
-    /// (`switch_block` family, the `extended` opcodes that hold
-    /// `struct_decl`/`union_decl`/`enum_decl`/`opaque_decl` bodies)
-    /// render flat for now -- their summary still names the payload
-    /// index, so a follow-up can extend this switch without changing
-    /// any call sites.
     fn recurseBodies(
         self: *Dumper,
         inst: Zir.Inst.Index,
@@ -237,13 +206,6 @@ const Dumper = struct {
     }
 };
 
-/// Per-tag data summary. The switch is exhaustive over
-/// `Zir.Inst.Tag`: adding a new tag in stdlib without updating
-/// this switch is a compile error, by design.
-///
-/// Tag -> data-arm mapping mirrors the dispatch in
-/// `src/print_zir.zig:writeInstToStream` so the categorisation
-/// matches the compiler exactly.
 fn writeDataSummary(
     zir: Zir,
     tag: Zir.Inst.Tag,
@@ -256,28 +218,11 @@ fn writeDataSummary(
         .add_unsafe,
         .addwrap,
         .array_cat,
-        .array_init,
-        .array_init_anon,
-        .array_init_elem_ptr,
-        .array_init_ref,
         .array_type,
-        .array_type_sentinel,
-        .as_node,
-        .as_shift_operand,
-        .atomic_load,
-        .atomic_rmw,
-        .atomic_store,
         .bit_and,
         .bitcast,
         .bit_offset_of,
         .bit_or,
-        .block,
-        .block_comptime,
-        .block_inline,
-        .bool_br_and,
-        .bool_br_or,
-        .builtin_call,
-        .call,
         .cmp_eq,
         .cmp_gt,
         .cmp_gte,
@@ -285,10 +230,6 @@ fn writeDataSummary(
         .cmp_lte,
         .cmp_neq,
         .coerce_ptr_elem_ty,
-        .condbr,
-        .condbr_inline,
-        .decl_literal,
-        .decl_literal_no_coerce,
         .div,
         .div_exact,
         .div_floor,
@@ -298,27 +239,13 @@ fn writeDataSummary(
         .elem_ptr_node,
         .elem_val,
         .enum_from_int,
-        .error_set_decl,
         .error_union_type,
-        .@"export",
-        .field_call,
-        .field_ptr,
-        .field_ptr_load,
-        .field_ptr_named,
-        .field_ptr_named_load,
-        .field_type_ref,
-        .float128,
         .float_cast,
         .float_from_int,
-        .for_len,
-        .func,
-        .func_fancy,
-        .func_inferred,
         .has_decl,
         .has_field,
         .int_cast,
         .int_from_float,
-        .loop,
         .max,
         .memcpy,
         .memmove,
@@ -328,7 +255,6 @@ fn writeDataSummary(
         .mod,
         .mod_rem,
         .mul,
-        .mul_add,
         .mul_sat,
         .mulwrap,
         .offset_of,
@@ -342,39 +268,77 @@ fn writeDataSummary(
         .shl_sat,
         .shr,
         .shr_exact,
+        .splat,
+        .store_node,
+        .store_to_inferred_ptr,
+        .sub,
+        .sub_sat,
+        .subwrap,
+        .truncate,
+        .vector_type,
+        .xor,
+        => try writeBin(zir, data, stdout),
+
+        .as_node, .as_shift_operand => try writeAs(zir, data, stdout),
+        .condbr, .condbr_inline => try writeCondBr(zir, data, stdout),
+        .@"try", .try_ptr => try writeTry(zir, data, stdout),
+        .bool_br_and, .bool_br_or => try writeBoolBr(zir, data, stdout),
+        .call => try writeCall(zir, data, stdout, .direct),
+        .field_call => try writeCall(zir, data, stdout, .field),
+
+        .block,
+        .block_inline,
+        .loop,
+        .suspend_block,
+        .typeof_builtin,
+        .validate_ptr_array_init,
+        .validate_ptr_struct_init,
+        => try stdout.print(" src_node={d}", .{@intFromEnum(data.pl_node.src_node)}),
+
+        .block_comptime => try writeBlockComptime(zir, data, stdout),
+
+        .array_init,
+        .array_init_anon,
+        .array_init_elem_ptr,
+        .array_init_ref,
+        .array_type_sentinel,
+        .atomic_load,
+        .atomic_rmw,
+        .atomic_store,
+        .builtin_call,
+        .decl_literal,
+        .decl_literal_no_coerce,
+        .error_set_decl,
+        .@"export",
+        .field_ptr,
+        .field_ptr_load,
+        .field_ptr_named,
+        .field_ptr_named_load,
+        .field_type_ref,
+        .float128,
+        .for_len,
+        .func,
+        .func_fancy,
+        .func_inferred,
+        .mul_add,
         .shuffle,
         .slice_end,
         .slice_length,
         .slice_sentinel,
         .slice_start,
-        .splat,
-        .store_node,
-        .store_to_inferred_ptr,
         .struct_init,
         .struct_init_anon,
         .struct_init_field_ptr,
         .struct_init_field_type,
         .struct_init_ref,
-        .sub,
-        .sub_sat,
-        .subwrap,
-        .suspend_block,
         .switch_block,
         .switch_block_err_union,
         .switch_block_ref,
-        .truncate,
-        .@"try",
-        .try_ptr,
-        .typeof_builtin,
         .union_init,
         .validate_array_init_ref_ty,
         .validate_array_init_result_ty,
         .validate_array_init_ty,
         .validate_destructure,
-        .validate_ptr_array_init,
-        .validate_ptr_struct_init,
-        .vector_type,
-        .xor,
         => try stdout.print(" payload={d} src_node={d}", .{ data.pl_node.payload_index, @intFromEnum(data.pl_node.src_node) }),
 
         .abs,
@@ -461,12 +425,20 @@ fn writeDataSummary(
         .validate_deref,
         .validate_struct_init_result_ty,
         .validate_struct_init_ty,
-        => try stdout.print(" operand={s} src_node={d}", .{ refLabel(data.un_node.operand), @intFromEnum(data.un_node.src_node) }),
+        => {
+            try stdout.writeAll(" operand=");
+            try writeRef(stdout, data.un_node.operand);
+            try stdout.print(" src_node={d}", .{@intFromEnum(data.un_node.src_node)});
+        },
 
         .ref,
         .ret_implicit,
         .validate_ref_ty,
-        => try stdout.print(" operand={s} src_tok={d}", .{ refLabel(data.un_tok.operand), @intFromEnum(data.un_tok.src_tok) }),
+        => {
+            try stdout.writeAll(" operand=");
+            try writeRef(stdout, data.un_tok.operand);
+            try stdout.print(" src_tok={d}", .{@intFromEnum(data.un_tok.src_tok)});
+        },
 
         .import,
         .param,
@@ -495,7 +467,10 @@ fn writeDataSummary(
 
         .dbg_var_ptr,
         .dbg_var_val,
-        => try stdout.print(" \"{s}\" operand={s}", .{ data.str_op.getStr(zir), refLabel(data.str_op.operand) }),
+        => {
+            try stdout.print(" \"{s}\" operand=", .{data.str_op.getStr(zir)});
+            try writeRef(stdout, data.str_op.operand);
+        },
 
         .int_big,
         .str,
@@ -504,7 +479,12 @@ fn writeDataSummary(
         .@"break",
         .break_inline,
         .switch_continue,
-        => try stdout.print(" operand={s} payload={d}", .{ refLabel(data.@"break".operand), data.@"break".payload_index }),
+        => {
+            const e = zir.extraData(Zir.Inst.Break, data.@"break".payload_index);
+            try stdout.writeAll(" operand=");
+            try writeRef(stdout, data.@"break".operand);
+            try stdout.print(" target=%{d}", .{@intFromEnum(e.data.block_inst)});
+        },
 
         .@"unreachable"
         => try stdout.print(" src_node={d}", .{@intFromEnum(data.@"unreachable".src_node)}),
@@ -512,27 +492,108 @@ fn writeDataSummary(
         .@"defer"
         => try stdout.print(" index={d} len={d}", .{ data.@"defer".index, data.@"defer".len }),
 
-        .save_err_ret_index => try stdout.print(" operand={s}", .{refLabel(data.save_err_ret_index.operand)}),
+        .save_err_ret_index => {
+            try stdout.writeAll(" operand=");
+            try writeRef(stdout, data.save_err_ret_index.operand);
+        },
         .ptr_type => try stdout.print(" size={s} payload={d}", .{ @tagName(data.ptr_type.size), data.ptr_type.payload_index }),
         .int_type => try stdout.print(" {s}{d}", .{ if (data.int_type.signedness == .signed) "i" else "u", data.int_type.bit_count }),
         .int => try stdout.print(" {d}", .{data.int}),
         .float => try stdout.print(" {d}", .{data.float}),
         .extended => try stdout.print(" opcode={s} small={d} operand={d}", .{ @tagName(data.extended.opcode), data.extended.small, data.extended.operand }),
-        .elem_val_imm => try stdout.print(" operand={s} idx={d}", .{ refLabel(data.elem_val_imm.operand), data.elem_val_imm.idx }),
+        .elem_val_imm => {
+            try stdout.writeAll(" operand=");
+            try writeRef(stdout, data.elem_val_imm.operand);
+            try stdout.print(" idx={d}", .{data.elem_val_imm.idx});
+        },
         .declaration => try stdout.print(" payload={d} src_node={d}", .{ data.declaration.payload_index, @intFromEnum(data.declaration.src_node) }),
         .dbg_stmt => try stdout.print(" line={d} col={d}", .{ data.dbg_stmt.line, data.dbg_stmt.column }),
-        .array_init_elem_type => try stdout.print(" lhs={s} rhs={s}", .{ refLabel(data.bin.lhs), refLabel(data.bin.rhs) }),
+        .array_init_elem_type => {
+            try stdout.writeAll(" lhs=");
+            try writeRef(stdout, data.bin.lhs);
+            try stdout.writeAll(" rhs=");
+            try writeRef(stdout, data.bin.rhs);
+        },
+    }
+}
+
+fn writeBin(zir: Zir, data: Zir.Inst.Data, stdout: *std.Io.Writer) !void {
+    const e = zir.extraData(Zir.Inst.Bin, data.pl_node.payload_index).data;
+    try stdout.writeAll(" lhs=");
+    try writeRef(stdout, e.lhs);
+    try stdout.writeAll(" rhs=");
+    try writeRef(stdout, e.rhs);
+}
+
+fn writeAs(zir: Zir, data: Zir.Inst.Data, stdout: *std.Io.Writer) !void {
+    const e = zir.extraData(Zir.Inst.As, data.pl_node.payload_index).data;
+    try stdout.writeAll(" dest_type=");
+    try writeRef(stdout, e.dest_type);
+    try stdout.writeAll(" operand=");
+    try writeRef(stdout, e.operand);
+}
+
+fn writeCondBr(zir: Zir, data: Zir.Inst.Data, stdout: *std.Io.Writer) !void {
+    const e = zir.extraData(Zir.Inst.CondBr, data.pl_node.payload_index).data;
+    try stdout.writeAll(" condition=");
+    try writeRef(stdout, e.condition);
+}
+
+fn writeTry(zir: Zir, data: Zir.Inst.Data, stdout: *std.Io.Writer) !void {
+    const e = zir.extraData(Zir.Inst.Try, data.pl_node.payload_index).data;
+    try stdout.writeAll(" operand=");
+    try writeRef(stdout, e.operand);
+}
+
+fn writeBoolBr(zir: Zir, data: Zir.Inst.Data, stdout: *std.Io.Writer) !void {
+    const e = zir.extraData(Zir.Inst.BoolBr, data.pl_node.payload_index).data;
+    try stdout.writeAll(" lhs=");
+    try writeRef(stdout, e.lhs);
+}
+
+fn writeBlockComptime(zir: Zir, data: Zir.Inst.Data, stdout: *std.Io.Writer) !void {
+    const e = zir.extraData(Zir.Inst.BlockComptime, data.pl_node.payload_index).data;
+    try stdout.print(" reason={s}", .{@tagName(e.reason)});
+}
+
+const CallKind = enum { direct, field };
+
+fn writeCall(
+    zir: Zir,
+    data: Zir.Inst.Data,
+    stdout: *std.Io.Writer,
+    kind: CallKind,
+) !void {
+    switch (kind) {
+        .direct => {
+            const e = zir.extraData(Zir.Inst.Call, data.pl_node.payload_index).data;
+            const modifier: std.lang.CallModifier = @enumFromInt(e.flags.packed_modifier);
+            try stdout.print(" modifier=.{s} callee=", .{@tagName(modifier)});
+            try writeRef(stdout, e.callee);
+            try stdout.print(" args_len={d}", .{@as(u32, e.flags.args_len)});
+        },
+        .field => {
+            const e = zir.extraData(Zir.Inst.FieldCall, data.pl_node.payload_index).data;
+            const modifier: std.lang.CallModifier = @enumFromInt(e.flags.packed_modifier);
+            const name = zir.nullTerminatedString(e.field_name_start);
+            try stdout.print(" modifier=.{s} obj_ptr=", .{@tagName(modifier)});
+            try writeRef(stdout, e.obj_ptr);
+            try stdout.print(" field=\"{s}\" args_len={d}", .{ name, @as(u32, e.flags.args_len) });
+        },
     }
 }
 
 /// Render a `Zir.Inst.Ref` as the same `%N` shorthand used in the
 /// `zir` listing. Well-known refs print under their stdlib tag name
-/// (e.g. `bool_true`, `u32_type`).
-fn refLabel(ref: Zir.Inst.Ref) []const u8 {
-    if (ref == .none) return ".none";
-    if (ref.toIndex()) |idx| {
-        var buf: [16]u8 = undefined;
-        return std.fmt.bufPrint(&buf, "%{d}", .{@intFromEnum(idx)}) catch unreachable;
+/// (e.g. `bool_true`, `u32_type`). Writes directly to the stream so
+/// callers can emit several refs in one line without a per-call
+/// scratch buffer.
+fn writeRef(stdout: *std.Io.Writer, ref: Zir.Inst.Ref) !void {
+    if (ref == .none) {
+        try stdout.writeAll(".none");
+    } else if (ref.toIndex()) |idx| {
+        try stdout.print("%{d}", .{@intFromEnum(idx)});
+    } else {
+        try stdout.writeAll(@tagName(ref));
     }
-    return @tagName(ref);
 }
