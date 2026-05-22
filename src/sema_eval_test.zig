@@ -1456,3 +1456,114 @@ test "error_set: cross-line const E = error{...} binds the type" {
     try testing.expect(key == .error_set_type);
     try testing.expectEqual(@as(usize, 2), key.error_set_type.names.len);
 }
+
+test "fn decl: nullary void fn binds with correct FuncType" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns_idx = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    _ = try evalSessionLines(gpa, &pool, ns_idx, &.{
+        "fn foo() void {}",
+    }, &diag_buf);
+
+    const ns = pool.namespacePtr(ns_idx);
+    const name = try pool.getOrPutString(gpa, "foo");
+    const nav_idx = ns.lookupNav(&pool, name).?;
+    const nav = pool.getNav(nav_idx);
+    const resolved = nav.resolved.?;
+
+    const fn_key = pool.indexToKey(resolved.value).func;
+    const fn_ty_key = pool.indexToKey(fn_key.ty).func_type;
+    try testing.expectEqual(@as(usize, 0), fn_ty_key.param_types.len);
+    try testing.expectEqual(InternPool.Index.void_type, fn_ty_key.return_type);
+    try testing.expectEqual(fn_key.ty, fn_key.uncoerced_ty);
+    try testing.expectEqual(InternPool.Index.none, fn_key.generic_owner);
+}
+
+test "fn decl: typed params populate FuncType.param_types in order" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns_idx = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    _ = try evalSessionLines(gpa, &pool, ns_idx, &.{
+        "fn add(a: u32, b: i32) u8 { _ = a; _ = b; return 0; }",
+    }, &diag_buf);
+
+    const ns = pool.namespacePtr(ns_idx);
+    const nav_idx = ns.lookupNav(&pool, try pool.getOrPutString(gpa, "add")).?;
+    const fn_key = pool.indexToKey(pool.getNav(nav_idx).resolved.?.value).func;
+    const fn_ty = pool.indexToKey(fn_key.ty).func_type;
+
+    try testing.expectEqual(@as(usize, 2), fn_ty.param_types.len);
+    try testing.expectEqual(InternPool.Index.u32_type, fn_ty.param_types[0]);
+    try testing.expectEqual(InternPool.Index.i32_type, fn_ty.param_types[1]);
+    try testing.expectEqual(InternPool.Index.u8_type, fn_ty.return_type);
+    try testing.expectEqual(@as(u32, 0), fn_ty.comptime_bits);
+}
+
+test "fn decl: comptime parameter sets comptime_bits" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns_idx = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    _ = try evalSessionLines(gpa, &pool, ns_idx, &.{
+        "fn pick(a: u32, comptime b: u32) u32 { return a + b; }",
+    }, &diag_buf);
+
+    const ns = pool.namespacePtr(ns_idx);
+    const nav_idx = ns.lookupNav(&pool, try pool.getOrPutString(gpa, "pick")).?;
+    const fn_key = pool.indexToKey(pool.getNav(nav_idx).resolved.?.value).func;
+    const fn_ty = pool.indexToKey(fn_key.ty).func_type;
+
+    // Bit 1 set means param 1 is comptime.
+    try testing.expectEqual(@as(u32, 0b10), fn_ty.comptime_bits);
+    try testing.expect(!fn_ty.paramIsComptime(0));
+    try testing.expect(fn_ty.paramIsComptime(1));
+}
+
+test "fn decl: dedup -- same signature reuses FuncType Index" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns_idx = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    _ = try evalSessionLines(gpa, &pool, ns_idx, &.{
+        "fn f() void {}",
+        "fn g() void {}",
+    }, &diag_buf);
+
+    const ns = pool.namespacePtr(ns_idx);
+    const fn_f = pool.indexToKey(pool.getNav(ns.lookupNav(&pool, try pool.getOrPutString(gpa, "f")).?).resolved.?.value).func;
+    const fn_g = pool.indexToKey(pool.getNav(ns.lookupNav(&pool, try pool.getOrPutString(gpa, "g")).?).resolved.?.value).func;
+
+    // Same signature -> same fn_type Index.
+    try testing.expectEqual(fn_f.ty, fn_g.ty);
+    // Different bodies -> different Func Index.
+    try testing.expect(fn_f.zir_body_inst != fn_g.zir_body_inst);
+}
+
+test "fn decl: cross-line retrieval round-trips the Func value" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns_idx = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = (try evalSessionLines(gpa, &pool, ns_idx, &.{
+        "fn h(a: u8) i32 { _ = a; return 0; }",
+        "h",
+    }, &diag_buf)).?;
+
+    const fn_key = pool.indexToKey(value.index).func;
+    const fn_ty = pool.indexToKey(fn_key.ty).func_type;
+    try testing.expectEqual(@as(usize, 1), fn_ty.param_types.len);
+    try testing.expectEqual(InternPool.Index.u8_type, fn_ty.param_types[0]);
+    try testing.expectEqual(InternPool.Index.i32_type, fn_ty.return_type);
+}

@@ -72,8 +72,40 @@ comptime_break_inst: Zir.Inst.Index = undefined,
 /// (Stage 7 builtin coverage).
 branch_quota: u32 = default_branch_quota,
 branch_count: u32 = 0,
+/// Currently-active `Block`. Mirrors the compiler's
+/// `block: *Block` parameter threaded through every handler in
+/// `src/Sema.zig`; we keep it on Sema rather than in every
+/// signature since the REPL has no nested fn definitions or
+/// runtime-Block lowering that would require save/restore
+/// across handler frames. When those land, the compiler's
+/// threading pattern lifts here.
+block: *Block = undefined,
 
 pub const default_branch_quota: u32 = 1000;
+
+/// Mirrors the compiler's `Sema.Block` (src/Sema.zig). Today
+/// only `params` is populated -- the other compiler fields
+/// (label, instructions, runtime_*, namespace overrides,
+/// comptime_reason, etc.) land alongside their dependent
+/// handlers. `params` accumulates `.param` / `.param_comptime`
+/// instructions seen during body walking, drained by
+/// `evalFunc` when the matching `.func` instruction lands.
+pub const Block = struct {
+    params: std.ArrayListUnmanaged(Param) = .empty,
+
+    pub fn deinit(self: *Block, gpa: std.mem.Allocator) void {
+        self.params.deinit(gpa);
+    }
+
+    /// Mirrors `Block.Param` in the compiler. `name` is omitted
+    /// since fn types don't carry param names; bare-decl
+    /// rendering will surface them via the AST source when
+    /// needed.
+    pub const Param = struct {
+        ty: InternPool.Index,
+        is_comptime: bool,
+    };
+};
 
 pub const ComptimeAlloc = struct {
     ty: InternPool.Index,
@@ -114,6 +146,9 @@ pub fn analyze(
     assert(@intFromPtr(intern_pool) != 0);
     assert(zir.instructions.len > 0);
 
+    var top_block: Block = .{};
+    defer top_block.deinit(gpa);
+
     var sema: Sema = .{
         .gpa = gpa,
         .intern_pool = intern_pool,
@@ -122,6 +157,7 @@ pub fn analyze(
         .results = .empty,
         .comptime_allocs = .empty,
         .namespace = namespace,
+        .block = &top_block,
     };
     defer sema.results.deinit(gpa);
     defer sema.comptime_allocs.deinit(gpa);
@@ -314,6 +350,15 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .switch_block_ref,
         .switch_block_err_union,
         => sema.evalSwitchBlock(inst),
+        .param, .param_comptime => sema.evalParam(inst, tag),
+        .param_anytype, .param_anytype_comptime => sema.failAnytypeParam(),
+        .func, .func_inferred, .func_fancy => sema.evalFunc(inst),
+        .typeof => sema.evalTypeof(inst),
+        .typeof_builtin => sema.evalTypeofBuiltin(inst),
+        .block_comptime => sema.evalBlockComptime(inst),
+        .restore_err_ret_index_unconditional,
+        .restore_err_ret_index_fn_entry,
+        => null,
         .extended => sema.evalExtended(inst),
         .dbg_stmt => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
@@ -2900,6 +2945,135 @@ fn failSwitch(sema: *Sema, what: []const u8) Error!?Value {
     return error.AnalysisFail;
 }
 
+/// `.param` / `.param_comptime`: evaluate the param's type body
+/// (break_target is the param inst itself, mirroring
+/// src/Sema.zig:zirParam ~9031) and push onto `params`
+/// for the enclosing `.func` to drain. `.is_generic` params
+/// surface a structured diagnostic -- generics are Stage 7+.
+fn evalParam(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_tok = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_tok;
+    const extra = sema.zir.extraData(Zir.Inst.Param, pl_tok.payload_index);
+    if (extra.data.type.is_generic) {
+        try sema.writer.writeAll("generic parameter types not yet supported\n");
+        return error.AnalysisFail;
+    }
+    const body = sema.zir.bodySlice(extra.end, extra.data.type.body_len);
+    const ty_value = try sema.resolveInlineBody(body, inst);
+    try sema.block.params.append(sema.gpa, .{
+        .ty = ty_value.index,
+        .is_comptime = tag == .param_comptime,
+    });
+    return null;
+}
+
+fn failAnytypeParam(sema: *Sema) Error!?Value {
+    try sema.writer.writeAll("anytype parameters not yet supported\n");
+    return error.AnalysisFail;
+}
+
+/// `.func` / `.func_inferred` / `.func_fancy`: build the Func
+/// type from the drained `params` + the resolved return
+/// type, intern both, return the Func value. Uses stdlib's
+/// `getFnInfo` to abstract the three Inst layouts. Compiler
+/// reference: src/Sema.zig:zirFunc ~8321 + funcCommon ~8896.
+///
+/// CC defaults to `.auto` here regardless of `func_fancy`'s
+/// cc_ref / cc_body -- same Stage-3 simplification documented at
+/// the FuncType storage site (Stage 5/8 FFI widens). The inferred-
+/// error-set flag (`.func_inferred`) is observed via `getFnInfo`
+/// but doesn't affect the FuncType encoding today; it'll matter
+/// when error-set inference moves out of the per-fn analysis.
+fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const info = sema.zir.getFnInfo(inst);
+
+    const ret_ty: InternPool.Index = if (info.ret_ty_ref != .none)
+        (try sema.resolveRef(info.ret_ty_ref)).index
+    else if (info.ret_ty_body.len > 0)
+        (try sema.resolveInlineBody(info.ret_ty_body, inst)).index
+    else
+        InternPool.Index.void_type;
+
+    const params = try sema.gpa.alloc(InternPool.Index, sema.block.params.items.len);
+    defer sema.gpa.free(params);
+    var comptime_bits: u32 = 0;
+    for (sema.block.params.items, 0..) |pp, i| {
+        params[i] = pp.ty;
+        if (pp.is_comptime) comptime_bits |= @as(u32, 1) << @intCast(i);
+    }
+    sema.block.params.clearRetainingCapacity();
+
+    const fn_ty = try sema.intern_pool.internFuncType(.{
+        .param_types = params,
+        .return_type = ret_ty,
+        .comptime_bits = comptime_bits,
+    });
+    // No body -> this is a fn TYPE expression (`fn () void`),
+    // not a fn declaration. Return the FuncType Index directly
+    // as the type-of-type value. Mirrors the compiler's
+    // funcCommon at src/Sema.zig:9004 which interns just the
+    // FuncType when `has_body == false`.
+    if (info.body.len == 0) return Value{ .index = fn_ty };
+
+    const func_idx = try sema.intern_pool.internFunc(.{
+        .ty = fn_ty,
+        .uncoerced_ty = fn_ty,
+        .zir_body_inst = inst,
+    });
+    return Value{ .index = func_idx };
+}
+
+/// `.block_comptime`: identical to `.block` for our comptime-only
+/// Sema, the only difference being the extra carries a `reason`
+/// (`std.zig.SimpleComptimeReason`) we don't observe today.
+/// Compiler reference: src/Sema.zig:1737 (zirBlockComptime) which
+/// makes the child block's comptime status explicit; we always
+/// run at comptime so the body resolves the same way as for
+/// `.block`.
+fn evalBlockComptime(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.BlockComptime, pl_node.payload_index);
+    const body = sema.zir.bodySlice(extra.end, extra.data.body_len);
+    return try sema.resolveInlineBody(body, inst);
+}
+
+/// `.typeof`: `@TypeOf(x)` single-arg form. Reads the operand,
+/// returns its type as a type-of-type value. Mirrors
+/// src/Sema.zig:zirTypeof ~16860.
+fn evalTypeof(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const operand = try sema.resolveRef(un_node.operand);
+    return Value{ .index = Value.typeOf(operand, sema.intern_pool).index };
+}
+
+/// `.typeof_builtin`: `@TypeOf(...)` body-form -- AstGen wraps
+/// the operand expression in an Inst.Block so the type-context
+/// (`is_typeof`) can short-circuit certain analyses. Resolves
+/// the body's break value via resolveInlineBody (break_target is
+/// this inst), returns the resulting value's type. Mirrors
+/// src/Sema.zig:zirTypeofBuiltin ~16869.
+fn evalTypeofBuiltin(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.Block, pl_node.payload_index);
+    const body = sema.zir.bodySlice(extra.end, extra.data.body_len);
+    const operand = try sema.resolveInlineBody(body, inst);
+    return Value{ .index = Value.typeOf(operand, sema.intern_pool).index };
+}
+
 /// Sub-dispatcher for the `.extended` ZIR tag. The data union arm
 /// carries `(opcode, small, operand)`; each `Zir.Inst.Extended`
 /// opcode names a distinct builtin / construct. Mirrors the
@@ -2932,6 +3106,22 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         => return null,
 
         .in_comptime => return Value.bool_false,
+
+        // Bridge into std.lang.* (CallingConvention, AtomicOrder,
+        // AddressSpace, ...). Compiler reference:
+        // src/Sema.zig:zirStdLangValue ~24709 + getStdLangType.
+        // Full end-to-end requires Stage 6's `std` module loader
+        // -- without it we have no interned Type for the std.lang
+        // container. Surface as a named diagnostic so the gap is
+        // visible (vs the generic `inline else` fallback).
+        .std_lang_value => {
+            const small: std.zig.Zir.Inst.StdLangValue = @enumFromInt(extended.small);
+            try sema.writer.print(
+                "extended.std_lang_value(.{s}): std.lang access requires Stage 6 module loading\n",
+                .{@tagName(small)},
+            );
+            return error.AnalysisFail;
+        },
 
         inline else => |op| {
             try sema.writer.print("unsupported extended ZIR opcode: {s}\n", .{@tagName(op)});

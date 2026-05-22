@@ -41,6 +41,12 @@ pub const max_input_bytes: u32 = 16 * 1024;
 /// Classifies an input line by its first non-trivia token using
 /// std.zig.Tokenizer, so the grammar's own list of declaration-introducing
 /// keywords stays the source of truth.
+///
+/// `keyword_fn` is overloaded: `fn name(...) ...` is a declaration,
+/// but `fn (...) R` (no name, parens immediately after) is an
+/// anonymous fn TYPE expression. Two-token lookahead disambiguates --
+/// an l_paren right after `fn` means expression; an identifier means
+/// declaration.
 pub fn classify(input: [:0]const u8) Shape {
     assert(input.len > 0);
     assert(input.len <= max_input_bytes);
@@ -48,7 +54,10 @@ pub fn classify(input: [:0]const u8) Shape {
     var tokenizer = std.zig.Tokenizer.init(input);
     const first = tokenizer.next();
     return switch (first.tag) {
-        .keyword_fn,
+        .keyword_fn => switch (tokenizer.next().tag) {
+            .l_paren => .expression,
+            else => .declaration,
+        },
         .keyword_const,
         .keyword_var,
         .keyword_pub,

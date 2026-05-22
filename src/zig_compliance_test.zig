@@ -449,3 +449,95 @@ test "compliance: catch-then-switch matches second error name" {
         "x catch |e| switch (e) { error.Bad => 1, error.Worse => 2 }",
     });
 }
+
+test "compliance: anonymous fn type, nullary void" {
+    try expectMatchesZig(testing.allocator, &.{"fn () void"});
+}
+
+test "compliance: anonymous fn type, single param" {
+    try expectMatchesZig(testing.allocator, &.{"fn (u32) u8"});
+}
+
+test "compliance: anonymous fn type, two int params" {
+    try expectMatchesZig(testing.allocator, &.{"fn (u32, i32) u8"});
+}
+
+test "compliance: anonymous fn type, mixed-type params" {
+    try expectMatchesZig(testing.allocator, &.{"fn (u32, bool) u8"});
+}
+
+test "compliance: fn type bound to a const, then referenced" {
+    try expectMatchesZig(testing.allocator, &.{
+        "const T = fn (u32) i32;",
+        "T",
+    });
+}
+
+test "compliance: @TypeOf on @as-typed int returns the dest type" {
+    try expectMatchesZig(testing.allocator, &.{"@TypeOf(@as(u32, 1))"});
+}
+
+test "compliance: @TypeOf on bool literal" {
+    try expectMatchesZig(testing.allocator, &.{"@TypeOf(true)"});
+}
+
+test "compliance: @TypeOf on bare int literal yields comptime_int" {
+    try expectMatchesZig(testing.allocator, &.{"@TypeOf(1)"});
+}
+
+test "compliance: @TypeOf on @as-typed signed int" {
+    try expectMatchesZig(testing.allocator, &.{"@TypeOf(@as(i32, -5))"});
+}
+
+test "compliance: @TypeOf on a normal fn declaration" {
+    try expectMatchesZig(testing.allocator, &.{
+        "fn foo() void {}",
+        "@TypeOf(foo)",
+    });
+}
+
+test "compliance: @TypeOf on a fn decl with params" {
+    try expectMatchesZig(testing.allocator, &.{
+        "fn add(a: u32, b: u32) u32 { return a + b; }",
+        "@TypeOf(add)",
+    });
+}
+
+test "compliance: @TypeOf on int arith result is comptime_int" {
+    try expectMatchesZig(testing.allocator, &.{"@TypeOf(1 + 2)"});
+}
+
+test "compliance: @TypeOf on peer-resolved int arith" {
+    try expectMatchesZig(testing.allocator, &.{"@TypeOf(@as(u8, 1) + @as(u16, 2))"});
+}
+
+test "compliance: @TypeOf on bare float literal is comptime_float" {
+    try expectMatchesZig(testing.allocator, &.{"@TypeOf(1.5)"});
+}
+
+test "compliance: @TypeOf on typed float" {
+    try expectMatchesZig(testing.allocator, &.{"@TypeOf(@as(f32, 1.5))"});
+}
+
+test "compliance: @TypeOf on bool short-circuit yields bool" {
+    try expectMatchesZig(testing.allocator, &.{"@TypeOf(true and false)"});
+}
+
+test "compliance: @TypeOf on if-as-value picks branch type" {
+    try expectMatchesZig(testing.allocator, &.{"@TypeOf(if (true) @as(u32, 1) else @as(u32, 0))"});
+}
+
+test "compliance: @TypeOf on empty block is void" {
+    try expectMatchesZig(testing.allocator, &.{"@TypeOf({})"});
+}
+
+test "compliance: @TypeOf on coerced error union" {
+    try expectMatchesZig(testing.allocator, &.{
+        "const E = error{Bad, Worse};",
+        "@TypeOf(@as(E!u32, 0))",
+    });
+}
+
+test "compliance: @TypeOf on switch result is the case type" {
+    try expectMatchesZig(testing.allocator, &.{"@TypeOf(switch (1) { 0 => @as(u8, 10), else => @as(u8, 20) })"});
+}

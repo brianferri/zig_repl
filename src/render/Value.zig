@@ -115,8 +115,55 @@ pub fn writeTypeName(
         .ptr_type => |pt| try writePtrTypeName(pt, pool, writer),
         .error_set_type => |es| try writeErrorSetTypeName(es, pool, writer),
         .error_union_type => |eu| try writeErrorUnionTypeName(eu, pool, writer),
+        .func_type => |ft| try writeFuncTypeName(ft, pool, writer),
         else => try writer.writeAll("<type>"),
     }
+}
+
+/// Render a function type as Zig surface syntax:
+///   `[noinline] fn ([comptime|noalias] P0, ..., [, ...]) [callconv(.@"name")] R`
+/// CC is omitted when `.auto` (the default). Per-param `comptime`
+/// / `noalias` come from FuncType's bitmasks (first 32 params).
+/// `@tagName` on the CC value gives the active union variant; we
+/// wrap in `@"..."` so keyword names like `async` / `inline` stay
+/// parseable.
+fn writeFuncTypeName(
+    ft: InternPool.Key.FuncType,
+    pool: *const InternPool,
+    writer: *std.Io.Writer,
+) Error!void {
+    if (ft.is_noinline) try writer.writeAll("noinline ");
+    try writer.writeAll("fn (");
+    for (ft.param_types, 0..) |p, i| {
+        if (i != 0) try writer.writeAll(", ");
+        // Only the first 32 params have flag bits; std.math.cast
+        // succeeds IFF `i` fits in `paramIsComptime`/`paramIsNoalias`'s
+        // u5 index.
+        if (std.math.cast(u5, i)) |idx| {
+            if (ft.paramIsComptime(idx)) try writer.writeAll("comptime ");
+            if (ft.paramIsNoalias(idx)) try writer.writeAll("noalias ");
+        }
+        try writeTypeName(p, pool, writer);
+    }
+    if (ft.is_var_args) {
+        try writer.writeAll(if (ft.param_types.len > 0) ", ..." else "...");
+    }
+    try writer.writeAll(") ");
+    const cc_tag: std.lang.CallingConvention.Tag = ft.cc;
+    if (cc_tag != .auto) {
+        const name = @tagName(cc_tag);
+        // `zig run` prints `.naked` (unescaped) since the variant
+        // name isn't a Zig keyword, but `.@"async"` / `.@"inline"`
+        // need the escape. std.zig.Token.getKeyword tells us which
+        // is which; matching its decision keeps render output
+        // byte-equal with the compiler's value-printer.
+        if (std.zig.Token.getKeyword(name) != null) {
+            try writer.print("callconv(.@\"{s}\") ", .{name});
+        } else {
+            try writer.print("callconv(.{s}) ", .{name});
+        }
+    }
+    try writeTypeName(ft.return_type, pool, writer);
 }
 
 fn writeErrorUnionTypeName(
@@ -186,11 +233,10 @@ fn renderFloat(
 ) Error!void {
     var buf: [128]u8 = undefined;
     const text = switch (float.storage) {
-        .f16 => |v| std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable,
-        .f32 => |v| std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable,
-        .f64 => |v| std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable,
+        // f80 has no dedicated {d} formatter; widen to f128 for
+        // display only (stored value keeps its precision).
         .f80 => |v| std.fmt.bufPrint(&buf, "{d}", .{@as(f128, @floatCast(v))}) catch unreachable,
-        .f128 => |v| std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable,
+        inline else => |v| std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable,
     };
     try writer.writeAll(text);
     if (needsTrailingDecimal(text)) try writer.writeAll(".0");
