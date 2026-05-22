@@ -196,8 +196,15 @@ const Dumper = struct {
                 try self.section("body", self.zir.bodySlice(data.@"defer".index, data.@"defer".len));
             },
             .func, .func_inferred, .func_fancy => {
+                // `info.param_body` is the enclosing block's body that
+                // contains this func instruction -- recursing into it
+                // re-walks `inst` itself and loops. The compiler's
+                // print_zir filters params by tag (param /
+                // param_comptime / param_anytype) rather than dumping
+                // the whole enclosing block. Defer that filtered walk
+                // until the Sema fn handler lands; show ret_ty_body
+                // + body which are self-contained.
                 const info = self.zir.getFnInfo(inst);
-                try self.section("param_body", info.param_body);
                 try self.section("ret_ty_body", info.ret_ty_body);
                 try self.section("body", info.body);
             },

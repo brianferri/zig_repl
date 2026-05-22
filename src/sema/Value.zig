@@ -37,6 +37,7 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
         .ptr => |p| .{ .index = p.ty },
         .err => |e| .{ .index = e.ty },
         .error_union => |eu| .{ .index = eu.ty },
+        .func => |f| .{ .index = f.ty },
         // A bare type Key (the slot a type lives in) doubles as the value
         // of type `type` with that type as its payload -- the compiler's
         // `Ref.X_type` directly identifies an Index that's both. So when
@@ -47,6 +48,7 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
         .ptr_type,
         .error_set_type,
         .error_union_type,
+        .func_type,
         => .type_type,
     };
 }

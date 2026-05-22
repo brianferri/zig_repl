@@ -522,6 +522,21 @@ pub const Key = union(enum) {
     /// or a payload value of the union's payload type. Mirrors
     /// `Key.ErrorUnion` (`src/InternPool.zig` ~2382).
     error_union: ErrorUnion,
+    /// A function type (`fn (P0, P1, ...) R`). Mirrors the
+    /// compiler's `Key.FuncType` (`src/InternPool.zig` ~2154):
+    /// same field set with the heavy incremental-compilation
+    /// extras stripped. `comptime_bits` / `noalias_bits` are
+    /// per-parameter bitmasks; the helper methods on `FuncType`
+    /// return the per-index flag.
+    func_type: FuncType,
+    /// A function value. Mirrors `Key.Func` (`src/InternPool.zig`
+    /// ~2228) with the comptime-only minimum: `ty` and the ZIR
+    /// instruction that owns the body. The compiler's
+    /// `analysis_extra_index` / `branch_quota_extra_index` /
+    /// `generic_owner` / `comptime_args` / source-range fields
+    /// land if/when incremental compilation does -- same
+    /// deferred-vestigial story as `Nav.analysis.zir_index`.
+    func: Func,
 
     pub const Int = struct {
         ty: Index,
@@ -667,6 +682,61 @@ pub const Key = union(enum) {
         };
     };
 
+    pub const FuncType = struct {
+        param_types: []const Index,
+        return_type: Index,
+        /// LSB is parameter 0. The compiler caps this at u32 so
+        /// fn signatures wider than 32 parameters cannot be marked
+        /// individually -- same constraint here.
+        comptime_bits: u32 = 0,
+        noalias_bits: u32 = 0,
+        cc: std.lang.CallingConvention = .auto,
+        is_var_args: bool = false,
+        is_noinline: bool = false,
+
+        pub fn paramIsComptime(self: FuncType, i: u5) bool {
+            assert(i < self.param_types.len);
+            return @as(u1, @truncate(self.comptime_bits >> i)) != 0;
+        }
+
+        pub fn paramIsNoalias(self: FuncType, i: u5) bool {
+            assert(i < self.param_types.len);
+            return @as(u1, @truncate(self.noalias_bits >> i)) != 0;
+        }
+    };
+
+    pub const Func = struct {
+        /// Effective function type, post-coercion. For `func_decl`
+        /// this matches `uncoerced_ty`; for `func_coerced` this is
+        /// the destination type; for `func_instance` this is the
+        /// instance's resolved type (which may have fewer params
+        /// than the generic owner's type).
+        ty: Index,
+        /// Function type at the original declaration site. Equals
+        /// `ty` unless the value came from `coerceValueToType`
+        /// retargeting an existing func value to a new fn type --
+        /// i.e. `Tag.func_coerced`. See `src/InternPool.zig`
+        /// `Key.Func.uncoerced_ty`.
+        uncoerced_ty: Index,
+        /// The ZIR `func` / `func_inferred` / `func_fancy`
+        /// instruction that owns the body. The compiler uses
+        /// `TrackedInst.Index` here for incremental-update
+        /// bookkeeping; we use the bare `Zir.Inst.Index` until
+        /// incremental compilation lands -- same deferred-vestigial
+        /// story as `Nav.analysis.zir_index`.
+        zir_body_inst: std.zig.Zir.Inst.Index,
+        /// `.none` unless this is a generic-fn instantiation. When
+        /// set, points at the `func_decl` this instance was spawned
+        /// from. Mirrors `Key.Func.generic_owner`.
+        generic_owner: Index = .none,
+        /// Empty unless this is a generic-fn instantiation. Each
+        /// element is the comptime-known value bound to the
+        /// corresponding parameter of `generic_owner`'s type
+        /// (`.none` for runtime-known elements). Mirrors
+        /// `Key.Func.comptime_args`. Stage 7 generics populate this.
+        comptime_args: []const Index = &.{},
+    };
+
     /// Stable hash for dedup. `pool` is reserved for future Key variants
     /// (e.g. `struct_type`) whose canonical form requires pool lookup;
     /// today's variants ignore it. Storage variants of `int` are
@@ -740,6 +810,22 @@ pub const Key = union(enum) {
                     .err_name => |name| std.hash.autoHash(&hasher, name),
                     .payload => |idx| std.hash.autoHash(&hasher, idx),
                 }
+            },
+            .func_type => |ft| {
+                for (ft.param_types) |p| std.hash.autoHash(&hasher, p);
+                std.hash.autoHash(&hasher, ft.return_type);
+                std.hash.autoHash(&hasher, ft.comptime_bits);
+                std.hash.autoHash(&hasher, ft.noalias_bits);
+                std.hash.autoHash(&hasher, @as(std.lang.CallingConvention.Tag, ft.cc));
+                std.hash.autoHash(&hasher, ft.is_var_args);
+                std.hash.autoHash(&hasher, ft.is_noinline);
+            },
+            .func => |f| {
+                std.hash.autoHash(&hasher, f.ty);
+                std.hash.autoHash(&hasher, f.uncoerced_ty);
+                std.hash.autoHash(&hasher, f.zir_body_inst);
+                std.hash.autoHash(&hasher, f.generic_owner);
+                for (f.comptime_args) |arg| std.hash.autoHash(&hasher, arg);
             },
         }
         return hasher.final();
@@ -834,6 +920,29 @@ pub const Key = union(enum) {
                     .payload => |idx| idx == y.val.payload,
                 };
             },
+            .func_type => |x| blk: {
+                const y = b.func_type;
+                if (x.return_type != y.return_type) break :blk false;
+                if (x.comptime_bits != y.comptime_bits) break :blk false;
+                if (x.noalias_bits != y.noalias_bits) break :blk false;
+                if (x.is_var_args != y.is_var_args) break :blk false;
+                if (x.is_noinline != y.is_noinline) break :blk false;
+                if (@as(std.lang.CallingConvention.Tag, x.cc) !=
+                    @as(std.lang.CallingConvention.Tag, y.cc)) break :blk false;
+                if (x.param_types.len != y.param_types.len) break :blk false;
+                for (x.param_types, y.param_types) |xp, yp| if (xp != yp) break :blk false;
+                break :blk true;
+            },
+            .func => |x| blk: {
+                const y = b.func;
+                if (x.ty != y.ty) break :blk false;
+                if (x.uncoerced_ty != y.uncoerced_ty) break :blk false;
+                if (x.zir_body_inst != y.zir_body_inst) break :blk false;
+                if (x.generic_owner != y.generic_owner) break :blk false;
+                if (x.comptime_args.len != y.comptime_args.len) break :blk false;
+                for (x.comptime_args, y.comptime_args) |xa, ya| if (xa != ya) break :blk false;
+                break :blk true;
+            },
         };
     }
 };
@@ -914,6 +1023,32 @@ const Item = struct {
         // Error-union value carrying a payload. data = extra index of
         // ErrorUnionPayloadRepr (2 u32 slots: ty, payload).
         error_union_payload,
+        // Function type. data = extra index of FuncTypeRepr (3 u32
+        // slots) plus trailing comptime_bits / noalias_bits (when
+        // present per flags) and `param_types[N]`. Mirrors the
+        // compiler's `Item.Tag.type_function`.
+        type_function,
+        // Function value at a declaration site. data = extra index
+        // of FuncDeclRepr (2 u32 slots: ty, zir_body_inst). Mirrors
+        // the compiler's `Item.Tag.func_decl` minus the
+        // incremental-compilation extras. Today this is the only
+        // func tag the REPL emits.
+        func_decl,
+        // Function value from a generic-fn instantiation. data =
+        // extra index of FuncInstanceRepr (3 u32 slots: ty,
+        // generic_owner, comptime_args_len) plus trailing
+        // `comptime_args[comptime_args_len]`. Lands with Stage 7
+        // generics; the tag slot exists today so the dispatcher,
+        // hash, and eql paths cover the variant without later
+        // refactoring.
+        func_instance,
+        // Function value coerced to a different fn type. data =
+        // extra index of FuncCoercedRepr (2 u32 slots: ty,
+        // inner_func). The inner index points at another
+        // func_decl / func_instance; `uncoerced_ty` derives from
+        // the inner's `ty`. Lands when fn coercion does -- shape
+        // ready today.
+        func_coerced,
     };
 };
 
@@ -943,6 +1078,57 @@ const PtrTypeRepr = extern struct {
 /// slots: ty, comptime-alloc index, and the 64-bit byte_offset split
 /// into lo/hi u32s. Mirrors the compiler's `Tag.PtrComptimeAlloc` --
 /// allocations born in Sema rather than backed by a declaration.
+/// Extra-arena header for `Item.Tag.type_function`. Three u32
+/// slots followed by optional `comptime_bits` / `noalias_bits`
+/// and `param_types[params_len]`. The compiler's
+/// `Tag.TypeFunction` shape; storage discipline matches.
+const FuncTypeRepr = extern struct {
+    params_len: u32,
+    return_type: u32,
+    flags: u32,
+
+    /// Stage-3-minimum CC packing: `cc_tag` only. The compiler
+    /// uses `PackedCallingConvention(u18)` which also carries
+    /// `incoming_stack_alignment` + per-variant `extra`. We
+    /// reconstruct the full `std.lang.CallingConvention` on unpack
+    /// with default-initialised payloads since REPL paths today
+    /// only need `.auto` / `.c`; FFI (Stage 5/8) widens to the
+    /// full pack.
+    const Flags = packed struct(u32) {
+        cc_tag: std.lang.CallingConvention.Tag,
+        is_var_args: bool,
+        is_noinline: bool,
+        has_comptime_bits: bool,
+        has_noalias_bits: bool,
+        _reserved: u20 = 0,
+    };
+};
+
+/// Extra-arena payload for `Item.Tag.func_decl`. Two u32 slots:
+/// `ty` and the ZIR func-instruction index.
+const FuncDeclRepr = extern struct {
+    ty: u32,
+    zir_body_inst: u32,
+};
+
+/// Extra-arena header for `Item.Tag.func_instance`. Three u32
+/// slots followed by `comptime_args[comptime_args_len]`. The
+/// generic_owner index resolves through `indexToKey` to its
+/// `func_decl` and contributes the body inst.
+const FuncInstanceRepr = extern struct {
+    ty: u32,
+    generic_owner: u32,
+    comptime_args_len: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.func_coerced`. Two u32
+/// slots: the destination fn type and the inner func index whose
+/// `uncoerced_ty` becomes this Key.Func's `uncoerced_ty`.
+const FuncCoercedRepr = extern struct {
+    ty: u32,
+    inner_func: u32,
+};
+
 const PtrComptimeAllocRepr = extern struct {
     ty: u32,
     alloc_index: u32,
@@ -1522,6 +1708,8 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .err => |e| try emitErr(pool, e),
         .error_union_type => |eu| try emitErrorUnionType(pool, eu),
         .error_union => |eu| try emitErrorUnion(pool, eu),
+        .func_type => |ft| try emitFuncType(pool, ft),
+        .func => |f| try emitFunc(pool, f),
     }
 
     assert(pool.items.len == gop.index + 1);
@@ -1598,6 +1786,10 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .type_error_union => errorUnionTypeFromExtra(pool, item.data),
         .error_union_error => errorUnionErrFromExtra(pool, item.data),
         .error_union_payload => errorUnionPayloadFromExtra(pool, item.data),
+        .type_function => funcTypeFromExtra(pool, item.data),
+        .func_decl => funcDeclFromExtra(pool, item.data),
+        .func_instance => funcInstanceFromExtra(pool, item.data),
+        .func_coerced => funcCoercedFromExtra(pool, item.data),
     };
 }
 
@@ -2127,6 +2319,227 @@ pub fn internErrorUnionType(pool: *InternPool, eu: Key.ErrorUnionType) Allocator
 /// Intern an error-union value.
 pub fn internErrorUnion(pool: *InternPool, eu: Key.ErrorUnion) Allocator.Error!Index {
     return pool.get(.{ .error_union = eu });
+}
+
+/// Intern a function type.
+pub fn internFuncType(pool: *InternPool, ft: Key.FuncType) Allocator.Error!Index {
+    return pool.get(.{ .func_type = ft });
+}
+
+/// Intern a function value.
+pub fn internFunc(pool: *InternPool, f: Key.Func) Allocator.Error!Index {
+    return pool.get(.{ .func = f });
+}
+
+/// Emit a `type_function` Item. Header is `FuncTypeRepr` (3 u32
+/// slots); trailing `comptime_bits` / `noalias_bits` slots appear
+/// only when the flags say so; then `param_types[params_len]`.
+fn emitFuncType(pool: *InternPool, ft: Key.FuncType) Allocator.Error!void {
+    assert(ft.return_type != .none);
+    assert(ft.param_types.len <= std.math.maxInt(u32));
+
+    const has_comptime_bits = ft.comptime_bits != 0;
+    const has_noalias_bits = ft.noalias_bits != 0;
+    const flags: FuncTypeRepr.Flags = .{
+        .cc_tag = ft.cc,
+        .is_var_args = ft.is_var_args,
+        .is_noinline = ft.is_noinline,
+        .has_comptime_bits = has_comptime_bits,
+        .has_noalias_bits = has_noalias_bits,
+    };
+
+    const extra_index: u32 = @intCast(pool.extra.items.len);
+    const header_slots: u32 = 3;
+    const opt_slots: u32 = @as(u32, @intFromBool(has_comptime_bits)) +
+        @as(u32, @intFromBool(has_noalias_bits));
+    const param_slots: u32 = @intCast(ft.param_types.len);
+    try pool.extra.ensureUnusedCapacity(pool.gpa, header_slots + opt_slots + param_slots);
+
+    pool.extra.appendAssumeCapacity(@intCast(ft.param_types.len));
+    pool.extra.appendAssumeCapacity(@intFromEnum(ft.return_type));
+    pool.extra.appendAssumeCapacity(@bitCast(flags));
+    if (has_comptime_bits) pool.extra.appendAssumeCapacity(ft.comptime_bits);
+    if (has_noalias_bits) pool.extra.appendAssumeCapacity(ft.noalias_bits);
+    for (ft.param_types) |p| pool.extra.appendAssumeCapacity(@intFromEnum(p));
+
+    pool.items.appendAssumeCapacity(.{ .tag = .type_function, .data = extra_index });
+}
+
+/// Emit a `func` Item. Dispatches between Tag.func_decl,
+/// Tag.func_instance, and Tag.func_coerced based on the Key.Func
+/// shape -- mirrors the compiler's three-Item-tag layout so
+/// Stage 7 generics and the fn-coercion follow-up land as pure
+/// emit additions without disturbing existing call sites.
+fn emitFunc(pool: *InternPool, f: Key.Func) Allocator.Error!void {
+    assert(f.ty != .none);
+    assert(f.uncoerced_ty != .none);
+
+    const extra_index: u32 = @intCast(pool.extra.items.len);
+    if (f.generic_owner != .none) {
+        try pool.extra.ensureUnusedCapacity(pool.gpa, 3 + f.comptime_args.len);
+        pool.extra.appendAssumeCapacity(@intFromEnum(f.ty));
+        pool.extra.appendAssumeCapacity(@intFromEnum(f.generic_owner));
+        pool.extra.appendAssumeCapacity(@intCast(f.comptime_args.len));
+        for (f.comptime_args) |arg| pool.extra.appendAssumeCapacity(@intFromEnum(arg));
+        pool.items.appendAssumeCapacity(.{ .tag = .func_instance, .data = extra_index });
+        return;
+    }
+    if (f.uncoerced_ty != f.ty) {
+        // func_coerced: store the destination ty + the inner
+        // (uncoerced) func index. The inner index round-trips back
+        // through indexToKey to recover uncoerced_ty and zir_body_inst.
+        // Stage 3 has no fn coercion yet, so this branch is reachable
+        // only via direct internFunc calls -- the shape is here so the
+        // coercion handler can land without restructuring storage.
+        const inner = try pool.internFunc(.{
+            .ty = f.uncoerced_ty,
+            .uncoerced_ty = f.uncoerced_ty,
+            .zir_body_inst = f.zir_body_inst,
+        });
+        const coerced_extra: u32 = @intCast(pool.extra.items.len);
+        try pool.extra.appendSlice(pool.gpa, &.{
+            @intFromEnum(f.ty),
+            @intFromEnum(inner),
+        });
+        pool.items.appendAssumeCapacity(.{ .tag = .func_coerced, .data = coerced_extra });
+        return;
+    }
+    try pool.extra.appendSlice(pool.gpa, &.{
+        @intFromEnum(f.ty),
+        @intFromEnum(f.zir_body_inst),
+    });
+    pool.items.appendAssumeCapacity(.{ .tag = .func_decl, .data = extra_index });
+}
+
+fn funcTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    assert(extra_index + 3 <= pool.extra.items.len);
+    const params_len = pool.extra.items[extra_index];
+    const return_type: Index = @enumFromInt(pool.extra.items[extra_index + 1]);
+    const flags: FuncTypeRepr.Flags = @bitCast(pool.extra.items[extra_index + 2]);
+
+    var trail: usize = extra_index + 3;
+    const comptime_bits: u32 = if (flags.has_comptime_bits) blk: {
+        const v = pool.extra.items[trail];
+        trail += 1;
+        break :blk v;
+    } else 0;
+    const noalias_bits: u32 = if (flags.has_noalias_bits) blk: {
+        const v = pool.extra.items[trail];
+        trail += 1;
+        break :blk v;
+    } else 0;
+    assert(trail + params_len <= pool.extra.items.len);
+
+    // Park the param slice straight from `extra`. Lifetime matches
+    // the pool's; callers should not retain across pool mutations
+    // that may reallocate `extra` (same discipline as
+    // `error_set_type.names`).
+    const param_slots = pool.extra.items[trail..][0..params_len];
+    const param_types: []const Index = @ptrCast(param_slots);
+
+    // Stage-3 simplification: reconstruct the CC variant with a
+    // default-initialised payload (incoming_stack_alignment = null
+    // for variants that carry one). Stage 5/8 widens to full
+    // `PackedCallingConvention` round-trip.
+    const cc: std.lang.CallingConvention = ccFromTag(flags.cc_tag);
+
+    return .{ .func_type = .{
+        .param_types = param_types,
+        .return_type = return_type,
+        .comptime_bits = comptime_bits,
+        .noalias_bits = noalias_bits,
+        .cc = cc,
+        .is_var_args = flags.is_var_args,
+        .is_noinline = flags.is_noinline,
+    } };
+}
+
+fn funcDeclFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    assert(extra_index + 2 <= pool.extra.items.len);
+    const ty: Index = @enumFromInt(pool.extra.items[extra_index]);
+    return .{ .func = .{
+        .ty = ty,
+        .uncoerced_ty = ty,
+        .zir_body_inst = @enumFromInt(pool.extra.items[extra_index + 1]),
+    } };
+}
+
+fn funcInstanceFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    assert(extra_index + 3 <= pool.extra.items.len);
+    const ty: Index = @enumFromInt(pool.extra.items[extra_index]);
+    const generic_owner: Index = @enumFromInt(pool.extra.items[extra_index + 1]);
+    const args_len = pool.extra.items[extra_index + 2];
+    assert(extra_index + 3 + args_len <= pool.extra.items.len);
+    const args_slots = pool.extra.items[extra_index + 3 ..][0..args_len];
+    const comptime_args: []const Index = @ptrCast(args_slots);
+
+    // Body inst comes from the generic owner's func_decl.
+    const owner_key = pool.indexToKey(generic_owner).func;
+    return .{ .func = .{
+        .ty = ty,
+        .uncoerced_ty = ty,
+        .zir_body_inst = owner_key.zir_body_inst,
+        .generic_owner = generic_owner,
+        .comptime_args = comptime_args,
+    } };
+}
+
+fn funcCoercedFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    assert(extra_index + 2 <= pool.extra.items.len);
+    const ty: Index = @enumFromInt(pool.extra.items[extra_index]);
+    const inner_index: Index = @enumFromInt(pool.extra.items[extra_index + 1]);
+    // Invariant: `inner_func` is always a flattened `func_decl` or
+    // `func_instance` -- never another `func_coerced`. `emitFunc`
+    // enforces this on the write side (it builds `inner` via a
+    // direct `internFunc` of the uncoerced form). Asserting here
+    // keeps the recursion through indexToKey bounded at one level,
+    // matching the compiler's flatten-on-intern discipline.
+    const inner_tag = pool.items.get(@intFromEnum(inner_index)).tag;
+    assert(inner_tag == .func_decl or inner_tag == .func_instance);
+    const inner_key = pool.indexToKey(inner_index).func;
+    return .{ .func = .{
+        .ty = ty,
+        .uncoerced_ty = inner_key.uncoerced_ty,
+        .zir_body_inst = inner_key.zir_body_inst,
+        .generic_owner = inner_key.generic_owner,
+        .comptime_args = inner_key.comptime_args,
+    } };
+}
+
+/// Reconstruct a `std.lang.CallingConvention` from its packed tag.
+/// Stage-3 storage keeps only the tag; the payload is reconstructed
+/// here for the safe variants AstGen emits in normal user code
+/// (void-payload CCs + the common per-target `.c` aliases whose
+/// payload is `CommonOptions{}`, all-default-fields). Variants
+/// whose payload has required fields (`spirv_*.mode`,
+/// `arm_interrupt.type`, etc.) panic loudly here so a future ZIR
+/// path using one of them surfaces immediately rather than reading
+/// undefined memory; lifted to full pack/unpack with Stage 5/8 FFI.
+fn ccFromTag(tag: std.lang.CallingConvention.Tag) std.lang.CallingConvention {
+    return switch (tag) {
+        .auto => .auto,
+        .async => .async,
+        .naked => .naked,
+        .@"inline" => .@"inline",
+        .x86_64_sysv => .{ .x86_64_sysv = .{} },
+        .x86_64_win => .{ .x86_64_win = .{} },
+        .x86_sysv => .{ .x86_sysv = .{} },
+        .x86_win => .{ .x86_win = .{} },
+        .x86_stdcall => .{ .x86_stdcall = .{} },
+        .x86_fastcall => .{ .x86_fastcall = .{} },
+        .x86_thiscall => .{ .x86_thiscall = .{} },
+        .x86_vectorcall => .{ .x86_vectorcall = .{} },
+        .aarch64_aapcs => .{ .aarch64_aapcs = .{} },
+        .aarch64_aapcs_darwin => .{ .aarch64_aapcs_darwin = .{} },
+        .aarch64_aapcs_win => .{ .aarch64_aapcs_win = .{} },
+        .aarch64_vfabi => .{ .aarch64_vfabi = .{} },
+        .aarch64_vfabi_sve => .{ .aarch64_vfabi_sve = .{} },
+        .arm_aapcs => .{ .arm_aapcs = .{} },
+        .arm_aapcs_vfp => .{ .arm_aapcs_vfp = .{} },
+        .riscv64_lp64 => .{ .riscv64_lp64 = .{} },
+        .riscv32_ilp32 => .{ .riscv32_ilp32 = .{} },
+        else => @panic("InternPool: round-trip for this CallingConvention.Tag variant not yet implemented"),
+    };
 }
 
 /// True IFF `ty` identifies a Zig float type. Mirrors the compiler's
@@ -2941,6 +3354,105 @@ test "error_union value: both arms round-trip and dedup independently" {
     const round_payload = pool.indexToKey(payload_val).error_union;
     try std.testing.expect(round_payload.val == .payload);
     try std.testing.expectEqual(payload_inner, round_payload.val.payload);
+}
+
+test "func_type: round-trip + dedup by (params, return, flags)" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const params = [_]Index{ .u32_type, .i32_type };
+    const ft: Key.FuncType = .{ .param_types = &params, .return_type = .void_type };
+
+    const a = try pool.internFuncType(ft);
+    const b = try pool.internFuncType(.{ .param_types = &params, .return_type = .void_type });
+    try std.testing.expectEqual(a, b);
+
+    const round = pool.indexToKey(a).func_type;
+    try std.testing.expectEqual(@as(usize, 2), round.param_types.len);
+    try std.testing.expectEqual(Index.u32_type, round.param_types[0]);
+    try std.testing.expectEqual(Index.i32_type, round.param_types[1]);
+    try std.testing.expectEqual(Index.void_type, round.return_type);
+    try std.testing.expectEqual(false, round.is_var_args);
+    try std.testing.expectEqual(std.lang.CallingConvention.Tag.auto, round.cc);
+}
+
+test "func_type: distinct return type produces distinct index" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const params = [_]Index{.u32_type};
+    const a = try pool.internFuncType(.{ .param_types = &params, .return_type = .void_type });
+    const b = try pool.internFuncType(.{ .param_types = &params, .return_type = .u32_type });
+    try std.testing.expect(a != b);
+}
+
+test "func_type: comptime_bits round-trip via flags" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const params = [_]Index{ .u32_type, .u32_type };
+    const a = try pool.internFuncType(.{
+        .param_types = &params,
+        .return_type = .void_type,
+        .comptime_bits = 0b10, // param 1 is comptime
+    });
+    const round = pool.indexToKey(a).func_type;
+    try std.testing.expectEqual(@as(u32, 0b10), round.comptime_bits);
+    try std.testing.expect(!round.paramIsComptime(0));
+    try std.testing.expect(round.paramIsComptime(1));
+}
+
+test "func_decl: round-trip + dedup by (ty, zir_body_inst)" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const params = [_]Index{.u32_type};
+    const fn_ty = try pool.internFuncType(.{ .param_types = &params, .return_type = .u32_type });
+    const body_inst: std.zig.Zir.Inst.Index = @enumFromInt(42);
+
+    const a = try pool.internFunc(.{ .ty = fn_ty, .uncoerced_ty = fn_ty, .zir_body_inst = body_inst });
+    const b = try pool.internFunc(.{ .ty = fn_ty, .uncoerced_ty = fn_ty, .zir_body_inst = body_inst });
+    try std.testing.expectEqual(a, b);
+
+    const round = pool.indexToKey(a).func;
+    try std.testing.expectEqual(fn_ty, round.ty);
+    try std.testing.expectEqual(fn_ty, round.uncoerced_ty);
+    try std.testing.expectEqual(body_inst, round.zir_body_inst);
+    try std.testing.expectEqual(Index.none, round.generic_owner);
+    try std.testing.expectEqual(@as(usize, 0), round.comptime_args.len);
+}
+
+test "func_decl: distinct zir_body_inst produces distinct index" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const params = [_]Index{};
+    const fn_ty = try pool.internFuncType(.{ .param_types = &params, .return_type = .void_type });
+
+    const a = try pool.internFunc(.{ .ty = fn_ty, .uncoerced_ty = fn_ty, .zir_body_inst = @enumFromInt(1) });
+    const b = try pool.internFunc(.{ .ty = fn_ty, .uncoerced_ty = fn_ty, .zir_body_inst = @enumFromInt(2) });
+    try std.testing.expect(a != b);
+}
+
+test "func_coerced: ty != uncoerced_ty routes through Tag.func_coerced" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    // Two fn types that differ only in return type.
+    const params = [_]Index{};
+    const ty_void = try pool.internFuncType(.{ .param_types = &params, .return_type = .void_type });
+    const ty_u32 = try pool.internFuncType(.{ .param_types = &params, .return_type = .u32_type });
+
+    const body_inst: std.zig.Zir.Inst.Index = @enumFromInt(7);
+    // First intern the underlying func_decl.
+    _ = try pool.internFunc(.{ .ty = ty_void, .uncoerced_ty = ty_void, .zir_body_inst = body_inst });
+    // Now request a coerced view: ty = ty_u32, uncoerced_ty = ty_void.
+    const coerced = try pool.internFunc(.{ .ty = ty_u32, .uncoerced_ty = ty_void, .zir_body_inst = body_inst });
+
+    const round = pool.indexToKey(coerced).func;
+    try std.testing.expectEqual(ty_u32, round.ty);
+    try std.testing.expectEqual(ty_void, round.uncoerced_ty);
+    try std.testing.expectEqual(body_inst, round.zir_body_inst);
 }
 
 test "ComptimeUnit: createComptimeUnit + getComptimeUnit round-trip" {

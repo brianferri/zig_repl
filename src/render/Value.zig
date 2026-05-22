@@ -41,10 +41,12 @@ pub fn render(
         .ptr_type,
         .error_set_type,
         .error_union_type,
+        .func_type,
         => renderTypeRef(value.index, pool, writer),
         .ptr => |p| writer.print("ptr@{d}+{d}\n", .{ @intFromEnum(p.ty), p.byte_offset }),
         .err => |e| writer.print("error.{s}\n", .{pool.stringSlice(e.name)}),
         .error_union => |eu| renderErrorUnion(eu, pool, writer),
+        .func => |f| writer.print("fn@{d}\n", .{@intFromEnum(f.zir_body_inst)}),
     };
 }
 
