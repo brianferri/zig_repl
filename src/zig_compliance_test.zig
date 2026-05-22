@@ -405,3 +405,47 @@ test "compliance: cross-line catch on .payload arm" {
         "y catch @as(u32, 0)",
     });
 }
+
+test "compliance: switch scalar case match" {
+    try expectMatchesZig(testing.allocator, &.{"switch (1) { 0 => 100, 1 => 200, else => 999 }"});
+}
+
+test "compliance: switch falls through to else" {
+    try expectMatchesZig(testing.allocator, &.{"switch (5) { 0 => 100, else => 999 }"});
+}
+
+test "compliance: switch on fixed-width int operand" {
+    try expectMatchesZig(testing.allocator, &.{"switch (@as(u8, 2)) { 0 => 10, 1 => 20, 2 => 30, else => 0 }"});
+}
+
+test "compliance: switch multi-case items" {
+    try expectMatchesZig(testing.allocator, &.{"switch (3) { 0, 1, 2 => 100, 3, 4 => 200, else => 0 }"});
+}
+
+test "compliance: switch range lower edge" {
+    try expectMatchesZig(testing.allocator, &.{"switch (0) { 0...2 => 100, 3...5 => 200, else => 999 }"});
+}
+
+test "compliance: switch range upper edge" {
+    try expectMatchesZig(testing.allocator, &.{"switch (5) { 0...2 => 100, 3...5 => 200, else => 999 }"});
+}
+
+test "compliance: switch range falls through" {
+    try expectMatchesZig(testing.allocator, &.{"switch (7) { 0...2 => 100, 3...5 => 200, else => 999 }"});
+}
+
+test "compliance: catch-then-switch matches first error name" {
+    try expectMatchesZig(testing.allocator, &.{
+        "const E = error{Bad, Worse};",
+        "const x: E!u32 = error.Bad;",
+        "x catch |e| switch (e) { error.Bad => 1, error.Worse => 2 }",
+    });
+}
+
+test "compliance: catch-then-switch matches second error name" {
+    try expectMatchesZig(testing.allocator, &.{
+        "const E = error{Bad, Worse};",
+        "const x: E!u32 = error.Worse;",
+        "x catch |e| switch (e) { error.Bad => 1, error.Worse => 2 }",
+    });
+}

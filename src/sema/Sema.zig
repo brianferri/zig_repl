@@ -310,6 +310,10 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .err_union_payload_unsafe => sema.evalErrUnionPayloadUnsafe(inst),
         .is_non_err => sema.evalIsNonErr(inst),
         .loop => sema.evalLoop(inst),
+        .switch_block,
+        .switch_block_ref,
+        .switch_block_err_union,
+        => sema.evalSwitchBlock(inst),
         .extended => sema.evalExtended(inst),
         .dbg_stmt => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
@@ -2001,7 +2005,7 @@ fn evalStoreNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return error.AnalysisFail;
     }
 
-    const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr, "store");
+    const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr);
     const rhs_value = try sema.resolveRef(bin.rhs);
     const coerced = try sema.coerceValueToType(rhs_value, alloc.ty, "store");
     alloc.val = coerced;
@@ -2019,12 +2023,19 @@ fn evalLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(un_node.operand != .none);
 
     const ptr_value = try sema.resolveRef(un_node.operand);
-    const ptr_key = sema.intern_pool.indexToKey(ptr_value.index);
+    return try sema.loadValue(ptr_value);
+}
+
+/// Dereference a Key.ptr Value through its backing comptime_alloc
+/// slot. Shared by `evalLoad` (ZIR `.load` arm) and the ptr-form
+/// switch operand (`switch_block_ref`).
+fn loadValue(sema: *Sema, ptr: Value) Error!Value {
+    const ptr_key = sema.intern_pool.indexToKey(ptr.index);
     if (ptr_key != .ptr) {
-        try sema.writer.writeAll("load: operand is not a pointer\n");
+        try sema.writer.writeAll("internal error: load through non-pointer value\n");
         return error.AnalysisFail;
     }
-    const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr, "load");
+    const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr);
     return alloc.val;
 }
 
@@ -2033,16 +2044,11 @@ fn evalLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// (for store) or read it (for load) without copying. The `byte_offset`
 /// is asserted to be zero -- field/element pointers (non-zero offsets)
 /// arrive with Stage 4 aggregates.
-fn lookupComptimeAlloc(
-    sema: *Sema,
-    ptr: InternPool.Key.Ptr,
-    op_name: []const u8,
-) Error!*ComptimeAlloc {
+fn lookupComptimeAlloc(sema: *Sema, ptr: InternPool.Key.Ptr) Error!*ComptimeAlloc {
     assert(@intFromPtr(sema) != 0);
-    assert(op_name.len > 0);
 
     if (ptr.byte_offset != 0) {
-        try sema.writer.print("{s}: pointer offset not yet supported\n", .{op_name});
+        try sema.writer.writeAll("comptime_alloc lookup: pointer offset not yet supported\n");
         return error.AnalysisFail;
     }
     const idx: u32 = @intFromEnum(ptr.base_addr.comptime_alloc);
@@ -2726,6 +2732,172 @@ fn evalLoop(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const extra = sema.zir.extraData(Zir.Inst.Block, pl_node.payload_index);
     const body = sema.zir.bodySlice(extra.end, extra.data.body_len);
     return try sema.resolveInlineBody(body, inst);
+}
+
+/// `switch_block` family: resolve the operand, walk cases via
+/// stdlib's `zir.getSwitchBlock`, evaluate the matching prong body.
+/// Handles all three tag flavors:
+///
+///   * `switch_block`     - direct operand.
+///   * `switch_block_ref` - operand is a pointer; load through it
+///                          first via `loadValue`.
+///   * `switch_block_err_union` - operand is an error_union. On the
+///                          `.payload` arm runs `non_err_case.body`;
+///                          on the `.err_name` arm continues into
+///                          case matching where items are
+///                          `error_value` names.
+///
+/// Item kinds covered: `.body_len` (literal / computed item),
+/// `.under` (wildcard), `.error_value` (matches err-union err_name).
+/// `.enum_literal` items and prong captures land with Stage 4 enum
+/// + capture machinery and surface a structured diagnostic.
+///
+/// Ranges (`range_infos`) use BigInt comparison after coercing both
+/// endpoints to the operand type.
+///
+/// Compiler reference: src/Sema.zig:zirSwitchBlock ~9984.
+fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const tag = sema.zir.instructions.items(.tag)[@intFromEnum(inst)];
+    const sw = sema.zir.getSwitchBlock(inst);
+
+    var operand = try sema.resolveRef(sw.main_operand);
+    if (tag == .switch_block_ref) {
+        operand = try sema.loadValue(operand);
+    }
+
+    // `switch_block_err_union`: dispatch by the error_union's val
+    // arm. `non_err_case.operand_is_ref` says the operand is a
+    // *EU; the compiler defers the is-err check to runtime via
+    // `analyzePtrIsNonErr` vs `analyzeIsNonErr`
+    // (src/Sema.zig:9894), keeping the pointer through both
+    // branches. We have no AIR to defer to, so the comptime path
+    // must materialise the error_union Key now -- if the operand
+    // is `Key.ptr`, the only way to reach the .val arm is through
+    // the comptime_alloc slot.
+    if (tag == .switch_block_err_union) {
+        const non_err = sw.non_err_case orelse {
+            try sema.writer.writeAll("switch_block_err_union: missing non_err_case\n");
+            return error.AnalysisFail;
+        };
+        if (non_err.operand_is_ref) {
+            operand = try sema.loadValue(operand);
+        }
+        const eu_key = sema.intern_pool.indexToKey(operand.index);
+        if (eu_key != .error_union) {
+            try sema.writer.writeAll("switch_block_err_union: operand is not an error_union\n");
+            return error.AnalysisFail;
+        }
+        switch (eu_key.error_union.val) {
+            .payload => {
+                if (non_err.capture != .none) return sema.failSwitch("non-err payload capture");
+                return try sema.resolveInlineBody(non_err.body, inst);
+            },
+            .err_name => {},
+        }
+    }
+
+    // Either way, `error_value` items match the operand's error
+    // name. Bare `Key.err` and the err arm of `Key.error_union`
+    // both surface a name we can compare against the item's
+    // interned name bytes.
+    const operand_err_name: ?InternPool.NullTerminatedString =
+        switch (sema.intern_pool.indexToKey(operand.index)) {
+            .err => |e| e.name,
+            .error_union => |eu| switch (eu.val) {
+                .err_name => |n| n,
+                .payload => null,
+            },
+            else => null,
+        };
+
+    const operand_ty = Value.typeOf(operand, sema.intern_pool).index;
+
+    var extra_index: usize = sw.end;
+    var it = sw.iterateCases();
+    while (it.next()) |case| {
+        const prong_body = sema.zir.bodySlice(extra_index, case.prong_info.body_len);
+        extra_index += case.prong_info.body_len;
+
+        if (case.prong_info.capture != .none) return sema.failSwitch("prong capture");
+
+        var matched = false;
+        for (case.item_infos) |item_info| {
+            switch (item_info.unwrap()) {
+                .body_len => |body_len| {
+                    const item_body = sema.zir.bodySlice(extra_index, body_len);
+                    extra_index += body_len;
+                    if (matched) continue;
+                    const item_raw = try sema.resolveInlineBody(item_body, inst);
+                    const item_coerced = try sema.coerceValueToType(item_raw, operand_ty, "switch case");
+                    if (item_coerced.index == operand.index) matched = true;
+                },
+                .under => matched = true,
+                .error_value => |item_err_name| {
+                    // Item names live in zir.string_bytes; the operand's
+                    // error name lives in the intern pool. Compare bytes.
+                    if (operand_err_name) |op| {
+                        const op_bytes = sema.intern_pool.stringSlice(op);
+                        const item_bytes = sema.zir.nullTerminatedString(item_err_name);
+                        if (std.mem.eql(u8, op_bytes, item_bytes)) matched = true;
+                    }
+                },
+                .enum_literal => return sema.failSwitch("enum_literal switch items"),
+            }
+        }
+
+        for (case.range_infos) |range_pair| {
+            const lo_len = range_pair[0].bodyLen() orelse 0;
+            const hi_len = range_pair[1].bodyLen() orelse 0;
+            const lo_body = sema.zir.bodySlice(extra_index, lo_len);
+            extra_index += lo_len;
+            const hi_body = sema.zir.bodySlice(extra_index, hi_len);
+            extra_index += hi_len;
+            if (matched) continue;
+            const lo_raw = try sema.resolveInlineBody(lo_body, inst);
+            const hi_raw = try sema.resolveInlineBody(hi_body, inst);
+            const lo_co = try sema.coerceValueToType(lo_raw, operand_ty, "switch range");
+            const hi_co = try sema.coerceValueToType(hi_raw, operand_ty, "switch range");
+            if (try integerInRange(sema, operand, lo_co, hi_co)) matched = true;
+        }
+
+        if (matched) return try sema.resolveInlineBody(prong_body, inst);
+    }
+
+    if (sw.else_case) |else_case| {
+        if (else_case.capture != .none) return sema.failSwitch("else capture");
+        return try sema.resolveInlineBody(else_case.body, inst);
+    }
+
+    try sema.writer.writeAll("switch: no matching case and no else\n");
+    return error.AnalysisFail;
+}
+
+/// `lo <= x <= hi` over the integer-key BigInt representations.
+/// Both endpoints have already been coerced to the operand type
+/// upstream; this just runs the order comparison.
+fn integerInRange(sema: *Sema, x: Value, lo: Value, hi: Value) Error!bool {
+    const x_key = sema.intern_pool.indexToKey(x.index);
+    const lo_key = sema.intern_pool.indexToKey(lo.index);
+    const hi_key = sema.intern_pool.indexToKey(hi.index);
+    if (x_key != .int or lo_key != .int or hi_key != .int) {
+        try sema.writer.writeAll("switch range: non-integer endpoint\n");
+        return error.AnalysisFail;
+    }
+    var x_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    var lo_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    var hi_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const x_big = x_key.int.storage.toBigInt(&x_space);
+    const lo_big = lo_key.int.storage.toBigInt(&lo_space);
+    const hi_big = hi_key.int.storage.toBigInt(&hi_space);
+    return x_big.order(lo_big) != .lt and x_big.order(hi_big) != .gt;
+}
+
+fn failSwitch(sema: *Sema, what: []const u8) Error!?Value {
+    try sema.writer.print("unsupported switch construct: {s}\n", .{what});
+    return error.AnalysisFail;
 }
 
 /// Sub-dispatcher for the `.extended` ZIR tag. The data union arm
