@@ -383,8 +383,6 @@ pub fn compareInt(
     return lhs.order(rhs).compare(op);
 }
 
-const DivKind = enum { trunc, floor };
-
 const DivPair = struct {
     quotient: InternPool.Index,
     remainder: InternPool.Index,
@@ -751,7 +749,7 @@ fn computeDivPair(
     intern_pool: *InternPool,
     lhs: BigIntConst,
     rhs: BigIntConst,
-    kind: DivKind,
+    comptime kind: enum { trunc, floor },
 ) DivError!DivPair {
     assert(@intFromPtr(intern_pool) != 0);
     assert(lhs.limbs.len > 0);

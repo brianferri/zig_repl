@@ -563,13 +563,11 @@ fn writeBlockComptime(zir: Zir, data: Zir.Inst.Data, stdout: *std.Io.Writer) !vo
     try stdout.print(" reason={s}", .{@tagName(e.reason)});
 }
 
-const CallKind = enum { direct, field };
-
 fn writeCall(
     zir: Zir,
     data: Zir.Inst.Data,
     stdout: *std.Io.Writer,
-    kind: CallKind,
+    comptime kind: enum { direct, field },
 ) !void {
     switch (kind) {
         .direct => {
