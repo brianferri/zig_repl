@@ -6,6 +6,7 @@ const testing = std.testing;
 
 const Pipeline = @import("front/Pipeline.zig");
 const Sema = @import("sema/Sema.zig");
+const Session = @import("Session.zig");
 const InternPool = @import("sema/InternPool.zig");
 const Value = @import("sema/Value.zig");
 
@@ -21,8 +22,12 @@ fn evalSource(
     try testing.expect(!result.hasParseErrors());
     try testing.expect(!result.hasZirErrors());
 
+    const ns = try intern_pool.createNamespace(gpa, .none);
+    var session = Session.initForTest(gpa, intern_pool, ns);
+    defer session.deinit();
+
     var writer = std.Io.Writer.fixed(diag_buf);
-    const maybe_value = try Sema.analyze(gpa, intern_pool, result.zir, &writer, null);
+    const maybe_value = try Sema.analyze(&session, result.zir, &writer);
     return maybe_value orelse error.NoValue;
 }
 
@@ -222,9 +227,13 @@ fn expectEvalFails(
     var result = try Pipeline.run(gpa, source);
     defer result.deinit(gpa);
 
+    const ns = try intern_pool.createNamespace(gpa, .none);
+    var session = Session.initForTest(gpa, intern_pool, ns);
+    defer session.deinit();
+
     var diag_buf: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&diag_buf);
-    const sema_result = Sema.analyze(gpa, intern_pool, result.zir, &writer, null);
+    const sema_result = Sema.analyze(&session, result.zir, &writer);
     try testing.expectError(error.AnalysisFail, sema_result);
 
     const written = diag_buf[0 .. writer.buffer.len - writer.unusedCapacityLen()];
@@ -1047,16 +1056,22 @@ fn evalSessionLines(
     inputs: []const []const u8,
     diag_buf: []u8,
 ) !?Value {
+    var session = Session.initForTest(gpa, pool, namespace);
+    defer session.deinit();
+
     var last_value: ?Value = null;
     for (inputs) |source| {
         var result = try Pipeline.runWithInjection(gpa, source, pool, .init(namespace));
-        defer result.deinit(gpa);
+        var committed = false;
+        defer if (!committed) result.deinit(gpa);
 
         try testing.expect(!result.hasParseErrors());
         try testing.expect(!result.hasZirErrors());
 
         var writer = std.Io.Writer.fixed(diag_buf);
-        last_value = try Sema.analyze(gpa, pool, result.zir, &writer, namespace);
+        last_value = try Sema.analyze(&session, result.zir, &writer);
+        try session.pipelines.append(gpa, result);
+        committed = true;
     }
     return last_value;
 }
@@ -1547,6 +1562,36 @@ test "fn decl: dedup -- same signature reuses FuncType Index" {
     try testing.expectEqual(fn_f.ty, fn_g.ty);
     // Different bodies -> different Func Index.
     try testing.expect(fn_f.zir_body_inst != fn_g.zir_body_inst);
+}
+
+test "fn call: cross-line call returns the right value" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = (try evalSessionLines(gpa, &pool, ns, &.{
+        "fn id(x: u32) u32 { return x; }",
+        "id(42)",
+    }, &diag_buf)).?;
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .int);
+    try testing.expectEqual(@as(u64, 42), key.int.storage.u64);
+}
+
+test "fn call: cross-line recursion (fib)" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = (try evalSessionLines(gpa, &pool, ns, &.{
+        "fn fib(n: u32) u32 { return if (n < 2) n else fib(n - 1) + fib(n - 2); }",
+        "fib(10)",
+    }, &diag_buf)).?;
+    try testing.expectEqual(@as(u64, 55), pool.indexToKey(value.index).int.storage.u64);
 }
 
 test "fn decl: cross-line retrieval round-trips the Func value" {

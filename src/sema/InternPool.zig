@@ -706,6 +706,16 @@ pub const Key = union(enum) {
     };
 
     pub const Func = struct {
+        /// Identifies which frozen ZIR snapshot owns this func's
+        /// body. `maxInt` is the sentinel for "the currently-active
+        /// `sema.zir`" -- used during a `analyze()` pass where the
+        /// func is bound in the SAME ZIR being walked. After the
+        /// pass commits, Repl promotes that Pipeline.Result into
+        /// `Session.frozen_pipelines` and the next analyze sees the
+        /// func's `source_zir_id` resolved to a stable index.
+        /// Mirrors the compiler's `TrackedInst.Index` purpose
+        /// (cross-update body identity) at the storage layer.
+        source_zir_id: u32 = std.math.maxInt(u32),
         /// Effective function type, post-coercion. For `func_decl`
         /// this matches `uncoerced_ty`; for `func_coerced` this is
         /// the destination type; for `func_instance` this is the
@@ -821,6 +831,7 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, ft.is_noinline);
             },
             .func => |f| {
+                std.hash.autoHash(&hasher, f.source_zir_id);
                 std.hash.autoHash(&hasher, f.ty);
                 std.hash.autoHash(&hasher, f.uncoerced_ty);
                 std.hash.autoHash(&hasher, f.zir_body_inst);
@@ -935,6 +946,7 @@ pub const Key = union(enum) {
             },
             .func => |x| blk: {
                 const y = b.func;
+                if (x.source_zir_id != y.source_zir_id) break :blk false;
                 if (x.ty != y.ty) break :blk false;
                 if (x.uncoerced_ty != y.uncoerced_ty) break :blk false;
                 if (x.zir_body_inst != y.zir_body_inst) break :blk false;
@@ -1104,18 +1116,22 @@ const FuncTypeRepr = extern struct {
     };
 };
 
-/// Extra-arena payload for `Item.Tag.func_decl`. Two u32 slots:
-/// `ty` and the ZIR func-instruction index.
+/// Extra-arena payload for `Item.Tag.func_decl`. Three u32 slots:
+/// the source ZIR snapshot id (matches `Sema.current_zir_id` at
+/// intern time; index into `Session.pipelines`), `ty`, and the
+/// ZIR func-instruction index within that snapshot.
 const FuncDeclRepr = extern struct {
+    source_zir_id: u32,
     ty: u32,
     zir_body_inst: u32,
 };
 
-/// Extra-arena header for `Item.Tag.func_instance`. Three u32
+/// Extra-arena header for `Item.Tag.func_instance`. Four u32
 /// slots followed by `comptime_args[comptime_args_len]`. The
 /// generic_owner index resolves through `indexToKey` to its
-/// `func_decl` and contributes the body inst.
+/// `func_decl` and contributes the body inst + source_zir_id.
 const FuncInstanceRepr = extern struct {
+    source_zir_id: u32,
     ty: u32,
     generic_owner: u32,
     comptime_args_len: u32,
@@ -1123,7 +1139,9 @@ const FuncInstanceRepr = extern struct {
 
 /// Extra-arena payload for `Item.Tag.func_coerced`. Two u32
 /// slots: the destination fn type and the inner func index whose
-/// `uncoerced_ty` becomes this Key.Func's `uncoerced_ty`.
+/// `uncoerced_ty` becomes this Key.Func's `uncoerced_ty`. The
+/// source_zir_id is inherited from the inner func -- no extra
+/// slot needed since the inner-index chase recovers it.
 const FuncCoercedRepr = extern struct {
     ty: u32,
     inner_func: u32,
@@ -2376,7 +2394,8 @@ fn emitFunc(pool: *InternPool, f: Key.Func) Allocator.Error!void {
 
     const extra_index: u32 = @intCast(pool.extra.items.len);
     if (f.generic_owner != .none) {
-        try pool.extra.ensureUnusedCapacity(pool.gpa, 3 + f.comptime_args.len);
+        try pool.extra.ensureUnusedCapacity(pool.gpa, 4 + f.comptime_args.len);
+        pool.extra.appendAssumeCapacity(f.source_zir_id);
         pool.extra.appendAssumeCapacity(@intFromEnum(f.ty));
         pool.extra.appendAssumeCapacity(@intFromEnum(f.generic_owner));
         pool.extra.appendAssumeCapacity(@intCast(f.comptime_args.len));
@@ -2387,11 +2406,10 @@ fn emitFunc(pool: *InternPool, f: Key.Func) Allocator.Error!void {
     if (f.uncoerced_ty != f.ty) {
         // func_coerced: store the destination ty + the inner
         // (uncoerced) func index. The inner index round-trips back
-        // through indexToKey to recover uncoerced_ty and zir_body_inst.
-        // Stage 3 has no fn coercion yet, so this branch is reachable
-        // only via direct internFunc calls -- the shape is here so the
-        // coercion handler can land without restructuring storage.
+        // through indexToKey to recover uncoerced_ty,
+        // zir_body_inst, and source_zir_id.
         const inner = try pool.internFunc(.{
+            .source_zir_id = f.source_zir_id,
             .ty = f.uncoerced_ty,
             .uncoerced_ty = f.uncoerced_ty,
             .zir_body_inst = f.zir_body_inst,
@@ -2405,6 +2423,7 @@ fn emitFunc(pool: *InternPool, f: Key.Func) Allocator.Error!void {
         return;
     }
     try pool.extra.appendSlice(pool.gpa, &.{
+        f.source_zir_id,
         @intFromEnum(f.ty),
         @intFromEnum(f.zir_body_inst),
     });
@@ -2455,27 +2474,31 @@ fn funcTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
 }
 
 fn funcDeclFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    assert(extra_index + 2 <= pool.extra.items.len);
-    const ty: Index = @enumFromInt(pool.extra.items[extra_index]);
+    assert(extra_index + 3 <= pool.extra.items.len);
+    const source_zir_id = pool.extra.items[extra_index];
+    const ty: Index = @enumFromInt(pool.extra.items[extra_index + 1]);
     return .{ .func = .{
+        .source_zir_id = source_zir_id,
         .ty = ty,
         .uncoerced_ty = ty,
-        .zir_body_inst = @enumFromInt(pool.extra.items[extra_index + 1]),
+        .zir_body_inst = @enumFromInt(pool.extra.items[extra_index + 2]),
     } };
 }
 
 fn funcInstanceFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    assert(extra_index + 3 <= pool.extra.items.len);
-    const ty: Index = @enumFromInt(pool.extra.items[extra_index]);
-    const generic_owner: Index = @enumFromInt(pool.extra.items[extra_index + 1]);
-    const args_len = pool.extra.items[extra_index + 2];
-    assert(extra_index + 3 + args_len <= pool.extra.items.len);
-    const args_slots = pool.extra.items[extra_index + 3 ..][0..args_len];
+    assert(extra_index + 4 <= pool.extra.items.len);
+    const source_zir_id = pool.extra.items[extra_index];
+    const ty: Index = @enumFromInt(pool.extra.items[extra_index + 1]);
+    const generic_owner: Index = @enumFromInt(pool.extra.items[extra_index + 2]);
+    const args_len = pool.extra.items[extra_index + 3];
+    assert(extra_index + 4 + args_len <= pool.extra.items.len);
+    const args_slots = pool.extra.items[extra_index + 4 ..][0..args_len];
     const comptime_args: []const Index = @ptrCast(args_slots);
 
     // Body inst comes from the generic owner's func_decl.
     const owner_key = pool.indexToKey(generic_owner).func;
     return .{ .func = .{
+        .source_zir_id = source_zir_id,
         .ty = ty,
         .uncoerced_ty = ty,
         .zir_body_inst = owner_key.zir_body_inst,
@@ -2498,6 +2521,7 @@ fn funcCoercedFromExtra(pool: *const InternPool, extra_index: u32) Key {
     assert(inner_tag == .func_decl or inner_tag == .func_instance);
     const inner_key = pool.indexToKey(inner_index).func;
     return .{ .func = .{
+        .source_zir_id = inner_key.source_zir_id,
         .ty = ty,
         .uncoerced_ty = inner_key.uncoerced_ty,
         .zir_body_inst = inner_key.zir_body_inst,

@@ -30,7 +30,7 @@ fn run(session: *Session, argument: []const u8, stdout: *std.Io.Writer) anyerror
     var result = Pipeline.runWithInjection(
         session.gpa,
         trimmed,
-        &session.intern_pool,
+        session.intern_pool,
         .init(session.root_namespace),
     ) catch |err| {
         try stdout.print("front-end failed: {s}\n", .{@errorName(err)});

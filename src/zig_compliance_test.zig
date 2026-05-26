@@ -9,6 +9,7 @@ const Io = std.Io;
 
 const Pipeline = @import("front/Pipeline.zig");
 const Sema = @import("sema/Sema.zig");
+const Session = @import("Session.zig");
 const InternPool = @import("sema/InternPool.zig");
 const Value = @import("sema/Value.zig");
 const render = @import("render/Value.zig");
@@ -30,17 +31,23 @@ fn runViaRepl(
     defer pool.deinit();
     const ns = try pool.createNamespace(gpa, .none);
 
-    var last_value: ?@import("sema/Value.zig") = null;
+    var session = Session.initForTest(gpa, &pool, ns);
+    defer session.deinit();
+
+    var last_value: ?Value = null;
     for (inputs) |source| {
         var result = try Pipeline.runWithInjection(gpa, source, &pool, .init(ns));
-        defer result.deinit(gpa);
+        var committed = false;
+        defer if (!committed) result.deinit(gpa);
 
         if (result.hasParseErrors()) return error.ParseError;
         if (result.hasZirErrors()) return error.ZirError;
 
         var diag_buf: [4096]u8 = undefined;
         var diag_writer = Io.Writer.fixed(&diag_buf);
-        last_value = try Sema.analyze(gpa, &pool, result.zir, &diag_writer, ns);
+        last_value = try Sema.analyze(&session, result.zir, &diag_writer);
+        try session.pipelines.append(gpa, result);
+        committed = true;
     }
 
     const value = last_value orelse return error.NoValue;
@@ -540,4 +547,53 @@ test "compliance: @TypeOf on coerced error union" {
 
 test "compliance: @TypeOf on switch result is the case type" {
     try expectMatchesZig(testing.allocator, &.{"@TypeOf(switch (1) { 0 => @as(u8, 10), else => @as(u8, 20) })"});
+}
+
+test "compliance: same-input fn call" {
+    try expectMatchesZig(testing.allocator, &.{
+        "fn double(x: u32) u32 { return x + x; } const r = double(7);",
+        "r",
+    });
+}
+
+test "compliance: same-input multi-arg fn call" {
+    try expectMatchesZig(testing.allocator, &.{
+        "fn add(a: u32, b: u32) u32 { return a + b; } const r = add(3, 4);",
+        "r",
+    });
+}
+
+test "compliance: same-input recursive fn (factorial)" {
+    try expectMatchesZig(testing.allocator, &.{
+        "fn fact(n: u32) u32 { return if (n == 0) 1 else n * fact(n - 1); } const r = fact(5);",
+        "r",
+    });
+}
+
+test "compliance: same-input nested call" {
+    try expectMatchesZig(testing.allocator, &.{
+        "fn d(x: u32) u32 { return x + x; } const r = d(d(5));",
+        "r",
+    });
+}
+
+test "compliance: cross-line fn call" {
+    try expectMatchesZig(testing.allocator, &.{
+        "fn id(x: u32) u32 { return x; }",
+        "id(42)",
+    });
+}
+
+test "compliance: cross-line recursive fib(10)" {
+    try expectMatchesZig(testing.allocator, &.{
+        "fn fib(n: u32) u32 { return if (n < 2) n else fib(n - 1) + fib(n - 2); }",
+        "fib(10)",
+    });
+}
+
+test "compliance: cross-line multi-arg fn" {
+    try expectMatchesZig(testing.allocator, &.{
+        "fn add(a: u32, b: u32) u32 { return a + b; }",
+        "add(3, 4)",
+    });
 }

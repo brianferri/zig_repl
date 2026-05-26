@@ -83,13 +83,18 @@ fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
     var result = Pipeline.runWithInjection(
         repl.session.gpa,
         input,
-        &repl.session.intern_pool,
+        repl.session.intern_pool,
         .init(repl.session.root_namespace),
     ) catch |err| {
         try stdout.print("front-end failed: {s}\n", .{@errorName(err)});
         return;
     };
-    defer result.deinit(repl.session.gpa);
+    // Don't deinit `result` here. We commit successfully-analysed
+    // results to `session.pipelines` so cross-line fn calls can
+    // swap to their source-ZIR snapshot. Cleanup happens in
+    // `Session.deinit`. Parse/ZIR-error paths free locally.
+    var commit_to_session = false;
+    defer if (!commit_to_session) result.deinit(repl.session.gpa);
 
     if (result.hasParseErrors()) {
         return Diagnostic.renderParseErrors(result.tree, result.userView(), stdout);
@@ -104,17 +109,20 @@ fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
         );
     }
 
-    if (Sema.analyze(
-        repl.session.gpa,
-        &repl.session.intern_pool,
-        result.zir,
-        stdout,
-        repl.session.root_namespace,
-    ) catch |err| switch (err) {
+    const value_opt = Sema.analyze(repl.session, result.zir, stdout) catch |err| switch (err) {
         error.AnalysisFail => return, // diagnostic already written
         else => |e| return e,
-    }) |value| {
-        try renderValue(value, &repl.session.intern_pool, stdout);
+    };
+
+    // Analysis succeeded -- commit the result so any Func values
+    // it bound retain their source ZIR for future cross-line
+    // calls. The append takes ownership; the deferred deinit is
+    // skipped via the flag.
+    try repl.session.pipelines.append(repl.session.gpa, result);
+    commit_to_session = true;
+
+    if (value_opt) |value| {
+        try renderValue(value, repl.session.intern_pool, stdout);
         return;
     }
 

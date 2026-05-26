@@ -20,6 +20,8 @@ const InternPool = @import("InternPool.zig");
 const Value = @import("Value.zig");
 const arith = @import("arith.zig");
 const InputShape = @import("../front/InputShape.zig");
+const Pipeline = @import("../front/Pipeline.zig");
+const Session = @import("../Session.zig");
 
 const Sema = @This();
 
@@ -33,6 +35,13 @@ pub const Error = Allocator.Error || std.Io.Writer.Error || error{
     /// at src/Sema.zig:1685 (`zirBreak` arm) +
     /// src/Sema.zig:1062 (`analyzeInlineBody`).
     ComptimeBreak,
+    /// Non-local control transfer from `ret_node` / `ret_load` /
+    /// `ret_implicit` (the `return X;` keyword inside a function
+    /// body). The value being returned lives in `sema.return_value`.
+    /// `evalCall` is the receiver: catches ComptimeReturn from the
+    /// resolveInlineBody on the fn body and returns the value.
+    /// Mirrors src/Zcu.zig:2816 CompileError.ComptimeReturn.
+    ComptimeReturn,
 };
 
 gpa: Allocator,
@@ -72,6 +81,33 @@ comptime_break_inst: Zir.Inst.Index = undefined,
 /// (Stage 7 builtin coverage).
 branch_quota: u32 = default_branch_quota,
 branch_count: u32 = 0,
+/// Recursion-depth counter for `.call` / `.field_call`.
+/// Incremented at evalCall entry; decremented via defer at exit.
+/// Bounded by `call_depth_max` -- exceeding raises a structured
+/// "stack overflow during comptime call evaluation" diagnostic
+/// rather than blowing the host stack. The compiler doesn't use
+/// a fixed depth limit (it folds calls into branch_count via
+/// `emitBackwardBranch`-equivalent paths); the REPL has no
+/// branch-quota knob exposed on function-call paths yet, so a
+/// hard cap keeps unbounded recursion bounded.
+call_depth: u32 = 0,
+/// Value carried by an in-flight `error.ComptimeReturn`. Set by
+/// the `.ret_node` / `.ret_load` / `.ret_implicit` arms of
+/// evalBody; consumed by `evalCall`'s catch. Garbage outside
+/// that transfer.
+return_value: Value = undefined,
+/// Read-only view of all previously-analysed Pipeline.Results.
+/// Each entry's `.zir` is callable as a fn body when a Func
+/// value's `source_zir_id` references its index. Populated by
+/// the REPL driver; tests can leave this empty since they don't
+/// exercise cross-line calls.
+pipelines: []const Pipeline.Result = &.{},
+/// The id THIS analyze pass's ZIR will have if registered. Used
+/// at evalFunc-intern time so the resulting Func's
+/// `source_zir_id` resolves correctly on future cross-line
+/// lookups. evalCall compares against `func.source_zir_id` to
+/// decide whether to swap `sema.zir` for the body eval.
+current_zir_id: u32 = 0,
 /// Currently-active `Block`. Mirrors the compiler's
 /// `block: *Block` parameter threaded through every handler in
 /// `src/Sema.zig`; we keep it on Sema rather than in every
@@ -82,6 +118,7 @@ branch_count: u32 = 0,
 block: *Block = undefined,
 
 pub const default_branch_quota: u32 = 1000;
+pub const call_depth_max: u32 = 256;
 
 /// Mirrors the compiler's `Sema.Block` (src/Sema.zig). Today
 /// only `params` is populated -- the other compiler fields
@@ -129,13 +166,30 @@ pub const ComptimeAlloc = struct {
 /// `namespace` is the session-root NamespaceIndex (or `null` for
 /// test paths without session state -- `evalDeclVal` errors and
 /// `bindDecls` is a no-op in that mode).
-pub fn analyze(
-    gpa: Allocator,
-    intern_pool: *InternPool,
-    zir: Zir,
-    writer: *std.Io.Writer,
-    namespace: ?InternPool.NamespaceIndex,
-) Error!?Value {
+/// Walks the ZIR produced by AstGen for a single REPL line.
+///
+/// Two control-flow modes depending on what AstGen produced:
+///
+///   1. The line was wrapped as `const __repl_input = (<expr>);`.
+///      `findReplInputBody` locates that decl and evaluates its
+///      body. The result is the Value returned to the REPL prompt.
+///   2. The line is a raw declaration (`const x = ...;` etc.).
+///      `bindDecls` walks every top-level decl in the root struct,
+///      evaluates the value bodies, and binds them into the session
+///      namespace via `createNav` + `pub_decls.put`. Returns `null`
+///      because declarations don't produce a value-to-print.
+///
+/// Session-owned state (gpa, intern_pool, root_namespace,
+/// pipelines) is read straight off `session`. Per-call inputs
+/// (the ZIR to analyse + the diagnostic writer) are explicit
+/// parameters. `current_zir_id` is derived as
+/// `session.pipelines.items.len` -- the slot THIS pass's
+/// Pipeline.Result will occupy once committed by the REPL
+/// driver after a successful analyze.
+pub fn analyze(session: *Session, zir: Zir, writer: *std.Io.Writer) Error!?Value {
+    const gpa = session.gpa;
+    const intern_pool = session.intern_pool;
+    const namespace = session.root_namespace;
     // Zir may carry compile-error items that the front-end Pipeline
     // classifies as non-actionable (see `front/ZirErrors.zig`).
     // Pipeline gates Sema entry via `hasZirErrors`; Sema itself
@@ -158,6 +212,8 @@ pub fn analyze(
         .comptime_allocs = .empty,
         .namespace = namespace,
         .block = &top_block,
+        .pipelines = session.pipelines.items,
+        .current_zir_id = @intCast(session.pipelines.items.len),
     };
     defer sema.results.deinit(gpa);
     defer sema.comptime_allocs.deinit(gpa);
@@ -165,7 +221,7 @@ pub fn analyze(
     if (findReplInputBody(zir)) |bound| {
         return try sema.resolveInlineBody(bound.body, bound.decl_inst);
     }
-    if (namespace != null) try sema.bindDecls();
+    try sema.bindDecls();
     return null;
 }
 
@@ -222,6 +278,28 @@ fn evalBody(sema: *Sema, body: []const Zir.Inst.Index) Error!Value {
                 try sema.emitBackwardBranch();
                 i = 0;
                 continue;
+            },
+            // `return X;` keyword inside a fn body. ret_node /
+            // ret_load read un_node; ret_implicit reads un_tok
+            // (no source-node offset since AstGen emits it
+            // implicitly at fn-body end). All three stash the
+            // resolved value in sema.return_value and raise
+            // ComptimeReturn for evalCall's catch.
+            .ret_node => {
+                const operand = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node.operand;
+                sema.return_value = try sema.resolveRef(operand);
+                return error.ComptimeReturn;
+            },
+            .ret_implicit => {
+                const operand = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_tok.operand;
+                sema.return_value = try sema.resolveRef(operand);
+                return error.ComptimeReturn;
+            },
+            .ret_load => {
+                const operand = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node.operand;
+                const ptr = try sema.resolveRef(operand);
+                sema.return_value = try sema.loadValue(ptr);
+                return error.ComptimeReturn;
             },
             else => {
                 if (try sema.evalInst(inst, tag)) |result| {
@@ -355,6 +433,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .func, .func_inferred, .func_fancy => sema.evalFunc(inst),
         .typeof => sema.evalTypeof(inst),
         .typeof_builtin => sema.evalTypeofBuiltin(inst),
+        .call => sema.evalCall(inst, .direct),
+        .field_call => sema.evalCall(inst, .field),
         .block_comptime => sema.evalBlockComptime(inst),
         .restore_err_ret_index_unconditional,
         .restore_err_ret_index_fn_entry,
@@ -3021,11 +3101,151 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     if (info.body.len == 0) return Value{ .index = fn_ty };
 
     const func_idx = try sema.intern_pool.internFunc(.{
+        .source_zir_id = sema.current_zir_id,
         .ty = fn_ty,
         .uncoerced_ty = fn_ty,
         .zir_body_inst = inst,
     });
     return Value{ .index = func_idx };
+}
+
+/// `.call` / `.field_call`: invoke a comptime-resolvable function
+/// value with args. Mirrors src/Sema.zig:zirCall ~6125 +
+/// analyzeCall ~6539 for the comptime slice:
+///
+///   1. Resolve the callee Value; require Key.func.
+///   2. Read args_len from Inst.Call's Flags.
+///   3. Walk per-arg bodies (stride table at extra[end..],
+///      first args_len entries are end-offsets) and evaluate
+///      each via resolveInlineBody (break_target = call inst).
+///   4. Coerce each arg to its FuncType param type.
+///   5. Get fn body via getFnInfo; filter param_body for .param
+///      tags to obtain the param inst indices.
+///   6. Pre-populate sema.results so the fn body's references to
+///      param insts resolve to the bound arg values.
+///   7. Evaluate fn body via resolveInlineBody.
+///   8. Remove the param-binding entries from results so other
+///      callers of the same func get a clean slate.
+///
+/// `.field_call` (`a.foo(x)`) needs type-method resolution which
+/// requires Stage 4 struct support; surfaces a structured
+/// diagnostic for now.
+fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, field }) Error!?Value {
+    assert(@intFromPtr(sema) != 0);
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    if (sema.call_depth >= call_depth_max) {
+        try sema.writer.print(
+            "call: exceeded comptime call depth limit ({d}); likely unbounded recursion\n",
+            .{call_depth_max},
+        );
+        return error.AnalysisFail;
+    }
+    sema.call_depth += 1;
+    defer sema.call_depth -= 1;
+
+    if (kind == .field) {
+        try sema.writer.writeAll("field_call: method-call resolution requires Stage 4 struct support\n");
+        return error.AnalysisFail;
+    }
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.Call, pl_node.payload_index);
+    const args_len: u32 = extra.data.flags.args_len;
+
+    const callee_value = try sema.resolveRef(extra.data.callee);
+    const callee_key = sema.intern_pool.indexToKey(callee_value.index);
+    if (callee_key != .func) {
+        try sema.writer.writeAll("call: callee is not a function value\n");
+        return error.AnalysisFail;
+    }
+    const func = callee_key.func;
+    const func_ty = sema.intern_pool.indexToKey(func.ty).func_type;
+
+    if (func_ty.param_types.len != args_len) {
+        try sema.writer.print(
+            "call: expected {d} args, got {d}\n",
+            .{ func_ty.param_types.len, args_len },
+        );
+        return error.AnalysisFail;
+    }
+
+    // Walk arg bodies via the stride table. args_body[0..args_len]
+    // holds end-offsets; arg N's body is args_body[start..end] where
+    // start is `args_len` for N=0 or `args_body[N-1]` otherwise.
+    const args_body: []const Zir.Inst.Index = @ptrCast(sema.zir.extra[extra.end..]);
+    var arg_values = try sema.gpa.alloc(Value, args_len);
+    defer sema.gpa.free(arg_values);
+    for (0..args_len) |i| {
+        const start = if (i == 0) args_len else @intFromEnum(args_body[i - 1]);
+        const end = @intFromEnum(args_body[i]);
+        const arg_body = args_body[start..end];
+        const raw = try sema.resolveInlineBody(arg_body, inst);
+        arg_values[i] = try sema.coerceValueToType(raw, func_ty.param_types[i], "call arg");
+    }
+
+    // Swap sema.zir to the func's source-ZIR snapshot when the
+    // call crosses a REPL line boundary. The common same-line
+    // case (current_zir_id == func.source_zir_id) skips the swap.
+    // Restored via defer so subsequent instructions in the
+    // caller's body see the caller's zir again.
+    const caller_zir = sema.zir;
+    if (func.source_zir_id != sema.current_zir_id) {
+        if (func.source_zir_id >= sema.pipelines.len) {
+            try sema.writer.writeAll("call: function's source ZIR is no longer available\n");
+            return error.AnalysisFail;
+        }
+        sema.zir = sema.pipelines[func.source_zir_id].zir;
+    }
+    defer sema.zir = caller_zir;
+
+    // Extract the body + param insts via getFnInfo on the (now
+    // possibly-swapped) sema.zir.
+    const info = sema.zir.getFnInfo(func.zir_body_inst);
+    const tags = sema.zir.instructions.items(.tag);
+    var param_insts = try sema.gpa.alloc(Zir.Inst.Index, args_len);
+    defer sema.gpa.free(param_insts);
+    var pi: u32 = 0;
+    for (info.param_body) |param_inst| {
+        switch (tags[@intFromEnum(param_inst)]) {
+            .param, .param_comptime, .param_anytype, .param_anytype_comptime => {
+                if (pi >= args_len) break;
+                param_insts[pi] = param_inst;
+                pi += 1;
+            },
+            else => continue,
+        }
+    }
+    assert(pi == args_len);
+
+    // Each call frame needs its own results map. The fn body's
+    // intermediate instruction results (n - 1, the inner call's
+    // return, etc.) share inst indices across recursive frames
+    // because the body's ZIR is the same; without isolation the
+    // inner frame's writes pollute the outer frame's reads.
+    // Swap in a fresh empty map for the body eval; restore the
+    // caller's map on exit. Param bindings go on the fresh map
+    // so the body's references resolve to the bound args.
+    const saved_results = sema.results;
+    sema.results = .empty;
+    defer {
+        sema.results.deinit(sema.gpa);
+        sema.results = saved_results;
+    }
+    for (param_insts, arg_values) |p_inst, val| {
+        try sema.results.put(sema.gpa, p_inst, val);
+    }
+
+    // Fn body terminates via `return X;` (ret_node /
+    // ret_implicit / ret_load) raising ComptimeReturn; catch it
+    // and surface the stashed value. Bare resolveInlineBody
+    // would propagate the error past the call site.
+    if (sema.resolveInlineBody(info.body, func.zir_body_inst)) |val| {
+        return val;
+    } else |err| switch (err) {
+        error.ComptimeReturn => return sema.return_value,
+        else => |e| return e,
+    }
 }
 
 /// `.block_comptime`: identical to `.block` for our comptime-only
