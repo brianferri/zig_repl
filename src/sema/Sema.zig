@@ -301,6 +301,36 @@ fn evalBody(sema: *Sema, body: []const Zir.Inst.Index) Error!Value {
                 sema.return_value = try sema.loadValue(ptr);
                 return error.ComptimeReturn;
             },
+            // AstGen has already done the LIFO scheduling: defers are
+            // emitted at the textual end of each block in reverse
+            // declaration order via `genDefers` (AstGen.zig ~2986).
+            // Errdefers share this tag -- they're distinguished only
+            // by AstGen emitting their invocation only at error-exit
+            // points (`genDefers(..., .normal_and_error)`). So Sema
+            // just runs each defer body inline as it encounters the
+            // instruction; no defer stack on our side. Mirrors
+            // src/Sema.zig:1956 (the @"defer" arm in analyzeBodyInner).
+            .@"defer" => {
+                const defer_data = sema.zir.instructions.items(.data)[@intFromEnum(inst)].@"defer";
+                const defer_body = sema.zir.bodySlice(defer_data.index, defer_data.len);
+                // AstGen-emitted defer bodies are block expressions
+                // terminated by `break_inline`, so evalBody MUST
+                // raise. The two ComptimeBreak shapes (own
+                // terminator vs further-out) match src/Sema.zig:1956.
+                // A returned Value would require the body to end in
+                // a condbr-as-terminator path AstGen never emits for
+                // defers -- surface loudly if it ever does.
+                if (sema.evalBody(defer_body)) |_| {
+                    @panic("defer body returned a value -- unexpected AstGen shape");
+                } else |err| switch (err) {
+                    error.ComptimeBreak => {
+                        if (sema.comptime_break_inst != defer_body[defer_body.len - 1]) {
+                            return error.ComptimeBreak;
+                        }
+                    },
+                    else => |e| return e,
+                }
+            },
             else => {
                 if (try sema.evalInst(inst, tag)) |result| {
                     try sema.results.put(sema.gpa, inst, result);
@@ -440,7 +470,12 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .restore_err_ret_index_fn_entry,
         => null,
         .extended => sema.evalExtended(inst),
-        .dbg_stmt => null,
+        // dbg_stmt / dbg_var_val / dbg_var_ptr are AstGen-emitted
+        // debug breadcrumbs for line/local tracking. Tolerated as
+        // no-ops here so we don't reject any function body that
+        // declares a local. A future `:scope` extension can read
+        // dbg_var_* via str_op to surface live local names.
+        .dbg_stmt, .dbg_var_val, .dbg_var_ptr => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
         inline else => |unhandled| sema.reportUnsupportedTag(unhandled),
     };

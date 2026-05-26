@@ -597,3 +597,24 @@ test "compliance: cross-line multi-arg fn" {
         "add(3, 4)",
     });
 }
+
+test "compliance: defer runs at block exit after subsequent assignments" {
+    try expectMatchesZig(testing.allocator, &.{
+        "fn run() u32 { var s: u32 = 0; { defer s = 1; s = 2; } return s; }",
+        "run()",
+    });
+}
+
+test "compliance: nested defers fire LIFO" {
+    try expectMatchesZig(testing.allocator, &.{
+        "fn run() u32 { var t: u32 = 1; { defer t = t * 2; defer t = t + 10; } return t; }",
+        "run()",
+    });
+}
+
+test "compliance: defer reads live state at scope exit, not at declaration" {
+    try expectMatchesZig(testing.allocator, &.{
+        "fn run() u32 { var x: u32 = 5; { defer x = x * 100; x = 7; } return x; }",
+        "run()",
+    });
+}
