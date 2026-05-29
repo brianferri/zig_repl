@@ -537,6 +537,13 @@ pub const Key = union(enum) {
     /// land if/when incremental compilation does -- same
     /// deferred-vestigial story as `Nav.analysis.zir_index`.
     func: Func,
+    /// `[N]T` and `[N:s]T` array types. Stored across two
+    /// `Item.Tag` entries: `type_array_small` (no sentinel, len fits
+    /// in u32) and `type_array_big` (sentinel OR len >= 2^32).
+    /// Mirrors the compiler's `Key.ArrayType` shape (`src/InternPool.zig`
+    /// ~2098); the Tag split mirrors `type_array_small` / `type_array_big`
+    /// (`src/InternPool.zig` ~4171-4172).
+    array_type: ArrayType,
 
     pub const Int = struct {
         ty: Index,
@@ -666,6 +673,26 @@ pub const Key = union(enum) {
     pub const ErrorUnionType = extern struct {
         error_set_type: Index,
         payload_type: Index,
+    };
+
+    /// `[len]child` (sentinel == .none) or `[len:sentinel]child`.
+    /// Mirrors compiler `Key.ArrayType` (`src/InternPool.zig` ~2094)
+    /// including the `extern struct` discipline -- the layout is
+    /// pinned so the value can be memory-reinterpreted for hashing.
+    /// `len` is a u64 to match the compiler's range; the storage
+    /// layer routes lens < 2^32 with no sentinel into the compact
+    /// `type_array_small` Tag.
+    pub const ArrayType = extern struct {
+        len: u64,
+        child: Index,
+        sentinel: Index = .none,
+
+        /// Effective slot count including the sentinel terminator.
+        /// Mirrors `Key.ArrayType.lenIncludingSentinel`
+        /// (`src/InternPool.zig` ~2099).
+        pub fn lenIncludingSentinel(at: ArrayType) u64 {
+            return at.len + @intFromBool(at.sentinel != .none);
+        }
     };
 
     /// Value of an error-union type. Either the `.err` arm
@@ -812,6 +839,11 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, eu.error_set_type);
                 std.hash.autoHash(&hasher, eu.payload_type);
             },
+            .array_type => |at| {
+                std.hash.autoHash(&hasher, at.len);
+                std.hash.autoHash(&hasher, at.child);
+                std.hash.autoHash(&hasher, at.sentinel);
+            },
             .error_union => |eu| {
                 std.hash.autoHash(&hasher, eu.ty);
                 const ValueTag = @typeInfo(ErrorUnion.Value).@"union".tag_type.?;
@@ -920,6 +952,12 @@ pub const Key = union(enum) {
                 const y = b.error_union_type;
                 break :blk x.error_set_type == y.error_set_type and
                     x.payload_type == y.payload_type;
+            },
+            .array_type => |x| blk: {
+                const y = b.array_type;
+                if (x.len != y.len) break :blk false;
+                if (x.child != y.child) break :blk false;
+                break :blk x.sentinel == y.sentinel;
             },
             .error_union => |x| blk: {
                 const y = b.error_union;
@@ -1061,6 +1099,18 @@ const Item = struct {
         // the inner's `ty`. Lands when fn coercion does -- shape
         // ready today.
         func_coerced,
+        // Sentinel-free `[len]child` array type where len fits in
+        // u32. data = extra index of ArrayTypeSmallRepr (2 u32
+        // slots: len, child). Mirrors the compiler's
+        // `Item.Tag.type_array_small` (`src/InternPool.zig` ~4172)
+        // which reuses the `Vector { len, child }` layout for the
+        // same packing.
+        type_array_small,
+        // Array type with a sentinel value OR with len >= 2^32.
+        // data = extra index of ArrayTypeBigRepr (4 u32 slots:
+        // len_lo, len_hi, child, sentinel). Mirrors the compiler's
+        // `Item.Tag.type_array_big` (`src/InternPool.zig` ~4171).
+        type_array_big,
     };
 };
 
@@ -1145,6 +1195,29 @@ const FuncInstanceRepr = extern struct {
 const FuncCoercedRepr = extern struct {
     ty: u32,
     inner_func: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.type_array_small`. Two u32
+/// slots: `len` then `child`. Used when sentinel == .none AND
+/// len fits in u32 -- the common case. Mirrors the compiler's
+/// `Vector { len, child }` layout that `type_array_small` reuses
+/// (`src/InternPool.zig` ~5967).
+const ArrayTypeSmallRepr = extern struct {
+    len: u32,
+    child: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.type_array_big`. Four u32
+/// slots: `len_lo`, `len_hi`, `child`, `sentinel`. Sentinel == 0
+/// (`Index.none`) is invalid here -- the dispatcher routes to
+/// `type_array_small` in that case. Mirrors the compiler's
+/// `Array { len0, len1, child, sentinel }` (`src/InternPool.zig`
+/// ~5972) with the same u32 pair for the 64-bit length.
+const ArrayTypeBigRepr = extern struct {
+    len_lo: u32,
+    len_hi: u32,
+    child: u32,
+    sentinel: u32,
 };
 
 const PtrComptimeAllocRepr = extern struct {
@@ -1728,6 +1801,7 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .error_union => |eu| try emitErrorUnion(pool, eu),
         .func_type => |ft| try emitFuncType(pool, ft),
         .func => |f| try emitFunc(pool, f),
+        .array_type => |at| try emitArrayType(pool, at),
     }
 
     assert(pool.items.len == gop.index + 1);
@@ -1808,6 +1882,8 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .func_decl => funcDeclFromExtra(pool, item.data),
         .func_instance => funcInstanceFromExtra(pool, item.data),
         .func_coerced => funcCoercedFromExtra(pool, item.data),
+        .type_array_small => arrayTypeSmallFromExtra(pool, item.data),
+        .type_array_big => arrayTypeBigFromExtra(pool, item.data),
     };
 }
 
@@ -1857,6 +1933,29 @@ fn errorUnionTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
     return .{ .error_union_type = .{
         .error_set_type = @enumFromInt(slice[0]),
         .payload_type = @enumFromInt(slice[1]),
+    } };
+}
+
+fn arrayTypeSmallFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const fields = comptime @divExact(@sizeOf(ArrayTypeSmallRepr), @sizeOf(u32));
+    assert(extra_index + fields <= pool.extra.items.len);
+    const slice = pool.extra.items[extra_index..][0..fields];
+    return .{ .array_type = .{
+        .len = slice[0],
+        .child = @enumFromInt(slice[1]),
+        .sentinel = .none,
+    } };
+}
+
+fn arrayTypeBigFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const fields = comptime @divExact(@sizeOf(ArrayTypeBigRepr), @sizeOf(u32));
+    assert(extra_index + fields <= pool.extra.items.len);
+    const slice = pool.extra.items[extra_index..][0..fields];
+    const len: u64 = (@as(u64, slice[1]) << 32) | @as(u64, slice[0]);
+    return .{ .array_type = .{
+        .len = len,
+        .child = @enumFromInt(slice[2]),
+        .sentinel = @enumFromInt(slice[3]),
     } };
 }
 
@@ -2244,6 +2343,34 @@ fn emitErr(pool: *InternPool, e: Key.Error) Allocator.Error!void {
     pool.items.appendAssumeCapacity(.{ .tag = .error_set_error, .data = extra_index });
 }
 
+/// Emit an array type. Picks `type_array_small` when the length
+/// fits in u32 AND there's no sentinel; otherwise `type_array_big`.
+/// Mirrors the compiler's `getOrPutTypeTagLen` split
+/// (`src/InternPool.zig` ~7248). Adding sentinel support later for
+/// the small Tag would force a Tag-shape change; routing through
+/// big when present keeps `type_array_small` faithful to its
+/// "Vector { len, child }" layout.
+fn emitArrayType(pool: *InternPool, at: Key.ArrayType) Allocator.Error!void {
+    assert(at.child != .none);
+    if (at.sentinel == .none and at.len <= std.math.maxInt(u32)) {
+        const extra_index: u32 = @intCast(pool.extra.items.len);
+        try pool.extra.appendSlice(pool.gpa, &.{
+            @intCast(at.len),
+            @intFromEnum(at.child),
+        });
+        pool.items.appendAssumeCapacity(.{ .tag = .type_array_small, .data = extra_index });
+        return;
+    }
+    const extra_index: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.appendSlice(pool.gpa, &.{
+        @truncate(at.len),
+        @truncate(at.len >> 32),
+        @intFromEnum(at.child),
+        @intFromEnum(at.sentinel),
+    });
+    pool.items.appendAssumeCapacity(.{ .tag = .type_array_big, .data = extra_index });
+}
+
 /// Emit a `type_error_union` Item. Two u32 slots: `error_set`, `payload`.
 fn emitErrorUnionType(pool: *InternPool, eu: Key.ErrorUnionType) Allocator.Error!void {
     assert(eu.error_set_type != .none);
@@ -2330,6 +2457,10 @@ pub fn internErr(pool: *InternPool, e: Key.Error) Allocator.Error!Index {
 }
 
 /// Intern an error-union type (`E!T`).
+pub fn internArrayType(pool: *InternPool, at: Key.ArrayType) Allocator.Error!Index {
+    return pool.get(.{ .array_type = at });
+}
+
 pub fn internErrorUnionType(pool: *InternPool, eu: Key.ErrorUnionType) Allocator.Error!Index {
     return pool.get(.{ .error_union_type = eu });
 }

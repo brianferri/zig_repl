@@ -42,6 +42,7 @@ pub fn render(
         .error_set_type,
         .error_union_type,
         .func_type,
+        .array_type,
         => renderTypeRef(value.index, pool, writer),
         .ptr => |p| writer.print("ptr@{d}+{d}\n", .{ @intFromEnum(p.ty), p.byte_offset }),
         .err => |e| writer.print("error.{s}\n", .{pool.stringSlice(e.name)}),
@@ -116,8 +117,35 @@ pub fn writeTypeName(
         .error_set_type => |es| try writeErrorSetTypeName(es, pool, writer),
         .error_union_type => |eu| try writeErrorUnionTypeName(eu, pool, writer),
         .func_type => |ft| try writeFuncTypeName(ft, pool, writer),
+        .array_type => |at| try writeArrayTypeName(at, pool, writer),
         else => try writer.writeAll("<type>"),
     }
+}
+
+/// Render an array type as Zig surface syntax: `[N]T` or `[N:s]T`.
+/// Sentinel is rendered by recursing into the value renderer with
+/// the sentinel slot's Index; for the Stage-2 set this collapses to
+/// integer literal text via the same `render` path.
+fn writeArrayTypeName(
+    at: InternPool.Key.ArrayType,
+    pool: *const InternPool,
+    writer: *std.Io.Writer,
+) Error!void {
+    try writer.print("[{d}", .{at.len});
+    if (at.sentinel != .none) {
+        try writer.writeAll(":");
+        const sentinel_key = pool.indexToKey(at.sentinel);
+        switch (sentinel_key) {
+            .int => |iv| {
+                var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+                const big = iv.storage.toBigInt(&space);
+                try writer.print("{f}", .{big});
+            },
+            else => try writer.writeAll("?"),
+        }
+    }
+    try writer.writeAll("]");
+    try writeTypeName(at.child, pool, writer);
 }
 
 /// Render a function type as Zig surface syntax:

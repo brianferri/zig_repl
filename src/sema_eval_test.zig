@@ -1612,3 +1612,93 @@ test "fn decl: cross-line retrieval round-trips the Func value" {
     try testing.expectEqual(InternPool.Index.u8_type, fn_ty.param_types[0]);
     try testing.expectEqual(InternPool.Index.i32_type, fn_ty.return_type);
 }
+
+test "array_type: small variant round-trip [3]i32" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    const idx_a = try pool.internArrayType(.{
+        .len = 3,
+        .child = .i32_type,
+        .sentinel = .none,
+    });
+    const idx_b = try pool.internArrayType(.{
+        .len = 3,
+        .child = .i32_type,
+        .sentinel = .none,
+    });
+    try testing.expectEqual(idx_a, idx_b);
+
+    const decoded = pool.indexToKey(idx_a).array_type;
+    try testing.expectEqual(@as(u64, 3), decoded.len);
+    try testing.expectEqual(InternPool.Index.i32_type, decoded.child);
+    try testing.expectEqual(InternPool.Index.none, decoded.sentinel);
+}
+
+test "array_type: big variant carries sentinel [3:0]u8" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    const idx = try pool.internArrayType(.{
+        .len = 3,
+        .child = .u8_type,
+        .sentinel = .zero,
+    });
+    const decoded = pool.indexToKey(idx).array_type;
+    try testing.expectEqual(@as(u64, 3), decoded.len);
+    try testing.expectEqual(InternPool.Index.u8_type, decoded.child);
+    try testing.expectEqual(InternPool.Index.zero, decoded.sentinel);
+}
+
+test "array_type: big variant carries 64-bit length" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    const huge: u64 = (@as(u64, 1) << 33) + 7;
+    const idx = try pool.internArrayType(.{
+        .len = huge,
+        .child = .u8_type,
+        .sentinel = .none,
+    });
+    const decoded = pool.indexToKey(idx).array_type;
+    try testing.expectEqual(huge, decoded.len);
+    try testing.expectEqual(InternPool.Index.u8_type, decoded.child);
+    try testing.expectEqual(InternPool.Index.none, decoded.sentinel);
+}
+
+test "array_type: small and big differ on sentinel" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    const small = try pool.internArrayType(.{
+        .len = 3,
+        .child = .u8_type,
+        .sentinel = .none,
+    });
+    const big = try pool.internArrayType(.{
+        .len = 3,
+        .child = .u8_type,
+        .sentinel = .zero,
+    });
+    try testing.expect(small != big);
+}
+
+test "array_type: lenIncludingSentinel adds the terminator" {
+    const at_no_sent: InternPool.Key.ArrayType = .{
+        .len = 3,
+        .child = .u8_type,
+        .sentinel = .none,
+    };
+    try testing.expectEqual(@as(u64, 3), at_no_sent.lenIncludingSentinel());
+
+    const at_sent: InternPool.Key.ArrayType = .{
+        .len = 3,
+        .child = .u8_type,
+        .sentinel = .zero,
+    };
+    try testing.expectEqual(@as(u64, 4), at_sent.lenIncludingSentinel());
+}
