@@ -14,9 +14,9 @@
 //! attempting a second instance fails with `error.AlreadyLive`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const posix = std.posix;
-const linux = std.os.linux;
 
 const Posix = @This();
 
@@ -29,6 +29,29 @@ pub const Error = error{
 };
 
 const probe_timeout_dsecs: u8 = 5;
+
+// UPSTREAM-WORKAROUND(std.os.linux.V): remove this block and use
+// `@intFromEnum(std.os.linux.V.MIN / .TIME)` directly once the Zig
+// stdlib compiles `linux.V` again.
+//
+// Termios cc[] indices for VMIN / VTIME, hardcoded rather than read
+// from `std.os.linux.V` because that enum fails to compile on Zig
+// 0.17 (master included): the V branch at `linux.zig:8552` compares
+// `arch_bits == .alpha` -- a module/type against an enum literal,
+// which is ill-typed -- where its sibling at line 4481 correctly
+// uses `native_arch == .alpha`. Any reference to `linux.V` (and the
+// `posix.V` / `c.V` aliases that forward to it) therefore won't
+// build. VTIME is index 5 on every non-alpha Linux arch; VMIN is 6
+// generically, 4 on mips.
+const vmin_index: usize = switch (builtin.cpu.arch) {
+    .mips, .mipsel, .mips64, .mips64el => 4,
+    .sparc, .sparc64 => @compileError("VMIN cc index unverified for sparc; see std.os.linux.V"),
+    else => 6,
+};
+const vtime_index: usize = switch (builtin.cpu.arch) {
+    .sparc, .sparc64 => @compileError("VTIME cc index unverified for sparc; see std.os.linux.V"),
+    else => 5,
+};
 
 /// Saved across the backend's lifetime AND across signal delivery.
 /// File-local because POSIX signal handlers carry no userdata. Only
@@ -86,12 +109,12 @@ pub fn setRawMode(self: *Posix, comptime phase: enum { probe, interactive }) Err
     clearCookedFlags(&raw);
     switch (phase) {
         .probe => {
-            raw.cc[@intFromEnum(linux.V.MIN)] = 0;
-            raw.cc[@intFromEnum(linux.V.TIME)] = probe_timeout_dsecs;
+            raw.cc[vmin_index] = 0;
+            raw.cc[vtime_index] = probe_timeout_dsecs;
         },
         .interactive => {
-            raw.cc[@intFromEnum(linux.V.MIN)] = 1;
-            raw.cc[@intFromEnum(linux.V.TIME)] = 0;
+            raw.cc[vmin_index] = 1;
+            raw.cc[vtime_index] = 0;
         },
     }
     posix.tcsetattr(self.tty_fd, .FLUSH, raw) catch return error.SetAttrFailed;
