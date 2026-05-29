@@ -2,6 +2,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const Session = @import("Session.zig");
+const LineEditor = @import("LineEditor.zig");
+const Terminal = @import("terminal/Terminal.zig");
 const commands = @import("commands.zig");
 const Pipeline = @import("front/Pipeline.zig");
 const Diagnostic = @import("render/Diagnostic.zig");
@@ -40,6 +42,59 @@ pub fn run(repl: *Repl) !void {
     const stdin = &stdin_reader.interface;
     const stdout = &stdout_writer.interface;
 
+    // Piped stdin stays on `takeDelimiter` so shell pipelines and
+    // the compliance harness keep working unchanged.
+    if (repl.session.is_interactive) {
+        return repl.runInteractive(stdout);
+    }
+    return repl.runCooked(stdin, stdout);
+}
+
+fn runInteractive(repl: *Repl, stdout: *std.Io.Writer) !void {
+    var terminal = Terminal.init(repl.session.gpa, repl.session.io, stdout) catch |err| {
+        // Initialisation failure usually means we couldn't open
+        // /dev/tty or apply termios -- e.g. detached console. Fall
+        // back loudly so the user knows why multiline isn't available.
+        try stdout.print("raw-mode terminal unavailable ({s}); using cooked mode\n", .{@errorName(err)});
+        try stdout.flush();
+        var input_buffer: [input_buffer_bytes]u8 = undefined;
+        var stdin_reader = std.Io.File.Reader.initStreaming(
+            repl.session.stdin_file,
+            repl.session.io,
+            &input_buffer,
+        );
+        return repl.runCooked(&stdin_reader.interface, stdout);
+    };
+    defer terminal.deinit();
+
+    // Advertise which protocols are active so the user knows whether
+    // Shift+Enter will work. Empty `setup_sequence` protocols are
+    // present-by-default rather than negotiated, so we just list names.
+    try stdout.writeAll("terminal protocols: ");
+    for (terminal.protocols, 0..) |p, i| {
+        if (i > 0) try stdout.writeAll(", ");
+        try stdout.writeAll(p.name);
+    }
+    try stdout.writeAll("\r\n");
+    try stdout.flush();
+
+    var editor = LineEditor.init(repl.session.gpa, stdout);
+    defer editor.deinit();
+
+    while (!repl.session.should_quit) {
+        const maybe_line = editor.readLine(&terminal) catch |err| {
+            try stdout.print("input error: {s}\r\n", .{@errorName(err)});
+            try stdout.flush();
+            continue;
+        };
+        const line = maybe_line orelse break;
+        if (line.len == 0) continue;
+        try repl.dispatch(line, stdout);
+    }
+    try stdout.flush();
+}
+
+fn runCooked(repl: *Repl, stdin: *std.Io.Reader, stdout: *std.Io.Writer) !void {
     while (!repl.session.should_quit) {
         try stdout.writeAll(prompt_string);
         try stdout.flush();

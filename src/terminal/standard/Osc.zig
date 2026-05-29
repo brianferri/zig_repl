@@ -1,0 +1,37 @@
+//! OSC (Operating System Command) parser. ECMA-48 sec 5.5. Wire
+//! form:
+//!
+//!   ESC ] <payload> ST
+//!
+//! Where ST is either `ESC \` (true String Terminator) or BEL
+//! (0x07, xterm's de-facto alternate terminator). The payload is
+//! returned verbatim; classification of well-known prefixes
+//! (e.g. `52;c;...` clipboard, `0;...` title) is the consumer's
+//! concern.
+
+const std = @import("std");
+const assert = std.debug.assert;
+
+const Standard = @import("../Standard.zig");
+
+pub const standard: Standard = .{
+    .introducer = ']',
+    .name = "OSC",
+    .parse = parse,
+};
+
+fn parse(input: []const u8) Standard.Result {
+    assert(input.len >= 2);
+    assert(input[0] == 0x1b);
+    assert(input[1] == ']');
+    var i: u32 = 2;
+    while (i < input.len) : (i += 1) {
+        if (input[i] == 0x07) {
+            return .{ .token = .{ .osc = input[2..i] }, .consumed = i + 1 };
+        }
+        if (input[i] == 0x1b and i + 1 < input.len and input[i + 1] == '\\') {
+            return .{ .token = .{ .osc = input[2..i] }, .consumed = i + 2 };
+        }
+    }
+    return .{ .token = null, .consumed = 0 };
+}
