@@ -544,6 +544,16 @@ pub const Key = union(enum) {
     /// ~2098); the Tag split mirrors `type_array_small` / `type_array_big`
     /// (`src/InternPool.zig` ~4171-4172).
     array_type: ArrayType,
+    /// An aggregate value (array, vector, struct -- the type
+    /// determines which). Storage is either an N-element slice or a
+    /// single-element repetition. Mirrors compiler `Key.Aggregate`
+    /// (`src/InternPool.zig` ~2542) split across `Item.Tag.aggregate`
+    /// and `Item.Tag.repeated` (`src/InternPool.zig` ~4276,4283).
+    /// `bytes`-storage flavor deferred until embedded-NUL string
+    /// support arrives -- our `getOrPutString` asserts no embedded
+    /// 0 bytes (`src/sema/InternPool.zig` ~`getOrPutString`), so we
+    /// can't safely store an arbitrary `[]u8` array as a string yet.
+    aggregate: Aggregate,
 
     pub const Int = struct {
         ty: Index,
@@ -675,6 +685,32 @@ pub const Key = union(enum) {
         payload_type: Index,
     };
 
+    /// An aggregate value -- the in-memory contents of an array,
+    /// vector, or struct. Storage variants compact the common cases:
+    /// `repeated_elem` for "every slot equal" and `elems` for the
+    /// general case. `bytes` is the third compiler variant (deferred
+    /// here -- see the union doc above). Mirrors compiler
+    /// `Key.Aggregate` (`src/InternPool.zig` ~2542).
+    pub const Aggregate = struct {
+        /// Aggregate type Index. Must resolve through `indexToKey`
+        /// to an array_type / vector_type / struct_type so the
+        /// decoder can compute the element count.
+        ty: Index,
+        storage: Storage,
+
+        pub const Storage = union(enum) {
+            /// Every slot is set to `repeated_elem`. The canonical
+            /// form when all `elems` values are equal -- the
+            /// `internAggregate` wrapper rewrites that case to this
+            /// variant before dedup lookup so `[5,5,5]` and
+            /// `repeated_elem = 5` intern at one Index.
+            repeated_elem: Index,
+            /// Per-slot Indices, length determined by the
+            /// aggregate type's element count.
+            elems: []const Index,
+        };
+    };
+
     /// `[len]child` (sentinel == .none) or `[len:sentinel]child`.
     /// Mirrors compiler `Key.ArrayType` (`src/InternPool.zig` ~2094)
     /// including the `extern struct` discipline -- the layout is
@@ -781,9 +817,8 @@ pub const Key = union(enum) {
     /// `.{ .u64 = 5 }` and `.{ .big_int = +5 }` hash identically -- the
     /// read-side compresses limbs back to inline storage so the pool's
     /// canonical form is stable, but a freshly constructed Key may
-    /// arrive in any variant. Same canonicalisation in `eql`.
+    /// arrive in any variant. Same canonicalization in `eql`.
     pub fn hash64(key: Key, pool: *const InternPool) u64 {
-        _ = pool;
         var hasher = std.hash.Wyhash.init(0);
         const Tag = @typeInfo(Key).@"union".tag_type.?;
         std.hash.autoHash(&hasher, @as(Tag, key));
@@ -844,6 +879,19 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, at.child);
                 std.hash.autoHash(&hasher, at.sentinel);
             },
+            .aggregate => |agg| {
+                std.hash.autoHash(&hasher, agg.ty);
+                // Hash structurally across element Indices regardless of
+                // the storage flavor -- mirrors the compiler's per-element
+                // hash at src/InternPool.zig ~3050 so `.elems = [I, I, I]`
+                // and `.repeated_elem = I` (same `ty`) hash identically
+                // and intern at one Index.
+                const count = aggregateElementCount(pool, agg.ty);
+                var i: u64 = 0;
+                while (i < count) : (i += 1) {
+                    std.hash.autoHash(&hasher, aggregateElementAt(agg, i));
+                }
+            },
             .error_union => |eu| {
                 std.hash.autoHash(&hasher, eu.ty);
                 const ValueTag = @typeInfo(ErrorUnion.Value).@"union".tag_type.?;
@@ -875,9 +923,8 @@ pub const Key = union(enum) {
     }
 
     /// Structural equality, paired with `hash64`. See `hash64` for the
-    /// `int` canonicalisation rationale.
+    /// `int` canonicalization rationale.
     pub fn eql(a: Key, b: Key, pool: *const InternPool) bool {
-        _ = pool;
         const Tag = @typeInfo(Key).@"union".tag_type.?;
         if (@as(Tag, a) != @as(Tag, b)) return false;
         return switch (a) {
@@ -958,6 +1005,23 @@ pub const Key = union(enum) {
                 if (x.len != y.len) break :blk false;
                 if (x.child != y.child) break :blk false;
                 break :blk x.sentinel == y.sentinel;
+            },
+            .aggregate => |x| blk: {
+                const y = b.aggregate;
+                if (x.ty != y.ty) break :blk false;
+                // Structural element-by-element equality regardless of
+                // storage flavor, matching the compiler at
+                // src/InternPool.zig ~3057. `.elems = [I, I, I]` and
+                // `.repeated_elem = I` (same `ty`) compare equal even
+                // though their storage variants differ.
+                const count = aggregateElementCount(pool, x.ty);
+                var i: u64 = 0;
+                while (i < count) : (i += 1) {
+                    if (aggregateElementAt(x, i) != aggregateElementAt(y, i)) {
+                        break :blk false;
+                    }
+                }
+                break :blk true;
             },
             .error_union => |x| blk: {
                 const y = b.error_union;
@@ -1111,6 +1175,17 @@ const Item = struct {
         // len_lo, len_hi, child, sentinel). Mirrors the compiler's
         // `Item.Tag.type_array_big` (`src/InternPool.zig` ~4171).
         type_array_big,
+        // Aggregate value with one element per slot. data = extra
+        // index of AggregateRepr (1 u32 slot: ty) followed by
+        // `element_values[N]` where N = effective element count
+        // derived from `ty`. Mirrors the compiler's
+        // `Item.Tag.aggregate` (`src/InternPool.zig` ~4276).
+        aggregate,
+        // Aggregate value with every slot equal. data = extra
+        // index of RepeatedRepr (2 u32 slots: ty, elem_val).
+        // Mirrors the compiler's `Item.Tag.repeated`
+        // (`src/InternPool.zig` ~4283).
+        repeated,
     };
 };
 
@@ -1218,6 +1293,24 @@ const ArrayTypeBigRepr = extern struct {
     len_hi: u32,
     child: u32,
     sentinel: u32,
+};
+
+/// Extra-arena header for `Item.Tag.aggregate`. One u32 slot for
+/// the aggregate `ty`; the N element Indices follow inline. N is
+/// not stored -- it derives from the aggregate type's element
+/// count (`lenIncludingSentinel` for arrays). Mirrors the compiler
+/// `Tag.Aggregate { ty }` + trailing `element_values: []Index`
+/// (`src/InternPool.zig` ~5395).
+const AggregateRepr = extern struct {
+    ty: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.repeated`. Two u32 slots:
+/// `ty` then `elem_val`. Mirrors the compiler's `Repeated`
+/// (`src/InternPool.zig` ~5730).
+const RepeatedRepr = extern struct {
+    ty: u32,
+    elem_val: u32,
 };
 
 const PtrComptimeAllocRepr = extern struct {
@@ -1802,6 +1895,7 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .func_type => |ft| try emitFuncType(pool, ft),
         .func => |f| try emitFunc(pool, f),
         .array_type => |at| try emitArrayType(pool, at),
+        .aggregate => |agg| try emitAggregate(pool, agg),
     }
 
     assert(pool.items.len == gop.index + 1);
@@ -1884,6 +1978,8 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .func_coerced => funcCoercedFromExtra(pool, item.data),
         .type_array_small => arrayTypeSmallFromExtra(pool, item.data),
         .type_array_big => arrayTypeBigFromExtra(pool, item.data),
+        .aggregate => aggregateFromExtra(pool, item.data),
+        .repeated => repeatedFromExtra(pool, item.data),
     };
 }
 
@@ -1956,6 +2052,32 @@ fn arrayTypeBigFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .len = len,
         .child = @enumFromInt(slice[2]),
         .sentinel = @enumFromInt(slice[3]),
+    } };
+}
+
+fn aggregateFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    assert(extra_index < pool.extra.items.len);
+    const ty: Index = @enumFromInt(pool.extra.items[extra_index]);
+    const count64 = aggregateElementCount(pool, ty);
+    const count: u32 = @intCast(count64);
+    assert(extra_index + 1 + count <= pool.extra.items.len);
+    const raw_elems = pool.extra.items[extra_index + 1 ..][0..count];
+    return .{ .aggregate = .{
+        .ty = ty,
+        // Reinterpret the u32 slice as `[]const Index` -- Index is
+        // `enum(u32)` and the slice shares the pool's extra arena
+        // for its lifetime. Same trick as `errorSetTypeFromExtra`.
+        .storage = .{ .elems = @ptrCast(raw_elems) },
+    } };
+}
+
+fn repeatedFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const fields = comptime @divExact(@sizeOf(RepeatedRepr), @sizeOf(u32));
+    assert(extra_index + fields <= pool.extra.items.len);
+    const slice = pool.extra.items[extra_index..][0..fields];
+    return .{ .aggregate = .{
+        .ty = @enumFromInt(slice[0]),
+        .storage = .{ .repeated_elem = @enumFromInt(slice[1]) },
     } };
 }
 
@@ -2343,6 +2465,62 @@ fn emitErr(pool: *InternPool, e: Key.Error) Allocator.Error!void {
     pool.items.appendAssumeCapacity(.{ .tag = .error_set_error, .data = extra_index });
 }
 
+/// Effective element count for an aggregate type. For an array
+/// it's `lenIncludingSentinel`; future struct / vector flavors plug
+/// in here. Used by both the encoder (deciding trailing length)
+/// and the decoder (slicing the trailing Indices). The compiler
+/// has the equivalent inline at the call sites of
+/// `Tag.Aggregate.trailing.element_values.len`
+/// (`src/InternPool.zig` ~4278).
+fn aggregateElementCount(pool: *const InternPool, ty: Index) u64 {
+    assert(ty != .none);
+    const key = pool.indexToKey(ty);
+    return switch (key) {
+        .array_type => |at| at.lenIncludingSentinel(),
+        else => unreachable, // future aggregate types land here
+    };
+}
+
+/// Resolve element `i` from any storage flavor. Mirrors the
+/// per-element extraction the compiler does at
+/// `src/InternPool.zig` ~3057 inside the aggregate eql arm. Hash
+/// and eql use this to walk the expanded element sequence so
+/// `.elems = [I, I, I]` and `.repeated_elem = I` (same `ty`)
+/// produce the same hash + compare equal without insert-time
+/// canonicalization.
+fn aggregateElementAt(agg: Key.Aggregate, i: u64) Index {
+    return switch (agg.storage) {
+        .repeated_elem => |e| e,
+        .elems => |es| es[@intCast(i)],
+    };
+}
+
+/// Emit an aggregate value. The caller's storage flavor picks the
+/// Tag (`elems` -> `aggregate`, `repeated_elem` -> `repeated`).
+/// Hash/eql canonicalization in `get()` ensures equivalent
+/// sequences across flavors land at one Index without modifying
+/// caller input -- mirrors compiler src/InternPool.zig ~3057.
+fn emitAggregate(pool: *InternPool, agg: Key.Aggregate) Allocator.Error!void {
+    assert(agg.ty != .none);
+    switch (agg.storage) {
+        .repeated_elem => |elem| {
+            const extra_index: u32 = @intCast(pool.extra.items.len);
+            try pool.extra.appendSlice(pool.gpa, &.{
+                @intFromEnum(agg.ty),
+                @intFromEnum(elem),
+            });
+            pool.items.appendAssumeCapacity(.{ .tag = .repeated, .data = extra_index });
+        },
+        .elems => |elems| {
+            const extra_index: u32 = @intCast(pool.extra.items.len);
+            try pool.extra.ensureUnusedCapacity(pool.gpa, 1 + elems.len);
+            pool.extra.appendAssumeCapacity(@intFromEnum(agg.ty));
+            for (elems) |e| pool.extra.appendAssumeCapacity(@intFromEnum(e));
+            pool.items.appendAssumeCapacity(.{ .tag = .aggregate, .data = extra_index });
+        },
+    }
+}
+
 /// Emit an array type. Picks `type_array_small` when the length
 /// fits in u32 AND there's no sentinel; otherwise `type_array_big`.
 /// Mirrors the compiler's `getOrPutTypeTagLen` split
@@ -2459,6 +2637,15 @@ pub fn internErr(pool: *InternPool, e: Key.Error) Allocator.Error!Index {
 /// Intern an error-union type (`E!T`).
 pub fn internArrayType(pool: *InternPool, at: Key.ArrayType) Allocator.Error!Index {
     return pool.get(.{ .array_type = at });
+}
+
+/// Intern an aggregate value. The caller's storage flavor is
+/// preserved; structural eql in `get()` collapses `.elems` and
+/// `.repeated_elem` to the same Index when they represent the same
+/// per-element sequence (matching compiler src/InternPool.zig
+/// ~3057). First-inserted storage flavor wins on subsequent lookups.
+pub fn internAggregate(pool: *InternPool, agg: Key.Aggregate) Allocator.Error!Index {
+    return pool.get(.{ .aggregate = agg });
 }
 
 pub fn internErrorUnionType(pool: *InternPool, eu: Key.ErrorUnionType) Allocator.Error!Index {

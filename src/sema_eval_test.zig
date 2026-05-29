@@ -1702,3 +1702,166 @@ test "array_type: lenIncludingSentinel adds the terminator" {
     };
     try testing.expectEqual(@as(u64, 4), at_sent.lenIncludingSentinel());
 }
+
+test "aggregate: elems round-trip [_]i32{1, 2, 3}" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    const arr_ty = try pool.internArrayType(.{
+        .len = 3,
+        .child = .i32_type,
+        .sentinel = .none,
+    });
+    const one = InternPool.Index.one;
+    const two = try pool.internInt(.{ .ty = .i32_type, .storage = .{ .u64 = 2 } });
+    const three = try pool.internInt(.{ .ty = .i32_type, .storage = .{ .u64 = 3 } });
+    const elems = [_]InternPool.Index{ one, two, three };
+    const idx_a = try pool.internAggregate(.{
+        .ty = arr_ty,
+        .storage = .{ .elems = &elems },
+    });
+    const idx_b = try pool.internAggregate(.{
+        .ty = arr_ty,
+        .storage = .{ .elems = &elems },
+    });
+    try testing.expectEqual(idx_a, idx_b);
+
+    const decoded = pool.indexToKey(idx_a).aggregate;
+    try testing.expectEqual(arr_ty, decoded.ty);
+    try testing.expect(decoded.storage == .elems);
+    try testing.expectEqual(@as(usize, 3), decoded.storage.elems.len);
+    try testing.expectEqual(one, decoded.storage.elems[0]);
+    try testing.expectEqual(two, decoded.storage.elems[1]);
+    try testing.expectEqual(three, decoded.storage.elems[2]);
+}
+
+test "aggregate: repeated_elem round-trip [_]u32{7, 7, 7}" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    const arr_ty = try pool.internArrayType(.{
+        .len = 3,
+        .child = .u32_type,
+        .sentinel = .none,
+    });
+    const seven = try pool.internInt(.{ .ty = .u32_type, .storage = .{ .u64 = 7 } });
+    const idx = try pool.internAggregate(.{
+        .ty = arr_ty,
+        .storage = .{ .repeated_elem = seven },
+    });
+
+    const decoded = pool.indexToKey(idx).aggregate;
+    try testing.expectEqual(arr_ty, decoded.ty);
+    try testing.expect(decoded.storage == .repeated_elem);
+    try testing.expectEqual(seven, decoded.storage.repeated_elem);
+}
+
+test "aggregate: structural eql dedups all-equal elems vs repeated_elem" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    const arr_ty = try pool.internArrayType(.{
+        .len = 3,
+        .child = .u32_type,
+        .sentinel = .none,
+    });
+    const seven = try pool.internInt(.{ .ty = .u32_type, .storage = .{ .u64 = 7 } });
+    const elems = [_]InternPool.Index{ seven, seven, seven };
+
+    const via_elems = try pool.internAggregate(.{
+        .ty = arr_ty,
+        .storage = .{ .elems = &elems },
+    });
+    const via_repeat = try pool.internAggregate(.{
+        .ty = arr_ty,
+        .storage = .{ .repeated_elem = seven },
+    });
+    // Compiler-faithful: hash/eql canonicalize across flavors so
+    // both calls return the same Index. Storage flavor preserved
+    // from the first insertion -- here `.elems`.
+    try testing.expectEqual(via_elems, via_repeat);
+    const decoded = pool.indexToKey(via_elems).aggregate;
+    try testing.expect(decoded.storage == .elems);
+}
+
+test "aggregate: structural eql with first insertion as repeated_elem" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    const arr_ty = try pool.internArrayType(.{
+        .len = 3,
+        .child = .u32_type,
+        .sentinel = .none,
+    });
+    const seven = try pool.internInt(.{ .ty = .u32_type, .storage = .{ .u64 = 7 } });
+
+    const via_repeat = try pool.internAggregate(.{
+        .ty = arr_ty,
+        .storage = .{ .repeated_elem = seven },
+    });
+    const elems = [_]InternPool.Index{ seven, seven, seven };
+    const via_elems = try pool.internAggregate(.{
+        .ty = arr_ty,
+        .storage = .{ .elems = &elems },
+    });
+    try testing.expectEqual(via_repeat, via_elems);
+    const decoded = pool.indexToKey(via_repeat).aggregate;
+    // First-insertion-wins -- `.repeated_elem` flavor preserved.
+    try testing.expect(decoded.storage == .repeated_elem);
+}
+
+test "aggregate: mixed elems stays in elems storage" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    const arr_ty = try pool.internArrayType(.{
+        .len = 3,
+        .child = .i32_type,
+        .sentinel = .none,
+    });
+    const one = InternPool.Index.one;
+    const two = try pool.internInt(.{ .ty = .i32_type, .storage = .{ .u64 = 2 } });
+    const three = try pool.internInt(.{ .ty = .i32_type, .storage = .{ .u64 = 3 } });
+    const elems = [_]InternPool.Index{ one, two, three };
+
+    const idx = try pool.internAggregate(.{
+        .ty = arr_ty,
+        .storage = .{ .elems = &elems },
+    });
+    const decoded = pool.indexToKey(idx).aggregate;
+    try testing.expect(decoded.storage == .elems);
+}
+
+test "aggregate: different types do not dedup" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    const i32_arr = try pool.internArrayType(.{
+        .len = 3,
+        .child = .i32_type,
+        .sentinel = .none,
+    });
+    const u32_arr = try pool.internArrayType(.{
+        .len = 3,
+        .child = .u32_type,
+        .sentinel = .none,
+    });
+    const seven_i32 = try pool.internInt(.{ .ty = .i32_type, .storage = .{ .u64 = 7 } });
+    const seven_u32 = try pool.internInt(.{ .ty = .u32_type, .storage = .{ .u64 = 7 } });
+
+    const a = try pool.internAggregate(.{
+        .ty = i32_arr,
+        .storage = .{ .repeated_elem = seven_i32 },
+    });
+    const b = try pool.internAggregate(.{
+        .ty = u32_arr,
+        .storage = .{ .repeated_elem = seven_u32 },
+    });
+    try testing.expect(a != b);
+}

@@ -48,7 +48,52 @@ pub fn render(
         .err => |e| writer.print("error.{s}\n", .{pool.stringSlice(e.name)}),
         .error_union => |eu| renderErrorUnion(eu, pool, writer),
         .func => |f| writer.print("fn@{d}\n", .{@intFromEnum(f.zir_body_inst)}),
+        .aggregate => |agg| renderAggregate(agg, pool, writer),
     };
+}
+
+/// Render an aggregate as `{ e0, e1, e2, ... }`. Each element is
+/// printed inline without the trailing newline that the top-level
+/// `render` would add -- the brace-list is itself one value.
+fn renderAggregate(
+    agg: InternPool.Key.Aggregate,
+    pool: *const InternPool,
+    writer: *std.Io.Writer,
+) Error!void {
+    try writer.writeAll("{ ");
+    const count: u64 = pool.indexToKey(agg.ty).array_type.lenIncludingSentinel();
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        if (i > 0) try writer.writeAll(", ");
+        const elem_idx: InternPool.Index = switch (agg.storage) {
+            .repeated_elem => |e| e,
+            .elems => |es| es[@intCast(i)],
+        };
+        try renderElemInline(elem_idx, pool, writer);
+    }
+    try writer.writeAll(" }\n");
+}
+
+/// Inline-print a value: same as `render` but without the trailing
+/// newline. Used by `renderAggregate` so element values compose
+/// into the parent brace-list. Stage 2 set: int / simple_value /
+/// undef. Unsupported keys render as `<elem>` rather than recurse.
+fn renderElemInline(
+    elem_idx: InternPool.Index,
+    pool: *const InternPool,
+    writer: *std.Io.Writer,
+) Error!void {
+    const key = pool.indexToKey(elem_idx);
+    switch (key) {
+        .int => |iv| {
+            var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+            const big = iv.storage.toBigInt(&space);
+            try writer.print("{f}", .{big});
+        },
+        .simple_value => |sv| try writer.writeAll(simpleValueText(sv)),
+        .undef => try writer.writeAll("undefined"),
+        else => try writer.writeAll("<elem>"),
+    }
 }
 
 fn renderErrorUnion(

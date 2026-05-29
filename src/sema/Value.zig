@@ -38,6 +38,7 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
         .err => |e| .{ .index = e.ty },
         .error_union => |eu| .{ .index = eu.ty },
         .func => |f| .{ .index = f.ty },
+        .aggregate => |agg| .{ .index = agg.ty },
         // A bare type Key (the slot a type lives in) doubles as the value
         // of type `type` with that type as its payload -- the compiler's
         // `Ref.X_type` directly identifies an Index that's both. So when
