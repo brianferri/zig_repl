@@ -10,7 +10,6 @@ const Event = @import("Event.zig");
 const Parser = @import("Parser.zig");
 const Protocol = @import("Protocol.zig");
 
-
 const Kitty = @import("protocol/Kitty.zig");
 const Xterm = @import("protocol/Xterm.zig");
 const ModifyOtherKeys = @import("protocol/ModifyOtherKeys.zig");
@@ -186,4 +185,3 @@ test "CSI 15~ is F5" {
     try testing.expect(e == .key_press);
     try testing.expectEqual(Event.key.f5, e.key_press.codepoint);
 }
-

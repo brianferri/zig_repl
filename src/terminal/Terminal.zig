@@ -6,18 +6,19 @@
 //! OS detail leaks past this boundary.
 //!
 //! Layered design:
-//!   * `Platform` -- OS-level raw-mode + read interface (vtable;
-//!     impls under `platform/`). Selected at comptime via
-//!     `builtin.os.tag`.
+//!   * platform backend -- OS-level raw-mode + read surface (impls
+//!     under `platform/`). The target is comptime-known, so the
+//!     backend is selected by-name via `builtin.os.tag`, not a
+//!     runtime vtable.
 //!   * `Protocol` -- token-level keyboard protocols (vtable; impls
 //!     under `protocol/`). Each owns its own probe query +
 //!     detection + interpretation.
-//!   * `Parser` -- ECMA-48 byte-stream classifier, platform- and
-//!     protocol-agnostic.
+//!   * `Standard` / `Parser` -- ECMA-48 byte-stream classifier,
+//!     platform- and protocol-agnostic.
 //!
-//! Adding a new platform = drop a `platform/Foo.zig`, register it
-//! in `PlatformBackend`. Adding a new protocol = drop a
-//! `protocol/Foo.zig`, register it in `allProtocols`. Nothing else
+//! Adding a new platform = drop a `platform/Foo.zig`, extend the
+//! `PlatformBackend` switch. Adding a new protocol = drop a
+//! `protocol/Foo.zig`, append it to `known_protocols`. Nothing else
 //! needs to change.
 
 const std = @import("std");
@@ -28,7 +29,6 @@ const Event = @import("Event.zig");
 const Negotiate = @import("Negotiate.zig");
 const Parser = @import("Parser.zig");
 const Protocol = @import("Protocol.zig");
-
 
 const Kitty = @import("protocol/Kitty.zig");
 const ModifyOtherKeys = @import("protocol/ModifyOtherKeys.zig");
