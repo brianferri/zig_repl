@@ -549,6 +549,16 @@ pub const Key = union(enum) {
     /// Mirrors the compiler's `Key.VectorType` (`src/InternPool.zig`
     /// ~2104) and its `type_vector` Tag (`src/InternPool.zig` ~4168).
     vector_type: VectorType,
+    /// `?child`. Stored inline (`type_optional`, data = child Index)
+    /// like `anyframe_type`. Mirrors the compiler's `Key.opt_type`
+    /// (`src/InternPool.zig` ~1969).
+    opt_type: Index,
+    /// An optional value. `val == .none` means `null`; otherwise `val`
+    /// is the payload Index (already of the optional's child type).
+    /// Split across `opt_payload` (a `{ty, val}` repr) and `opt_null`
+    /// (inline ty), mirroring the compiler's `Key.opt` / `Tag.opt_payload`
+    /// + `opt_null` (`src/InternPool.zig` ~2006,4230,4231).
+    opt: Opt,
     /// An aggregate value (array, vector, struct -- the type
     /// determines which). Storage is either an N-element slice or a
     /// single-element repetition. Mirrors compiler `Key.Aggregate`
@@ -744,6 +754,15 @@ pub const Key = union(enum) {
         child: Index,
     };
 
+    /// An optional value. Mirrors compiler `Key.Opt`
+    /// (`src/InternPool.zig` ~2523).
+    pub const Opt = extern struct {
+        /// The optional type (`?T`), not the payload type `T`.
+        ty: Index,
+        /// The payload Index, or `.none` when the optional is `null`.
+        val: Index,
+    };
+
     /// Value of an error-union type. Either the `.err` arm
     /// (carrying the interned error name) or the `.payload` arm
     /// (carrying the payload Value's Index). `ty` is always an
@@ -896,6 +915,11 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, vt.len);
                 std.hash.autoHash(&hasher, vt.child);
             },
+            .opt_type => |child| std.hash.autoHash(&hasher, child),
+            .opt => |o| {
+                std.hash.autoHash(&hasher, o.ty);
+                std.hash.autoHash(&hasher, o.val);
+            },
             .aggregate => |agg| {
                 std.hash.autoHash(&hasher, agg.ty);
                 // Hash structurally across element Indices regardless of
@@ -1026,6 +1050,11 @@ pub const Key = union(enum) {
             .vector_type => |x| blk: {
                 const y = b.vector_type;
                 break :blk x.len == y.len and x.child == y.child;
+            },
+            .opt_type => |x| x == b.opt_type,
+            .opt => |x| blk: {
+                const y = b.opt;
+                break :blk x.ty == y.ty and x.val == y.val;
             },
             .aggregate => |x| blk: {
                 const y = b.aggregate;
@@ -1188,6 +1217,10 @@ const Item = struct {
         // (2 u32 slots: len, child). Mirrors the compiler's
         // `Item.Tag.type_vector` (`src/InternPool.zig` ~4168).
         type_vector,
+        // `?child` optional type. data = the child type Index.
+        // Mirrors the compiler's `Item.Tag.type_optional`
+        // (`src/InternPool.zig` ~4171).
+        type_optional,
         // Sentinel-free `[len]child` array type where len fits in
         // u32. data = extra index of VectorTypeRepr (2 u32 slots:
         // len, child). Mirrors the compiler's
@@ -1210,6 +1243,14 @@ const Item = struct {
         // Mirrors the compiler's `Item.Tag.repeated`
         // (`src/InternPool.zig` ~4283).
         repeated,
+        // Non-null optional value. data = extra index of OptPayloadRepr
+        // (2 u32 slots: ty, val). Mirrors the compiler's
+        // `Item.Tag.opt_payload` (`src/InternPool.zig` ~4230).
+        opt_payload,
+        // Null optional value. data = the optional type Index.
+        // Mirrors the compiler's `Item.Tag.opt_null`
+        // (`src/InternPool.zig` ~4231).
+        opt_null,
     };
 };
 
@@ -1304,6 +1345,15 @@ const FuncCoercedRepr = extern struct {
 const VectorTypeRepr = extern struct {
     len: u32,
     child: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.opt_payload` -- the optional type
+/// then the (non-none) payload value. `opt_null` needs no repr; it
+/// stores the optional type inline. Mirrors the compiler's
+/// `Tag.TypeValue` reuse for `opt_payload` (`src/InternPool.zig` ~4230).
+const OptPayloadRepr = extern struct {
+    ty: u32,
+    val: u32,
 };
 
 /// Extra-arena payload for `Item.Tag.type_array_big`. Four u32
@@ -1920,6 +1970,8 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .func => |f| try emitFunc(pool, f),
         .array_type => |at| try emitArrayType(pool, at),
         .vector_type => |vt| try emitVectorType(pool, vt),
+        .opt_type => |child| appendOptionalType(pool, child),
+        .opt => |o| try emitOpt(pool, o),
         .aggregate => |agg| try emitAggregate(pool, agg),
     }
 
@@ -2002,6 +2054,9 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .func_instance => funcInstanceFromExtra(pool, item.data),
         .func_coerced => funcCoercedFromExtra(pool, item.data),
         .type_vector => vectorTypeFromExtra(pool, item.data),
+        .type_optional => .{ .opt_type = @enumFromInt(item.data) },
+        .opt_payload => optPayloadFromExtra(pool, item.data),
+        .opt_null => .{ .opt = .{ .ty = @enumFromInt(item.data), .val = .none } },
         .type_array_small => arrayTypeSmallFromExtra(pool, item.data),
         .type_array_big => arrayTypeBigFromExtra(pool, item.data),
         .aggregate => aggregateFromExtra(pool, item.data),
@@ -2076,6 +2131,16 @@ fn vectorTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
     return .{ .vector_type = .{
         .len = slice[0],
         .child = @enumFromInt(slice[1]),
+    } };
+}
+
+fn optPayloadFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const fields = comptime @divExact(@sizeOf(OptPayloadRepr), @sizeOf(u32));
+    assert(extra_index + fields <= pool.extra.items.len);
+    const slice = pool.extra.items[extra_index..][0..fields];
+    return .{ .opt = .{
+        .ty = @enumFromInt(slice[0]),
+        .val = @enumFromInt(slice[1]),
     } };
 }
 
@@ -2598,6 +2663,36 @@ fn emitVectorType(pool: *InternPool, vt: Key.VectorType) Allocator.Error!void {
     pool.items.appendAssumeCapacity(.{ .tag = .type_vector, .data = extra_index });
 }
 
+/// Emit a `type_optional` Item. data = the child type Index (inline,
+/// like `type_anyframe`).
+fn appendOptionalType(pool: *InternPool, child: Index) void {
+    assert(child != .none);
+    pool.items.appendAssumeCapacity(.{
+        .tag = .type_optional,
+        .data = @intFromEnum(child),
+    });
+}
+
+/// Emit an optional value. A `null` optional (`val == .none`) is the
+/// inline `opt_null` Tag carrying the optional type; otherwise the
+/// `opt_payload` Tag stores `(ty, val)` in extra.
+fn emitOpt(pool: *InternPool, o: Key.Opt) Allocator.Error!void {
+    assert(o.ty != .none);
+    if (o.val == .none) {
+        pool.items.appendAssumeCapacity(.{
+            .tag = .opt_null,
+            .data = @intFromEnum(o.ty),
+        });
+        return;
+    }
+    const extra_index: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.appendSlice(pool.gpa, &.{
+        @intFromEnum(o.ty),
+        @intFromEnum(o.val),
+    });
+    pool.items.appendAssumeCapacity(.{ .tag = .opt_payload, .data = extra_index });
+}
+
 /// Emit a `type_error_union` Item. Two u32 slots: `error_set`, `payload`.
 fn emitErrorUnionType(pool: *InternPool, eu: Key.ErrorUnionType) Allocator.Error!void {
     assert(eu.error_set_type != .none);
@@ -2691,6 +2786,16 @@ pub fn internArrayType(pool: *InternPool, at: Key.ArrayType) Allocator.Error!Ind
 /// Intern a vector type (`@Vector(N, T)`).
 pub fn internVectorType(pool: *InternPool, vt: Key.VectorType) Allocator.Error!Index {
     return pool.get(.{ .vector_type = vt });
+}
+
+/// Intern an optional type (`?T`).
+pub fn internOptionalType(pool: *InternPool, child: Index) Allocator.Error!Index {
+    return pool.get(.{ .opt_type = child });
+}
+
+/// Intern an optional value (`val == .none` is `null`).
+pub fn internOpt(pool: *InternPool, o: Key.Opt) Allocator.Error!Index {
+    return pool.get(.{ .opt = o });
 }
 
 /// Intern an aggregate value. The caller's storage flavor is

@@ -153,6 +153,29 @@ fn expectMatchesZig(gpa: std.mem.Allocator, inputs: []const []const u8) !void {
     try testing.expectEqualStrings(normalize(zig_output), normalize(our_output));
 }
 
+/// Assert both our REPL and `zig run` reject the program. For cases
+/// that are compile errors on both sides (e.g. unwrapping a
+/// comptime-known null) there is no output to compare -- only mutual
+/// rejection. Matching the exact message would key on wording that
+/// drifts between toolchains, so this checks rejection, not text.
+fn expectBothReject(gpa: std.mem.Allocator, inputs: []const []const u8) !void {
+    if (runViaRepl(gpa, inputs)) |out| {
+        gpa.free(out);
+        return error.TestUnexpectedReplSuccess;
+    } else |err| switch (err) {
+        error.ParseError, error.ZirError, error.AnalysisFail => {},
+        else => return err,
+    }
+
+    if (runViaZig(gpa, inputs)) |out| {
+        gpa.free(out);
+        return error.TestUnexpectedZigSuccess;
+    } else |err| switch (err) {
+        error.ZigRunFailed => {},
+        else => return err,
+    }
+}
+
 const assert = std.debug.assert;
 
 test "compliance: comptime_int arithmetic" {
@@ -700,4 +723,30 @@ test "compliance: vector type renders across awkward element widths" {
 test "compliance: pointer to aggregate renders (vector / array as a pointer child)" {
     try expectMatchesZig(testing.allocator, &.{"*@Vector(4, i32)"});
     try expectMatchesZig(testing.allocator, &.{"*[3]i32"});
+}
+
+test "compliance: optional type renders across child kinds" {
+    try expectMatchesZig(testing.allocator, &.{"?i32"});
+    try expectMatchesZig(testing.allocator, &.{"?*const u8"});
+    try expectMatchesZig(testing.allocator, &.{"?@Vector(4, i32)"});
+}
+
+test "compliance: optional values (payload, null, unwrap)" {
+    try expectMatchesZig(testing.allocator, &.{"@as(?i32, 5)"});
+    try expectMatchesZig(testing.allocator, &.{"@as(?i32, null)"});
+    try expectMatchesZig(testing.allocator, &.{"@as(?i32, 5).?"});
+    // var must be mutated or zig rejects it ("never mutated"); the
+    // store-through path coerces 6 into the ?i32 slot, then .? unwraps.
+    try expectMatchesZig(testing.allocator, &.{"blk: { var x: ?i32 = 5; x = 6; break :blk x.?; }"});
+}
+
+test "compliance: unwrapping a comptime-known null is rejected by both" {
+    try expectBothReject(testing.allocator, &.{"@as(?i32, null).?"});
+}
+
+test "compliance: optional across awkward payload widths" {
+    inline for (awkward_widths) |bits| {
+        const decl = std.fmt.comptimePrint("@as(?u{d}, 1)", .{bits});
+        try expectMatchesZig(testing.allocator, &.{decl});
+    }
 }

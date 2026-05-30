@@ -44,7 +44,12 @@ pub fn render(
         .func_type,
         .array_type,
         .vector_type,
+        .opt_type,
         => renderTypeRef(value.index, pool, writer),
+        .opt => |o| if (o.val == .none)
+            writer.writeAll("null\n")
+        else
+            render(.{ .index = o.val }, pool, writer),
         .ptr => |p| writer.print("ptr@{d}+{d}\n", .{ @intFromEnum(p.ty), p.byte_offset }),
         .err => |e| writer.print("error.{s}\n", .{pool.stringSlice(e.name)}),
         .error_union => |eu| renderErrorUnion(eu, pool, writer),
@@ -165,6 +170,10 @@ pub fn writeTypeName(
         .func_type => |ft| try writeFuncTypeName(ft, pool, writer),
         .array_type => |at| try writeArrayTypeName(at, pool, writer),
         .vector_type => |vt| try writeVectorTypeName(vt, pool, writer),
+        .opt_type => |child| {
+            try writer.writeAll("?");
+            try writeTypeName(child, pool, writer);
+        },
         else => try writer.writeAll("<type>"),
     }
 }

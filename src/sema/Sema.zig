@@ -482,6 +482,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
         .int_type => sema.evalIntType(inst),
         .vector_type => sema.evalVectorType(inst),
+        .optional_type => sema.evalOptionalType(inst),
+        .optional_payload_safe, .optional_payload_unsafe => sema.evalOptionalPayload(inst),
         .array_type => sema.evalArrayType(inst),
         .array_init => sema.evalArrayInit(inst),
         .array_init_ref => sema.evalArrayInitRef(inst),
@@ -1293,6 +1295,7 @@ fn resolveDestType(
         .error_union_type,
         .array_type,
         .vector_type,
+        .opt_type,
         => dest_value.index,
         else => blk: {
             try sema.writer.print("{s}: destination is not a type\n", .{op_name});
@@ -2280,8 +2283,32 @@ fn coerceValueToType(
         return try sema.coerceToErrorUnion(value, dest_ty, op_name);
     }
 
+    // Coercion into an optional type: `null` becomes the null optional;
+    // any other value coerces to the child type and wraps as the
+    // payload. Same shape as the compiler's `coerceExtra` optional arm.
+    if (ip.indexToKey(dest_ty) == .opt_type) {
+        return try sema.coerceToOptional(value, dest_ty, op_name);
+    }
+
     try sema.writer.print("{s}: cannot coerce value to destination type\n", .{op_name});
     return error.AnalysisFail;
+}
+
+fn coerceToOptional(
+    sema: *Sema,
+    value: Value,
+    dest_ty: InternPool.Index,
+    op_name: []const u8,
+) Error!Value {
+    const ip = sema.intern_pool;
+    if (value.index == .null_value) {
+        const idx = try ip.internOpt(.{ .ty = dest_ty, .val = .none });
+        return .{ .index = idx };
+    }
+    const child = ip.indexToKey(dest_ty).opt_type;
+    const payload = try sema.coerceValueToType(value, child, op_name);
+    const idx = try ip.internOpt(.{ .ty = dest_ty, .val = payload.index });
+    return .{ .index = idx };
 }
 
 /// `int_type`: an arbitrary-width integer type (`u69`, `i420`, ...).
@@ -2375,6 +2402,45 @@ fn isVectorElemType(pool: *const InternPool, child: InternPool.Index) bool {
         },
         else => false,
     };
+}
+
+/// `optional_type operand`: build `?child`. Compiler reference:
+/// src/Sema.zig:zirOptionalType. The compiler also rejects opaque and
+/// `null` element types; neither is constructible in the REPL yet
+/// (opaque arrives with Stage 4 container decls), so that guard is
+/// deferred rather than silently dropped.
+fn evalOptionalType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const child = try sema.resolveDestType(un_node.operand, "optional_type");
+    const opt_ty = try sema.intern_pool.internOptionalType(child);
+    return .{ .index = opt_ty };
+}
+
+/// `optional_payload_safe` / `_unsafe` (`x.?`): unwrap an optional to
+/// its payload. Both ZIR forms collapse here -- the safe variant's
+/// runtime null check has no comptime analogue; a comptime-known
+/// `null` is the "unable to unwrap null" compile error either way.
+/// Compiler reference: src/Sema.zig:zirOptionalPayload (~8037). The
+/// `_ptr` pointer-to-payload variants are not wired (they need an
+/// offset into the optional's slot) and surface the unsupported-tag
+/// diagnostic.
+fn evalOptionalPayload(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const operand = try sema.resolveRef(un_node.operand);
+    const key = sema.intern_pool.indexToKey(operand.index);
+    if (key != .opt) {
+        try sema.writer.writeAll("optional unwrap: operand is not an optional\n");
+        return error.AnalysisFail;
+    }
+    if (key.opt.val == .none) {
+        try sema.writer.writeAll("unable to unwrap null\n");
+        return error.AnalysisFail;
+    }
+    return .{ .index = key.opt.val };
 }
 
 /// `array_init`: build the aggregate value. `array_init_ref`: build

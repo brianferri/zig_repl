@@ -964,6 +964,68 @@ test "vector_type: coercing a value into a vector destination fails loudly" {
     try expectEvalFails(gpa, &pool, "@as(@Vector(4, i32), [_]i32{ 1, 2, 3, 4 })", "cannot coerce value");
 }
 
+test "opt_type: renders ?T across child kinds" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypeName(gpa, &pool, "?i32", "?i32");
+    try expectEvalTypeName(gpa, &pool, "?*const u8", "?*const u8");
+    try expectEvalTypeName(gpa, &pool, "?@Vector(4, i32)", "?@Vector(4, i32)");
+
+    inline for (.{ 3, 69, 420 }) |bits| {
+        const src = std.fmt.comptimePrint("?u{d}", .{bits});
+        try expectEvalTypeName(gpa, &pool, src, src);
+    }
+}
+
+test "opt: payload and null values render, unwrap extracts the payload" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypeName(gpa, &pool, "@as(?i32, 5)", "5");
+    try expectEvalTypeName(gpa, &pool, "@as(?i32, null)", "null");
+    try expectEvalTypeName(gpa, &pool, "@as(?i32, 5).?", "5");
+    try expectEvalTypeName(gpa, &pool, "blk: { var x: ?i32 = 5; break :blk x.?; }", "5");
+}
+
+test "opt: e2e Key shape + dedup, payload carries the coerced child type" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, &pool, "@as(?i32, 5)", &diag_buf);
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .opt);
+    const opt_ty = pool.indexToKey(key.opt.ty);
+    try testing.expect(opt_ty == .opt_type);
+    try testing.expectEqual(InternPool.Index.i32_type, opt_ty.opt_type);
+    // Payload was coerced to the child type, not left as comptime_int.
+    const payload = pool.indexToKey(key.opt.val);
+    try testing.expectEqual(InternPool.Index.i32_type, payload.int.ty);
+
+    const second = try evalSource(gpa, &pool, "@as(?i32, 5)", &diag_buf);
+    try testing.expectEqual(value.index, second.index);
+
+    // The null optional interns under a distinct tag and dedups too.
+    const null_val = try evalSource(gpa, &pool, "@as(?i32, null)", &diag_buf);
+    const null_key = pool.indexToKey(null_val.index);
+    try testing.expect(null_key == .opt);
+    try testing.expectEqual(InternPool.Index.none, null_key.opt.val);
+    const null_second = try evalSource(gpa, &pool, "@as(?i32, null)", &diag_buf);
+    try testing.expectEqual(null_val.index, null_second.index);
+}
+
+test "opt: unwrapping a null optional is a compile error" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalFails(gpa, &pool, "@as(?i32, null).?", "unable to unwrap null");
+}
+
 test "ptr_type: e2e through Pipeline produces interned Key.ptr_type" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);

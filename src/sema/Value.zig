@@ -38,6 +38,7 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
         .err => |e| .{ .index = e.ty },
         .error_union => |eu| .{ .index = eu.ty },
         .func => |f| .{ .index = f.ty },
+        .opt => |o| .{ .index = o.ty },
         .aggregate => |agg| .{ .index = agg.ty },
         // A bare type Key (the slot a type lives in) doubles as the value
         // of type `type` with that type as its payload -- the compiler's
@@ -52,6 +53,7 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
         .func_type,
         .array_type,
         .vector_type,
+        .opt_type,
         => .type_type,
     };
 }
