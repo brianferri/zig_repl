@@ -898,6 +898,72 @@ test "int_type: arbitrary-width array type constructs and renders" {
     }
 }
 
+test "vector_type: renders @Vector(N, T) across element kinds" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalTypeName(gpa, &pool, "@Vector(4, i32)", "@Vector(4, i32)");
+    try expectEvalTypeName(gpa, &pool, "@Vector(2, f32)", "@Vector(2, f32)");
+    try expectEvalTypeName(gpa, &pool, "@Vector(8, bool)", "@Vector(8, bool)");
+    try expectEvalTypeName(gpa, &pool, "@Vector(3, *const u8)", "@Vector(3, *const u8)");
+
+    inline for (.{ 1, 3, 69, 420 }) |bits| {
+        const src = std.fmt.comptimePrint("@Vector(7, u{d})", .{bits});
+        try expectEvalTypeName(gpa, &pool, src, src);
+    }
+}
+
+test "vector_type: e2e Key shape + dedup" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, &pool, "@Vector(4, i32)", &diag_buf);
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .vector_type);
+    try testing.expectEqual(@as(u32, 4), key.vector_type.len);
+    try testing.expectEqual(InternPool.Index.i32_type, key.vector_type.child);
+
+    const second = try evalSource(gpa, &pool, "@Vector(4, i32)", &diag_buf);
+    try testing.expectEqual(value.index, second.index);
+
+    // A u69 child interns a fresh int_type rather than a well-known
+    // Index, so the child slot must round-trip the interned type, not
+    // just a built-in constant.
+    const wide = try evalSource(gpa, &pool, "@Vector(7, u69)", &diag_buf);
+    const wide_key = pool.indexToKey(wide.index);
+    try testing.expect(wide_key == .vector_type);
+    try testing.expectEqual(@as(u32, 7), wide_key.vector_type.len);
+    const child_key = pool.indexToKey(wide_key.vector_type.child);
+    try testing.expect(child_key == .int_type);
+    try testing.expectEqual(@as(u16, 69), child_key.int_type.bits);
+    try testing.expectEqual(std.builtin.Signedness.unsigned, child_key.int_type.signedness);
+}
+
+test "vector_type: rejects element types without a fixed bit width" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalFails(gpa, &pool, "@Vector(4, comptime_int)", "vector element type");
+    try expectEvalFails(gpa, &pool, "@Vector(2, type)", "vector element type");
+    try expectEvalFails(gpa, &pool, "@Vector(2, [3]u8)", "vector element type");
+}
+
+test "vector_type: coercing a value into a vector destination fails loudly" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // resolveDestType accepts vector types so they can be pointer/array
+    // children; coercing a value into one is not wired until vector
+    // values land, and must fail loudly rather than build a half-formed
+    // vector aggregate (which would trip aggregateElementCount).
+    try expectEvalFails(gpa, &pool, "@as(@Vector(4, i32), [_]i32{ 1, 2, 3, 4 })", "cannot coerce value");
+}
+
 test "ptr_type: e2e through Pipeline produces interned Key.ptr_type" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);

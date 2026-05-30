@@ -481,6 +481,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .dbg_stmt, .dbg_var_val, .dbg_var_ptr, .validate_const => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
         .int_type => sema.evalIntType(inst),
+        .vector_type => sema.evalVectorType(inst),
         .array_type => sema.evalArrayType(inst),
         .array_init => sema.evalArrayInit(inst),
         .array_init_ref => sema.evalArrayInitRef(inst),
@@ -1291,6 +1292,7 @@ fn resolveDestType(
         .error_set_type,
         .error_union_type,
         .array_type,
+        .vector_type,
         => dest_value.index,
         else => blk: {
             try sema.writer.print("{s}: destination is not a type\n", .{op_name});
@@ -2074,15 +2076,7 @@ fn evalPtrType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const payload = sema.zir.extraData(Zir.Inst.PtrType, inst_data.payload_index).data;
     assert(payload.elem_type != .none);
 
-    const elem_value = try sema.resolveRef(payload.elem_type);
-    const child_ty: InternPool.Index = switch (sema.intern_pool.indexToKey(elem_value.index)) {
-        .type_value => |t| t,
-        .simple_type, .int_type, .anyframe_type, .ptr_type => elem_value.index,
-        else => {
-            try sema.writer.writeAll("ptr_type: element is not a type\n");
-            return error.AnalysisFail;
-        },
-    };
+    const child_ty = try sema.resolveDestType(payload.elem_type, "ptr_type");
     assert(child_ty != .none);
 
     const idx = try sema.intern_pool.internPtrType(.{
@@ -2319,6 +2313,68 @@ fn evalArrayType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const child = try sema.resolveDestType(bin.rhs, "array_type");
     const array_ty = try sema.intern_pool.internArrayType(.{ .len = len, .child = child });
     return .{ .index = array_ty };
+}
+
+/// `vector_type lhs, rhs`: `lhs` is the lane count, `rhs` the element
+/// type. The length is a u32 upstream, so a wider value is rejected.
+/// The element type is restricted to concrete int/float/bool/pointer
+/// via `isVectorElemType`. Compiler reference: src/Sema.zig:zirVectorType
+/// (~7456).
+fn evalVectorType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    assert(bin.lhs != .none);
+    assert(bin.rhs != .none);
+
+    const len64 = try sema.resolveArrayLen(bin.lhs, "vector_type");
+    const len = std.math.cast(u32, len64) orelse {
+        try sema.writer.print("vector_type: length {d} exceeds u32\n", .{len64});
+        return error.AnalysisFail;
+    };
+    const child = try sema.resolveDestType(bin.rhs, "vector_type");
+    if (!isVectorElemType(sema.intern_pool, child)) {
+        try sema.writer.writeAll(
+            "vector_type: expected integer, float, bool, or pointer for the vector element type\n",
+        );
+        return error.AnalysisFail;
+    }
+    const vector_ty = try sema.intern_pool.internVectorType(.{ .len = len, .child = child });
+    return .{ .index = vector_ty };
+}
+
+/// Predicate for `@Vector` element types -- concrete integer, float,
+/// bool, or pointer. comptime_int / comptime_float are excluded: a
+/// vector lane needs a fixed bit width. Mirrors the compiler's
+/// `checkVectorElemType` (src/Sema.zig).
+fn isVectorElemType(pool: *const InternPool, child: InternPool.Index) bool {
+    return switch (pool.indexToKey(child)) {
+        .int_type, .ptr_type => true,
+        .simple_type => |st| switch (st) {
+            .usize,
+            .isize,
+            .c_char,
+            .c_short,
+            .c_ushort,
+            .c_int,
+            .c_uint,
+            .c_long,
+            .c_ulong,
+            .c_longlong,
+            .c_ulonglong,
+            .c_longdouble,
+            .f16,
+            .f32,
+            .f64,
+            .f80,
+            .f128,
+            .bool,
+            => true,
+            else => false,
+        },
+        else => false,
+    };
 }
 
 /// `array_init`: build the aggregate value. `array_init_ref`: build

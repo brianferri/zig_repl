@@ -682,3 +682,22 @@ test "compliance: wide-width values round-trip (u69 large, i420 negative)" {
         "a[0]",
     });
 }
+
+test "compliance: vector type renders across element kinds" {
+    try expectMatchesZig(testing.allocator, &.{"@Vector(4, i32)"});
+    try expectMatchesZig(testing.allocator, &.{"@Vector(2, f32)"});
+    try expectMatchesZig(testing.allocator, &.{"@Vector(8, bool)"});
+    try expectMatchesZig(testing.allocator, &.{"@Vector(3, *const u8)"});
+}
+
+test "compliance: vector type renders across awkward element widths" {
+    inline for (awkward_widths) |bits| {
+        const src = std.fmt.comptimePrint("@Vector(7, u{d})", .{bits});
+        try expectMatchesZig(testing.allocator, &.{src});
+    }
+}
+
+test "compliance: pointer to aggregate renders (vector / array as a pointer child)" {
+    try expectMatchesZig(testing.allocator, &.{"*@Vector(4, i32)"});
+    try expectMatchesZig(testing.allocator, &.{"*[3]i32"});
+}

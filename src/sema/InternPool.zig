@@ -544,6 +544,11 @@ pub const Key = union(enum) {
     /// ~2098); the Tag split mirrors `type_array_small` / `type_array_big`
     /// (`src/InternPool.zig` ~4171-4172).
     array_type: ArrayType,
+    /// `@Vector(len, child)`. A single `Item.Tag` (`type_vector`) since
+    /// `len` is always a `u32` -- no big/small split like `array_type`.
+    /// Mirrors the compiler's `Key.VectorType` (`src/InternPool.zig`
+    /// ~2104) and its `type_vector` Tag (`src/InternPool.zig` ~4168).
+    vector_type: VectorType,
     /// An aggregate value (array, vector, struct -- the type
     /// determines which). Storage is either an N-element slice or a
     /// single-element repetition. Mirrors compiler `Key.Aggregate`
@@ -731,6 +736,14 @@ pub const Key = union(enum) {
         }
     };
 
+    /// `@Vector(len, child)`. Mirrors compiler `Key.VectorType`
+    /// (`src/InternPool.zig` ~2104) including the `extern struct`
+    /// discipline -- the layout is pinned for memory-reinterpret hashing.
+    pub const VectorType = extern struct {
+        len: u32,
+        child: Index,
+    };
+
     /// Value of an error-union type. Either the `.err` arm
     /// (carrying the interned error name) or the `.payload` arm
     /// (carrying the payload Value's Index). `ty` is always an
@@ -879,6 +892,10 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, at.child);
                 std.hash.autoHash(&hasher, at.sentinel);
             },
+            .vector_type => |vt| {
+                std.hash.autoHash(&hasher, vt.len);
+                std.hash.autoHash(&hasher, vt.child);
+            },
             .aggregate => |agg| {
                 std.hash.autoHash(&hasher, agg.ty);
                 // Hash structurally across element Indices regardless of
@@ -1005,6 +1022,10 @@ pub const Key = union(enum) {
                 if (x.len != y.len) break :blk false;
                 if (x.child != y.child) break :blk false;
                 break :blk x.sentinel == y.sentinel;
+            },
+            .vector_type => |x| blk: {
+                const y = b.vector_type;
+                break :blk x.len == y.len and x.child == y.child;
             },
             .aggregate => |x| blk: {
                 const y = b.aggregate;
@@ -1163,12 +1184,15 @@ const Item = struct {
         // the inner's `ty`. Lands when fn coercion does -- shape
         // ready today.
         func_coerced,
+        // `@Vector(len, child)`. data = extra index of VectorTypeRepr
+        // (2 u32 slots: len, child). Mirrors the compiler's
+        // `Item.Tag.type_vector` (`src/InternPool.zig` ~4168).
+        type_vector,
         // Sentinel-free `[len]child` array type where len fits in
-        // u32. data = extra index of ArrayTypeSmallRepr (2 u32
-        // slots: len, child). Mirrors the compiler's
+        // u32. data = extra index of VectorTypeRepr (2 u32 slots:
+        // len, child). Mirrors the compiler's
         // `Item.Tag.type_array_small` (`src/InternPool.zig` ~4172)
-        // which reuses the `Vector { len, child }` layout for the
-        // same packing.
+        // which reuses the same `len, child` packing.
         type_array_small,
         // Array type with a sentinel value OR with len >= 2^32.
         // data = extra index of ArrayTypeBigRepr (4 u32 slots:
@@ -1272,12 +1296,12 @@ const FuncCoercedRepr = extern struct {
     inner_func: u32,
 };
 
-/// Extra-arena payload for `Item.Tag.type_array_small`. Two u32
-/// slots: `len` then `child`. Used when sentinel == .none AND
-/// len fits in u32 -- the common case. Mirrors the compiler's
-/// `Vector { len, child }` layout that `type_array_small` reuses
-/// (`src/InternPool.zig` ~5967).
-const ArrayTypeSmallRepr = extern struct {
+/// Extra-arena payload for `Item.Tag.type_vector` -- `len` then
+/// `child`. `Item.Tag.type_array_small` reuses this same layout for
+/// sentinel-free arrays whose len fits in u32; the Tag, not the repr,
+/// is what `indexToKey` discriminates on. Mirrors the compiler's
+/// `Vector { len, child }` (`src/InternPool.zig` ~5967).
+const VectorTypeRepr = extern struct {
     len: u32,
     child: u32,
 };
@@ -1895,6 +1919,7 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .func_type => |ft| try emitFuncType(pool, ft),
         .func => |f| try emitFunc(pool, f),
         .array_type => |at| try emitArrayType(pool, at),
+        .vector_type => |vt| try emitVectorType(pool, vt),
         .aggregate => |agg| try emitAggregate(pool, agg),
     }
 
@@ -1976,6 +2001,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .func_decl => funcDeclFromExtra(pool, item.data),
         .func_instance => funcInstanceFromExtra(pool, item.data),
         .func_coerced => funcCoercedFromExtra(pool, item.data),
+        .type_vector => vectorTypeFromExtra(pool, item.data),
         .type_array_small => arrayTypeSmallFromExtra(pool, item.data),
         .type_array_big => arrayTypeBigFromExtra(pool, item.data),
         .aggregate => aggregateFromExtra(pool, item.data),
@@ -2033,13 +2059,23 @@ fn errorUnionTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
 }
 
 fn arrayTypeSmallFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const fields = comptime @divExact(@sizeOf(ArrayTypeSmallRepr), @sizeOf(u32));
+    const fields = comptime @divExact(@sizeOf(VectorTypeRepr), @sizeOf(u32));
     assert(extra_index + fields <= pool.extra.items.len);
     const slice = pool.extra.items[extra_index..][0..fields];
     return .{ .array_type = .{
         .len = slice[0],
         .child = @enumFromInt(slice[1]),
         .sentinel = .none,
+    } };
+}
+
+fn vectorTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const fields = comptime @divExact(@sizeOf(VectorTypeRepr), @sizeOf(u32));
+    assert(extra_index + fields <= pool.extra.items.len);
+    const slice = pool.extra.items[extra_index..][0..fields];
+    return .{ .vector_type = .{
+        .len = slice[0],
+        .child = @enumFromInt(slice[1]),
     } };
 }
 
@@ -2551,6 +2587,17 @@ fn emitArrayType(pool: *InternPool, at: Key.ArrayType) Allocator.Error!void {
     pool.items.appendAssumeCapacity(.{ .tag = .type_array_big, .data = extra_index });
 }
 
+/// Emit a `type_vector` Item. Two u32 slots: `len`, `child`.
+fn emitVectorType(pool: *InternPool, vt: Key.VectorType) Allocator.Error!void {
+    assert(vt.child != .none);
+    const extra_index: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.appendSlice(pool.gpa, &.{
+        vt.len,
+        @intFromEnum(vt.child),
+    });
+    pool.items.appendAssumeCapacity(.{ .tag = .type_vector, .data = extra_index });
+}
+
 /// Emit a `type_error_union` Item. Two u32 slots: `error_set`, `payload`.
 fn emitErrorUnionType(pool: *InternPool, eu: Key.ErrorUnionType) Allocator.Error!void {
     assert(eu.error_set_type != .none);
@@ -2636,9 +2683,14 @@ pub fn internErr(pool: *InternPool, e: Key.Error) Allocator.Error!Index {
     return pool.get(.{ .err = e });
 }
 
-/// Intern an error-union type (`E!T`).
+/// Intern an array type (`[N]T` / `[N:s]T`).
 pub fn internArrayType(pool: *InternPool, at: Key.ArrayType) Allocator.Error!Index {
     return pool.get(.{ .array_type = at });
+}
+
+/// Intern a vector type (`@Vector(N, T)`).
+pub fn internVectorType(pool: *InternPool, vt: Key.VectorType) Allocator.Error!Index {
+    return pool.get(.{ .vector_type = vt });
 }
 
 /// Intern an aggregate value. The caller's storage flavor is

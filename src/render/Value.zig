@@ -43,6 +43,7 @@ pub fn render(
         .error_union_type,
         .func_type,
         .array_type,
+        .vector_type,
         => renderTypeRef(value.index, pool, writer),
         .ptr => |p| writer.print("ptr@{d}+{d}\n", .{ @intFromEnum(p.ty), p.byte_offset }),
         .err => |e| writer.print("error.{s}\n", .{pool.stringSlice(e.name)}),
@@ -163,6 +164,7 @@ pub fn writeTypeName(
         .error_union_type => |eu| try writeErrorUnionTypeName(eu, pool, writer),
         .func_type => |ft| try writeFuncTypeName(ft, pool, writer),
         .array_type => |at| try writeArrayTypeName(at, pool, writer),
+        .vector_type => |vt| try writeVectorTypeName(vt, pool, writer),
         else => try writer.writeAll("<type>"),
     }
 }
@@ -191,6 +193,17 @@ fn writeArrayTypeName(
     }
     try writer.writeAll("]");
     try writeTypeName(at.child, pool, writer);
+}
+
+/// Render a vector type as Zig surface syntax: `@Vector(N, T)`.
+fn writeVectorTypeName(
+    vt: InternPool.Key.VectorType,
+    pool: *const InternPool,
+    writer: *std.Io.Writer,
+) Error!void {
+    try writer.print("@Vector({d}, ", .{vt.len});
+    try writeTypeName(vt.child, pool, writer);
+    try writer.writeAll(")");
 }
 
 /// Render a function type as Zig surface syntax:
