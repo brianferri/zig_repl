@@ -271,6 +271,17 @@ test "@as rejects values that don't fit in the target int type" {
     try expectEvalFails(gpa, &pool, "@as(u32, -1)", "does not fit in u32");
 }
 
+test "array_init rejects elements that don't fit the element type" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalFails(gpa, &pool, "[_]u3{8}", "does not fit in u3");
+    try expectEvalFails(gpa, &pool, "[_]u8{256}", "does not fit in u8");
+    try expectEvalFails(gpa, &pool, "[_]i4{8}", "does not fit in i4"); // i4 holds -8..7
+    try expectEvalFails(gpa, &pool, "[_]u8{-1}", "does not fit in u8");
+}
+
 test "if branches with negative results" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
@@ -853,6 +864,38 @@ fn expectEvalTypeName(
     const rendered_raw = render_buf[0 .. render_writer.buffer.len - render_writer.unusedCapacityLen()];
     const rendered = std.mem.trimEnd(u8, rendered_raw, "\n");
     try testing.expectEqualStrings(expected, rendered);
+}
+
+test "int_type: arbitrary widths construct and render across a sweep" {
+    @setEvalBranchQuota(20000);
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    // Spans widths <=16 (well-known Inst.Refs) and wider (the
+    // int_type handler) -- distinct paths that must agree.
+    const widths = [_]u16{ 0, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 69, 127, 128, 255, 420, 1000, 65535 };
+    inline for (.{ "u", "i" }) |sign| {
+        inline for (widths) |bits| {
+            // `i0` is illegal ("signed integer cannot have bit width
+            // 0"); `u0` is valid. Skip the one bad combination.
+            if (bits == 0 and sign[0] == 'i') continue;
+            const name = std.fmt.comptimePrint("{s}{d}", .{ sign, bits });
+            try expectEvalTypeName(gpa, &pool, name, name);
+        }
+    }
+}
+
+test "int_type: arbitrary-width array type constructs and renders" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    inline for (.{ 3, 69, 420, 65535 }) |bits| {
+        const src = std.fmt.comptimePrint("[4]u{d}", .{bits});
+        const want = std.fmt.comptimePrint("[4]u{d}", .{bits});
+        try expectEvalTypeName(gpa, &pool, src, want);
+    }
 }
 
 test "ptr_type: e2e through Pipeline produces interned Key.ptr_type" {

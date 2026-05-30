@@ -14,7 +14,8 @@ const InternPool = @import("sema/InternPool.zig");
 const Value = @import("sema/Value.zig");
 const render = @import("render/Value.zig");
 
-const tmp_zig_path = "/tmp/zig_repl_compliance_check.zig";
+// Shared across cases; sits under .zig-cache so `zig build` cleans it.
+const compliance_cache_dir = ".zig-cache/tmp/zig-repl-compliance";
 
 /// Run a sequence of REPL inputs through Pipeline + Sema + render
 /// against a fresh session namespace. The last input must produce a
@@ -87,18 +88,26 @@ fn runViaZig(
     defer io_instance.deinit();
     const io = io_instance.io();
 
-    Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp_zig_path, .data = prog.written() }) catch
+    // tmpDir gives each call its own source path so concurrent runs
+    // can't clobber one another's program.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    tmp.dir.writeFile(io, .{ .sub_path = "prog.zig", .data = prog.written() }) catch
         return error.SkipZigTest;
 
-    // Explicit cache dirs so the subprocess doesn't need
-    // `$XDG_CACHE_HOME` / `$HOME` from a possibly-empty inherited
-    // environment.
+    var path_buf: [128]u8 = undefined;
+    const src_path = std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/prog.zig", .{tmp.sub_path}) catch
+        return error.SkipZigTest;
+
+    // Cache dirs are explicit and shared: `zig build test` runs the
+    // test binary with no HOME, so zig can't resolve its default
+    // global cache (AppDataDirUnavailable); a shared dir also compiles
+    // std once instead of once per case.
     const result = std.process.run(gpa, io, .{
         .argv = &.{
-            "zig",                "run",
-            "--cache-dir",        "/tmp/zig-compliance-cache",
-            "--global-cache-dir", "/tmp/zig-compliance-global-cache",
-            tmp_zig_path,
+            "zig",                "run",                src_path,
+            "--cache-dir",        compliance_cache_dir, "--global-cache-dir",
+            compliance_cache_dir,
         },
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(16 * 1024),
@@ -616,5 +625,60 @@ test "compliance: defer reads live state at scope exit, not at declaration" {
     try expectMatchesZig(testing.allocator, &.{
         "fn run() u32 { var x: u32 = 5; { defer x = x * 100; x = 7; } return x; }",
         "run()",
+    });
+}
+
+test "compliance: array literal index (elems storage)" {
+    try expectMatchesZig(testing.allocator, &.{
+        "const a = [_]i32{1, 2, 3};",
+        "a[1]",
+    });
+}
+
+test "compliance: array literal index (repeated_elem storage)" {
+    try expectMatchesZig(testing.allocator, &.{
+        "const a = [_]u32{7, 7, 7};",
+        "a[2]",
+    });
+}
+
+test "compliance: array aggregate renders as brace list" {
+    try expectMatchesZig(testing.allocator, &.{"[_]i32{1, 2, 3}"});
+}
+
+test "compliance: array type renders" {
+    try expectMatchesZig(testing.allocator, &.{"[3]i32"});
+}
+
+// Non-power-of-two widths reach the `int_type` handler rather than a
+// well-known Inst.Ref -- the path the round-number widths never hit.
+const awkward_widths = [_]u16{ 1, 3, 7, 33, 69, 420 };
+
+test "compliance: array index across awkward integer widths" {
+    // {1, 0, 1} fits every width >= 1, so one template serves all.
+    inline for (awkward_widths) |bits| {
+        const decl = std.fmt.comptimePrint("const a = [_]u{d}{{1, 0, 1}};", .{bits});
+        try expectMatchesZig(testing.allocator, &.{ decl, "a[0]" });
+    }
+}
+
+test "compliance: array type renders across awkward integer widths" {
+    inline for (awkward_widths) |bits| {
+        const src = std.fmt.comptimePrint("[3]u{d}", .{bits});
+        try expectMatchesZig(testing.allocator, &.{src});
+    }
+}
+
+// Targeted value round-trips the uniform sweep can't express: large
+// positive values at a wide width, and negatives at a wide signed
+// width.
+test "compliance: wide-width values round-trip (u69 large, i420 negative)" {
+    try expectMatchesZig(testing.allocator, &.{
+        "const a = [_]u69{100, 200, 300};",
+        "a[2]",
+    });
+    try expectMatchesZig(testing.allocator, &.{
+        "const a = [_]i420{-123456789, 0, 1};",
+        "a[0]",
     });
 }

@@ -1,15 +1,8 @@
 pub const Session = @import("Session.zig");
 pub const Repl = @import("Repl.zig");
 pub const LineEditor = @import("LineEditor.zig");
-pub const InternPool = @import("sema/InternPool.zig");
 pub const commands = @import("commands.zig");
-pub const sema = struct {
-    pub const InternPool = @import("sema/InternPool.zig");
-    pub const Type = @import("sema/Type.zig");
-    pub const Value = @import("sema/Value.zig");
-    pub const Sema = @import("sema/Sema.zig");
-    pub const arith = @import("sema/arith.zig");
-};
+pub const sema = @import("sema/root.zig");
 pub const render = struct {
     pub const Diagnostic = @import("render/Diagnostic.zig");
     pub const value = @import("render/Value.zig");

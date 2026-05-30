@@ -2062,13 +2062,15 @@ fn aggregateFromExtra(pool: *const InternPool, extra_index: u32) Key {
     const count: u32 = @intCast(count64);
     assert(extra_index + 1 + count <= pool.extra.items.len);
     const raw_elems = pool.extra.items[extra_index + 1 ..][0..count];
-    return .{ .aggregate = .{
-        .ty = ty,
-        // Reinterpret the u32 slice as `[]const Index` -- Index is
-        // `enum(u32)` and the slice shares the pool's extra arena
-        // for its lifetime. Same trick as `errorSetTypeFromExtra`.
-        .storage = .{ .elems = @ptrCast(raw_elems) },
-    } };
+    return .{
+        .aggregate = .{
+            .ty = ty,
+            // Reinterpret the u32 slice as `[]const Index` -- Index is
+            // `enum(u32)` and the slice shares the pool's extra arena
+            // for its lifetime. Same trick as `errorSetTypeFromExtra`.
+            .storage = .{ .elems = @ptrCast(raw_elems) },
+        },
+    };
 }
 
 fn repeatedFromExtra(pool: *const InternPool, extra_index: u32) Key {
@@ -2472,7 +2474,7 @@ fn emitErr(pool: *InternPool, e: Key.Error) Allocator.Error!void {
 /// has the equivalent inline at the call sites of
 /// `Tag.Aggregate.trailing.element_values.len`
 /// (`src/InternPool.zig` ~4278).
-fn aggregateElementCount(pool: *const InternPool, ty: Index) u64 {
+pub fn aggregateElementCount(pool: *const InternPool, ty: Index) u64 {
     assert(ty != .none);
     const key = pool.indexToKey(ty);
     return switch (key) {
@@ -2488,7 +2490,7 @@ fn aggregateElementCount(pool: *const InternPool, ty: Index) u64 {
 /// `.elems = [I, I, I]` and `.repeated_elem = I` (same `ty`)
 /// produce the same hash + compare equal without insert-time
 /// canonicalization.
-fn aggregateElementAt(agg: Key.Aggregate, i: u64) Index {
+pub fn aggregateElementAt(agg: Key.Aggregate, i: u64) Index {
     return switch (agg.storage) {
         .repeated_elem => |e| e,
         .elems => |es| es[@intCast(i)],

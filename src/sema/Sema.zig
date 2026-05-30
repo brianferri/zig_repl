@@ -447,6 +447,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .store_node => sema.evalStoreNode(inst),
         .load => sema.evalLoad(inst),
         .decl_val => sema.evalDeclVal(inst),
+        .decl_ref => sema.evalDeclRef(inst),
         .error_set_decl => sema.evalErrorSetDecl(inst),
         .error_value => sema.evalErrorValue(inst),
         .error_union_type => sema.evalErrorUnionType(inst),
@@ -475,8 +476,16 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         // no-ops here so we don't reject any function body that
         // declares a local. A future `:scope` extension can read
         // dbg_var_* via str_op to surface live local names.
-        .dbg_stmt, .dbg_var_val, .dbg_var_ptr => null,
+        // validate_const is a runtime-safety guard the compiler
+        // lowers to nothing in comptime context -- a no-op for us.
+        .dbg_stmt, .dbg_var_val, .dbg_var_ptr, .validate_const => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
+        .int_type => sema.evalIntType(inst),
+        .array_type => sema.evalArrayType(inst),
+        .array_init => sema.evalArrayInit(inst),
+        .array_init_ref => sema.evalArrayInitRef(inst),
+        .ref => sema.evalRef(inst),
+        .elem_ptr_load => sema.evalElemPtrLoad(inst),
         inline else => |unhandled| sema.reportUnsupportedTag(unhandled),
     };
 }
@@ -1281,6 +1290,7 @@ fn resolveDestType(
         .anyframe_type,
         .error_set_type,
         .error_union_type,
+        .array_type,
         => dest_value.index,
         else => blk: {
             try sema.writer.print("{s}: destination is not a type\n", .{op_name});
@@ -2114,13 +2124,29 @@ fn evalAlloc(sema: *Sema, inst: Zir.Inst.Index, is_const: bool) Error!?Value {
     assert(un_node.operand != .none);
 
     const child_ty = try sema.resolveDestType(un_node.operand, "alloc");
+    const undef_idx = try sema.intern_pool.get(.{ .undef = child_ty });
+    return try sema.pushComptimeAlloc(child_ty, .{ .index = undef_idx }, is_const);
+}
+
+/// Append a comptime-alloc slot holding `val` (of type `child_ty`)
+/// and return a single-item pointer to it (`*T` / `*const T` per
+/// `is_const`). The one place that turns "a value needs an address"
+/// into a slot + pointer: shared by `alloc` (undef slot) and the
+/// ref-producing tags (`ref`, `decl_ref`, `array_init_ref`).
+fn pushComptimeAlloc(
+    sema: *Sema,
+    child_ty: InternPool.Index,
+    val: Value,
+    is_const: bool,
+) Error!Value {
+    assert(child_ty != .none);
+    assert(val.index != .none);
 
     const ip = sema.intern_pool;
-    const undef_idx = try ip.get(.{ .undef = child_ty });
     const alloc_index: u32 = @intCast(sema.comptime_allocs.items.len);
     try sema.comptime_allocs.append(sema.gpa, .{
         .ty = child_ty,
-        .val = .{ .index = undef_idx },
+        .val = val,
         .is_const = is_const,
     });
 
@@ -2262,6 +2288,154 @@ fn coerceValueToType(
 
     try sema.writer.print("{s}: cannot coerce value to destination type\n", .{op_name});
     return error.AnalysisFail;
+}
+
+/// `int_type`: an arbitrary-width integer type (`u69`, `i420`, ...).
+/// Well-known widths (`u8`, `i32`, `usize`, ...) arrive as pre-
+/// interned `Inst.Ref` constants and never reach here; this handles
+/// the rest. Compiler reference: src/Sema.zig:zirIntType (~7372).
+fn evalIntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const int_type = sema.zir.instructions.items(.data)[@intFromEnum(inst)].int_type;
+    const idx = try sema.intern_pool.internIntType(int_type.signedness, int_type.bit_count);
+    return .{ .index = idx };
+}
+
+/// `array_type lhs, rhs`: `lhs` is the length operand, `rhs` the
+/// element type. Builds `[len]child` with no sentinel (the
+/// sentinel form is `array_type_sentinel`, a separate tag). Returns
+/// the array-type Index, which doubles as the value-of-type-`type`.
+/// Compiler reference: src/Sema.zig:zirArrayType (~7460).
+fn evalArrayType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    assert(bin.lhs != .none);
+    assert(bin.rhs != .none);
+
+    const len = try sema.resolveArrayLen(bin.lhs, "array_type");
+    const child = try sema.resolveDestType(bin.rhs, "array_type");
+    const array_ty = try sema.intern_pool.internArrayType(.{ .len = len, .child = child });
+    return .{ .index = array_ty };
+}
+
+/// `array_init`: build the aggregate value. `array_init_ref`: build
+/// it and hand back a `*const [N]T` instead. AstGen emits the `_ref`
+/// form when the result is indexed in place (`([_]T{...})[i]`) and
+/// the value form when it's used directly. Both share
+/// `buildArrayAggregate`. Compiler reference: src/Sema.zig:zirArrayInit
+/// (~18826) -- the comptime slice that builds an aggregate Value.
+fn evalArrayInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    return .{ .index = try sema.buildArrayAggregate(inst) };
+}
+
+fn evalArrayInitRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const agg = try sema.buildArrayAggregate(inst);
+    return try sema.materializeConstPtr(.{ .index = agg });
+}
+
+/// Decode an `array_init[_ref]` MultiOp into an interned aggregate
+/// Index. First operand is the array type; the rest are element
+/// values coerced to the array's child type.
+fn buildArrayAggregate(sema: *Sema, inst: Zir.Inst.Index) Error!InternPool.Index {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.MultiOp, pl_node.payload_index);
+    const operands = sema.zir.refSlice(extra.end, extra.data.operands_len);
+    assert(operands.len >= 1);
+
+    const ip = sema.intern_pool;
+    const array_ty = try sema.resolveDestType(operands[0], "array_init");
+    const array_key = ip.indexToKey(array_ty);
+    assert(array_key == .array_type); // resolveDestType guarantees a type; AstGen guarantees array
+    const child = array_key.array_type.child;
+
+    const elems = operands[1..];
+    const buf = try sema.gpa.alloc(InternPool.Index, elems.len);
+    defer sema.gpa.free(buf);
+    for (elems, 0..) |elem_ref, i| {
+        const elem = try sema.resolveRef(elem_ref);
+        const coerced = try sema.coerceValueToType(elem, child, "array_init");
+        buf[i] = coerced.index;
+    }
+
+    return try ip.internAggregate(.{ .ty = array_ty, .storage = .{ .elems = buf } });
+}
+
+/// `ref operand`: materialise `operand`'s value into a fresh const
+/// comptime-alloc slot and return a `*const T` to it. Compiler
+/// reference: src/Sema.zig:zirRef (~3052) -> analyzeRef.
+fn evalRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_tok = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_tok;
+    assert(un_tok.operand != .none);
+
+    const value = try sema.resolveRef(un_tok.operand);
+    return try sema.materializeConstPtr(value);
+}
+
+/// Store `value` in a fresh const comptime-alloc slot and return a
+/// `*const T` pointer to it. Shared by `ref` (pointer to an inline
+/// value), `decl_ref` (pointer to a session binding), and
+/// `array_init_ref` (pointer to a fresh aggregate).
+fn materializeConstPtr(sema: *Sema, value: Value) Error!Value {
+    const child_ty = Value.typeOf(value, sema.intern_pool).index;
+    return try sema.pushComptimeAlloc(child_ty, value, true);
+}
+
+/// `elem_ptr_load lhs, rhs`: load the aggregate behind pointer
+/// `lhs`, then return element `rhs`. AstGen emits this for `a[i]`
+/// in value position (the ptr-then-load fusion). Bounds are checked
+/// against the aggregate type's element count -- an out-of-range
+/// index is a comptime error here (we have no runtime panic path).
+fn evalElemPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    assert(bin.lhs != .none);
+    assert(bin.rhs != .none);
+
+    const ip = sema.intern_pool;
+    const ptr_value = try sema.resolveRef(bin.lhs);
+    const array_value = try sema.loadValue(ptr_value);
+    const agg_key = ip.indexToKey(array_value.index);
+    if (agg_key != .aggregate) {
+        try sema.writer.writeAll("elem access: operand is not an indexable aggregate\n");
+        return error.AnalysisFail;
+    }
+
+    const index = try sema.resolveArrayLen(bin.rhs, "elem access");
+    const count = ip.aggregateElementCount(agg_key.aggregate.ty);
+    if (index >= count) {
+        try sema.writer.print("index out of bounds: index {d}, len {d}\n", .{ index, count });
+        return error.AnalysisFail;
+    }
+    return .{ .index = InternPool.aggregateElementAt(agg_key.aggregate, index) };
+}
+
+/// Resolve a ZIR ref to a `u64` array length or element index:
+/// coerce to `usize`, then read the scalar. Lengths and indices are
+/// comptime-known integers in every shape AstGen emits here.
+fn resolveArrayLen(sema: *Sema, ref: Zir.Inst.Ref, op_name: []const u8) Error!u64 {
+    assert(ref != .none);
+    const value = try sema.resolveRef(ref);
+    const coerced = try sema.coerceValueToType(value, .usize_type, op_name);
+    const key = sema.intern_pool.indexToKey(coerced.index);
+    if (key != .int) {
+        try sema.writer.print("{s}: expected an integer\n", .{op_name});
+        return error.AnalysisFail;
+    }
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const big = key.int.storage.toBigInt(&space);
+    return big.toInt(u64) catch {
+        try sema.writer.print("{s}: value out of usize range\n", .{op_name});
+        return error.AnalysisFail;
+    };
 }
 
 fn coerceToErrorUnion(
@@ -2517,6 +2691,22 @@ fn wellKnownRefToValue(ref: Zir.Inst.Ref) ?Value {
 /// names are in scope before AstGen runs, so a missing name would
 /// be a structural bug in wrap-injection itself.
 fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    return try sema.lookupDeclValue(inst, "decl_val");
+}
+
+/// `decl_ref name`: AstGen emits this (rather than `decl_val`) when
+/// the use site needs a pointer -- e.g. `a[i]` takes `&a` first.
+/// Resolve the binding's value, then hand back a `*const T` to a
+/// materialised slot. Compiler reference: src/Sema.zig:zirDeclRef.
+fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const value = try sema.lookupDeclValue(inst, "decl_ref");
+    return try sema.materializeConstPtr(value);
+}
+
+/// Resolve a `str_tok` decl name against the session namespace to
+/// its bound value. Shared by `decl_val` (returns the value) and
+/// `decl_ref` (wraps it in a pointer).
+fn lookupDeclValue(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error!Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const data = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok;
@@ -2524,7 +2714,7 @@ fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const name = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes);
 
     const ns_idx = sema.namespace orelse {
-        try sema.writer.print("decl_val '{s}': no namespace in scope\n", .{name_bytes});
+        try sema.writer.print("{s} '{s}': no namespace in scope\n", .{ op_name, name_bytes });
         return error.AnalysisFail;
     };
 
@@ -2532,19 +2722,22 @@ fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         const nav = sema.intern_pool.getNav(nav_idx);
         const resolved = nav.resolved orelse {
             try sema.writer.print(
-                "decl_val '{s}': binding recorded but value not resolved (test / comptime / extern)\n",
-                .{name_bytes},
+                "{s} '{s}': binding recorded but value not resolved (test / comptime / extern)\n",
+                .{ op_name, name_bytes },
             );
             return error.AnalysisFail;
         };
         if (resolved.value == .none) {
-            try sema.writer.print("decl_val '{s}': type resolved but value not yet\n", .{name_bytes});
+            try sema.writer.print(
+                "{s} '{s}': type resolved but value not yet\n",
+                .{ op_name, name_bytes },
+            );
             return error.AnalysisFail;
         }
         return Value{ .index = resolved.value };
     }
 
-    try sema.writer.print("decl_val '{s}': not found in scope\n", .{name_bytes});
+    try sema.writer.print("{s} '{s}': not found in scope\n", .{ op_name, name_bytes });
     return error.AnalysisFail;
 }
 
