@@ -19,17 +19,19 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const Terminal = @import("terminal/Terminal.zig");
+const Session = @import("Session.zig");
 const Event = @import("terminal/Event.zig");
+const themes = @import("theme/root.zig");
+const ColorLevel = @import("terminal/Color.zig").ColorLevel;
 
 const LineEditor = @This();
 
 pub const max_input_bytes: u32 = 4096;
 pub const history_max_entries: u32 = 1000;
 
-/// Output sink. `readLine` reads input via the Terminal passed to it;
+/// Output sink. `readLine` reads input via the session's terminal;
 /// every other method (applyEvent, redraw, etc.) writes only here,
-/// which keeps the editor unit-testable without a real terminal.
+/// which keeps the editor core unit-testable without a real terminal.
 writer: *std.Io.Writer,
 gpa: std.mem.Allocator,
 buffer: std.ArrayListUnmanaged(u8),
@@ -53,9 +55,6 @@ history_offset: ?u32,
 /// Snapshot of `buffer` before entering history mode so down-past-
 /// newest can restore the in-progress edit.
 draft: std.ArrayListUnmanaged(u8),
-
-const prompt_primary: []const u8 = "> ";
-const prompt_continuation: []const u8 = "... ";
 
 pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer) LineEditor {
     assert(@intFromPtr(writer) != 0);
@@ -84,9 +83,14 @@ pub fn deinit(editor: *LineEditor) void {
 /// (Ctrl+D on empty buffer, or the underlying terminal closing).
 /// The returned slice is borrowed from the editor's buffer and is
 /// invalidated on the next `readLine` call.
-pub fn readLine(editor: *LineEditor, terminal: *Terminal) !?[]const u8 {
+pub fn readLine(editor: *LineEditor, session: *Session) !?[]const u8 {
     assert(@intFromPtr(editor) != 0);
-    assert(@intFromPtr(terminal) != 0);
+    // readLine only runs interactively, where the session holds the
+    // live terminal; the prompt's theme and color come from there.
+    assert(session.terminal != null);
+    const terminal = session.terminal.?;
+    const theme = session.theme;
+    const level = terminal.color_level;
 
     editor.buffer.clearRetainingCapacity();
     editor.cursor = 0;
@@ -94,14 +98,14 @@ pub fn readLine(editor: *LineEditor, terminal: *Terminal) !?[]const u8 {
     editor.cursor_row_drawn = 0;
     editor.history_offset = null;
     editor.draft.clearRetainingCapacity();
-    try editor.redraw();
+    try editor.redraw(theme, level);
 
     while (true) {
         const maybe_event = try terminal.readEvent();
         const event = maybe_event orelse return null;
         const outcome = try editor.applyEvent(event);
         switch (outcome) {
-            .keep_reading => try editor.redraw(),
+            .keep_reading => try editor.redraw(theme, level),
             .submit => {
                 try editor.moveCursorBelowInput();
                 try editor.pushHistory(editor.buffer.items);
@@ -414,8 +418,10 @@ fn beep(editor: *LineEditor) !Outcome {
 
 /// Rewrite the entire input area: cursor to start of input region,
 /// erase below, emit prompt + buffer (with continuation prompts on
-/// embedded `\n`), reposition cursor at its logical location.
-fn redraw(editor: *LineEditor) !void {
+/// embedded `\n`), reposition cursor at its logical location. `theme`
+/// and `level` come from the caller (the session theme + the
+/// terminal's color capability) so the editor core stays session-free.
+fn redraw(editor: *LineEditor, theme: *const themes.Theme, level: ColorLevel) !void {
     assert(@intFromPtr(editor) != 0);
     assert(editor.cursor <= editor.buffer.items.len);
     // Previous-draw invariant: the cursor row was within the
@@ -432,9 +438,9 @@ fn redraw(editor: *LineEditor) !void {
     }
     try writer.writeAll("\r\x1b[J");
 
-    try writer.writeAll(prompt_primary);
+    try theme.primary.write(writer, level);
 
-    var col: u32 = @intCast(prompt_primary.len);
+    var col: u32 = @intCast(theme.primary.width());
     var row: u32 = 0;
     var cursor_col: u32 = col;
     var cursor_row: u32 = 0;
@@ -448,9 +454,9 @@ fn redraw(editor: *LineEditor) !void {
         }
         if (b == '\n') {
             try writer.writeAll("\r\n");
-            try writer.writeAll(prompt_continuation);
+            try theme.continuation.write(writer, level);
             row += 1;
-            col = @intCast(prompt_continuation.len);
+            col = @intCast(theme.continuation.width());
         } else {
             try writer.writeByte(b);
             col += 1;
@@ -565,11 +571,11 @@ test "arrow up + edit keeps cursor bookkeeping inside drawn area" {
     try typeBytes(&ed, "abc");
     _ = try ed.applyEvent(shiftPress(Event.key.enter));
     try typeBytes(&ed, "def");
-    try ed.redraw();
+    try ed.redraw(themes.default, .none);
     _ = try ed.applyEvent(keyPress(Event.key.up));
-    try ed.redraw();
+    try ed.redraw(themes.default, .none);
     _ = try ed.applyEvent(keyPress('X'));
-    try ed.redraw();
+    try ed.redraw(themes.default, .none);
     try testing.expectEqualStrings("abcX\ndef", ed.buffer.items);
     // The bug we're guarding against: cursor_row_drawn was set
     // higher than lines_drawn, causing the next redraw's CSI A
@@ -585,9 +591,9 @@ test "moveCursorBelowInput descends past last input row before newline" {
     try typeBytes(&ed, "a");
     _ = try ed.applyEvent(shiftPress(Event.key.enter));
     try typeBytes(&ed, "b");
-    try ed.redraw();
+    try ed.redraw(themes.default, .none);
     _ = try ed.applyEvent(keyPress(Event.key.up));
-    try ed.redraw();
+    try ed.redraw(themes.default, .none);
     aw.clearRetainingCapacity();
     try ed.moveCursorBelowInput();
     const out = aw.writer.buffered();

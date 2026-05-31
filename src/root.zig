@@ -15,6 +15,9 @@ test {
     _ = @import("Session.zig");
     _ = @import("Repl.zig");
     _ = @import("LineEditor.zig");
+    _ = @import("Theme.zig");
+    _ = @import("theme/root.zig");
+    _ = @import("terminal/Color.zig");
     _ = @import("terminal/Terminal.zig");
     _ = @import("terminal/Parser.zig");
     _ = @import("terminal/Event.zig");

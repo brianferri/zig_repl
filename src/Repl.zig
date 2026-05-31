@@ -12,7 +12,6 @@ const renderValue = @import("render/Value.zig").render;
 
 const Repl = @This();
 
-const prompt_string: []const u8 = "> ";
 const input_buffer_bytes: u32 = 4096;
 const output_buffer_bytes: u32 = 4096;
 const max_command_line_bytes: u32 = 1024;
@@ -24,7 +23,7 @@ pub fn init(session: *Session) Repl {
     return .{ .session = session };
 }
 
-pub fn run(repl: *Repl) !void {
+pub fn run(repl: *Repl, environ: *const std.process.Environ.Map) !void {
     assert(@intFromPtr(repl.session) != 0);
 
     var input_buffer: [input_buffer_bytes]u8 = undefined;
@@ -45,13 +44,25 @@ pub fn run(repl: *Repl) !void {
     // Piped stdin stays on `takeDelimiter` so shell pipelines and
     // the compliance harness keep working unchanged.
     if (repl.session.is_interactive) {
-        return repl.runInteractive(stdout);
+        return repl.runInteractive(stdout, environ);
     }
     return repl.runCooked(stdin, stdout);
 }
 
-fn runInteractive(repl: *Repl, stdout: *std.Io.Writer) !void {
-    var terminal = Terminal.init(repl.session.gpa, repl.session.io, stdout) catch |err| {
+fn runInteractive(
+    repl: *Repl,
+    stdout: *std.Io.Writer,
+    environ: *const std.process.Environ.Map,
+) !void {
+    // A `var` local: the session borrows `&terminal`, and `readEvent`
+    // needs a mutable pointee (the address of a temporary would be
+    // `*const`). The session reference lasts only the interactive scope.
+    var terminal = Terminal.init(
+        repl.session.gpa,
+        repl.session.io,
+        stdout,
+        environ,
+    ) catch |err| {
         // Initialisation failure usually means we couldn't open
         // /dev/tty or apply termios -- e.g. detached console. Fall
         // back loudly so the user knows why multiline isn't available.
@@ -65,24 +76,17 @@ fn runInteractive(repl: *Repl, stdout: *std.Io.Writer) !void {
         );
         return repl.runCooked(&stdin_reader.interface, stdout);
     };
-    defer terminal.deinit();
-
-    // Advertise which protocols are active so the user knows whether
-    // Shift+Enter will work. Empty `setup_sequence` protocols are
-    // present-by-default rather than negotiated, so we just list names.
-    try stdout.writeAll("terminal protocols: ");
-    for (terminal.protocols, 0..) |p, i| {
-        if (i > 0) try stdout.writeAll(", ");
-        try stdout.writeAll(p.name);
+    repl.session.terminal = &terminal;
+    defer {
+        repl.session.terminal = null;
+        terminal.deinit();
     }
-    try stdout.writeAll("\r\n");
-    try stdout.flush();
 
     var editor = LineEditor.init(repl.session.gpa, stdout);
     defer editor.deinit();
 
     while (!repl.session.should_quit) {
-        const maybe_line = editor.readLine(&terminal) catch |err| {
+        const maybe_line = editor.readLine(repl.session) catch |err| {
             try stdout.print("input error: {s}\r\n", .{@errorName(err)});
             try stdout.flush();
             continue;
@@ -96,7 +100,9 @@ fn runInteractive(repl: *Repl, stdout: *std.Io.Writer) !void {
 
 fn runCooked(repl: *Repl, stdin: *std.Io.Reader, stdout: *std.Io.Writer) !void {
     while (!repl.session.should_quit) {
-        try stdout.writeAll(prompt_string);
+        // Cooked mode has no Terminal, hence no detected color level;
+        // the prompt stays uncolored (piped output must, anyway).
+        try repl.session.theme.primary.write(stdout, .none);
         try stdout.flush();
         const maybe_line = stdin.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => {

@@ -29,6 +29,7 @@ const Event = @import("Event.zig");
 const Negotiate = @import("Negotiate.zig");
 const Parser = @import("Parser.zig");
 const Protocol = @import("Protocol.zig");
+const Color = @import("Color.zig");
 
 const Kitty = @import("protocol/Kitty.zig");
 const ModifyOtherKeys = @import("protocol/ModifyOtherKeys.zig");
@@ -75,6 +76,9 @@ gpa: std.mem.Allocator,
 /// the dispatcher calls `Protocol.tryInterpret(p, token)`, which
 /// recovers the concrete via `@fieldParentPtr` inside the vtable.
 protocols: []const *Protocol,
+/// Color capability, resolved from the environment at init alongside
+/// protocol negotiation. Renderers read it to pick a theme's tier.
+color_level: Color.ColorLevel,
 read_buffer: [read_buffer_bytes]u8 = @splat(0),
 read_buffer_len: u32 = 0,
 
@@ -82,6 +86,7 @@ pub fn init(
     gpa: std.mem.Allocator,
     io: std.Io,
     writer: *std.Io.Writer,
+    environ: *const std.process.Environ.Map,
 ) !Terminal {
     assert(@intFromPtr(writer) != 0);
 
@@ -113,6 +118,7 @@ pub fn init(
         .writer = writer,
         .gpa = gpa,
         .protocols = protocols,
+        .color_level = Color.fromEnv(environ),
     };
 }
 

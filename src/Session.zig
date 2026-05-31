@@ -3,6 +3,8 @@ const assert = std.debug.assert;
 
 const InternPool = @import("sema/InternPool.zig");
 const Pipeline = @import("front/Pipeline.zig");
+const Terminal = @import("terminal/Terminal.zig");
+const themes = @import("theme/root.zig");
 
 const Session = @This();
 
@@ -33,6 +35,14 @@ root_namespace: InternPool.NamespaceIndex,
 ///     (see `Repl.echoInput`) so transcripts read like an
 ///     interactive session instead of bunching prompts together.
 is_interactive: bool,
+/// Selected prompt theme (a preference; the terminal's color
+/// capability decides how much of it shows). Defaults to the Zig
+/// theme; repoint to switch themes at runtime.
+theme: *const themes.Theme,
+/// The live terminal while an interactive session runs: `readLine`
+/// drives it for events and the prompt's color level, and commands
+/// introspect it. Null in cooked/piped mode.
+terminal: ?*Terminal,
 should_quit: bool,
 /// Every successfully-analysed Pipeline.Result stays here for
 /// the session lifetime. Function values store an index into
@@ -63,6 +73,8 @@ pub fn init(
         .intern_pool = intern_pool,
         .root_namespace = root_namespace,
         .is_interactive = is_interactive,
+        .theme = themes.default,
+        .terminal = null,
         .should_quit = false,
         .pipelines = .empty,
     };
@@ -88,6 +100,8 @@ pub fn initForTest(
         .intern_pool = intern_pool,
         .root_namespace = root_namespace,
         .is_interactive = false,
+        .theme = themes.default,
+        .terminal = null,
         .should_quit = false,
         .pipelines = .empty,
     };

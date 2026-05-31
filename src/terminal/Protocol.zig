@@ -25,9 +25,9 @@ const Event = @import("Event.zig").Event;
 
 const Protocol = @This();
 
-/// Human-readable identifier the protocol picks for itself. Used
-/// for diagnostics and the `:terminal` REPL command when
-/// introspecting the active protocol set.
+/// Human-readable identifier the protocol picks for itself. Shown
+/// in the startup `terminal protocols:` line that lists the active
+/// protocol set.
 name: []const u8,
 /// Bytes to emit during capability negotiation. Empty means the
 /// protocol is always supported (no query needed).

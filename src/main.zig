@@ -14,5 +14,5 @@ pub fn main(init: std.process.Init) !void {
     defer session.deinit();
 
     var repl = zig_repl.Repl.init(&session);
-    return repl.run();
+    return repl.run(init.environ_map);
 }
