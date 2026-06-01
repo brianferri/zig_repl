@@ -563,6 +563,19 @@ pub const Key = union(enum) {
     /// also carries a parallel `values` slice (comptime-field defaults);
     /// omitted here -- deferred, see `Sema.evalArrayInitAnon`.
     tuple_type: TupleType,
+    /// A named struct type (`struct { x: i32 }`). Nominal: identity is
+    /// `(source_zir_id, decl_inst)`, like `func_decl` -- two distinct
+    /// declarations are distinct types even with identical fields. The
+    /// compiler's `ContainerType.declared` hashes `zir_index` + captures
+    /// (`src/InternPool.zig`); we omit captures, which distinguish only
+    /// generic instantiations we don't model -- the same omission
+    /// `func_decl` makes. `name` is the fully-qualified name baked at
+    /// creation (`setTypeName`'s model), excluded from identity (the
+    /// compiler keeps it in `LoadedStructType`, not the hash). A shell
+    /// mirroring `getDeclaredStructType` (identity only) before lazy
+    /// `resolveStructFieldTypes`: field names/types are resolved on
+    /// demand from the decl's ZIR, not stored here.
+    struct_type: StructType,
     /// An aggregate value (array, vector, struct -- the type
     /// determines which). Storage is either an N-element slice or a
     /// single-element repetition. Mirrors compiler `Key.Aggregate`
@@ -685,6 +698,16 @@ pub const Key = union(enum) {
     /// Anonymous tuple type: one type per positional field.
     pub const TupleType = struct {
         types: []const Index,
+    };
+
+    /// Named struct type. `(source_zir_id, decl_inst)` is the nominal
+    /// identity; `name` is the fully-qualified name (e.g. `repl.P`).
+    /// Fields are not stored -- they are resolved on demand from the
+    /// decl's ZIR (see the `struct_type` Key doc).
+    pub const StructType = struct {
+        source_zir_id: u32,
+        decl_inst: std.zig.Zir.Inst.Index,
+        name: NullTerminatedString,
     };
 
     /// An error value. `ty` is always an `error_set_type` Index --
@@ -911,6 +934,12 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, @as(u32, @intCast(tt.types.len)));
                 for (tt.types) |ty| std.hash.autoHash(&hasher, ty);
             },
+            // Nominal: identity is the declaration site. `name` is
+            // derived from it, so it is excluded here (and in `eql`).
+            .struct_type => |st| {
+                std.hash.autoHash(&hasher, st.source_zir_id);
+                std.hash.autoHash(&hasher, st.decl_inst);
+            },
             .err => |e| {
                 std.hash.autoHash(&hasher, e.ty);
                 std.hash.autoHash(&hasher, e.name);
@@ -1050,6 +1079,10 @@ pub const Key = union(enum) {
                 if (x.types.len != y.types.len) break :blk false;
                 for (x.types, y.types) |xt, yt| if (xt != yt) break :blk false;
                 break :blk true;
+            },
+            .struct_type => |x| blk: {
+                const y = b.struct_type;
+                break :blk x.source_zir_id == y.source_zir_id and x.decl_inst == y.decl_inst;
             },
             .err => |x| blk: {
                 const y = b.err;
@@ -1200,6 +1233,13 @@ const Item = struct {
         // additionally trails per-field values (deferred, see the
         // `tuple_type` Key doc).
         type_tuple,
+        // Named struct type. data = extra index of StructTypeRepr (3 u32
+        // slots: source_zir_id, decl_inst, name). Nominal identity; fields
+        // are resolved from the decl's ZIR on demand, not stored. The
+        // compiler splits declared vs reified container types across
+        // separate tags (`Item.Tag.type_struct*`); we emit only the
+        // declared flavor today.
+        type_struct,
         // Error value. data = extra index of ErrRepr (2 u32 slots:
         // ty, name). Mirrors the compiler's `Item.Tag.error_set_error`.
         error_set_error,
@@ -1812,6 +1852,59 @@ pub fn namespacePtr(pool: *InternPool, index: NamespaceIndex) *Namespace {
     return &pool.namespaces.items[raw];
 }
 
+/// The session root namespace's name. The compiler derives a file's
+/// root container name from its path; a REPL session has no file, so
+/// every fully-qualified name bottoms out here instead.
+pub const root_namespace_name = "repl";
+
+/// A container type's name, used to qualify the names of its members.
+/// Only declared containers own namespaces, so only they reach here.
+/// Mirrors `Type.containerTypeName`.
+fn containerTypeName(pool: *const InternPool, ty: Index) NullTerminatedString {
+    return switch (pool.indexToKey(ty)) {
+        .struct_type => |st| st.name,
+        else => unreachable, // only declared containers own a namespace
+    };
+}
+
+/// A namespace's own name -- the prefix its members qualify under: its
+/// owner container's name, or the session root (`repl`) when nothing owns
+/// it. This is the base of the fully-qualified-name recursion and the
+/// seed for the root naming context (the compiler's
+/// `block.type_name_ctx`). Mirrors the `ns.owner_type`-name lookup inside
+/// `Zcu.Namespace.internFullyQualifiedName`.
+pub fn namespaceName(
+    pool: *InternPool,
+    gpa: Allocator,
+    ns_idx: NamespaceIndex,
+) Allocator.Error!NullTerminatedString {
+    const ns = pool.namespacePtr(ns_idx);
+    if (ns.owner_type == .none) return pool.getOrPutString(gpa, root_namespace_name);
+    return containerTypeName(pool, ns.owner_type);
+}
+
+/// Fully-qualified name of declaration `name` in `ns_idx`:
+/// `<namespace name>.<name>`. Mirrors
+/// `Zcu.Namespace.internFullyQualifiedName` (whose empty-name branch --
+/// which just returns the namespace name, here `namespaceName` -- is
+/// dropped: every caller qualifies a real declaration name).
+pub fn fullyQualifiedName(
+    pool: *InternPool,
+    gpa: Allocator,
+    ns_idx: NamespaceIndex,
+    name: NullTerminatedString,
+) Allocator.Error!NullTerminatedString {
+    assert(name != .empty);
+    const ns_name = try pool.namespaceName(gpa, ns_idx);
+
+    // `allocPrint` copies both borrowed slices into a fresh `text` before
+    // `getOrPutString`, whose append can resize `string_bytes` (which the
+    // slices borrow) -- so the borrows can't dangle.
+    const text = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ pool.stringSlice(ns_name), pool.stringSlice(name) });
+    defer gpa.free(text);
+    return pool.getOrPutString(gpa, text);
+}
+
 /// Record a `comptime { ... }` block. Returns its stable `Id` so
 /// the namespace's `comptime_decls` list can reference it. Execution
 /// is deferred to Stage 7 (`@comptime` evaluator).
@@ -1990,6 +2083,7 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .ptr => |p| try emitPtr(pool, p),
         .error_set_type => |es| try emitErrorSetType(pool, es),
         .tuple_type => |tt| try emitTupleType(pool, tt),
+        .struct_type => |st| try emitStructType(pool, st),
         .err => |e| try emitErr(pool, e),
         .error_union_type => |eu| try emitErrorUnionType(pool, eu),
         .error_union => |eu| try emitErrorUnion(pool, eu),
@@ -2073,6 +2167,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .ptr_comptime_alloc => ptrComptimeAllocFromExtra(pool, item.data),
         .type_error_set => errorSetTypeFromExtra(pool, item.data),
         .type_tuple => tupleTypeFromExtra(pool, item.data),
+        .type_struct => structTypeFromExtra(pool, item.data),
         .error_set_error => errFromExtra(pool, item.data),
         .type_error_union => errorUnionTypeFromExtra(pool, item.data),
         .error_union_error => errorUnionErrFromExtra(pool, item.data),
@@ -2116,6 +2211,16 @@ fn tupleTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
         // lifetime. Same trick as `errorSetTypeFromExtra`.
         .tuple_type = .{ .types = @ptrCast(raw_types) },
     };
+}
+
+fn structTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    assert(extra_index + 3 <= pool.extra.items.len);
+    const slice = pool.extra.items[extra_index..][0..3];
+    return .{ .struct_type = .{
+        .source_zir_id = slice[0],
+        .decl_inst = @enumFromInt(slice[1]),
+        .name = @enumFromInt(slice[2]),
+    } };
 }
 
 fn errorSetTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
@@ -2608,6 +2713,18 @@ fn emitTupleType(pool: *InternPool, tt: Key.TupleType) Allocator.Error!void {
     pool.items.appendAssumeCapacity(.{ .tag = .type_tuple, .data = extra_index });
 }
 
+/// Emit a `type_struct` Item. Three u32 slots: source_zir_id,
+/// decl_inst, name.
+fn emitStructType(pool: *InternPool, st: Key.StructType) Allocator.Error!void {
+    const extra_index: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.appendSlice(pool.gpa, &.{
+        st.source_zir_id,
+        @intFromEnum(st.decl_inst),
+        @intFromEnum(st.name),
+    });
+    pool.items.appendAssumeCapacity(.{ .tag = .type_struct, .data = extra_index });
+}
+
 /// Emit an `err` Item. Two u32 slots: `ty`, `name`.
 fn emitErr(pool: *InternPool, e: Key.Error) Allocator.Error!void {
     assert(e.ty != .none);
@@ -2796,6 +2913,10 @@ pub fn internPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!Index {
 /// Intern an anonymous tuple type from its field types.
 pub fn internTupleType(pool: *InternPool, types: []const Index) Allocator.Error!Index {
     return pool.get(.{ .tuple_type = .{ .types = types } });
+}
+
+pub fn internStructType(pool: *InternPool, st: Key.StructType) Allocator.Error!Index {
+    return pool.get(.{ .struct_type = st });
 }
 
 /// Intern an error-set type from `names`. Sorts the names by their
@@ -3716,6 +3837,36 @@ test "Namespace: createNamespace seeds an empty parent-less scope" {
     try std.testing.expectEqual(@as(usize, 0), ns.priv_decls.count());
     try std.testing.expectEqual(@as(usize, 0), ns.test_decls.items.len);
     try std.testing.expectEqual(@as(usize, 0), ns.comptime_decls.items.len);
+}
+
+test "fullyQualifiedName: a root-namespace decl qualifies under the session root" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    const ns = try pool.createNamespace(pool.gpa, .none); // owner_type .none == session root
+    const name = try pool.getOrPutString(pool.gpa, "P");
+    const fqn = try pool.fullyQualifiedName(pool.gpa, ns, name);
+    try std.testing.expectEqualStrings("repl.P", pool.stringSlice(fqn));
+}
+
+test "fullyQualifiedName: a member of a named container nests under it" {
+    var pool = try InternPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    // A namespace owned by a struct type named `repl.Outer`; its members
+    // qualify under that name. This exercises the owner-type recursion
+    // (`containerTypeName`) that activates once a container owns a scope.
+    const outer = try pool.internStructType(.{
+        .source_zir_id = 0,
+        .decl_inst = @enumFromInt(1),
+        .name = try pool.getOrPutString(pool.gpa, "repl.Outer"),
+    });
+    const ns = try pool.createNamespace(pool.gpa, .none);
+    pool.namespacePtr(ns).owner_type = outer;
+
+    const inner = try pool.getOrPutString(pool.gpa, "Inner");
+    const fqn = try pool.fullyQualifiedName(pool.gpa, ns, inner);
+    try std.testing.expectEqualStrings("repl.Outer.Inner", pool.stringSlice(fqn));
 }
 
 test "Namespace: NavNameContext dedups Nav.Index entries by interned name" {

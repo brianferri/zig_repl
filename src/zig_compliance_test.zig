@@ -773,6 +773,16 @@ test "mixed input: a declaration from a compound line persists to later input" {
     try testing.expectEqualStrings("10", out);
 }
 
+test "named struct renders with the session-qualified `repl.` prefix" {
+    // End-to-end render coverage. The type's structure (it is a
+    // `struct_type` named `repl.P`, distinct per declaration) is asserted
+    // on the interned Key in sema_eval_test; a build-specific qualified
+    // name has no portable `zig run` form to compare against here.
+    const out = try runViaRepl(testing.allocator, &.{ "const P = struct { x: i32 };", "P" });
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("repl.P", out);
+}
+
 // Non-power-of-two widths reach the `int_type` handler rather than a
 // well-known Inst.Ref -- the path the round-number widths never hit.
 const awkward_widths = [_]u16{ 1, 3, 7, 33, 69, 420 };

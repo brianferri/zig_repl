@@ -49,6 +49,7 @@ pub fn render(
         .vector_type,
         .opt_type,
         .tuple_type,
+        .struct_type,
         => renderTypeRef(value.index, pool, writer),
         .opt => |o| if (o.val == .none)
             writer.writeAll("null\n")
@@ -182,6 +183,9 @@ pub fn writeTypeName(
             try writeTypeName(child, pool, writer);
         },
         .tuple_type => |tt| try writeTupleTypeName(tt, pool, writer),
+        // `name` is the fully-qualified name baked at creation (the
+        // compiler's `module.fn.Name`; our `repl.Name`), printed verbatim.
+        .struct_type => |st| try writer.writeAll(pool.stringSlice(st.name)),
         else => try writer.writeAll("<type>"),
     }
 }

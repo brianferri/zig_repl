@@ -116,6 +116,13 @@ current_zir_id: u32 = 0,
 /// across handler frames. When those land, the compiler's
 /// threading pattern lifts here.
 block: *Block = undefined,
+/// Fully-qualified name of the declaration whose value body is being
+/// evaluated, used to name a container type declared in it
+/// (`const P = struct {...}` -> the struct is named after `P`'s fqn,
+/// `repl.P`). Mirrors the compiler's `block.type_name_ctx`; our flat
+/// REPL has one enclosing declaration at a time, so `bindValueDecl`
+/// sets it around the value-body eval.
+type_name_ctx: InternPool.NullTerminatedString = .empty,
 
 pub const default_branch_quota: u32 = 1000;
 pub const call_depth_max: u32 = 256;
@@ -217,6 +224,13 @@ pub fn analyze(session: *Session, zir: Zir, writer: *std.Io.Writer) Error!?Value
     };
     defer sema.results.deinit(gpa);
     defer sema.comptime_allocs.deinit(gpa);
+
+    // Seed the naming context with the root namespace's own name, so a
+    // type declared at session scope (e.g. an anonymous `struct {...}` in
+    // an expression, which never passes through `bindValueDecl`) still
+    // qualifies under `repl`. Mirrors the compiler seeding a file block's
+    // `type_name_ctx` to the file-root name.
+    sema.type_name_ctx = try intern_pool.namespaceName(gpa, namespace);
 
     if (findReplInputBody(zir)) |bound| {
         return try sema.resolveInlineBody(bound.body, bound.decl_inst);
@@ -2634,6 +2648,42 @@ fn evalTupleDecl(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value
     return .{ .index = try sema.intern_pool.internTupleType(types) };
 }
 
+/// `struct_decl` (extended): a named struct type (`struct { x: i32 }`).
+/// Interns a nominal `struct_type` shell keyed on the declaration site;
+/// the compiler likewise creates the type before resolving fields (its
+/// `getDeclaredStructType` + lazy `resolveStructFieldTypes`), so the
+/// field bodies are left in the ZIR and resolved on demand. The name
+/// follows `name_strategy`: `.parent` borrows the enclosing
+/// declaration's name (`const P = struct {...}` -> `P`); the rest have
+/// no name to borrow, so a stable name is synthesized from the
+/// declaration site. Compiler reference: src/Sema.zig:zirStructDecl,
+/// setTypeName.
+fn evalStructDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const struct_decl = sema.zir.getStructDecl(inst);
+    const name = switch (struct_decl.name_strategy) {
+        // Named after the enclosing declaration: its fully-qualified
+        // name is already `type_name_ctx` (the compiler's `.parent`).
+        .parent => sema.type_name_ctx,
+        // No declaration to borrow from: `<ctx>__struct_<N>`, the format
+        // `setTypeName` uses for `.anon`. `.func` (generic-instantiation
+        // naming) and `.dbg_var` fall here too.
+        .anon, .func, .dbg_var => blk: {
+            const ctx = sema.intern_pool.stringSlice(sema.type_name_ctx);
+            const text = try std.fmt.allocPrint(sema.gpa, "{s}__struct_{d}", .{ ctx, @intFromEnum(inst) });
+            defer sema.gpa.free(text);
+            break :blk try sema.intern_pool.getOrPutString(sema.gpa, text);
+        },
+    };
+
+    return .{ .index = try sema.intern_pool.internStructType(.{
+        .source_zir_id = sema.current_zir_id,
+        .decl_inst = inst,
+        .name = name,
+    }) };
+}
+
 /// `ref operand`: materialise `operand`'s value into a fresh const
 /// comptime-alloc slot and return a `*const T` to it. Compiler
 /// reference: src/Sema.zig:zirRef (~3052) -> analyzeRef.
@@ -3112,6 +3162,10 @@ fn bindValueDecl(
         try sema.results.put(sema.gpa, decl_inst, .{ .index = t });
         break :blk t;
     } else null;
+    const fqn = try sema.intern_pool.fullyQualifiedName(sema.gpa, ns_idx, name);
+    const prev_ctx = sema.type_name_ctx;
+    sema.type_name_ctx = fqn;
+    defer sema.type_name_ctx = prev_ctx;
     const raw_value = try sema.resolveInlineBody(value_body, decl_inst);
     const final_value = if (declared_type) |dest_ty|
         try sema.coerceValueToType(raw_value, dest_ty, "decl")
@@ -3122,7 +3176,7 @@ fn bindValueDecl(
     else
         Value.typeOf(final_value, sema.intern_pool).index;
 
-    const nav_idx = try sema.intern_pool.createNav(sema.gpa, name, name);
+    const nav_idx = try sema.intern_pool.createNav(sema.gpa, name, fqn);
     sema.intern_pool.navPtr(nav_idx).resolved = .{
         .type = final_type,
         .@"align" = .none,
@@ -3805,6 +3859,7 @@ fn evalTypeofBuiltin(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///   * `in_comptime` -- honest `false`; we have no comptime/runtime
 ///     bifurcation so the spec branch is the runtime one.
 ///   * `tuple_decl` -- a positional struct type (`struct { i32, f128 }`).
+///   * `struct_decl` -- a named struct type (`struct { x: i32 }`).
 ///
 /// Every other opcode surfaces a structured
 /// "unsupported extended opcode: <name>" diagnostic; the `inline
@@ -3827,6 +3882,7 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .in_comptime => return Value.bool_false,
 
         .tuple_decl => return sema.evalTupleDecl(extended),
+        .struct_decl => return sema.evalStructDecl(inst),
 
         // Bridge into std.lang.* (CallingConvention, AtomicOrder,
         // AddressSpace, ...). Compiler reference:

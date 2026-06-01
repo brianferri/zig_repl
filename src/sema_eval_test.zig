@@ -985,6 +985,27 @@ test "tuple_decl: explicit `struct { i32, f128 }` interns its annotated field ty
     try testing.expectEqual(InternPool.Index.f128_type, key.tuple_type.types[1]);
 }
 
+test "struct_type: nominal identity keys on (source_zir_id, decl_inst)" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    const name_a = try pool.getOrPutString(gpa, "repl.A");
+    const a1 = try pool.internStructType(.{ .source_zir_id = 0, .decl_inst = @enumFromInt(2), .name = name_a });
+    const a2 = try pool.internStructType(.{ .source_zir_id = 0, .decl_inst = @enumFromInt(2), .name = name_a });
+    const b = try pool.internStructType(.{
+        .source_zir_id = 0,
+        .decl_inst = @enumFromInt(3),
+        .name = try pool.getOrPutString(gpa, "repl.B"),
+    });
+
+    // Same declaration site dedups to one type; a different site is a
+    // distinct type even with an identical shape (nominal, not structural).
+    try testing.expectEqual(a1, a2);
+    try testing.expect(a1 != b);
+    try testing.expectEqualStrings("repl.A", pool.stringSlice(pool.indexToKey(a1).struct_type.name));
+}
+
 test "coercion: void and non-void types do not coerce into each other" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
@@ -1298,6 +1319,23 @@ fn evalSessionLines(
         committed = true;
     }
     return last_value;
+}
+
+test "struct_decl: `const P = struct {...}` evaluates to a struct_type named after P" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = (try evalSessionLines(gpa, &pool, ns, &.{
+        "const P = struct { x: i32, y: bool };",
+        "P",
+    }, &diag_buf)).?;
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .struct_type);
+    // `.parent` name strategy: qualified with the session marker.
+    try testing.expectEqualStrings("repl.P", pool.stringSlice(key.struct_type.name));
 }
 
 test "decl: top-level const binds and is readable on the next line" {
