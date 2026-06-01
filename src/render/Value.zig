@@ -29,7 +29,10 @@ pub fn render(
             const big = iv.storage.toBigInt(&space);
             return writer.print("{f}\n", .{big});
         },
-        .float => |fv| renderFloat(fv, writer),
+        .float => |fv| {
+            try renderFloat(fv, writer);
+            try writer.writeByte('\n');
+        },
         .simple_value => |sv| writer.print("{s}\n", .{simpleValueText(sv)}),
         .undef => writer.writeAll("undefined\n"),
         .type_value => |ty_idx| renderTypeRef(ty_idx, pool, writer),
@@ -45,6 +48,7 @@ pub fn render(
         .array_type,
         .vector_type,
         .opt_type,
+        .tuple_type,
         => renderTypeRef(value.index, pool, writer),
         .opt => |o| if (o.val == .none)
             writer.writeAll("null\n")
@@ -66,8 +70,10 @@ fn renderAggregate(
     pool: *const InternPool,
     writer: *std.Io.Writer,
 ) Error!void {
+    // Tuples print with a leading dot (`.{ ... }`); arrays don't.
+    if (pool.indexToKey(agg.ty) == .tuple_type) try writer.writeByte('.');
     try writer.writeAll("{ ");
-    const count: u64 = pool.indexToKey(agg.ty).array_type.lenIncludingSentinel();
+    const count: u64 = pool.aggregateElementCount(agg.ty);
     var i: u64 = 0;
     while (i < count) : (i += 1) {
         if (i > 0) try writer.writeAll(", ");
@@ -96,6 +102,7 @@ fn renderElemInline(
             const big = iv.storage.toBigInt(&space);
             try writer.print("{f}", .{big});
         },
+        .float => |fv| try renderFloat(fv, writer),
         .simple_value => |sv| try writer.writeAll(simpleValueText(sv)),
         .undef => try writer.writeAll("undefined"),
         else => try writer.writeAll("<elem>"),
@@ -335,7 +342,6 @@ fn renderFloat(
     };
     try writer.writeAll(text);
     if (needsTrailingDecimal(text)) try writer.writeAll(".0");
-    try writer.writeAll("\n");
 }
 
 /// True IFF `text` is a finite-magnitude float printed without a decimal

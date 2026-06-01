@@ -54,6 +54,7 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
         .array_type,
         .vector_type,
         .opt_type,
+        .tuple_type,
         => .type_type,
     };
 }

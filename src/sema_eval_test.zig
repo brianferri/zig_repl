@@ -942,6 +942,33 @@ test "vector_type: e2e Key shape + dedup" {
     try testing.expectEqual(std.builtin.Signedness.unsigned, child_key.int_type.signedness);
 }
 
+test "tuple: array_init_anon infers a tuple_type from element types + dedups" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, &pool, ".{ 1, 2.5 }", &diag_buf);
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .aggregate);
+
+    const tuple = pool.indexToKey(key.aggregate.ty);
+    try testing.expect(tuple == .tuple_type);
+    try testing.expectEqual(@as(usize, 2), tuple.tuple_type.types.len);
+    try testing.expectEqual(InternPool.Index.comptime_int_type, tuple.tuple_type.types[0]);
+    try testing.expectEqual(InternPool.Index.comptime_float_type, tuple.tuple_type.types[1]);
+
+    const again = try evalSource(gpa, &pool, ".{ 1, 2.5 }", &diag_buf);
+    try testing.expectEqual(value.index, again.index);
+
+    // Identity rides on the aggregate's elements, not just the tuple
+    // type: same field types but different values must stay distinct
+    // (otherwise one tuple would read the other's elements).
+    const other = try evalSource(gpa, &pool, ".{ 3, 4.5 }", &diag_buf);
+    try testing.expect(value.index != other.index);
+    try testing.expectEqual(key.aggregate.ty, pool.indexToKey(other.index).aggregate.ty);
+}
+
 test "vector_type: rejects element types without a fixed bit width" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);

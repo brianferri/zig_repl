@@ -487,6 +487,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .array_type => sema.evalArrayType(inst),
         .array_init => sema.evalArrayInit(inst),
         .array_init_ref => sema.evalArrayInitRef(inst),
+        .array_init_anon => sema.evalArrayInitAnon(inst),
         .ref => sema.evalRef(inst),
         .elem_ptr_load => sema.evalElemPtrLoad(inst),
         inline else => |unhandled| sema.reportUnsupportedTag(unhandled),
@@ -2456,6 +2457,37 @@ fn evalArrayInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 fn evalArrayInitRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const agg = try sema.buildArrayAggregate(inst);
     return try sema.materializeConstPtr(.{ .index = agg });
+}
+
+/// `array_init_anon`: an anonymous tuple literal (`.{a, b, ...}`).
+/// Unlike `array_init` there's no destination type -- the tuple type
+/// is inferred from each operand's own type, and elements are not
+/// coerced. The field values live in the aggregate; `elem_ptr_load`
+/// then indexes it (AstGen emits a separate `ref` for that path).
+/// Compiler reference: src/Sema.zig:zirArrayInitAnon (~19210).
+fn evalArrayInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.MultiOp, pl_node.payload_index);
+    const operands = sema.zir.refSlice(extra.end, extra.data.operands_len);
+
+    const ip = sema.intern_pool;
+    const types = try sema.gpa.alloc(InternPool.Index, operands.len);
+    defer sema.gpa.free(types);
+    const values = try sema.gpa.alloc(InternPool.Index, operands.len);
+    defer sema.gpa.free(values);
+
+    for (operands, types, values) |operand, *ty, *val| {
+        const elem = try sema.resolveRef(operand);
+        ty.* = Value.typeOf(elem, ip).index;
+        val.* = elem.index;
+    }
+
+    // Both interns copy into the pool, so the gpa buffers free safely.
+    const tuple_ty = try ip.internTupleType(types);
+    const agg = try ip.internAggregate(.{ .ty = tuple_ty, .storage = .{ .elems = values } });
+    return .{ .index = agg };
 }
 
 /// Decode an `array_init[_ref]` MultiOp into an interned aggregate

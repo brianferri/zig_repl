@@ -559,6 +559,12 @@ pub const Key = union(enum) {
     /// (inline ty), mirroring the compiler's `Key.opt` / `Tag.opt_payload`
     /// + `opt_null` (`src/InternPool.zig` ~2006,4230,4231).
     opt: Opt,
+    /// An anonymous tuple type (`.{a, b, ...}`'s type): the per-field
+    /// types. The compiler's `Key.TupleType` also carries per-field
+    /// comptime `values` for runtime-field tuples (`.none`); we are
+    /// comptime-only, so a tuple's field values live entirely in its
+    /// aggregate value and the type needs only the field types.
+    tuple_type: TupleType,
     /// An aggregate value (array, vector, struct -- the type
     /// determines which). Storage is either an N-element slice or a
     /// single-element repetition. Mirrors compiler `Key.Aggregate`
@@ -676,6 +682,11 @@ pub const Key = union(enum) {
     /// valid for the pool's lifetime.
     pub const ErrorSetType = struct {
         names: []const NullTerminatedString,
+    };
+
+    /// Anonymous tuple type: one type per positional field.
+    pub const TupleType = struct {
+        types: []const Index,
     };
 
     /// An error value. `ty` is always an `error_set_type` Index --
@@ -898,6 +909,10 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, @as(u32, @intCast(es.names.len)));
                 for (es.names) |name| std.hash.autoHash(&hasher, name);
             },
+            .tuple_type => |tt| {
+                std.hash.autoHash(&hasher, @as(u32, @intCast(tt.types.len)));
+                for (tt.types) |ty| std.hash.autoHash(&hasher, ty);
+            },
             .err => |e| {
                 std.hash.autoHash(&hasher, e.ty);
                 std.hash.autoHash(&hasher, e.name);
@@ -1030,6 +1045,12 @@ pub const Key = union(enum) {
                 const y = b.error_set_type;
                 if (x.names.len != y.names.len) break :blk false;
                 for (x.names, y.names) |xn, yn| if (xn != yn) break :blk false;
+                break :blk true;
+            },
+            .tuple_type => |x| blk: {
+                const y = b.tuple_type;
+                if (x.types.len != y.types.len) break :blk false;
+                for (x.types, y.types) |xt, yt| if (xt != yt) break :blk false;
                 break :blk true;
             },
             .err => |x| blk: {
@@ -1174,6 +1195,13 @@ const Item = struct {
         // interned-string handles. Mirrors the compiler's
         // `Item.Tag.type_error_set`.
         type_error_set,
+        // Anonymous tuple type. data = extra index of `[types_len,
+        // type0, type1, ...]` -- one u32 length then `types_len`
+        // field-type Indices. Mirrors the slice storage of
+        // `type_error_set`; the compiler's `Item.Tag.type_tuple`
+        // additionally trails per-field values (deferred, see the
+        // `tuple_type` Key doc).
+        type_tuple,
         // Error value. data = extra index of ErrRepr (2 u32 slots:
         // ty, name). Mirrors the compiler's `Item.Tag.error_set_error`.
         error_set_error,
@@ -1963,6 +1991,7 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .ptr_type => |pt| try emitPtrType(pool, pt),
         .ptr => |p| try emitPtr(pool, p),
         .error_set_type => |es| try emitErrorSetType(pool, es),
+        .tuple_type => |tt| try emitTupleType(pool, tt),
         .err => |e| try emitErr(pool, e),
         .error_union_type => |eu| try emitErrorUnionType(pool, eu),
         .error_union => |eu| try emitErrorUnion(pool, eu),
@@ -2045,6 +2074,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .type_pointer => ptrTypeFromExtra(pool, item.data),
         .ptr_comptime_alloc => ptrComptimeAllocFromExtra(pool, item.data),
         .type_error_set => errorSetTypeFromExtra(pool, item.data),
+        .type_tuple => tupleTypeFromExtra(pool, item.data),
         .error_set_error => errFromExtra(pool, item.data),
         .type_error_union => errorUnionTypeFromExtra(pool, item.data),
         .error_union_error => errorUnionErrFromExtra(pool, item.data),
@@ -2074,6 +2104,20 @@ fn ptrTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .sentinel = @enumFromInt(repr.sentinel),
         .flags = @bitCast(repr.flags),
     } };
+}
+
+fn tupleTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    assert(extra_index < pool.extra.items.len);
+    const types_len = pool.extra.items[extra_index];
+    assert(extra_index + 1 + types_len <= pool.extra.items.len);
+
+    const raw_types = pool.extra.items[extra_index + 1 ..][0..types_len];
+    return .{
+        // Reinterpret the u32 slice as `[]const Index` -- Index is
+        // `enum(u32)`; the slice shares the pool's extra arena for its
+        // lifetime. Same trick as `errorSetTypeFromExtra`.
+        .tuple_type = .{ .types = @ptrCast(raw_types) },
+    };
 }
 
 fn errorSetTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
@@ -2556,6 +2600,16 @@ fn emitErrorSetType(pool: *InternPool, es: Key.ErrorSetType) Allocator.Error!voi
     pool.items.appendAssumeCapacity(.{ .tag = .type_error_set, .data = extra_index });
 }
 
+fn emitTupleType(pool: *InternPool, tt: Key.TupleType) Allocator.Error!void {
+    assert(tt.types.len <= std.math.maxInt(u32));
+
+    const extra_index: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.ensureUnusedCapacity(pool.gpa, 1 + tt.types.len);
+    pool.extra.appendAssumeCapacity(@intCast(tt.types.len));
+    for (tt.types) |ty| pool.extra.appendAssumeCapacity(@intFromEnum(ty));
+    pool.items.appendAssumeCapacity(.{ .tag = .type_tuple, .data = extra_index });
+}
+
 /// Emit an `err` Item. Two u32 slots: `ty`, `name`.
 fn emitErr(pool: *InternPool, e: Key.Error) Allocator.Error!void {
     assert(e.ty != .none);
@@ -2580,6 +2634,7 @@ pub fn aggregateElementCount(pool: *const InternPool, ty: Index) u64 {
     const key = pool.indexToKey(ty);
     return switch (key) {
         .array_type => |at| at.lenIncludingSentinel(),
+        .tuple_type => |tt| tt.types.len,
         else => unreachable, // future aggregate types land here
     };
 }
@@ -2738,6 +2793,11 @@ pub fn internPtrType(pool: *InternPool, pt: Key.PtrType) Allocator.Error!Index {
 /// Intern a pointer value.
 pub fn internPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!Index {
     return pool.get(.{ .ptr = p });
+}
+
+/// Intern an anonymous tuple type from its field types.
+pub fn internTupleType(pool: *InternPool, types: []const Index) Allocator.Error!Index {
+    return pool.get(.{ .tuple_type = .{ .types = types } });
 }
 
 /// Intern an error-set type from `names`. Sorts the names by their

@@ -673,6 +673,31 @@ test "compliance: array type renders" {
     try expectMatchesZig(testing.allocator, &.{"[3]i32"});
 }
 
+test "compliance: tuple literal renders with a leading dot" {
+    try expectMatchesZig(testing.allocator, &.{".{1, 2, 3}"});
+    try expectMatchesZig(testing.allocator, &.{".{1, 2.5, 3}"});
+}
+
+test "compliance: tuple index" {
+    try expectMatchesZig(testing.allocator, &.{".{1, 2.5}[1]"});
+    try expectMatchesZig(testing.allocator, &.{
+        "const t = .{ 1, 2.5, 3 };",
+        "t[0]",
+    });
+}
+
+test "compliance: prior decl used as a tuple element" {
+    try expectMatchesZig(testing.allocator, &.{
+        "const x = 7;",
+        ".{ x, 2.5 }",
+    });
+    try expectMatchesZig(testing.allocator, &.{
+        "const y = 9;",
+        "const t = .{ y, 2.5 };",
+        "t[0]",
+    });
+}
+
 // Non-power-of-two widths reach the `int_type` handler rather than a
 // well-known Inst.Ref -- the path the round-number widths never hit.
 const awkward_widths = [_]u16{ 1, 3, 7, 33, 69, 420 };
