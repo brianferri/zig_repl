@@ -33,30 +33,21 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
         .int => |iv| .{ .index = iv.ty },
         .float => |fv| .{ .index = fv.ty },
         .undef => |ty| .{ .index = ty },
-        .type_value => .type_type,
         .ptr => |p| .{ .index = p.ty },
         .err => |e| .{ .index = e.ty },
         .error_union => |eu| .{ .index = eu.ty },
         .func => |f| .{ .index = f.ty },
         .opt => |o| .{ .index = o.ty },
         .aggregate => |agg| .{ .index = agg.ty },
-        // A bare type Key (the slot a type lives in) doubles as the value
-        // of type `type` with that type as its payload -- the compiler's
-        // `Ref.X_type` directly identifies an Index that's both. So when
-        // such an index is used as a value, its type is `type`.
-        .simple_type,
-        .int_type,
-        .anyframe_type,
-        .ptr_type,
-        .error_set_type,
-        .error_union_type,
-        .func_type,
-        .array_type,
-        .vector_type,
-        .opt_type,
-        .tuple_type,
-        .struct_type,
-        => .type_type,
+        // Every remaining Key denotes a type (`type_value` and the bare
+        // type Keys); a type's own type is `type`. The value Keys above
+        // are exhaustive, so anything reaching here is a type -- the
+        // assert turns a future unclassified value Key into a loud crash
+        // rather than a silent `.type_type`.
+        else => blk: {
+            assert(key.isType());
+            break :blk .type_type;
+        },
     };
 }
 

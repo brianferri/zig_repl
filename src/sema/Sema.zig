@@ -1302,20 +1302,15 @@ fn resolveDestType(
 ) Error!InternPool.Index {
     assert(ref != .none);
     const dest_value = try sema.resolveRef(ref);
-    return switch (sema.intern_pool.indexToKey(dest_value.index)) {
+    const key = sema.intern_pool.indexToKey(dest_value.index);
+    // `type_value` wraps its type; a bare type Key is its own type. Any
+    // other type Key (per `Key.isType`) is itself the destination. The
+    // earlier hand-maintained accept-list had drifted out of this set
+    // (missing `struct_type`, `func_type`); deriving from `isType` keeps
+    // it in lockstep.
+    return switch (key) {
         .type_value => |t| t,
-        .simple_type,
-        .int_type,
-        .ptr_type,
-        .anyframe_type,
-        .error_set_type,
-        .error_union_type,
-        .array_type,
-        .vector_type,
-        .opt_type,
-        .tuple_type,
-        => dest_value.index,
-        else => blk: {
+        else => if (key.isType()) dest_value.index else blk: {
             try sema.writer.print("{s}: destination is not a type\n", .{op_name});
             break :blk error.AnalysisFail;
         },

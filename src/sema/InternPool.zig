@@ -1161,6 +1161,42 @@ pub const Key = union(enum) {
             },
         };
     }
+
+    /// Whether this Key denotes a type -- i.e. a value whose own type is
+    /// `type` (`Value.typeOf` returns `.type_type` for exactly this set).
+    /// Single owner of the type/value partition: `typeOf`, the value
+    /// renderer, and `resolveDestType` all consult it instead of each
+    /// re-listing the type tags. Exhaustive (no `else`) so a new Key must
+    /// be classified here.
+    pub fn isType(key: Key) bool {
+        return switch (key) {
+            .type_value,
+            .simple_type,
+            .int_type,
+            .anyframe_type,
+            .ptr_type,
+            .error_set_type,
+            .error_union_type,
+            .func_type,
+            .array_type,
+            .vector_type,
+            .opt_type,
+            .tuple_type,
+            .struct_type,
+            => true,
+            .simple_value,
+            .int,
+            .float,
+            .ptr,
+            .undef,
+            .err,
+            .error_union,
+            .opt,
+            .func,
+            .aggregate,
+            => false,
+        };
+    }
 };
 
 /// Tagged storage. `data` interpretation depends on `tag`. Naming mirrors

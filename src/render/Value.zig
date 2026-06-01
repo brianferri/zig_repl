@@ -36,21 +36,6 @@ pub fn render(
         .simple_value => |sv| writer.print("{s}\n", .{simpleValueText(sv)}),
         .undef => writer.writeAll("undefined\n"),
         .type_value => |ty_idx| renderTypeRef(ty_idx, pool, writer),
-        // A bare type Key viewed as a value identifies the type itself
-        // (Sema's value-of-type-type convention; see Value.typeOf).
-        .simple_type,
-        .int_type,
-        .anyframe_type,
-        .ptr_type,
-        .error_set_type,
-        .error_union_type,
-        .func_type,
-        .array_type,
-        .vector_type,
-        .opt_type,
-        .tuple_type,
-        .struct_type,
-        => renderTypeRef(value.index, pool, writer),
         .opt => |o| if (o.val == .none)
             writer.writeAll("null\n")
         else
@@ -60,6 +45,14 @@ pub fn render(
         .error_union => |eu| renderErrorUnion(eu, pool, writer),
         .func => |f| writer.print("fn@{d}\n", .{@intFromEnum(f.zir_body_inst)}),
         .aggregate => |agg| renderAggregate(agg, pool, writer),
+        // A bare type Key viewed as a value identifies the type itself
+        // (Sema's value-of-type-type convention; see Value.typeOf). The
+        // value Keys above are exhaustive, so the assert turns a future
+        // unclassified one into a crash rather than a mis-render as a type.
+        else => blk: {
+            assert(key.isType());
+            break :blk renderTypeRef(value.index, pool, writer);
+        },
     };
 }
 

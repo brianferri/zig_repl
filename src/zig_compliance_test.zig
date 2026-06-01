@@ -783,6 +783,15 @@ test "named struct renders with the session-qualified `repl.` prefix" {
     try testing.expectEqualStrings("repl.P", out);
 }
 
+test "pointer to a named struct resolves the struct as its child type" {
+    // Regression guard for the `Key.isType` consolidation: `*P` routes the
+    // struct type through `resolveDestType`, which previously rejected
+    // `struct_type` as "not a type".
+    const out = try runViaRepl(testing.allocator, &.{ "const P = struct { x: i32 };", "*P" });
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("*repl.P", out);
+}
+
 // Non-power-of-two widths reach the `int_type` handler rather than a
 // well-known Inst.Ref -- the path the round-number widths never hit.
 const awkward_widths = [_]u16{ 1, 3, 7, 33, 69, 420 };
