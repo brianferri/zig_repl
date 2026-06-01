@@ -131,7 +131,7 @@ pub fn runWithInjection(
     return .{ .wrapped = wrapped, .tree = tree, .zir = zir };
 }
 
-/// Render `const <name>: <type> = undefined;\n` per session-bound decl,
+/// Render `const <name> = undefined;\n` per session-bound decl,
 /// returning the concatenated prefix. The caller frees with `gpa`.
 /// Returns an empty owned slice when there is no session context or
 /// the namespace has no decls; callers can pass either branch to
