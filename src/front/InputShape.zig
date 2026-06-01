@@ -73,6 +73,76 @@ pub fn classify(input: [:0]const u8) Shape {
     };
 }
 
+pub const Split = struct {
+    decls: []const u8,
+    expr: []const u8,
+};
+
+/// When `input` is a run of declarations followed by a single trailing
+/// expression (`const x = 1; x + 1`), return it split into the
+/// declaration prefix and the trailing expression. The REPL runs them
+/// as two passes -- the decls persist to the session, then the
+/// expression is evaluated with them in scope -- so each pass keeps a
+/// single contiguous user region and the existing wrap and diagnostic
+/// mapping apply unchanged.
+///
+/// "Declarations then one trailing expression" is the only shape with a
+/// split: at container scope Zig accepts declarations and rejects a bare
+/// expression except in trailing (result) position, so an expression can
+/// legally appear only last. Newlines are whitespace to the tokenizer,
+/// so a Shift-Enter multi-line buffer is handled by the same `;` scan.
+///
+/// Returns null when a single wrap already suffices -- a lone expression
+/// or pure declarations -- and for inputs with no trailing expression
+/// (the tail is itself a declaration); those fall through to
+/// `wrapWithInjection`. The returned slices borrow from `input`.
+pub fn splitTrailingExpr(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!?Split {
+    assert(input.len > 0);
+    assert(input.len <= max_input_bytes);
+
+    const sentinel = try gpa.allocSentinel(u8, input.len, 0);
+    defer gpa.free(sentinel);
+    @memcpy(sentinel, input);
+
+    // Byte just past the last top-level `;` -- the boundary between the
+    // declaration prefix and a trailing statement. Depth tracks
+    // bracketing so a `;` inside a `struct {...}` body (or any nested
+    // braces/parens/brackets) is not read as a statement separator;
+    // literals and comments are single (or skipped) tokens, so their
+    // contents never reach the scan.
+    var tokenizer = std.zig.Tokenizer.init(sentinel);
+    var depth: u32 = 0;
+    var boundary: ?usize = null;
+    while (true) {
+        const token = tokenizer.next();
+        switch (token.tag) {
+            .eof => break,
+            .l_brace, .l_paren, .l_bracket => depth += 1,
+            .r_brace, .r_paren, .r_bracket => if (depth > 0) {
+                depth -= 1;
+            },
+            .semicolon => if (depth == 0) {
+                boundary = token.loc.end;
+            },
+            else => {},
+        }
+    }
+
+    const split_at = boundary orelse return null; // a single statement
+    // `sentinel[split_at..]` keeps the trailing sentinel, so `classify`
+    // can read its first token. An empty tail means the input ended in
+    // `;` (pure declarations); a declaration tail means no trailing
+    // expression. Either way there is nothing to evaluate separately.
+    const tail = sentinel[split_at..];
+    if (std.mem.trim(u8, tail, " \t\r\n").len == 0) return null;
+    if (classify(tail) == .declaration) return null;
+
+    const decls = std.mem.trim(u8, input[0..split_at], " \t\r\n");
+    const expr = std.mem.trim(u8, input[split_at..], " \t\r\n");
+    if (decls.len == 0) return null;
+    return .{ .decls = decls, .expr = expr };
+}
+
 pub fn wrap(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!Wrapped {
     return wrapWithInjection(gpa, "", input);
 }
@@ -136,4 +206,29 @@ fn wrapDeclaration(
         .{ injection_prefix, input },
         0,
     );
+}
+
+test "splitTrailingExpr: declarations then a trailing expression" {
+    const split = (try splitTrailingExpr(std.testing.allocator, "const x = 1; x + 1")).?;
+    try std.testing.expectEqualStrings("const x = 1;", split.decls);
+    try std.testing.expectEqualStrings("x + 1", split.expr);
+}
+
+test "splitTrailingExpr: multiple declarations precede the expression" {
+    const split = (try splitTrailingExpr(std.testing.allocator, "const a = 1; const b = 2; a + b")).?;
+    try std.testing.expectEqualStrings("const a = 1; const b = 2;", split.decls);
+    try std.testing.expectEqualStrings("a + b", split.expr);
+}
+
+test "splitTrailingExpr: a `;` nested in a container body is not a split point" {
+    const split = (try splitTrailingExpr(std.testing.allocator, "const S = struct { const k = 1; }; S.k")).?;
+    try std.testing.expectEqualStrings("const S = struct { const k = 1; };", split.decls);
+    try std.testing.expectEqualStrings("S.k", split.expr);
+}
+
+test "splitTrailingExpr: shapes a single wrap handles return null" {
+    const gpa = std.testing.allocator;
+    try std.testing.expect(try splitTrailingExpr(gpa, "const x = 1;") == null); // pure declaration
+    try std.testing.expect(try splitTrailingExpr(gpa, "1 + 2") == null); // pure expression
+    try std.testing.expect(try splitTrailingExpr(gpa, "const a = 1; const b = 2;") == null); // trailing decl
 }

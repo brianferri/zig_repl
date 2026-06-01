@@ -8,6 +8,7 @@ const testing = std.testing;
 const Io = std.Io;
 
 const Pipeline = @import("front/Pipeline.zig");
+const InputShape = @import("front/InputShape.zig");
 const Sema = @import("sema/Sema.zig");
 const Session = @import("Session.zig");
 const InternPool = @import("sema/InternPool.zig");
@@ -16,6 +17,31 @@ const render = @import("render/Value.zig");
 
 // Shared across cases; sits under .zig-cache so `zig build` cleans it.
 const compliance_cache_dir = ".zig-cache/tmp/zig-repl-compliance";
+
+/// Front-end + Sema for one wrapped segment, committing the pipeline so
+/// later segments can reference what it bound. Returns the produced
+/// Value (null for a declaration segment). Parse/ZIR errors surface as
+/// the same error tags `expectBothReject` matches.
+fn analyzeViaRepl(
+    gpa: std.mem.Allocator,
+    pool: *InternPool,
+    session: *Session,
+    source: []const u8,
+) !?Value {
+    var result = try Pipeline.runWithInjection(gpa, source, pool, .init(session.root_namespace));
+    var committed = false;
+    defer if (!committed) result.deinit(gpa);
+
+    if (result.hasParseErrors()) return error.ParseError;
+    if (result.hasZirErrors()) return error.ZirError;
+
+    var diag_buf: [4096]u8 = undefined;
+    var diag_writer = Io.Writer.fixed(&diag_buf);
+    const value = try Sema.analyze(session, result.zir, &diag_writer);
+    try session.pipelines.append(gpa, result);
+    committed = true;
+    return value;
+}
 
 /// Run a sequence of REPL inputs through Pipeline + Sema + render
 /// against a fresh session namespace. The last input must produce a
@@ -37,18 +63,17 @@ fn runViaRepl(
 
     var last_value: ?Value = null;
     for (inputs) |source| {
-        var result = try Pipeline.runWithInjection(gpa, source, &pool, .init(ns));
-        var committed = false;
-        defer if (!committed) result.deinit(gpa);
-
-        if (result.hasParseErrors()) return error.ParseError;
-        if (result.hasZirErrors()) return error.ZirError;
-
-        var diag_buf: [4096]u8 = undefined;
-        var diag_writer = Io.Writer.fixed(&diag_buf);
-        last_value = try Sema.analyze(&session, result.zir, &diag_writer);
-        try session.pipelines.append(gpa, result);
-        committed = true;
+        // Mirror `Repl.evaluate`: an input that is declarations plus a
+        // trailing expression runs as two passes so the harness exercises
+        // the same path the REPL does.
+        if (try InputShape.splitTrailingExpr(gpa, source)) |split| {
+            // The declaration pass yields null (decls render nothing);
+            // the trailing expression's value is the one that matters.
+            last_value = try analyzeViaRepl(gpa, &pool, &session, split.decls);
+            last_value = try analyzeViaRepl(gpa, &pool, &session, split.expr);
+        } else {
+            last_value = try analyzeViaRepl(gpa, &pool, &session, source);
+        }
     }
 
     const value = last_value orelse return error.NoValue;
@@ -706,6 +731,20 @@ test "compliance: void renders as `void`, including as a tuple element" {
 test "compliance: void does not coerce to a non-void type, nor the reverse" {
     try expectBothReject(testing.allocator, &.{"@as(i32, {})"});
     try expectBothReject(testing.allocator, &.{"@as(void, 5)"});
+}
+
+test "mixed input: declarations then a trailing expression on one line" {
+    // `zig run` can't wrap a compound line as a print argument, so this
+    // is REPL-only: the line runs as two passes (bind, then evaluate).
+    const out = try runViaRepl(testing.allocator, &.{"const mx = 10; mx + 1"});
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("11", out);
+}
+
+test "mixed input: a declaration from a compound line persists to later input" {
+    const out = try runViaRepl(testing.allocator, &.{ "const mz = 5; mz", "mz * 2" });
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("10", out);
 }
 
 // Non-power-of-two widths reach the `int_type` handler rather than a

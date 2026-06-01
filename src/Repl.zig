@@ -6,6 +6,7 @@ const LineEditor = @import("LineEditor.zig");
 const Terminal = @import("terminal/Terminal.zig");
 const commands = @import("commands.zig");
 const Pipeline = @import("front/Pipeline.zig");
+const InputShape = @import("front/InputShape.zig");
 const Diagnostic = @import("render/Diagnostic.zig");
 const Sema = @import("sema/Sema.zig");
 const renderValue = @import("render/Value.zig").render;
@@ -141,6 +142,31 @@ fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
     assert(input.len > 0);
     assert(input.len <= input_buffer_bytes);
 
+    // A single input that is declarations followed by a trailing
+    // expression (`const x = 1; x + 1`) runs as two passes: bind the
+    // decls, then evaluate the expression with them in scope. This
+    // reuses the single-segment wrap and diagnostics rather than a
+    // split-region wrap. If the decls fail, stop -- the expression
+    // would only reference unbound names and report a second,
+    // misleading error. The decls still commit (matching the per-input
+    // commit model): defining them succeeded even if the expression
+    // that follows does not.
+    if (try InputShape.splitTrailingExpr(repl.session.gpa, input)) |split| {
+        if (!try repl.evaluateOne(split.decls, stdout)) return;
+        _ = try repl.evaluateOne(split.expr, stdout);
+        return;
+    }
+    _ = try repl.evaluateOne(input, stdout);
+}
+
+/// Run one wrapped input through the front end and Sema. Returns
+/// whether analysis succeeded so `evaluate` can sequence multi-pass
+/// input. Diagnostics are written to `stdout`; only host/OOM errors
+/// propagate.
+fn evaluateOne(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !bool {
+    assert(input.len > 0);
+    assert(input.len <= input_buffer_bytes);
+
     var result = Pipeline.runWithInjection(
         repl.session.gpa,
         input,
@@ -148,7 +174,7 @@ fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
         .init(repl.session.root_namespace),
     ) catch |err| {
         try stdout.print("front-end failed: {s}\n", .{@errorName(err)});
-        return;
+        return false;
     };
     // Don't deinit `result` here. We commit successfully-analysed
     // results to `session.pipelines` so cross-line fn calls can
@@ -158,20 +184,22 @@ fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
     defer if (!commit_to_session) result.deinit(repl.session.gpa);
 
     if (result.hasParseErrors()) {
-        return Diagnostic.renderParseErrors(result.tree, result.userView(), stdout);
+        try Diagnostic.renderParseErrors(result.tree, result.userView(), stdout);
+        return false;
     }
     if (result.hasZirErrors()) {
-        return Diagnostic.renderZirErrors(
+        try Diagnostic.renderZirErrors(
             repl.session.gpa,
             result.zir,
             result.tree,
             result.userView(),
             stdout,
         );
+        return false;
     }
 
     const value_opt = Sema.analyze(repl.session, result.zir, stdout) catch |err| switch (err) {
-        error.AnalysisFail => return, // diagnostic already written
+        error.AnalysisFail => return false, // diagnostic already written
         else => |e| return e,
     };
 
@@ -184,13 +212,14 @@ fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
 
     if (value_opt) |value| {
         try renderValue(value, repl.session.intern_pool, stdout);
-        return;
+        return true;
     }
 
     if (result.wrapped.shape == .expression) {
         // Expression shape with no result is a Sema-side gap.
         try stdout.writeAll("(no value)\n");
     }
+    return true;
 }
 
 test "echoInput: interactive mode writes nothing (tty echoes via line discipline)" {

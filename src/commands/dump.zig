@@ -6,6 +6,7 @@ const assert = std.debug.assert;
 const Session = @import("../Session.zig");
 const Spec = @import("Spec.zig");
 const Pipeline = @import("../front/Pipeline.zig");
+const InputShape = @import("../front/InputShape.zig");
 const Diagnostic = @import("../render/Diagnostic.zig");
 
 const Ast = std.zig.Ast;
@@ -27,9 +28,26 @@ fn run(session: *Session, argument: []const u8, stdout: *std.Io.Writer) anyerror
         return;
     }
 
+    // Route through the same splitter the evaluator uses so `:dump` of a
+    // mixed input (declarations + a trailing expression) shows what the
+    // REPL would actually run -- two passes -- rather than wrapping it as
+    // one file and reporting the spurious "file cannot be a tuple". Each
+    // segment is dumped on its own; the expression segment is shown in
+    // isolation (the declarations are not persisted by `:dump`).
+    if (try InputShape.splitTrailingExpr(session.gpa, trimmed)) |split| {
+        try stdout.writeAll("=== declarations ===\n");
+        try dumpOne(session, split.decls, stdout);
+        try stdout.writeAll("\n=== trailing expression ===\n");
+        try dumpOne(session, split.expr, stdout);
+        return;
+    }
+    try dumpOne(session, trimmed, stdout);
+}
+
+fn dumpOne(session: *Session, input: []const u8, stdout: *std.Io.Writer) !void {
     var result = Pipeline.runWithInjection(
         session.gpa,
-        trimmed,
+        input,
         session.intern_pool,
         .init(session.root_namespace),
     ) catch |err| {
@@ -44,6 +62,18 @@ fn run(session: *Session, argument: []const u8, stdout: *std.Io.Writer) anyerror
         return;
     }
     try dumpAst(result.tree, stdout);
+    // A failed AstGen emits error-ZIR with no instructions; walking it
+    // (typeDecls reads the root container at index 0) would panic. Mirror
+    // the eval path and surface the compile errors instead.
+    if (result.hasZirErrors()) {
+        return Diagnostic.renderZirErrors(
+            session.gpa,
+            result.zir,
+            result.tree,
+            result.userView(),
+            stdout,
+        );
+    }
     try dumpZir(result.zir, stdout);
 }
 
@@ -90,6 +120,15 @@ fn dumpZir(zir: Zir, stdout: *std.Io.Writer) !void {
         zir.extra.len,
         zir.string_bytes.len,
     });
+
+    // A failed AstGen produces error-ZIR with no instructions, so the
+    // root container `typeDecls` reads at index 0 is absent and the walk
+    // would index out of bounds. Compile errors can be present yet
+    // suppressed (so the caller's `hasZirErrors` gate lets them through,
+    // matching `Sema.analyze`), so guard on the instruction list rather
+    // than the error flag -- a user typo must surface as the rendered
+    // diagnostic, never a panic.
+    if (zir.instructions.len == 0) return;
 
     var dumper: Dumper = .{ .zir = zir, .stdout = stdout };
     const decl_insts = zir.typeDecls(.main_struct_inst);
