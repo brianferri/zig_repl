@@ -4,7 +4,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const Session = @import("../Session.zig");
-const Spec = @import("Spec.zig");
+const Spec = @import("Spec.zig").Spec;
 const Pipeline = @import("../front/Pipeline.zig");
 const InputShape = @import("../front/InputShape.zig");
 const Diagnostic = @import("../render/Diagnostic.zig");
@@ -12,7 +12,7 @@ const Diagnostic = @import("../render/Diagnostic.zig");
 const Ast = std.zig.Ast;
 const Zir = std.zig.Zir;
 
-pub const spec: Spec = .{
+pub const spec: Spec(*Session) = .{
     .name = "dump",
     .summary = "Dump AST + ZIR for an expression: :dump <expr>",
     .run = run,
@@ -532,11 +532,9 @@ fn writeDataSummary(
             try stdout.print(" target=%{d}", .{@intFromEnum(e.data.block_inst)});
         },
 
-        .@"unreachable"
-        => try stdout.print(" src_node={d}", .{@intFromEnum(data.@"unreachable".src_node)}),
+        .@"unreachable" => try stdout.print(" src_node={d}", .{@intFromEnum(data.@"unreachable".src_node)}),
 
-        .@"defer"
-        => try stdout.print(" index={d} len={d}", .{ data.@"defer".index, data.@"defer".len }),
+        .@"defer" => try stdout.print(" index={d} len={d}", .{ data.@"defer".index, data.@"defer".len }),
 
         .save_err_ret_index => {
             try stdout.writeAll(" operand=");

@@ -2,22 +2,22 @@ const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 
-const Session = @import("../Session.zig");
-const Spec = @import("Spec.zig");
-const themes = @import("../theme/root.zig");
+const Repl = @import("Repl.zig");
+const themes = @import("../../theme/root.zig");
+const Spec = @import("../../commands/Spec.zig").Spec;
 
-pub const spec: Spec = .{
+pub const spec: Spec(*Repl) = .{
     .name = "terminal",
     .summary = "Show the active terminal's detected capabilities",
     .run = run,
 };
 
-fn run(session: *Session, argument: []const u8, stdout: *std.Io.Writer) anyerror!void {
-    assert(@intFromPtr(session) != 0);
+fn run(repl: *Repl, argument: []const u8, stdout: *std.Io.Writer) anyerror!void {
+    assert(@intFromPtr(repl) != 0);
     assert(@intFromPtr(stdout) != 0);
     _ = argument;
 
-    const terminal = session.terminal orelse {
+    const terminal = repl.terminal orelse {
         try stdout.writeAll("no interactive terminal (running in cooked mode)\n");
         return;
     };
@@ -33,15 +33,12 @@ fn run(session: *Session, argument: []const u8, stdout: *std.Io.Writer) anyerror
     }
     try stdout.writeByte('\n');
 
-    // Show the active theme with a live preview of its prompts in the
-    // detected color tier, so the user sees exactly what they get.
-    const active = session.theme;
+    const active = repl.theme;
     try stdout.print("theme:     {s}  ", .{active.name});
     try active.primary.write(stdout, level);
     try active.continuation.write(stdout, level);
     try stdout.writeByte('\n');
 
-    // The full palette, each name in its own color.
     try stdout.writeAll("themes:    ");
     for (themes.themes, 0..) |theme, i| {
         if (i != 0) try stdout.writeAll(", ");

@@ -24,7 +24,7 @@ fn evalSource(
     try testing.expect(!result.hasZirErrors());
 
     const ns = try intern_pool.createNamespace(gpa, .none);
-    var session = Session.initForTest(gpa, intern_pool, ns);
+    var session = Session.init(gpa, intern_pool, ns);
     defer session.deinit();
 
     var writer = std.Io.Writer.fixed(diag_buf);
@@ -229,7 +229,7 @@ fn expectEvalFails(
     defer result.deinit(gpa);
 
     const ns = try intern_pool.createNamespace(gpa, .none);
-    var session = Session.initForTest(gpa, intern_pool, ns);
+    var session = Session.init(gpa, intern_pool, ns);
     defer session.deinit();
 
     var diag_buf: [4096]u8 = undefined;
@@ -1303,7 +1303,7 @@ fn evalSessionLines(
     inputs: []const []const u8,
     diag_buf: []u8,
 ) !?Value {
-    var session = Session.initForTest(gpa, pool, namespace);
+    var session = Session.init(gpa, pool, namespace);
     defer session.deinit();
 
     var writer = std.Io.Writer.fixed(diag_buf);

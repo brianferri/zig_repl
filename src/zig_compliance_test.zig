@@ -33,7 +33,7 @@ fn runViaRepl(
     defer pool.deinit();
     const ns = try pool.createNamespace(gpa, .none);
 
-    var session = Session.initForTest(gpa, &pool, ns);
+    var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
 
     var diag: std.Io.Writer.Allocating = .init(gpa);

@@ -10,9 +10,10 @@ pub fn main(init: std.process.Init) !void {
     defer pool.deinit();
     const root_namespace = try pool.createNamespace(init.gpa, .none);
 
-    var session = try zig_repl.Session.init(init.gpa, init.io, &pool, root_namespace);
+    var session = zig_repl.Session.init(init.gpa, &pool, root_namespace);
     defer session.deinit();
 
-    var repl = zig_repl.Repl.init(&session);
+    // The TTY frontend wraps the core session with the terminal/IO surface.
+    var repl = try zig_repl.frontend.tty.Repl.init(&session, init.io);
     return repl.run(init.environ_map);
 }

@@ -1,19 +1,37 @@
+// Library backend: frontend-agnostic, drives input through Sema. Any
+// frontend (the TTY REPL below, or a wasm module) builds on these.
 pub const Session = @import("Session.zig");
-pub const Repl = @import("Repl.zig");
-pub const LineEditor = @import("LineEditor.zig");
-pub const commands = @import("commands.zig");
+pub const eval = @import("eval.zig");
 pub const sema = @import("sema/root.zig");
 pub const render = struct {
     pub const Diagnostic = @import("render/Diagnostic.zig");
     pub const value = @import("render/Value.zig");
 };
+/// Session-utility commands (`:dump`, `:help`) -- reusable across frontends.
+pub const commands = @import("commands.zig");
+
+// Frontends. Each drives the backend with its own IO/device behavior;
+// selected by the build root (native exe -> tty; a wasm root -> a wasm
+// frontend). The shared session utilities above stay reusable across them.
+pub const frontend = struct {
+    pub const tty = struct {
+        pub const Repl = @import("frontend/tty/Repl.zig");
+    };
+};
+/// Multi-line editing logic, used by the TTY frontend today; intended to
+/// be frontend-agnostic once `terminal/` becomes a device abstraction.
+pub const LineEditor = @import("LineEditor.zig");
 
 // `zig build test` only discovers tests in modules referenced from the root
 // file. Force inclusion of every source file's tests by referencing them at
 // comptime here.
 test {
     _ = @import("Session.zig");
-    _ = @import("Repl.zig");
+    _ = @import("eval.zig");
+    _ = @import("frontend/tty/Repl.zig");
+    _ = @import("frontend/tty/quit.zig");
+    _ = @import("frontend/tty/theme.zig");
+    _ = @import("frontend/tty/terminal.zig");
     _ = @import("LineEditor.zig");
     _ = @import("Theme.zig");
     _ = @import("theme/root.zig");

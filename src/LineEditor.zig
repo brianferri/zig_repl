@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const Session = @import("Session.zig");
+const Repl = @import("frontend/tty/Repl.zig");
 const Event = @import("terminal/Event.zig");
 const themes = @import("theme/root.zig");
 const ColorLevel = @import("terminal/Color.zig").ColorLevel;
@@ -83,13 +83,13 @@ pub fn deinit(editor: *LineEditor) void {
 /// (Ctrl+D on empty buffer, or the underlying terminal closing).
 /// The returned slice is borrowed from the editor's buffer and is
 /// invalidated on the next `readLine` call.
-pub fn readLine(editor: *LineEditor, session: *Session) !?[]const u8 {
+pub fn readLine(editor: *LineEditor, repl: *Repl) !?[]const u8 {
     assert(@intFromPtr(editor) != 0);
-    // readLine only runs interactively, where the session holds the
+    // readLine only runs interactively, where the frontend holds the
     // live terminal; the prompt's theme and color come from there.
-    assert(session.terminal != null);
-    const terminal = session.terminal.?;
-    const theme = session.theme;
+    assert(repl.terminal != null);
+    const terminal = repl.terminal.?;
+    const theme = repl.theme;
     const level = terminal.color_level;
 
     editor.buffer.clearRetainingCapacity();

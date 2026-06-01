@@ -2,10 +2,10 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const Session = @import("../Session.zig");
-const Spec = @import("Spec.zig");
+const Spec = @import("Spec.zig").Spec;
 const commands = @import("../commands.zig");
 
-pub const spec: Spec = .{
+pub const spec: Spec(*Session) = .{
     .name = "help",
     .summary = "Show available commands",
     .run = run,
