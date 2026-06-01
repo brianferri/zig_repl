@@ -122,7 +122,7 @@ fn renderErrorUnion(
 
 fn simpleValueText(sv: InternPool.SimpleValue) []const u8 {
     return switch (sv) {
-        .void => "{}",
+        .void => "void",
         .null => "null",
         .true => "true",
         .false => "false",

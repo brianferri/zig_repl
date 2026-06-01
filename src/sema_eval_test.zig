@@ -969,6 +969,16 @@ test "tuple: array_init_anon infers a tuple_type from element types + dedups" {
     try testing.expectEqual(key.aggregate.ty, pool.indexToKey(other.index).aggregate.ty);
 }
 
+test "coercion: void and non-void types do not coerce into each other" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalFails(gpa, &pool, "@as(i32, {})", "cannot coerce value");
+    try expectEvalFails(gpa, &pool, "@as(f128, {})", "cannot coerce value");
+    try expectEvalFails(gpa, &pool, "@as(void, 5)", "cannot coerce value");
+}
+
 test "vector_type: rejects element types without a fixed bit width" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);

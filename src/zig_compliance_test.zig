@@ -698,6 +698,16 @@ test "compliance: prior decl used as a tuple element" {
     });
 }
 
+test "compliance: void renders as `void`, including as a tuple element" {
+    try expectMatchesZig(testing.allocator, &.{"{}"});
+    try expectMatchesZig(testing.allocator, &.{".{ 1, {} }"});
+}
+
+test "compliance: void does not coerce to a non-void type, nor the reverse" {
+    try expectBothReject(testing.allocator, &.{"@as(i32, {})"});
+    try expectBothReject(testing.allocator, &.{"@as(void, 5)"});
+}
+
 // Non-power-of-two widths reach the `int_type` handler rather than a
 // well-known Inst.Ref -- the path the round-number widths never hit.
 const awkward_widths = [_]u16{ 1, 3, 7, 33, 69, 420 };
