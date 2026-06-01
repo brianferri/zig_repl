@@ -36,6 +36,18 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the REPL");
     run_step.dependOn(&run_cmd.step);
 
+    const docs_obj = b.addObject(.{
+        .name = "zig_repl",
+        .root_module = repl_module,
+    });
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = docs_obj.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    const docs_step = b.step("docs", "Generate library documentation");
+    docs_step.dependOn(&install_docs.step);
+
     const module_tests = b.addTest(.{ .root_module = repl_module });
     const exe_tests = b.addTest(.{ .root_module = exe_module });
     const run_module_tests = b.addRunArtifact(module_tests);
