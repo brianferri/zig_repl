@@ -7,9 +7,7 @@ const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
 
-const Pipeline = @import("front/Pipeline.zig");
-const InputShape = @import("front/InputShape.zig");
-const Sema = @import("sema/Sema.zig");
+const eval = @import("eval.zig");
 const Session = @import("Session.zig");
 const InternPool = @import("sema/InternPool.zig");
 const Value = @import("sema/Value.zig");
@@ -18,36 +16,13 @@ const render = @import("render/Value.zig");
 // Shared across cases; sits under .zig-cache so `zig build` cleans it.
 const compliance_cache_dir = ".zig-cache/tmp/zig-repl-compliance";
 
-/// Front-end + Sema for one wrapped segment, committing the pipeline so
-/// later segments can reference what it bound. Returns the produced
-/// Value (null for a declaration segment). Parse/ZIR errors surface as
-/// the same error tags `expectBothReject` matches.
-fn analyzeViaRepl(
-    gpa: std.mem.Allocator,
-    pool: *InternPool,
-    session: *Session,
-    source: []const u8,
-) !?Value {
-    var result = try Pipeline.runWithInjection(gpa, source, pool, .init(session.root_namespace));
-    var committed = false;
-    defer if (!committed) result.deinit(gpa);
-
-    if (result.hasParseErrors()) return error.ParseError;
-    if (result.hasZirErrors()) return error.ZirError;
-
-    var diag_buf: [4096]u8 = undefined;
-    var diag_writer = Io.Writer.fixed(&diag_buf);
-    const value = try Sema.analyze(session, result.zir, &diag_writer);
-    try session.pipelines.append(gpa, result);
-    committed = true;
-    return value;
-}
-
-/// Run a sequence of REPL inputs through Pipeline + Sema + render
-/// against a fresh session namespace. The last input must produce a
-/// Value; the prior inputs typically bind decls the last expression
-/// references. Returns the rendered text of the final value with
-/// trailing newline stripped.
+/// Run a sequence of REPL inputs through the shared `eval.run` driver --
+/// the same path the interactive REPL takes -- against a fresh session.
+/// The last input must produce a Value; prior inputs typically bind decls
+/// the last expression references. Returns the rendered text of the final
+/// value with the trailing newline stripped. Parse/ZIR/analysis errors
+/// propagate as the tags `expectBothReject` matches; their diagnostics go
+/// to a discarded allocating writer (so a long rendering can't overflow).
 fn runViaRepl(
     gpa: std.mem.Allocator,
     inputs: []const []const u8,
@@ -61,19 +36,12 @@ fn runViaRepl(
     var session = Session.initForTest(gpa, &pool, ns);
     defer session.deinit();
 
+    var diag: std.Io.Writer.Allocating = .init(gpa);
+    defer diag.deinit();
+
     var last_value: ?Value = null;
     for (inputs) |source| {
-        // Mirror `Repl.evaluate`: an input that is declarations plus a
-        // trailing expression runs as two passes so the harness exercises
-        // the same path the REPL does.
-        if (try InputShape.splitTrailingExpr(gpa, source)) |split| {
-            // The declaration pass yields null (decls render nothing);
-            // the trailing expression's value is the one that matters.
-            last_value = try analyzeViaRepl(gpa, &pool, &session, split.decls);
-            last_value = try analyzeViaRepl(gpa, &pool, &session, split.expr);
-        } else {
-            last_value = try analyzeViaRepl(gpa, &pool, &session, source);
-        }
+        last_value = (try eval.run(&session, source, &diag.writer)).value;
     }
 
     const value = last_value orelse return error.NoValue;

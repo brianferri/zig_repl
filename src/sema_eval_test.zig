@@ -6,6 +6,7 @@ const testing = std.testing;
 
 const Pipeline = @import("front/Pipeline.zig");
 const Sema = @import("sema/Sema.zig");
+const eval = @import("eval.zig");
 const Session = @import("Session.zig");
 const InternPool = @import("sema/InternPool.zig");
 const Value = @import("sema/Value.zig");
@@ -1291,9 +1292,10 @@ test "alloc/store/load: wrap arith through a stored var" {
 }
 
 /// Multi-input session harness: runs each line through
-/// Pipeline.runWithInjection + Sema.analyze, persisting bindings in
-/// the supplied namespace. Returns the final line's evaluated Value
-/// or null when the final line was a declaration.
+/// Run a sequence of session inputs through the shared `eval.run` driver,
+/// persisting bindings in `namespace`. Returns the final input's Value (or
+/// null when it was a declaration). Diagnostics for the (unexpected) error
+/// case go to `diag_buf`.
 fn evalSessionLines(
     gpa: std.mem.Allocator,
     pool: *InternPool,
@@ -1304,19 +1306,10 @@ fn evalSessionLines(
     var session = Session.initForTest(gpa, pool, namespace);
     defer session.deinit();
 
+    var writer = std.Io.Writer.fixed(diag_buf);
     var last_value: ?Value = null;
     for (inputs) |source| {
-        var result = try Pipeline.runWithInjection(gpa, source, pool, .init(namespace));
-        var committed = false;
-        defer if (!committed) result.deinit(gpa);
-
-        try testing.expect(!result.hasParseErrors());
-        try testing.expect(!result.hasZirErrors());
-
-        var writer = std.Io.Writer.fixed(diag_buf);
-        last_value = try Sema.analyze(&session, result.zir, &writer);
-        try session.pipelines.append(gpa, result);
-        committed = true;
+        last_value = (try eval.run(&session, source, &writer)).value;
     }
     return last_value;
 }
