@@ -181,6 +181,7 @@ pub fn writeTypeName(
             try writer.writeAll("?");
             try writeTypeName(child, pool, writer);
         },
+        .tuple_type => |tt| try writeTupleTypeName(tt, pool, writer),
         else => try writer.writeAll("<type>"),
     }
 }
@@ -209,6 +210,25 @@ fn writeArrayTypeName(
     }
     try writer.writeAll("]");
     try writeTypeName(at.child, pool, writer);
+}
+
+/// Render a tuple type as Zig surface syntax: `struct { T0, T1, ... }`.
+/// An empty tuple renders `struct {}` (matching `@typeName`).
+fn writeTupleTypeName(
+    tt: InternPool.Key.TupleType,
+    pool: *const InternPool,
+    writer: *std.Io.Writer,
+) Error!void {
+    if (tt.types.len == 0) {
+        try writer.writeAll("struct {}");
+        return;
+    }
+    try writer.writeAll("struct { ");
+    for (tt.types, 0..) |field_ty, i| {
+        if (i != 0) try writer.writeAll(", ");
+        try writeTypeName(field_ty, pool, writer);
+    }
+    try writer.writeAll(" }");
 }
 
 /// Render a vector type as Zig surface syntax: `@Vector(N, T)`.

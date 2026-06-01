@@ -559,11 +559,9 @@ pub const Key = union(enum) {
     /// (inline ty), mirroring the compiler's `Key.opt` / `Tag.opt_payload`
     /// + `opt_null` (`src/InternPool.zig` ~2006,4230,4231).
     opt: Opt,
-    /// An anonymous tuple type (`.{a, b, ...}`'s type): the per-field
-    /// types. The compiler's `Key.TupleType` also carries per-field
-    /// comptime `values` for runtime-field tuples (`.none`); we are
-    /// comptime-only, so a tuple's field values live entirely in its
-    /// aggregate value and the type needs only the field types.
+    /// A tuple type: the per-field types. The compiler's `Key.TupleType`
+    /// also carries a parallel `values` slice (comptime-field defaults);
+    /// omitted here -- deferred, see `Sema.evalArrayInitAnon`.
     tuple_type: TupleType,
     /// An aggregate value (array, vector, struct -- the type
     /// determines which). Storage is either an N-element slice or a

@@ -969,6 +969,22 @@ test "tuple: array_init_anon infers a tuple_type from element types + dedups" {
     try testing.expectEqual(key.aggregate.ty, pool.indexToKey(other.index).aggregate.ty);
 }
 
+test "tuple_decl: explicit `struct { i32, f128 }` interns its annotated field types" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, &pool, "struct { i32, f128 }", &diag_buf);
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .tuple_type);
+    try testing.expectEqual(@as(usize, 2), key.tuple_type.types.len);
+    // Unlike `array_init_anon` (which infers comptime_int/comptime_float
+    // from literals), an explicit tuple decl keeps the written types.
+    try testing.expectEqual(InternPool.Index.i32_type, key.tuple_type.types[0]);
+    try testing.expectEqual(InternPool.Index.f128_type, key.tuple_type.types[1]);
+}
+
 test "coercion: void and non-void types do not coerce into each other" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);

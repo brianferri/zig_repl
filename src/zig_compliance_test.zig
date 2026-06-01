@@ -733,6 +733,32 @@ test "compliance: void does not coerce to a non-void type, nor the reverse" {
     try expectBothReject(testing.allocator, &.{"@as(void, 5)"});
 }
 
+test "compliance: an explicit tuple type renders structurally" {
+    try expectMatchesZig(testing.allocator, &.{
+        "const T = struct { i32, f128 };",
+        "T",
+    });
+    try expectMatchesZig(testing.allocator, &.{"struct { i32, void }"});
+}
+
+test "compliance: a typed tuple literal coerces elements to the field types" {
+    // Non-integral float so the rendered form has no trailing `.0` for
+    // `normalize` to reconcile mid-string (see renderFloat's note).
+    try expectMatchesZig(testing.allocator, &.{
+        "const x: struct { i32, f128, void } = .{ 420, 2.5, {} };",
+        "x",
+    });
+}
+
+test "compliance: tuple element type and arity mismatches are rejected" {
+    // void into a non-void field, and a non-void value into a void field.
+    try expectBothReject(testing.allocator, &.{"const x: struct { i32 } = .{ {} };"});
+    try expectBothReject(testing.allocator, &.{"const x: struct { void } = .{ 420 };"});
+    // Too few / too many initializers for the field count.
+    try expectBothReject(testing.allocator, &.{"const x: struct { i32, f128 } = .{ 1 };"});
+    try expectBothReject(testing.allocator, &.{"const x: struct { i32 } = .{ 1, 2 };"});
+}
+
 test "mixed input: declarations then a trailing expression on one line" {
     // `zig run` can't wrap a compound line as a print argument, so this
     // is REPL-only: the line runs as two passes (bind, then evaluate).

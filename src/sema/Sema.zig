@@ -488,6 +488,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .array_init => sema.evalArrayInit(inst),
         .array_init_ref => sema.evalArrayInitRef(inst),
         .array_init_anon => sema.evalArrayInitAnon(inst),
+        .array_init_elem_type => sema.evalArrayInitElemType(inst),
+        .validate_array_init_result_ty => sema.evalValidateArrayInitResultTy(inst),
         .ref => sema.evalRef(inst),
         .elem_ptr_load => sema.evalElemPtrLoad(inst),
         inline else => |unhandled| sema.reportUnsupportedTag(unhandled),
@@ -1297,6 +1299,7 @@ fn resolveDestType(
         .array_type,
         .vector_type,
         .opt_type,
+        .tuple_type,
         => dest_value.index,
         else => blk: {
             try sema.writer.print("{s}: destination is not a type\n", .{op_name});
@@ -2465,6 +2468,12 @@ fn evalArrayInitRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// coerced. The field values live in the aggregate; `elem_ptr_load`
 /// then indexes it (AstGen emits a separate `ref` for that path).
 /// Compiler reference: src/Sema.zig:zirArrayInitAnon (~19210).
+///
+/// Deviation: the compiler bakes the elements into the type
+/// (`@TypeOf(.{1, 2.5})` is `struct { comptime comptime_int = 1, ... }`,
+/// so `.{1,2.5}` and `.{1,3.5}` differ). We intern field types only and
+/// keep values in the aggregate, deduping by type. Observable only via
+/// `@TypeOf`/`@typeName`/type-equality, none of which we model yet.
 fn evalArrayInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
@@ -2504,19 +2513,125 @@ fn buildArrayAggregate(sema: *Sema, inst: Zir.Inst.Index) Error!InternPool.Index
     const ip = sema.intern_pool;
     const array_ty = try sema.resolveDestType(operands[0], "array_init");
     const array_key = ip.indexToKey(array_ty);
-    assert(array_key == .array_type); // resolveDestType guarantees a type; AstGen guarantees array
-    const child = array_key.array_type.child;
 
     const elems = operands[1..];
     const buf = try sema.gpa.alloc(InternPool.Index, elems.len);
     defer sema.gpa.free(buf);
     for (elems, 0..) |elem_ref, i| {
         const elem = try sema.resolveRef(elem_ref);
-        const coerced = try sema.coerceValueToType(elem, child, "array_init");
+        // Arrays/vectors share one child type; a tuple gives each
+        // position its own field type (`array_ty.fieldType(i)` in the
+        // compiler), which is where a void/non-void mismatch is caught.
+        const elem_ty = try sema.arrayInitElemType(array_key, i, "array_init");
+        const coerced = try sema.coerceValueToType(elem, elem_ty, "array_init");
         buf[i] = coerced.index;
     }
 
     return try ip.internAggregate(.{ .ty = array_ty, .storage = .{ .elems = buf } });
+}
+
+/// The element type at `index` for an array-initializable result type:
+/// the shared child for arrays/vectors, or the positional field type for
+/// a tuple. Mirrors the `is_tuple ? fieldType(i) : childType()` split in
+/// src/Sema.zig:zirArrayInit / zirArrayInitElemType.
+fn arrayInitElemType(
+    sema: *Sema,
+    key: InternPool.Key,
+    index: usize,
+    op_name: []const u8,
+) Error!InternPool.Index {
+    switch (key) {
+        .array_type => |at| return at.child,
+        .vector_type => |vt| return vt.child,
+        .tuple_type => |tt| {
+            if (index < tt.types.len) return tt.types[index];
+            try sema.writer.print(
+                "{s}: element {d} is out of range for a {d}-field tuple\n",
+                .{ op_name, index, tt.types.len },
+            );
+            return error.AnalysisFail;
+        },
+        else => {
+            try sema.writer.print("{s}: type does not support array-init syntax\n", .{op_name});
+            return error.AnalysisFail;
+        },
+    }
+}
+
+/// `array_init_elem_type lhs, rhs`: given a result type (`lhs`) and an
+/// element index (`rhs`, carried as the integer value of the Ref), yield
+/// the element's expected type. AstGen emits one per element to supply a
+/// result-type hint to each initializer expression.
+/// Compiler reference: src/Sema.zig:zirArrayInitElemType.
+fn evalArrayInitElemType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const bin = sema.zir.instructions.items(.data)[@intFromEnum(inst)].bin;
+    const indexable_ty = try sema.resolveDestType(bin.lhs, "array_init_elem_type");
+    const index: usize = @intFromEnum(bin.rhs);
+    const elem_ty = try sema.arrayInitElemType(
+        sema.intern_pool.indexToKey(indexable_ty),
+        index,
+        "array_init_elem_type",
+    );
+    return .{ .index = elem_ty };
+}
+
+/// `validate_array_init_result_ty`: confirm the known result type accepts
+/// array-init syntax and that the element count matches. The compiler
+/// returns void; the real type checking happens element-by-element in
+/// `array_init`. Compiler reference: src/Sema.zig:zirValidateArrayInitResultTy.
+fn evalValidateArrayInitResultTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const data = sema.zir.extraData(Zir.Inst.ArrayInit, pl_node.payload_index).data;
+    const result_ty = try sema.resolveDestType(data.ty, "array init");
+    const field_count: u64 = switch (sema.intern_pool.indexToKey(result_ty)) {
+        .array_type => |at| at.len,
+        .vector_type => |vt| vt.len,
+        .tuple_type => |tt| tt.types.len,
+        else => {
+            try sema.writer.print("array init: type does not support array-init syntax\n", .{});
+            return error.AnalysisFail;
+        },
+    };
+    if (data.init_count != field_count) {
+        try sema.writer.print(
+            "array init: expected {d} elements, found {d}\n",
+            .{ field_count, data.init_count },
+        );
+        return error.AnalysisFail;
+    }
+    return null;
+}
+
+/// `tuple_decl` (extended): a positional struct type, e.g.
+/// `struct { i32, f128 }`. The `small` field is the field count; trailing
+/// the `TupleDecl` payload are two Refs per field -- a type and a default
+/// init. Only `comptime` fields take a default; we don't model those yet,
+/// so a present init is rejected. Compiler reference: src/Sema.zig:zirTupleDecl.
+fn evalTupleDecl(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
+    const fields_len = extended.small;
+    const extra = sema.zir.extraData(Zir.Inst.TupleDecl, extended.operand);
+    const refs = sema.zir.refSlice(extra.end, fields_len * 2);
+
+    const types = try sema.gpa.alloc(InternPool.Index, fields_len);
+    defer sema.gpa.free(types);
+    for (types, 0..) |*ty, i| {
+        const zir_field_ty = refs[i * 2];
+        const zir_field_init = refs[i * 2 + 1];
+        if (zir_field_init != .none) {
+            try sema.writer.print(
+                "tuple field {d}: comptime field defaults are not supported\n",
+                .{i},
+            );
+            return error.AnalysisFail;
+        }
+        ty.* = try sema.resolveDestType(zir_field_ty, "tuple field type");
+    }
+
+    return .{ .index = try sema.intern_pool.internTupleType(types) };
 }
 
 /// `ref operand`: materialise `operand`'s value into a fresh const
@@ -2986,17 +3101,18 @@ fn bindValueDecl(
         return error.AnalysisFail;
     };
 
-    // Evaluate the value body first; if the decl has a type
-    // annotation (`const x: T = ...`), AstGen emits a `type_body`
-    // that resolves T, and we coerce the value to it. Otherwise we
-    // keep the value's natural type (typically `comptime_int` /
-    // `comptime_float` for unannotated literals). Both bodies use
-    // the declaration instruction as their break_inline target.
+    // Resolve the type annotation (`const x: T = ...`) before the
+    // value: a result-located init (typed tuple/struct/array literal)
+    // refers to the declaration instruction as its result type
+    // (`array_init args[0]=%decl`, `array_init_elem_type lhs=%decl`),
+    // so `%decl` must already resolve to T. Store it so `resolveRef`
+    // finds it. Both bodies break to the declaration instruction.
+    const declared_type: ?InternPool.Index = if (unwrapped.type_body) |tb| blk: {
+        const t = (try sema.resolveInlineBody(tb, decl_inst)).index;
+        try sema.results.put(sema.gpa, decl_inst, .{ .index = t });
+        break :blk t;
+    } else null;
     const raw_value = try sema.resolveInlineBody(value_body, decl_inst);
-    const declared_type: ?InternPool.Index = if (unwrapped.type_body) |tb|
-        (try sema.resolveInlineBody(tb, decl_inst)).index
-    else
-        null;
     const final_value = if (declared_type) |dest_ty|
         try sema.coerceValueToType(raw_value, dest_ty, "decl")
     else
@@ -3688,6 +3804,7 @@ fn evalTypeofBuiltin(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///     instrumentation, no error-return-trace machinery yet).
 ///   * `in_comptime` -- honest `false`; we have no comptime/runtime
 ///     bifurcation so the spec branch is the runtime one.
+///   * `tuple_decl` -- a positional struct type (`struct { i32, f128 }`).
 ///
 /// Every other opcode surfaces a structured
 /// "unsupported extended opcode: <name>" diagnostic; the `inline
@@ -3708,6 +3825,8 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         => return null,
 
         .in_comptime => return Value.bool_false,
+
+        .tuple_decl => return sema.evalTupleDecl(extended),
 
         // Bridge into std.lang.* (CallingConvention, AtomicOrder,
         // AddressSpace, ...). Compiler reference:
