@@ -4,7 +4,6 @@ const assert = std.debug.assert;
 const InputShape = @import("InputShape.zig");
 const ZirErrors = @import("ZirErrors.zig");
 const InternPool = @import("../sema/InternPool.zig");
-const render = @import("../render/Value.zig");
 
 pub const Result = struct {
     wrapped: InputShape.Wrapped,
@@ -170,11 +169,13 @@ fn appendDeclLine(
     writer: *std.Io.Writer,
 ) !void {
     const nav = pool.getNav(nav_idx);
-    const resolved = nav.resolved orelse return; // test / comptime / unresolved extern
+    _ = nav.resolved orelse return; // test / comptime / unresolved extern
     const name = pool.stringSlice(nav.name);
-    try writer.print("const {s}: ", .{name});
-    try render.writeTypeName(resolved.type, pool, writer);
-    try writer.writeAll(" = undefined;\n");
+    // Scaffold only: puts the name in scope so a later line's reference
+    // lowers to `decl_val` instead of erroring. `bindOneDecl` skips it
+    // (already bound from its real line), so the type is never analysed
+    // and `= undefined` needs none.
+    try writer.print("const {s} = undefined;\n", .{name});
 }
 
 test "UserView.translate: span entirely in user frame translates to user-relative" {
