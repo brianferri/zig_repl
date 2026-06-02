@@ -94,7 +94,7 @@ fn interpretGround(b: u8) ?Event.Event {
         } },
         // Printable ASCII -- pass through. UTF-8 multibyte sequences
         // arrive byte-at-a-time and aren't yet assembled into
-        // codepoints; that's a Stage-9 ergonomics extension.
+        // codepoints; multibyte assembly is unsupported.
         0x20...0x7E => .{ .key_press = .{ .codepoint = b } },
         else => null,
     };

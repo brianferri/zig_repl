@@ -1,7 +1,7 @@
 //! Filters AstGen's compile-error stream against a REPL-specific
 //! suppression criterion. The compiler treats `var x = 7;` with no
 //! syntactic mutation as a hard error ("local variable is never
-//! mutated", `std/zig/AstGen.zig:3113`) to push users toward
+//! mutated", from `std.zig.AstGen`) to push users toward
 //! `const`. For a REPL that is *advisory*: mutability is a Sema-time
 //! concern enforced by `evalStoreNode`'s `is_const` check against the
 //! pointer type, not a parsing concern. Surfacing the warning would
@@ -12,8 +12,7 @@
 //! message text:
 //!
 //!   * AstGen anchors `local_var_*` advisories on the var's name
-//!     identifier token (`s.token_src = name_token` at
-//!     `std/zig/AstGen.zig:11212`, used at lines 3105 + 3113).
+//!     identifier token (`s.token_src = name_token` in `std.zig.AstGen`).
 //!   * In Zig grammar, an identifier token is preceded by
 //!     `keyword_var` exactly when it is the name in a `var_decl`.
 //!     No other production places those tokens adjacent.

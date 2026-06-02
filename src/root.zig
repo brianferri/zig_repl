@@ -1,18 +1,7 @@
-// Library backend: frontend-agnostic, drives input through Sema. Any
-// frontend (the TTY REPL below, or a wasm module) builds on these.
+// Root of the native executable's module: the frontend-agnostic core
+// (`Session`, Sema) and the tty driver `main.zig` runs against it.
 pub const Session = @import("Session.zig");
-pub const eval = @import("eval.zig");
 pub const sema = @import("sema/root.zig");
-pub const render = struct {
-    pub const Diagnostic = @import("render/Diagnostic.zig");
-    pub const value = @import("render/Value.zig");
-};
-/// Session-utility commands (`:dump`, `:help`) -- reusable across frontends.
-pub const commands = @import("commands.zig");
-
-// Frontends. Each drives the backend with its own IO/device behavior;
-// selected by the build root (native exe -> tty; a wasm root -> a wasm
-// frontend). The shared session utilities above stay reusable across them.
 pub const drivers = struct {
     pub const tty = struct {
         pub const Repl = @import("drivers/tty/Repl.zig");
@@ -25,7 +14,7 @@ test {
     _ = @import("Session.zig");
     _ = @import("eval.zig");
     _ = @import("drivers/tty/Repl.zig");
-    _ = @import("drivers/tty/Commands.zig");
+    _ = @import("drivers/tty/root.zig");
     _ = @import("drivers/tty/quit.zig");
     _ = @import("drivers/tty/theme.zig");
     _ = @import("drivers/tty/terminal.zig");
@@ -58,10 +47,10 @@ test {
         .windows => @import("terminal/platform/Windows.zig"),
         else => @import("terminal/platform/Posix.zig"),
     };
-    _ = @import("commands.zig");
-    _ = @import("commands/Command.zig");
-    _ = @import("commands/help.zig");
-    _ = @import("commands/dump.zig");
+    _ = @import("drivers/commands/Command.zig");
+    _ = @import("drivers/commands/registry.zig");
+    _ = @import("drivers/commands/help.zig");
+    _ = @import("drivers/commands/dump.zig");
     _ = @import("front/InputShape.zig");
     _ = @import("front/Pipeline.zig");
     _ = @import("render/Diagnostic.zig");

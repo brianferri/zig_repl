@@ -1,18 +1,20 @@
 //! Source-mapped structured view of one input's lowering, for the web
-//! explorer. Emits JSON: the user source, plus AST nodes and ZIR
-//! instructions each tagged with the byte range of user text it came from
-//! (`lo`/`hi`), or no range when it maps into injected/synthetic bytes or
-//! an instruction shape this resolver does not handle. A missing range is
-//! an honest gap; a wrong range would silently misrepresent the lowering,
-//! so unresolved shapes degrade to "unmapped" rather than guess.
+//! explorer. Emits JSON `{ source, ast, zir }`:
 //!
-//! ZIR source resolution mirrors `src/print_zir.zig`: a body instruction's
-//! `src_node` is an `Ast.Node.Offset` relative to the enclosing
-//! declaration's node, made absolute via `toAbsolute(decl_node)`, then
-//! `nodeToSpan` + `UserView.translate` into the user's frame. Only a
-//! declaration's direct bodies are walked (no sub-body or nested-decl
-//! recursion yet), so instructions inside blocks / nested declarations are
-//! currently unmapped.
+//!   * `ast` -- the syntax **tree** of the user's expression. Each node keys by
+//!     its `Ast` node index (`id`) and carries the byte range it spans
+//!     (`lo`/`hi`); `children` nest. Children are extracted per tag (the AST
+//!     exposes no generic child iterator); a tag the REPL does not lower yet is
+//!     a leaf rather than a guess.
+//!   * `zir` -- the ZIR instruction tree (ZIR is a flat array whose bodies
+//!     nest; `ZirWalk` reports that nesting). Each instruction records the AST
+//!     node it lowered from (`node`), so the explorer binds an instruction to
+//!     its syntax by node identity rather than overlapping spans.
+//!
+//! Both views are rooted at the user's input: the front end wraps an
+//! expression as `const __repl_input = ( EXPR )` and injects prior session
+//! declarations ahead of it, so the AST roots at EXPR (unwrapping the synthetic
+//! decl + parens) and the ZIR walks only the last declaration.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -21,24 +23,15 @@ const Json = std.json.Stringify;
 
 const Pipeline = @import("../../front/Pipeline.zig");
 const Session = @import("../../Session.zig");
+const InputShape = @import("../../front/InputShape.zig");
+const ZirWalk = @import("../../front/ZirWalk.zig");
+const ZirSummary = @import("../../render/ZirSummary.zig");
 
 const UserView = Pipeline.UserView;
 
-/// One mapped node/instruction. `lo`/`hi` are user-source byte offsets,
-/// omitted from the JSON when unmapped (`emit_null_optional_fields`).
-const Item = struct {
-    label: []const u8,
-    lo: ?u32 = null,
-    hi: ?u32 = null,
-
-    fn from(label: []const u8, span: ?Ast.Span) Item {
-        return if (span) |s| .{ .label = label, .lo = s.start, .hi = s.end } else .{ .label = label };
-    }
-};
-
-/// Run the front end on `input` against `session` and write the lowering
-/// as JSON `{ source, ast, zir }` to `w`. On a front-end failure the AST
-/// and ZIR arrays are empty (the explorer falls back to diagnostics).
+/// Run the front end on `input` against `session` and write the lowering as
+/// JSON `{ source, ast, zir }` to `w`. On a front-end failure the arrays are
+/// empty (the explorer falls back to diagnostics).
 pub fn writeJson(session: *Session, input: []const u8, w: *std.Io.Writer) !void {
     var result = Pipeline.runWithInjection(
         session.gpa,
@@ -60,57 +53,259 @@ pub fn writeJson(session: *Session, input: []const u8, w: *std.Io.Writer) !void 
 
     try json.objectField("ast");
     try json.beginArray();
-    if (!result.hasParseErrors()) try emitAst(&json, result.tree, view);
+    if (!result.hasParseErrors()) {
+        // Every user declaration; one that maps into injected bytes (a bound
+        // declaration the expression pipeline prepends) is dropped by
+        // `emitAstNode`.
+        for (result.tree.rootDecls()) |decl| {
+            try emitAstNode(&json, result.tree, view, outlineNode(result.tree, decl));
+        }
+    }
     try json.endArray();
 
     try json.objectField("zir");
     try json.beginArray();
-    if (!result.hasParseErrors() and !result.hasZirErrors()) try emitZir(&json, result.zir, result.tree, view);
+    if (!result.hasParseErrors() and !result.hasZirErrors()) {
+        var scratch: std.Io.Writer.Allocating = .init(session.gpa);
+        defer scratch.deinit();
+        var sink: ZirSink = .{ .json = &json, .zir = result.zir, .scratch = &scratch };
+        const datas = result.zir.instructions.items(.data);
+        // Each user declaration; skip injected-prelude decls, whose own node
+        // maps into bytes the `UserView` hides.
+        for (result.zir.typeDecls(.main_struct_inst)) |decl_inst| {
+            const decl_node = datas[@intFromEnum(decl_inst)].declaration.src_node;
+            if (view.translate(result.tree.nodeToSpan(decl_node)) == null) continue;
+            try ZirWalk.walkDecl(result.zir, decl_inst, &sink);
+        }
+    }
     try json.endArray();
 
     try json.endObject();
 }
 
-fn emitAst(json: *Json, tree: Ast, view: UserView) !void {
-    var i: u32 = 1; // skip the root node (spans the whole file)
-    while (i < tree.nodes.len) : (i += 1) {
-        const node: Ast.Node.Index = @enumFromInt(i);
-        const user = view.translate(tree.nodeToSpan(node)) orelse continue;
-        try json.write(Item.from(@tagName(tree.nodeTag(node)), user));
-    }
-}
-
-fn emitZir(json: *Json, zir: Zir, tree: Ast, view: UserView) !void {
-    if (zir.instructions.len == 0) return;
-    const tags = zir.instructions.items(.tag);
-    const datas = zir.instructions.items(.data);
-    for (zir.typeDecls(.main_struct_inst)) |decl_inst| {
-        // The declaration's own node (already absolute) is the base for its
-        // body instructions' relative `src_node` offsets (parent_decl_node
-        // in print_zir terms).
-        const decl_node = datas[@intFromEnum(decl_inst)].declaration.src_node;
-        const decl = zir.getDeclaration(decl_inst);
-        for ([_]?[]const Zir.Inst.Index{ decl.type_body, decl.value_body }) |maybe_body| {
-            const body = maybe_body orelse continue;
-            for (body) |inst| {
-                const idx = @intFromEnum(inst);
-                try json.write(Item.from(@tagName(tags[idx]), instSpan(tree, view, decl_node, tags[idx], datas[idx])));
-            }
+/// The node to outline for root declaration `decl`. An expression input is
+/// wrapped `const __repl_input = ( EXPR )`, so unwrap the synthetic decl and
+/// parens to EXPR; any other declaration is its own node.
+fn outlineNode(tree: Ast, decl: Ast.Node.Index) Ast.Node.Index {
+    if (tree.nodeTag(decl) == .simple_var_decl and isWrapperDecl(tree, decl)) {
+        const init = tree.nodeData(decl).opt_node_and_opt_node[1].unwrap() orelse return decl;
+        if (tree.nodeTag(init) == .grouped_expression) {
+            return tree.nodeData(init).node_and_token[0];
         }
+        return init;
+    }
+    return decl;
+}
+
+fn isWrapperDecl(tree: Ast, decl: Ast.Node.Index) bool {
+    const name = tree.tokenSlice(tree.nodeMainToken(decl) + 1);
+    return std.mem.eql(u8, name, InputShape.expression_decl_name);
+}
+
+/// Emit `node` and its children as a nested JSON object
+/// `{ id, label, lo, hi, children }`. A node mapping into injected bytes (no
+/// user-frame span) drops out with its subtree.
+fn emitAstNode(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index) anyerror!void {
+    const span = view.translate(tree.nodeToSpan(node)) orelse return;
+    try json.beginObject();
+    try json.objectField("id");
+    try json.write(@intFromEnum(node));
+    try json.objectField("label");
+    try json.write(@tagName(tree.nodeTag(node)));
+    try json.objectField("lo");
+    try json.write(span.start);
+    try json.objectField("hi");
+    try json.write(span.end);
+    try json.objectField("children");
+    try json.beginArray();
+    try emitChildren(json, tree, view, node);
+    try json.endArray();
+    try json.endObject();
+}
+
+/// Recurse into `node`'s children. The AST has no generic child iterator, so
+/// children are read per tag from the operand slots the tag's grammar fills
+/// (using the `Ast` `full*` helpers where they unify the small/large variants);
+/// an unhandled tag is a leaf rather than a guess. `fn_proto` itself is a leaf:
+/// a parameter's name is a token, not a node, so descending shows only the
+/// (often repeated) type expressions -- the signature reads better as text.
+fn emitChildren(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index) anyerror!void {
+    switch (tree.nodeTag(node)) {
+        // `lhs OP rhs` binary operators store both operands in `node_and_node`.
+        .mul,
+        .div,
+        .mod,
+        .mul_wrap,
+        .mul_sat,
+        .add,
+        .sub,
+        .add_wrap,
+        .sub_wrap,
+        .add_sat,
+        .sub_sat,
+        .shl,
+        .shl_sat,
+        .shr,
+        .bit_and,
+        .bit_xor,
+        .bit_or,
+        .bool_and,
+        .bool_or,
+        .equal_equal,
+        .bang_equal,
+        .less_than,
+        .greater_than,
+        .less_or_equal,
+        .greater_or_equal,
+        => {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            try emitAstNode(json, tree, view, lhs);
+            try emitAstNode(json, tree, view, rhs);
+        },
+
+        // `OP expr` prefix operators store the operand in `node`.
+        .negation,
+        .negation_wrap,
+        .bit_not,
+        .bool_not,
+        .address_of,
+        .optional_type,
+        => try emitAstNode(json, tree, view, tree.nodeData(node).node),
+
+        // `( expr )` keeps the inner node in `node_and_token`.
+        .grouped_expression => try emitAstNode(json, tree, view, tree.nodeData(node).node_and_token[0]),
+
+        // `fn proto body`: show the signature (as a leaf) then the body block.
+        .fn_decl => {
+            const proto, const body = tree.nodeData(node).node_and_node;
+            try emitAstNode(json, tree, view, proto);
+            try emitAstNode(json, tree, view, body);
+        },
+
+        // `{ stmts }`: `blockStatements` unifies the two-statement and N
+        // statement forms.
+        .block,
+        .block_semicolon,
+        .block_two,
+        .block_two_semicolon,
+        => {
+            var buf: [2]Ast.Node.Index = undefined;
+            for (tree.blockStatements(&buf, node).?) |stmt| try emitAstNode(json, tree, view, stmt);
+        },
+
+        // `callee(args)`: `fullCall` unifies the one-arg and N-arg forms.
+        .call,
+        .call_comma,
+        .call_one,
+        .call_one_comma,
+        => {
+            var buf: [1]Ast.Node.Index = undefined;
+            const c = tree.fullCall(&buf, node).?;
+            try emitAstNode(json, tree, view, c.ast.fn_expr);
+            for (c.ast.params) |arg| try emitAstNode(json, tree, view, arg);
+        },
+
+        // `return expr`: the value is optional (`return;` has none).
+        .@"return" => {
+            if (tree.nodeData(node).opt_node.unwrap()) |operand| try emitAstNode(json, tree, view, operand);
+        },
+
+        // A declaration input is shown rooted at its decl; descend into the
+        // initializer when present.
+        .simple_var_decl => {
+            if (tree.nodeData(node).opt_node_and_opt_node[1].unwrap()) |init| {
+                try emitAstNode(json, tree, view, init);
+            }
+        },
+
+        else => {},
     }
 }
 
-/// User-frame span of one instruction, or null when its shape carries no
-/// resolvable source node (or it maps into synthetic bytes). Only the
-/// shapes whose mapping is verified are handled; the rest stay unmapped.
-fn instSpan(
-    tree: Ast,
-    view: UserView,
-    base_node: Ast.Node.Index,
-    tag: Zir.Inst.Tag,
-    data: Zir.Inst.Data,
-) ?Ast.Span {
-    const wrapped: Ast.Span = switch (tag) {
+/// `ZirWalk` sink that emits the instruction tree as nested JSON objects
+/// `{ label, detail?, node?, children }`. Section headers are structural
+/// (no `detail`/`node`); an instruction carries its operand/value summary
+/// (`detail`, via `ZirSummary`) and the AST node it lowered from (`node`,
+/// when its shape resolves one).
+const ZirSink = struct {
+    json: *Json,
+    zir: Zir,
+    scratch: *std.Io.Writer.Allocating,
+
+    // The explorer always outlines a wrapped expression, whose only
+    // declaration is the synthetic `__repl_input` the `UserView` otherwise
+    // hides. Emitting it would surface that injection, so the declaration is
+    // elided and its bodies become the top-level sections.
+    pub fn openDeclaration(self: *ZirSink, decl_inst: Zir.Inst.Index, base: Ast.Node.Index) !void {
+        _ = self;
+        _ = decl_inst;
+        _ = base;
+    }
+
+    pub fn closeDeclaration(self: *ZirSink) !void {
+        _ = self;
+    }
+
+    pub fn openSection(self: *ZirSink, label: []const u8) !void {
+        try self.open(label, null, null);
+    }
+
+    pub fn closeSection(self: *ZirSink) !void {
+        try self.close();
+    }
+
+    pub fn openInstruction(
+        self: *ZirSink,
+        inst: Zir.Inst.Index,
+        tag: Zir.Inst.Tag,
+        data: Zir.Inst.Data,
+        base: Ast.Node.Index,
+    ) !void {
+        _ = inst;
+        self.scratch.clearRetainingCapacity();
+        ZirSummary.write(self.zir, tag, data, &self.scratch.writer) catch {};
+        const detail = std.mem.trim(u8, self.scratch.written(), " ");
+        const node = instNode(base, tag, data);
+        try self.open(
+            @tagName(tag),
+            if (node) |n| @intFromEnum(n) else null,
+            if (detail.len > 0) detail else null,
+        );
+    }
+
+    pub fn closeInstruction(self: *ZirSink) !void {
+        try self.close();
+    }
+
+    fn open(self: *ZirSink, label: []const u8, node: ?u32, detail: ?[]const u8) !void {
+        try self.json.beginObject();
+        try self.json.objectField("label");
+        try self.json.write(label);
+        if (detail) |d| {
+            try self.json.objectField("detail");
+            try self.json.write(d);
+        }
+        if (node) |n| {
+            try self.json.objectField("node");
+            try self.json.write(n);
+        }
+        try self.json.objectField("children");
+        try self.json.beginArray();
+    }
+
+    fn close(self: *ZirSink) !void {
+        try self.json.endArray();
+        try self.json.endObject();
+    }
+};
+
+/// AST node an instruction lowered from, or null when its shape carries no
+/// node-relative source. A ZIR `src_node` is relative to the enclosing
+/// declaration (`base`); `toAbsolute` lifts it to an `Ast` node index, which
+/// is the same key `emitAstNode` tags its nodes with. Only verified shapes are
+/// mapped; the rest stay unlinked.
+fn instNode(base: Ast.Node.Index, tag: Zir.Inst.Tag, data: Zir.Inst.Data) ?Ast.Node.Index {
+    return switch (tag) {
         // Binary ops + coercion carry `pl_node.src_node`.
         .add,
         .addwrap,
@@ -137,19 +332,15 @@ fn instSpan(
         .cmp_gt,
         .cmp_gte,
         .as_node,
-        => tree.nodeToSpan(data.pl_node.src_node.toAbsolute(base_node)),
+        => data.pl_node.src_node.toAbsolute(base),
 
         // Unary ops carry `un_node.src_node`.
         .negate,
         .negate_wrap,
         .bit_not,
         .bool_not,
-        => tree.nodeToSpan(data.un_node.src_node.toAbsolute(base_node)),
+        => data.un_node.src_node.toAbsolute(base),
 
-        // Everything else (token-relative shapes like `decl_val`, literals
-        // with no source node, control-flow terminators) stays unmapped --
-        // their AST nodes still carry the source range.
-        else => return null,
+        else => null,
     };
-    return view.translate(wrapped);
 }

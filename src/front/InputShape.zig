@@ -47,7 +47,7 @@ pub const max_input_bytes: u32 = 16 * 1024;
 /// anonymous fn TYPE expression. Two-token lookahead disambiguates --
 /// an l_paren right after `fn` means expression; an identifier means
 /// declaration.
-pub fn classify(input: [:0]const u8) Shape {
+fn classify(input: [:0]const u8) Shape {
     assert(input.len > 0);
     assert(input.len <= max_input_bytes);
 

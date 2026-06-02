@@ -17,29 +17,29 @@
 
     <main>
         <section id="repl-view" class="view">
-            <pre id="repl-output">zig_repl (wasm). try `1 + 2`, `const x = 40; x + 2`, `:help`, `:clear`.
-</pre>
+            <pre id="repl-output"></pre>
             <form id="repl-form">
                 <span class="prompt">&gt;&gt;&gt;</span>
-                <input id="repl-input" autocomplete="off" autofocus spellcheck="false" />
+                <textarea id="repl-input" rows="1" autocomplete="off" autofocus spellcheck="false"></textarea>
             </form>
         </section>
 
         <section id="explorer-view" class="view" hidden>
-            <textarea id="editor" spellcheck="false" placeholder="const x: u32 = 40;&#10;x + 2"></textarea>
+            <textarea id="editor" spellcheck="false"></textarea>
+            <div class="gutter gutter-col"></div>
             <div id="panels">
-                <div class="card" id="card-result">
+                <section class="pane" id="pane-result">
                     <h2>result</h2>
                     <pre id="out-result"></pre>
-                </div>
-                <div class="card" id="card-ast">
+                </section>
+                <section class="pane" id="pane-ast">
                     <h2>ast</h2>
-                    <pre id="out-ast"></pre>
-                </div>
-                <div class="card" id="card-zir">
+                    <div id="out-ast" class="nodes"></div>
+                </section>
+                <section class="pane" id="pane-zir">
                     <h2>zir</h2>
-                    <pre id="out-zir"></pre>
-                </div>
+                    <div id="out-zir" class="nodes"></div>
+                </section>
             </div>
         </section>
     </main>

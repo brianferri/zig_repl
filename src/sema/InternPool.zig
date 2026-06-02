@@ -210,7 +210,7 @@ pub const Nav = struct {
         wanted: bool,
     },
     /// `null` IFF semantic analysis has not yet resolved this Nav.
-    /// In REPL `bindDecls` populates it eagerly, so non-Stage-7
+    /// In REPL `bindDecls` populates it eagerly, so non-generic
     /// flows always see `resolved != null`.
     resolved: ?Resolved,
 
@@ -224,11 +224,11 @@ pub const Nav = struct {
         @"const": bool,
         @"threadlocal": bool,
         /// True IFF this Nav is the binding for an `extern` decl.
-        /// Stage 5/8 sets it; Stage 2 leaves it false.
+        /// Set once FFI lands; false until then.
         is_extern_decl: bool,
         /// The decl's value. Compiler shape: `.none` is the
         /// "type resolved but value not yet" sentinel -- NOT an
-        /// optional. Stage 2's eager evaluator always populates it
+        /// optional. The eager evaluator always populates it
         /// with a real index for `.@"const"` / `.@"var"` kinds.
         value: InternPool.Index,
     };
@@ -259,14 +259,14 @@ pub const OptionalNamespaceIndex = enum(u32) {
     }
 };
 
-/// Stable handle into a file table that lands with Stage 6 (modules).
+/// Stable handle into a file table that lands with module loading.
 /// Defined here so `Namespace.file_scope` matches the compiler's
 /// `Zcu.File.Index` type today; the actual file storage is empty
 /// until the loader exists. Same shape as `src/Zcu.zig:1232`.
 pub const FileIndex = enum(u32) { _ };
 
 /// Optional `FileIndex`. The REPL session-root namespace uses `.none`
-/// because there is no on-disk file backing it; Stage 6 module
+/// because there is no on-disk file backing it; module
 /// loading populates real file indices for loaded modules. Stdlib's
 /// compiler keeps `Namespace.file_scope` non-optional because every
 /// compiler namespace originates from a parsed file -- we deviate to
@@ -306,10 +306,10 @@ pub const Alignment = enum(u6) {
 };
 
 /// A `comptime { ... }` top-level block. Mirrors the compiler's
-/// `InternPool.ComptimeUnit` (`src/InternPool.zig` ~498). Stage 2
-/// records these so `bindDecls` can register them in a namespace's
+/// `InternPool.ComptimeUnit` (`src/InternPool.zig` ~498). These
+/// are recorded so `bindDecls` can register them in a namespace's
 /// `comptime_decls` list; execution lands when Sema gains a
-/// comptime evaluator (Stage 7).
+/// comptime evaluator.
 ///
 /// Known deviation: `zir_index` is `Zir.Inst.Index`, not
 /// `TrackedInst.Index` (see `Nav.analysis.zir_index` for the
@@ -324,13 +324,14 @@ pub const ComptimeUnit = struct {
 /// A lookup scope. Mirrors the compiler's `Zcu.Namespace`
 /// (`src/Zcu.zig` ~844): a parent-chained map of named decls plus
 /// side lists for tests and comptime blocks. Every field present in
-/// the compiler's struct lives here too, even when Stage 2 leaves
-/// it at a sentinel default -- the vestigial fields make Stage 4 /
-/// 6 / 8 additive rather than schema-changing.
+/// the compiler's struct lives here too, even when the current
+/// subset leaves it at a sentinel default -- the vestigial fields
+/// make aggregates / modules / FFI additive rather than
+/// schema-changing.
 pub const Namespace = struct {
     parent: OptionalNamespaceIndex,
     /// The file backing this namespace. `.none` for the session-root
-    /// namespace; Stage 6's module loader populates real file
+    /// namespace; the module loader populates real file
     /// indices for loaded modules. Stdlib keeps this non-optional
     /// because every compiler namespace originates from a parsed
     /// file -- we use `Optional` to give the session root a home.
@@ -342,7 +343,7 @@ pub const Namespace = struct {
     /// change.
     generation: u32,
     /// The struct / enum / union / opaque whose `Key` owns this
-    /// namespace. `.none` for the session root; Stage 4 aggregates
+    /// namespace. `.none` for the session root; aggregates
     /// set it on inner namespaces created by `struct_decl` /
     /// `union_decl` / `enum_decl` / `opaque_decl`.
     owner_type: Index,
@@ -491,8 +492,8 @@ pub const Key = union(enum) {
     type_value: Index,
     /// A pointer type (`*T`, `*const T`, `[*]T`, `[]T`, etc.). Mirrors
     /// the compiler's `Key.PtrType` -- the same shape but a subset of
-    /// the flag set; we start with what Stage 2's alloc/store/load
-    /// needs and widen with each stage.
+    /// the flag set; we carry what the current alloc/store/load
+    /// subset needs and widen as features land.
     ptr_type: PtrType,
     /// A pointer value. Mirrors the compiler's `Key.Ptr`. `base_addr`
     /// today only has `.comptime_alloc` -- enough for REPL session
@@ -633,10 +634,10 @@ pub const Key = union(enum) {
         };
     };
 
-    /// Pointer type. Stage 2's minimal subset of the compiler's
+    /// Pointer type. A minimal subset of the compiler's
     /// `Key.PtrType` -- shape matches but the flag field carries only
     /// what `alloc` / `store` / `load` need (size, is_const, address
-    /// space). Sentinel and alignment will be wired alongside Stage 4
+    /// space). Sentinel and alignment are wired alongside
     /// aggregates.
     pub const PtrType = struct {
         child: Index,
@@ -662,8 +663,8 @@ pub const Key = union(enum) {
 
     /// Pointer value. `ty` is the pointer's type (always a `ptr_type`
     /// Index). `base_addr` identifies the storage region; `byte_offset`
-    /// is the offset within that region. Stage 2 ships
-    /// `.comptime_alloc` only; later stages add `.nav` (declarations),
+    /// is the offset within that region. The current subset is
+    /// `.comptime_alloc` only; later features add `.nav` (declarations),
     /// `.uav` (anonymous addressable values), `.int` (`@ptrFromInt`),
     /// `.eu_payload`, `.opt_payload`, `.comptime_field`, etc. as their
     /// dependent ZIR tags land. Variant naming mirrors the compiler's
@@ -870,7 +871,7 @@ pub const Key = union(enum) {
         /// element is the comptime-known value bound to the
         /// corresponding parameter of `generic_owner`'s type
         /// (`.none` for runtime-known elements). Mirrors
-        /// `Key.Func.comptime_args`. Stage 7 generics populate this.
+        /// `Key.Func.comptime_args`. Generics populate this.
         comptime_args: []const Index = &.{},
     };
 
@@ -1303,7 +1304,7 @@ const Item = struct {
         // Function value from a generic-fn instantiation. data =
         // extra index of FuncInstanceRepr (3 u32 slots: ty,
         // generic_owner, comptime_args_len) plus trailing
-        // `comptime_args[comptime_args_len]`. Lands with Stage 7
+        // `comptime_args[comptime_args_len]`. Lands with
         // generics; the tag slot exists today so the dispatcher,
         // hash, and eql paths cover the variant without later
         // refactoring.
@@ -1370,8 +1371,8 @@ const IntSmall = extern struct {
 /// Extra-arena payload for `Item.Tag.type_pointer`. Three u32 slots:
 /// child, sentinel, and the bit-packed `Key.PtrType.Flags`. Mirrors
 /// the compiler's `Tag.TypePointer` storage shape (smaller because we
-/// haven't ported `packed_offset` yet -- adds when Stage 4's
-/// host-int-backed slice machinery needs it).
+/// haven't ported `packed_offset` yet -- adds when the
+/// host-int-backed slice machinery for aggregates needs it).
 const PtrTypeRepr = extern struct {
     child: u32,
     sentinel: u32,
@@ -1391,12 +1392,12 @@ const FuncTypeRepr = extern struct {
     return_type: u32,
     flags: u32,
 
-    /// Stage-3-minimum CC packing: `cc_tag` only. The compiler
+    /// Minimal CC packing: `cc_tag` only. The compiler
     /// uses `PackedCallingConvention(u18)` which also carries
     /// `incoming_stack_alignment` + per-variant `extra`. We
     /// reconstruct the full `std.lang.CallingConvention` on unpack
     /// with default-initialised payloads since REPL paths today
-    /// only need `.auto` / `.c`; FFI (Stage 5/8) widens to the
+    /// only need `.auto` / `.c`; FFI widens to the
     /// full pack.
     const Flags = packed struct(u32) {
         cc_tag: std.lang.CallingConvention.Tag,
@@ -1764,7 +1765,7 @@ fn seedEmptyString(pool: *InternPool) Allocator.Error!void {
 /// the same with one map. The dedup-hit rollback is identical -- the
 /// trailing append simply leaves dead bytes that nothing references.
 ///
-/// Asserts there are no embedded `0` bytes. Stage 2 callers (decl
+/// Asserts there are no embedded `0` bytes. Current callers (decl
 /// names, type names) cannot legally contain them. When a `Key`
 /// variant eventually needs embedded-null content (e.g. error names),
 /// add an `EmbeddedNulls` policy parameter mirroring the compiler's
@@ -1943,7 +1944,7 @@ pub fn fullyQualifiedName(
 
 /// Record a `comptime { ... }` block. Returns its stable `Id` so
 /// the namespace's `comptime_decls` list can reference it. Execution
-/// is deferred to Stage 7 (`@comptime` evaluator).
+/// is deferred until the `@comptime` evaluator lands.
 pub fn createComptimeUnit(
     pool: *InternPool,
     gpa: Allocator,
@@ -3078,7 +3079,7 @@ fn emitFuncType(pool: *InternPool, ft: Key.FuncType) Allocator.Error!void {
 /// Emit a `func` Item. Dispatches between Tag.func_decl,
 /// Tag.func_instance, and Tag.func_coerced based on the Key.Func
 /// shape -- mirrors the compiler's three-Item-tag layout so
-/// Stage 7 generics and the fn-coercion follow-up land as pure
+/// generics and the fn-coercion follow-up land as pure
 /// emit additions without disturbing existing call sites.
 fn emitFunc(pool: *InternPool, f: Key.Func) Allocator.Error!void {
     assert(f.ty != .none);
@@ -3148,9 +3149,9 @@ fn funcTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
     const param_slots = pool.extra.items[trail..][0..params_len];
     const param_types: []const Index = @ptrCast(param_slots);
 
-    // Stage-3 simplification: reconstruct the CC variant with a
-    // default-initialised payload (incoming_stack_alignment = null
-    // for variants that carry one). Stage 5/8 widens to full
+    // Minimal calling-convention storage: reconstruct the CC variant
+    // with a default-initialised payload (incoming_stack_alignment =
+    // null for variants that carry one). FFI widens to full
     // `PackedCallingConvention` round-trip.
     const cc: std.lang.CallingConvention = ccFromTag(flags.cc_tag);
 
@@ -3223,14 +3224,14 @@ fn funcCoercedFromExtra(pool: *const InternPool, extra_index: u32) Key {
 }
 
 /// Reconstruct a `std.lang.CallingConvention` from its packed tag.
-/// Stage-3 storage keeps only the tag; the payload is reconstructed
+/// Minimal storage keeps only the tag; the payload is reconstructed
 /// here for the safe variants AstGen emits in normal user code
 /// (void-payload CCs + the common per-target `.c` aliases whose
 /// payload is `CommonOptions{}`, all-default-fields). Variants
 /// whose payload has required fields (`spirv_*.mode`,
 /// `arm_interrupt.type`, etc.) panic loudly here so a future ZIR
 /// path using one of them surfaces immediately rather than reading
-/// undefined memory; lifted to full pack/unpack with Stage 5/8 FFI.
+/// undefined memory; lifted to full pack/unpack with FFI.
 fn ccFromTag(tag: std.lang.CallingConvention.Tag) std.lang.CallingConvention {
     return switch (tag) {
         .auto => .auto,

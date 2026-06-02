@@ -1,0 +1,20 @@
+{
+  "name": "zig_repl-web-test",
+  "private": true,
+  "type": "module",
+  "description": "Headless browser harness for the wasm SPA in web/public.",
+  "scripts": {
+    "check": "tsc --noEmit && tsc -p ../public && eslint .",
+    "test": "node --import tsx/esm --test '**/*.test.ts'"
+  },
+  "devDependencies": {
+    "@stylistic/eslint-plugin": "^5.10.0",
+    "@types/node": "^25.5.0",
+    "eslint": "^10.1.0",
+    "eslint-plugin-jsdoc": "^62.8.1",
+    "playwright": "^1.49.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.57.2"
+  }
+}

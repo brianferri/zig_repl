@@ -13,8 +13,7 @@ const Session = @import("../../Session.zig");
 const LineEditor = @import("LineEditor.zig");
 const Terminal = @import("../../terminal/Terminal.zig");
 const themes = @import("theme/root.zig");
-const Command = @import("../../commands/Command.zig");
-const Commands = @import("Commands.zig");
+const Commands = @import("root.zig").commands;
 const eval = @import("../../eval.zig");
 const renderValue = @import("../../render/Value.zig").render;
 
@@ -148,23 +147,15 @@ fn dispatch(repl: *Repl, raw_line: []const u8, stdout: *std.Io.Writer) !void {
     if (trimmed.len == 0) return;
     if (trimmed[0] != ':') return repl.evaluate(trimmed, stdout);
 
-    // Build the registry per dispatch, where each command's bound
-    // context is in scope. `set` and `buf` are stack locals that the
-    // entries point into, so they must outlive the match below -- they
-    // do, living for this call.
-    var set = Commands.init(repl);
-    var buf: [Commands.count]*Command = undefined;
-    const entries = set.slice(&buf);
-
     var iter = std.mem.splitScalar(u8, trimmed[1..], ' ');
     const name = iter.first();
     const argument = iter.rest();
 
-    const cmd = Commands.find(entries, name) orelse {
+    const cmd = Commands.find(name) orelse {
         try stdout.print("unknown command: :{s}\n", .{name});
         return;
     };
-    try cmd.run(argument, stdout);
+    try cmd.run(repl, &Commands.all, argument, stdout);
 }
 
 fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {

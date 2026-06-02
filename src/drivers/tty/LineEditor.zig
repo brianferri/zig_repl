@@ -474,15 +474,6 @@ fn redraw(editor: *LineEditor, theme: *const themes.Theme, level: ColorLevel) !v
     try writer.flush();
 }
 
-// ---- test harness ----------------------------------------------
-//
-// These tests drive `applyEvent` and `redraw` directly against an
-// in-memory writer, exercising the editor without a real terminal.
-// Each test feeds a synthetic Event sequence and asserts the
-// resulting buffer / cursor / writer state. Names map directly to
-// the bugs they protect against: arrow-overshoot wipes, submit-
-// over-buffer, line-join, history recall.
-
 const testing = std.testing;
 
 fn keyPress(cp: u21) Event.Event {

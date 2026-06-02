@@ -63,16 +63,18 @@ pub fn build(b: *std.Build) void {
     wasm.entry = .disabled;
 
     const install_wasm = b.addInstallArtifact(wasm, .{
-        .dest_dir = .{ .override = .{ .custom = "web" } },
+        .dest_dir = .{ .override = .{
+            .custom = "web",
+        } },
     });
-    const install_web_assets = b.addInstallDirectory(.{
-        .source_dir = b.path("web"),
+    const install_web = b.addInstallDirectory(.{
+        .source_dir = b.path("web/public"),
         .install_dir = .prefix,
         .install_subdir = "web",
     });
-    const wasm_step = b.step("wasm", "Build the wasm REPL + web testing ground");
+    const wasm_step = b.step("wasm", "Build the wasm REPL + web frontend");
     wasm_step.dependOn(&install_wasm.step);
-    wasm_step.dependOn(&install_web_assets.step);
+    wasm_step.dependOn(&install_web.step);
 
     const module_tests = b.addTest(.{ .root_module = repl_module });
     const exe_tests = b.addTest(.{ .root_module = exe_module });

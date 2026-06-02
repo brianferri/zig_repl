@@ -1,10 +1,9 @@
-//! Input-device interface the `LineEditor` drives, decoupling the
-//! editor from the concrete TTY `Terminal`. Modelled on `Protocol` /
-//! `std.Io.Reader`: an implementation embeds a `Device` as a field
-//! named `interface` and recovers its concrete `*Self` inside the
-//! vtable via `@fieldParentPtr("interface", d)`. The editor reads only
-//! this interface, so any frontend can supply its own device -- its own
-//! event source -- without the editor learning of it.
+//! Input-device interface the `LineEditor` drives. Modelled on
+//! `std.Io.Reader`: an implementation embeds a `Device` as a field named
+//! `interface` and recovers its concrete `*Self` inside the vtable via
+//! `@fieldParentPtr("interface", d)`. The editor reads only this
+//! interface, so any frontend supplies its own event source without the
+//! editor learning of it.
 
 const std = @import("std");
 const assert = std.debug.assert;

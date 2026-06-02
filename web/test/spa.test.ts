@@ -1,0 +1,125 @@
+import assert from "node:assert/strict";
+
+import { after, before, describe, test } from "node:test";
+
+import { chromium } from "playwright";
+
+import type { Browser, Page } from "playwright";
+
+const BASE = process.env.BASE_URL ?? "http://localhost:3000";
+
+interface AstNode {
+    id: number;
+    label: string;
+    lo: number;
+    hi: number;
+    children: Array<AstNode>;
+}
+
+interface ZirNode {
+    label: string;
+    detail?: string;
+    node?: number;
+    children: Array<ZirNode>;
+}
+
+interface Outline {
+    source: string;
+    ast: Array<AstNode>;
+    zir: Array<ZirNode>;
+}
+
+declare global {
+    interface Window {
+        repl: {
+            evalLine: (line: string) => string,
+            preview: (line: string) => string,
+            outline: (line: string) => Outline
+        };
+    }
+}
+
+function flattenZir(nodes: Array<ZirNode>): Array<ZirNode> {
+    const out: Array<ZirNode> = [];
+    for (const node of nodes) {
+        out.push(node);
+        out.push(...flattenZir(node.children));
+    }
+    return out;
+}
+
+await describe("wasm repl", async () => {
+    let browser: Browser;
+    let page: Page;
+    const errors: Array<string> = [];
+
+    before(async () => {
+        browser = await chromium.launch();
+        page = await browser.newPage();
+        page.on("pageerror", (error) => errors.push(String(error)));
+        page.on("console", (message) => {
+            if (message.type() === "error")
+                errors.push(message.text());
+        });
+        await page.goto(BASE, { waitUntil: "load" });
+        await page.waitForSelector("body[data-ready]", { timeout: 15000 });
+    });
+
+    after(async () => {
+        await browser.close();
+    });
+
+    await test("evaluates an expression to its value", async () => {
+        const out = await page.evaluate(() => window.repl.evalLine("1 + 2"));
+        assert.match(out, /\b3\b/);
+    });
+
+    await test("persists session bindings across evaluations", async () => {
+        const first = await page.evaluate(() => window.repl.evalLine("const x = 40; x + 2"));
+        assert.match(first, /\b42\b/);
+        const second = await page.evaluate(() => window.repl.evalLine("x * 2"));
+        assert.match(second, /\b80\b/);
+    });
+
+    await test("recognises :clear and reports unknown commands", async () => {
+        assert.equal((await page.evaluate(() => window.repl.evalLine(":clear"))).trim(), "");
+        assert.match(await page.evaluate(() => window.repl.evalLine(":help")), /:clear/);
+        assert.match(await page.evaluate(() => window.repl.evalLine(":bogus")), /unknown command: :bogus/);
+    });
+
+    await test("previews value and type without touching session state", async () => {
+        const out = await page.evaluate(() => window.repl.preview("40 * 3 - 1"));
+        assert.match(out, /\b119\b/);
+        assert.match(out, /comptime_int/);
+    });
+
+    await test("outlines the ast as a tree and binds zir instructions to it by id", async () => {
+        const out = await page.evaluate(() => window.repl.outline("40 * 3 - 1"));
+        assert.equal(out.source, "40 * 3 - 1");
+
+        // the syntax tree roots at `sub`, with `mul` and the `1` literal as its
+        // children -- `1` belongs to the subtraction, not the multiplication
+        const [root] = out.ast;
+        assert.equal(root.label, "sub");
+        assert.equal(out.source.slice(root.lo, root.hi), "40 * 3 - 1");
+        const mul = root.children.find((node) => node.label === "mul");
+        assert.ok(mul);
+        assert.equal(out.source.slice(mul.lo, mul.hi), "40 * 3");
+        assert.equal(mul.children.length, 2);
+        assert.ok(root.children.some((node) => node.label === "number_literal"));
+
+        // the zir comes back as a tree too; its arithmetic points back to those
+        // ast nodes by id, not by overlapping spans
+        assert.ok(out.zir[0].children.length);
+        const zir = flattenZir(out.zir);
+        const zmul = zir.find((node) => node.label === "mul");
+        assert.ok(zmul);
+        assert.equal(zmul.node, mul.id);
+        assert.match(zmul.detail ?? "", /lhs=/);
+        assert.equal(zir.find((node) => node.label === "sub")?.node, root.id);
+    });
+
+    await test("loads without page errors", () => {
+        assert.deepEqual(errors, []);
+    });
+});

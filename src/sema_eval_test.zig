@@ -1116,7 +1116,7 @@ test "ptr_type: e2e through Pipeline produces interned Key.ptr_type" {
     try testing.expectEqual(true, key.ptr_type.flags.is_const);
     try testing.expectEqual(InternPool.Key.PtrType.Size.one, key.ptr_type.flags.size);
 
-    // Stage 1 dedup check at the e2e layer: same source twice gives
+    // Interning dedup at the e2e layer: same source twice gives
     // the same Index.
     const second = try evalSource(gpa, &pool, "*const u8", &diag_buf);
     try testing.expectEqual(value.index, second.index);
@@ -1539,7 +1539,7 @@ test "decl: cross-line rebind preserves the original binding (silent-drop limita
     var diag_buf: [4096]u8 = undefined;
     _ = try evalSessionLines(gpa, &pool, ns, &.{"const z = 1;"}, &diag_buf);
 
-    // Known Stage-2 limitation: cross-line rebind via wrap-injection
+    // Known limitation: cross-line rebind via wrap-injection
     // produces a ZIR "duplicate struct member name" error whose main
     // span anchors on the *injected* `const z: ... = undefined;`
     // line (the original occurrence from AstGen's perspective).

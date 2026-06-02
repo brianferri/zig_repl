@@ -78,7 +78,7 @@ comptime_break_inst: Zir.Inst.Index = undefined,
 /// `branch_count`; when it exceeds `branch_quota`, Sema fails with
 /// the same "evaluation exceeded N backwards branches" diagnostic
 /// AstGen emits. The user-facing knob is `@setEvalBranchQuota`
-/// (Stage 7 builtin coverage).
+/// (lands with broader builtin coverage).
 branch_quota: u32 = default_branch_quota,
 branch_count: u32 = 0,
 /// Recursion-depth counter for `.call` / `.field_call`.
@@ -359,7 +359,7 @@ fn evalBody(sema: *Sema, body: []const Zir.Inst.Index) Error!Value {
 /// Increments `branch_count`; on overflow past `branch_quota`,
 /// emits the same diagnostic AstGen does and aborts via
 /// `error.AnalysisFail`. Raise the limit at runtime through
-/// `@setEvalBranchQuota` (Stage 7).
+/// `@setEvalBranchQuota` once the comptime evaluator lands.
 fn emitBackwardBranch(sema: *Sema) Error!void {
     sema.branch_count += 1;
     if (sema.branch_count > sema.branch_quota) {
@@ -2073,8 +2073,8 @@ fn evalNegate(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value
 /// `ptr_type`: evaluate a `*T` / `*const T` / `[*]T` / `[]T` / `[*c]T`
 /// type expression to an interned `Key.ptr_type` value. Sentinel,
 /// align, address_space, and bit_range extensions trail the payload
-/// via additional `Ref` slots in extra; Stage 2 handles only the
-/// base case (none of the optional extensions). Compiler reference:
+/// via additional `Ref` slots in extra; the current subset handles
+/// only the base case (none of the optional extensions). Compiler reference:
 /// `src/Sema.zig:zirPtrType`.
 fn evalPtrType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
@@ -2239,7 +2239,7 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
 /// a pointer into `comptime_allocs` so the caller can mutate `val`
 /// (for store) or read it (for load) without copying. The `byte_offset`
 /// is asserted to be zero -- field/element pointers (non-zero offsets)
-/// arrive with Stage 4 aggregates.
+/// arrive with aggregates.
 fn lookupComptimeAlloc(sema: *Sema, ptr: InternPool.Key.Ptr) Error!*ComptimeAlloc {
     assert(@intFromPtr(sema) != 0);
 
@@ -2420,7 +2420,7 @@ fn isVectorElemType(pool: *const InternPool, child: InternPool.Index) bool {
 /// `optional_type operand`: build `?child`. Compiler reference:
 /// src/Sema.zig:zirOptionalType. The compiler also rejects opaque and
 /// `null` element types; neither is constructible in the REPL yet
-/// (opaque arrives with Stage 4 container decls), so that guard is
+/// (opaque arrives with container decls), so that guard is
 /// deferred rather than silently dropped.
 fn evalOptionalType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
@@ -2764,8 +2764,9 @@ fn coerceToErrorUnion(
 
     // An error value of any error-set type coerces in by name --
     // the compiler verifies the name is a member of the destination
-    // error set. Stage 3 ships the name carry; set-membership
-    // checking lands when error-union narrowing handlers do.
+    // error set. The current subset carries the name only;
+    // set-membership checking lands when error-union narrowing
+    // handlers do.
     if (value_key == .err) {
         const idx = try ip.internErrorUnion(.{
             .ty = dest_ty,
@@ -3140,7 +3141,7 @@ fn bindValueDecl(
 ) Error!void {
     const value_body = unwrapped.value_body orelse {
         try sema.writer.print(
-            "bindDecls '{s}': no value_body (extern decl, Stage 5/8)\n",
+            "bindDecls '{s}': no value_body (extern decl)\n",
             .{sema.intern_pool.stringSlice(name)},
         );
         return error.AnalysisFail;
@@ -3198,7 +3199,7 @@ fn bindTestDecl(
 ) Error!void {
     _ = unwrapped;
     const nav_idx = try sema.intern_pool.createNav(sema.gpa, name, name);
-    // Test bodies stay unevaluated until Stage 6 brings std.testing;
+    // Test bodies stay unevaluated until module loading brings std.testing;
     // the Nav carries the name for `:test <name>` listing later.
     sema.intern_pool.navPtr(nav_idx).analysis = .{
         .namespace = ns_idx,
@@ -3421,7 +3422,7 @@ fn evalLoop(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///
 /// Item kinds covered: `.body_len` (literal / computed item),
 /// `.under` (wildcard), `.error_value` (matches err-union err_name).
-/// `.enum_literal` items and prong captures land with Stage 4 enum
+/// `.enum_literal` items and prong captures land with enum
 /// + capture machinery and surface a structured diagnostic.
 ///
 /// Ranges (`range_infos`) use BigInt comparison after coercing both
@@ -3576,7 +3577,7 @@ fn failSwitch(sema: *Sema, what: []const u8) Error!?Value {
 /// (break_target is the param inst itself, mirroring
 /// src/Sema.zig:zirParam ~9031) and push onto `params`
 /// for the enclosing `.func` to drain. `.is_generic` params
-/// surface a structured diagnostic -- generics are Stage 7+.
+/// surface a structured diagnostic -- generics are unsupported.
 fn evalParam(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
@@ -3608,8 +3609,8 @@ fn failAnytypeParam(sema: *Sema) Error!?Value {
 /// reference: src/Sema.zig:zirFunc ~8321 + funcCommon ~8896.
 ///
 /// CC defaults to `.auto` here regardless of `func_fancy`'s
-/// cc_ref / cc_body -- same Stage-3 simplification documented at
-/// the FuncType storage site (Stage 5/8 FFI widens). The inferred-
+/// cc_ref / cc_body -- same minimal calling-convention storage
+/// documented at the FuncType storage site (FFI widens). The inferred-
 /// error-set flag (`.func_inferred`) is observed via `getFnInfo`
 /// but doesn't affect the FuncType encoding today; it'll matter
 /// when error-set inference moves out of the per-fn analysis.
@@ -3675,8 +3676,7 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///      callers of the same func get a clean slate.
 ///
 /// `.field_call` (`a.foo(x)`) needs type-method resolution which
-/// requires Stage 4 struct support; surfaces a structured
-/// diagnostic for now.
+/// requires struct support; surfaces a structured diagnostic.
 fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, field }) Error!?Value {
     assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
@@ -3692,7 +3692,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     defer sema.call_depth -= 1;
 
     if (kind == .field) {
-        try sema.writer.writeAll("field_call: method-call resolution requires Stage 4 struct support\n");
+        try sema.writer.writeAll("field_call: method-call resolution requires struct support\n");
         return error.AnalysisFail;
     }
 
@@ -3746,8 +3746,8 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     }
     defer sema.zir = caller_zir;
 
-    // Extract the body + param insts via getFnInfo on the (now
-    // possibly-swapped) sema.zir.
+    // Extract the body + param insts via getFnInfo on the
+    // possibly-swapped sema.zir.
     const info = sema.zir.getFnInfo(func.zir_body_inst);
     const tags = sema.zir.instructions.items(.tag);
     var param_insts = try sema.gpa.alloc(Zir.Inst.Index, args_len);
@@ -3882,14 +3882,14 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         // Bridge into std.lang.* (CallingConvention, AtomicOrder,
         // AddressSpace, ...). Compiler reference:
         // src/Sema.zig:zirStdLangValue ~24709 + getStdLangType.
-        // Full end-to-end requires Stage 6's `std` module loader
+        // Full end-to-end requires the `std` module loader
         // -- without it we have no interned Type for the std.lang
         // container. Surface as a named diagnostic so the gap is
         // visible (vs the generic `inline else` fallback).
         .std_lang_value => {
             const small: std.zig.Zir.Inst.StdLangValue = @enumFromInt(extended.small);
             try sema.writer.print(
-                "extended.std_lang_value(.{s}): std.lang access requires Stage 6 module loading\n",
+                "extended.std_lang_value(.{s}): std.lang access requires module loading\n",
                 .{@tagName(small)},
             );
             return error.AnalysisFail;

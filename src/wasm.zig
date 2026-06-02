@@ -20,9 +20,7 @@ const InternPool = @import("sema/InternPool.zig");
 const InputShape = @import("front/InputShape.zig");
 const render_value = @import("render/Value.zig");
 const outline = @import("drivers/wasm/outline.zig");
-const dump = @import("commands/dump.zig");
-const Command = @import("commands/Command.zig");
-const Commands = @import("drivers/wasm/Commands.zig");
+const Commands = @import("drivers/wasm/root.zig").commands;
 
 // `wasm_allocator` requires the module be single-threaded (build.zig sets
 // it); it grows linear memory as needed, which detaches the host's view of
@@ -83,14 +81,11 @@ fn dispatch(input: []const u8) !void {
     const name = iter.first();
     const argument = iter.rest();
 
-    var set = Commands.init(&session);
-    var buf: [Commands.count]*Command = undefined;
-    const entries = set.slice(&buf);
-    const cmd = Commands.find(entries, name) orelse {
+    const cmd = Commands.find(name) orelse {
         try w.print("unknown command: :{s}\n", .{name});
         return;
     };
-    try cmd.run(argument, w);
+    try cmd.run(&session, &Commands.all, argument, w);
 }
 
 fn evaluate(input: []const u8, w: *std.Io.Writer) !void {
@@ -130,11 +125,8 @@ fn preview(input: []const u8) !void {
     defer preview_session.deinit();
 
     // For "declarations; trailing expression", bind the declarations into
-    // the throwaway session first so the expression's lowering and value
-    // resolve them. Dumping the expression before evaluating it keeps the
-    // synthetic wrapper out of scope, so its name can't collide on the
-    // following eval. The lone-segment case (pure expression or pure
-    // declarations) just runs as-is.
+    // the throwaway session first so the trailing expression resolves them.
+    // The lone-segment case (pure expression or pure declarations) runs as-is.
     var expr = trimmed;
     if (try InputShape.splitTrailingExpr(gpa, trimmed)) |split| {
         _ = eval.run(&preview_session, split.decls, w) catch |err| switch (err) {
@@ -144,8 +136,6 @@ fn preview(input: []const u8) !void {
         expr = split.expr;
     }
 
-    try dump.dumpInput(&preview_session, expr, w);
-
     const outcome = eval.run(&preview_session, expr, w) catch |err| switch (err) {
         error.ParseError, error.ZirError, error.AnalysisFail => return,
         else => |e| return e,
@@ -154,7 +144,7 @@ fn preview(input: []const u8) !void {
         if (outcome.shape == .expression) try w.writeAll("(no value)\n");
         return;
     };
-    try w.writeAll("\n=> ");
+    try w.writeAll("=> ");
     try render_value.render(value, preview_session.intern_pool, w);
     try w.writeAll("   type: ");
     try render_value.writeTypeName(value.typeOf(preview_session.intern_pool).toIndex(), preview_session.intern_pool, w);

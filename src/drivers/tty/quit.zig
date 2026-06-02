@@ -1,37 +1,23 @@
+//! `:quit` -- end the TTY run loop.
+
 const std = @import("std");
 const assert = std.debug.assert;
 
 const Repl = @import("Repl.zig");
-const Command = @import("../../commands/Command.zig");
+const Command = @import("../commands/Command.zig").Command;
 
-const Quit = @This();
-
-interface: Command,
-repl: *Repl,
-
-pub fn init(repl: *Repl) Quit {
+pub fn command(comptime Ctx: type) Command(Ctx) {
     return .{
-        .interface = .{
-            .name = "quit",
-            .summary = "Exit the REPL",
-            .vtable = &vtable,
-        },
-        .repl = repl,
+        .name = "quit",
+        .summary = "Exit the REPL",
+        .run = struct {
+            fn run(ctx: Ctx, _: []const Command(Ctx), _: []const u8, stdout: *std.Io.Writer) anyerror!void {
+                const repl: *Repl = ctx;
+                assert(@intFromPtr(repl) != 0);
+                assert(@intFromPtr(stdout) != 0);
+                try stdout.writeAll("bye\n");
+                repl.should_quit = true;
+            }
+        }.run,
     };
-}
-
-pub fn command(self: *Quit) *Command {
-    return &self.interface;
-}
-
-const vtable: Command.VTable = .{ .run = run };
-
-fn run(c: *Command, argument: []const u8, stdout: *std.Io.Writer) anyerror!void {
-    _ = argument;
-    const self: *Quit = @fieldParentPtr("interface", c);
-    assert(@intFromPtr(self.repl) != 0);
-    assert(@intFromPtr(stdout) != 0);
-
-    try stdout.writeAll("bye\n");
-    self.repl.should_quit = true;
 }

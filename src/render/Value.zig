@@ -82,8 +82,9 @@ fn renderAggregate(
 
 /// Inline-print a value: same as `render` but without the trailing
 /// newline. Used by `renderAggregate` so element values compose
-/// into the parent brace-list. Stage 2 set: int / simple_value /
-/// undef. Unsupported keys render as `<elem>` rather than recurse.
+/// into the parent brace-list. The current subset is int /
+/// simple_value / undef. Unsupported keys render as `<elem>` rather
+/// than recurse.
 fn renderElemInline(
     elem_idx: InternPool.Index,
     pool: *const InternPool,
@@ -141,8 +142,8 @@ fn renderTypeRef(
 
 /// Write a type Index's Zig surface-syntax name (no trailing newline).
 /// Recurses on pointer / anyframe children. Matches the canonical
-/// print form used by the compiler's `Type.print` for the cases
-/// Stage 2 ships (no sentinel, no align, no address_space prefix,
+/// print form used by the compiler's `Type.print` for the
+/// supported cases (no sentinel, no align, no address_space prefix,
 /// no vector_index, no bit_range).
 pub fn writeTypeName(
     type_index: InternPool.Index,
@@ -185,7 +186,7 @@ pub fn writeTypeName(
 
 /// Render an array type as Zig surface syntax: `[N]T` or `[N:s]T`.
 /// Sentinel is rendered by recursing into the value renderer with
-/// the sentinel slot's Index; for the Stage-2 set this collapses to
+/// the sentinel slot's Index; for the current subset this collapses to
 /// integer literal text via the same `render` path.
 fn writeArrayTypeName(
     at: InternPool.Key.ArrayType,
