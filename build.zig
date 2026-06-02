@@ -48,6 +48,32 @@ pub fn build(b: *std.Build) void {
     const docs_step = b.step("docs", "Generate library documentation");
     docs_step.dependOn(&install_docs.step);
 
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const wasm = b.addExecutable(.{
+        .name = "zig_repl",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm.zig"),
+            .target = wasm_target,
+            .optimize = optimize,
+            .single_threaded = true,
+            .link_libc = false,
+        }),
+    });
+    wasm.rdynamic = true;
+    wasm.entry = .disabled;
+
+    const install_wasm = b.addInstallArtifact(wasm, .{
+        .dest_dir = .{ .override = .{ .custom = "web" } },
+    });
+    const install_web_assets = b.addInstallDirectory(.{
+        .source_dir = b.path("web"),
+        .install_dir = .prefix,
+        .install_subdir = "web",
+    });
+    const wasm_step = b.step("wasm", "Build the wasm REPL + web testing ground");
+    wasm_step.dependOn(&install_wasm.step);
+    wasm_step.dependOn(&install_web_assets.step);
+
     const module_tests = b.addTest(.{ .root_module = repl_module });
     const exe_tests = b.addTest(.{ .root_module = exe_module });
     const run_module_tests = b.addRunArtifact(module_tests);

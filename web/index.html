@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>zig_repl</title>
+    <link rel="stylesheet" href="./style.css" />
+</head>
+
+<body>
+    <nav>
+        <span class="brand">zig_repl</span>
+        <button id="tab-repl" class="active" data-view="repl-view">repl</button>
+        <button id="tab-explorer" data-view="explorer-view">explorer</button>
+    </nav>
+
+    <main>
+        <section id="repl-view" class="view">
+            <pre id="repl-output">zig_repl (wasm). try `1 + 2`, `const x = 40; x + 2`, `:help`, `:clear`.
+</pre>
+            <form id="repl-form">
+                <span class="prompt">&gt;&gt;&gt;</span>
+                <input id="repl-input" autocomplete="off" autofocus spellcheck="false" />
+            </form>
+        </section>
+
+        <section id="explorer-view" class="view" hidden>
+            <textarea id="editor" spellcheck="false" placeholder="const x: u32 = 40;&#10;x + 2"></textarea>
+            <div id="panels">
+                <div class="card" id="card-result">
+                    <h2>result</h2>
+                    <pre id="out-result"></pre>
+                </div>
+                <div class="card" id="card-ast">
+                    <h2>ast</h2>
+                    <pre id="out-ast"></pre>
+                </div>
+                <div class="card" id="card-zir">
+                    <h2>zir</h2>
+                    <pre id="out-zir"></pre>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+</body>
+
+</html>
