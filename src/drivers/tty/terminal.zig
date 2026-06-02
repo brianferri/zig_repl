@@ -3,25 +3,43 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 const Repl = @import("Repl.zig");
-const themes = @import("../../theme/root.zig");
-const Spec = @import("../../commands/Spec.zig").Spec;
+const themes = @import("theme/root.zig");
+const Command = @import("../../commands/Command.zig");
 
-pub const spec: Spec(*Repl) = .{
-    .name = "terminal",
-    .summary = "Show the active terminal's detected capabilities",
-    .run = run,
-};
+const TerminalCmd = @This();
 
-fn run(repl: *Repl, argument: []const u8, stdout: *std.Io.Writer) anyerror!void {
+interface: Command,
+repl: *Repl,
+
+pub fn init(repl: *Repl) TerminalCmd {
+    return .{
+        .interface = .{
+            .name = "terminal",
+            .summary = "Show the active terminal's detected capabilities",
+            .vtable = &vtable,
+        },
+        .repl = repl,
+    };
+}
+
+pub fn command(self: *TerminalCmd) *Command {
+    return &self.interface;
+}
+
+const vtable: Command.VTable = .{ .run = run };
+
+fn run(c: *Command, argument: []const u8, stdout: *std.Io.Writer) anyerror!void {
+    _ = argument;
+    const self: *TerminalCmd = @fieldParentPtr("interface", c);
+    const repl = self.repl;
     assert(@intFromPtr(repl) != 0);
     assert(@intFromPtr(stdout) != 0);
-    _ = argument;
 
     const terminal = repl.terminal orelse {
         try stdout.writeAll("no interactive terminal (running in cooked mode)\n");
         return;
     };
-    const level = terminal.color_level;
+    const level = terminal.interface.color_level;
 
     try stdout.print("platform:  {s}\n", .{@tagName(builtin.os.tag)});
     try stdout.print("color:     {s}\n", .{@tagName(level)});

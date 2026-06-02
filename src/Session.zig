@@ -1,8 +1,9 @@
 //! Frontend-agnostic interpreter session: the state a backend needs to
 //! evaluate input -- allocator, intern pool, root namespace, and the
 //! committed pipeline snapshots. No terminal, file, or IO surface; those
-//! live in the frontend (`Frontend.zig` for the TTY REPL). Any frontend --
-//! the TTY REPL, a wasm module, or a test -- creates one of these directly.
+//! live in the frontend (`frontend/tty/Repl.zig` for the TTY REPL). Any
+//! frontend -- the TTY REPL, a wasm module, or a test -- creates one of
+//! these directly.
 
 const std = @import("std");
 const assert = std.debug.assert;

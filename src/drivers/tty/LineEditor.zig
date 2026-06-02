@@ -19,10 +19,10 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const Repl = @import("frontend/tty/Repl.zig");
-const Event = @import("terminal/Event.zig");
+const Device = @import("../../device/Device.zig");
+const Event = @import("../../device/Event.zig");
 const themes = @import("theme/root.zig");
-const ColorLevel = @import("terminal/Color.zig").ColorLevel;
+const ColorLevel = @import("../../device/Color.zig").ColorLevel;
 
 const LineEditor = @This();
 
@@ -83,14 +83,10 @@ pub fn deinit(editor: *LineEditor) void {
 /// (Ctrl+D on empty buffer, or the underlying terminal closing).
 /// The returned slice is borrowed from the editor's buffer and is
 /// invalidated on the next `readLine` call.
-pub fn readLine(editor: *LineEditor, repl: *Repl) !?[]const u8 {
+pub fn readLine(editor: *LineEditor, device: *Device, theme: *const themes.Theme) !?[]const u8 {
     assert(@intFromPtr(editor) != 0);
-    // readLine only runs interactively, where the frontend holds the
-    // live terminal; the prompt's theme and color come from there.
-    assert(repl.terminal != null);
-    const terminal = repl.terminal.?;
-    const theme = repl.theme;
-    const level = terminal.color_level;
+    assert(@intFromPtr(device) != 0);
+    const level = device.color_level;
 
     editor.buffer.clearRetainingCapacity();
     editor.cursor = 0;
@@ -101,7 +97,7 @@ pub fn readLine(editor: *LineEditor, repl: *Repl) !?[]const u8 {
     try editor.redraw(theme, level);
 
     while (true) {
-        const maybe_event = try terminal.readEvent();
+        const maybe_event = try device.readEvent();
         const event = maybe_event orelse return null;
         const outcome = try editor.applyEvent(event);
         switch (outcome) {

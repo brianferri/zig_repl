@@ -10,15 +10,13 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const Session = @import("../../Session.zig");
-const LineEditor = @import("../../LineEditor.zig");
+const LineEditor = @import("LineEditor.zig");
 const Terminal = @import("../../terminal/Terminal.zig");
-const themes = @import("../../theme/root.zig");
-const commands = @import("../../commands.zig");
+const themes = @import("theme/root.zig");
+const Command = @import("../../commands/Command.zig");
+const Commands = @import("Commands.zig");
 const eval = @import("../../eval.zig");
 const renderValue = @import("../../render/Value.zig").render;
-const quit_cmd = @import("quit.zig");
-const theme_cmd = @import("theme.zig");
-const terminal_cmd = @import("terminal.zig");
 
 const Repl = @This();
 
@@ -102,7 +100,7 @@ fn runInteractive(repl: *Repl, stdout: *std.Io.Writer, environ: *const std.proce
     defer editor.deinit();
 
     while (!repl.should_quit) {
-        const maybe_line = editor.readLine(repl) catch |err| {
+        const maybe_line = editor.readLine(terminal.device(), repl.theme) catch |err| {
             try stdout.print("input error: {s}\r\n", .{@errorName(err)});
             try stdout.flush();
             continue;
@@ -150,35 +148,23 @@ fn dispatch(repl: *Repl, raw_line: []const u8, stdout: *std.Io.Writer) !void {
     if (trimmed.len == 0) return;
     if (trimmed[0] != ':') return repl.evaluate(trimmed, stdout);
 
-    const rest = trimmed[1..];
-    var iter = std.mem.splitScalar(u8, rest, ' ');
+    // Build the registry per dispatch, where each command's bound
+    // context is in scope. `set` and `buf` are stack locals that the
+    // entries point into, so they must outlive the match below -- they
+    // do, living for this call.
+    var set = Commands.init(repl);
+    var buf: [Commands.count]*Command = undefined;
+    const entries = set.slice(&buf);
+
+    var iter = std.mem.splitScalar(u8, trimmed[1..], ' ');
     const name = iter.first();
     const argument = iter.rest();
 
-    for (frontend_commands) |spec| {
-        if (std.mem.eql(u8, name, spec.name)) return spec.run(repl, argument, stdout);
-    }
-
-    // Shared commands only know their own set, so `:help` appends the
-    // frontend's after the shared listing.
-    if (try commands.run(repl.session, rest, stdout)) {
-        if (std.mem.eql(u8, name, "help")) try printFrontendCommands(stdout);
+    const cmd = Commands.find(entries, name) orelse {
+        try stdout.print("unknown command: :{s}\n", .{name});
         return;
-    }
-    try stdout.print("unknown command: :{s}\n", .{name});
-}
-
-const Command = @import("../../commands/Spec.zig").Spec(*Repl);
-const frontend_commands = [_]Command{
-    quit_cmd.spec,
-    theme_cmd.spec,
-    terminal_cmd.spec,
-};
-
-fn printFrontendCommands(stdout: *std.Io.Writer) !void {
-    for (frontend_commands) |spec| {
-        try stdout.print("  :{s: <8}  {s}\n", .{ spec.name, spec.summary });
-    }
+    };
+    try cmd.run(argument, stdout);
 }
 
 fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {

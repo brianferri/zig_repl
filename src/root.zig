@@ -13,32 +13,31 @@ pub const commands = @import("commands.zig");
 // Frontends. Each drives the backend with its own IO/device behavior;
 // selected by the build root (native exe -> tty; a wasm root -> a wasm
 // frontend). The shared session utilities above stay reusable across them.
-pub const frontend = struct {
+pub const drivers = struct {
     pub const tty = struct {
-        pub const Repl = @import("frontend/tty/Repl.zig");
+        pub const Repl = @import("drivers/tty/Repl.zig");
     };
 };
-/// Multi-line editing logic, used by the TTY frontend today; intended to
-/// be frontend-agnostic once `terminal/` becomes a device abstraction.
-pub const LineEditor = @import("LineEditor.zig");
-
 // `zig build test` only discovers tests in modules referenced from the root
 // file. Force inclusion of every source file's tests by referencing them at
 // comptime here.
 test {
     _ = @import("Session.zig");
     _ = @import("eval.zig");
-    _ = @import("frontend/tty/Repl.zig");
-    _ = @import("frontend/tty/quit.zig");
-    _ = @import("frontend/tty/theme.zig");
-    _ = @import("frontend/tty/terminal.zig");
-    _ = @import("LineEditor.zig");
-    _ = @import("Theme.zig");
-    _ = @import("theme/root.zig");
-    _ = @import("terminal/Color.zig");
+    _ = @import("drivers/tty/Repl.zig");
+    _ = @import("drivers/tty/Commands.zig");
+    _ = @import("drivers/tty/quit.zig");
+    _ = @import("drivers/tty/theme.zig");
+    _ = @import("drivers/tty/terminal.zig");
+    _ = @import("drivers/tty/LineEditor.zig");
+    _ = @import("drivers/mock/Device.zig");
+    _ = @import("drivers/tty/Theme.zig");
+    _ = @import("drivers/tty/theme/root.zig");
+    _ = @import("device/Color.zig");
+    _ = @import("device/Device.zig");
     _ = @import("terminal/Terminal.zig");
     _ = @import("terminal/Parser.zig");
-    _ = @import("terminal/Event.zig");
+    _ = @import("device/Event.zig");
     _ = @import("terminal/Protocol.zig");
     _ = @import("terminal/Standard.zig");
     _ = @import("terminal/Negotiate.zig");
@@ -60,6 +59,9 @@ test {
         else => @import("terminal/platform/Posix.zig"),
     };
     _ = @import("commands.zig");
+    _ = @import("commands/Command.zig");
+    _ = @import("commands/help.zig");
+    _ = @import("commands/dump.zig");
     _ = @import("front/InputShape.zig");
     _ = @import("front/Pipeline.zig");
     _ = @import("render/Diagnostic.zig");

@@ -21,7 +21,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Token = @import("Standard.zig").Token;
-const Event = @import("Event.zig").Event;
+const Event = @import("../device/Event.zig").Event;
 
 const Protocol = @This();
 

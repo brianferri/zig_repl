@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const repl_module = b.addModule("zig_repl", .{
+    const repl_module = b.addModule("repl", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "zig_repl", .module = repl_module },
+            .{ .name = "repl", .module = repl_module },
         },
     });
     exe_module.link_libc = true;

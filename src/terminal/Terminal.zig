@@ -25,11 +25,12 @@ const std = @import("std");
 const assert = std.debug.assert;
 const builtin = @import("builtin");
 
-const Event = @import("Event.zig");
+const Event = @import("../device/Event.zig");
 const Negotiate = @import("Negotiate.zig");
 const Parser = @import("Parser.zig");
 const Protocol = @import("Protocol.zig");
-const Color = @import("Color.zig");
+const Device = @import("../device/Device.zig");
+const Color = @import("../device/Color.zig");
 
 const Kitty = @import("protocol/Kitty.zig");
 const ModifyOtherKeys = @import("protocol/ModifyOtherKeys.zig");
@@ -76,9 +77,11 @@ gpa: std.mem.Allocator,
 /// the dispatcher calls `Protocol.tryInterpret(p, token)`, which
 /// recovers the concrete via `@fieldParentPtr` inside the vtable.
 protocols: []const *Protocol,
-/// Color capability, resolved from the environment at init alongside
-/// protocol negotiation. Renderers read it to pick a theme's tier.
-color_level: Color.ColorLevel,
+/// The input-device interface the editor consumes (carries the
+/// resolved color capability). Embedded by value so `device()` can
+/// hand out `&interface` and the vtable can recover `*Terminal` via
+/// `@fieldParentPtr`.
+interface: Device,
 read_buffer: [read_buffer_bytes]u8 = @splat(0),
 read_buffer_len: u32 = 0,
 
@@ -118,8 +121,26 @@ pub fn init(
         .writer = writer,
         .gpa = gpa,
         .protocols = protocols,
-        .color_level = Color.fromEnv(environ),
+        .interface = .{
+            .color_level = Color.fromEnv(environ),
+            .vtable = &device_vtable,
+        },
     };
+}
+
+/// Hand out the device interface for the editor to drive. Valid only
+/// for a live `Terminal` whose address is stable: the vtable resolves
+/// `*Terminal` from `&interface` via `@fieldParentPtr`, so a copy's
+/// `&interface` would point back at the wrong object.
+pub fn device(term: *Terminal) *Device {
+    return &term.interface;
+}
+
+const device_vtable: Device.VTable = .{ .readEvent = vtableReadEvent };
+
+fn vtableReadEvent(d: *Device) anyerror!?Event.Event {
+    const term: *Terminal = @fieldParentPtr("interface", d);
+    return term.readEvent();
 }
 
 pub fn deinit(term: *Terminal) void {

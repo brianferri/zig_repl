@@ -1,23 +1,35 @@
 const std = @import("std");
-const assert = std.debug.assert;
 
-const Session = @import("../Session.zig");
-const Spec = @import("Spec.zig").Spec;
-const commands = @import("../commands.zig");
+const Command = @import("Command.zig");
 
-pub const spec: Spec(*Session) = .{
-    .name = "help",
-    .summary = "Show available commands",
-    .run = run,
-};
+const Help = @This();
 
-fn run(session: *Session, argument: []const u8, stdout: *std.Io.Writer) anyerror!void {
-    assert(@intFromPtr(session) != 0);
-    assert(@intFromPtr(stdout) != 0);
+interface: Command,
+/// The full command set to enumerate. Wired after the registry array
+/// is built, since that array contains this command -- it cannot be
+/// passed at `init` without a forward reference to itself.
+entries: []const *Command,
+
+pub fn init() Help {
+    return .{
+        .interface = .{
+            .name = "help",
+            .summary = "Show available commands",
+            .vtable = &vtable,
+        },
+        .entries = &.{},
+    };
+}
+
+pub fn command(self: *Help) *Command {
+    return &self.interface;
+}
+
+const vtable: Command.VTable = .{ .run = run };
+
+fn run(c: *Command, argument: []const u8, writer: *std.Io.Writer) anyerror!void {
     _ = argument;
-
-    try stdout.writeAll("commands:\n");
-    for (commands.registry) |entry| {
-        try stdout.print("  :{s: <8}  {s}\n", .{ entry.name, entry.summary });
-    }
+    const self: *Help = @fieldParentPtr("interface", c);
+    try writer.writeAll("commands:\n");
+    try Command.list(self.entries, writer);
 }

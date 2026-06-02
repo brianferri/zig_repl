@@ -2,21 +2,39 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const Repl = @import("Repl.zig");
-const themes = @import("../../theme/root.zig");
-const ColorLevel = @import("../../terminal/Color.zig").ColorLevel;
-const Spec = @import("../../commands/Spec.zig").Spec;
+const themes = @import("theme/root.zig");
+const ColorLevel = @import("../../device/Color.zig").ColorLevel;
+const Command = @import("../../commands/Command.zig");
 
-pub const spec: Spec(*Repl) = .{
-    .name = "theme",
-    .summary = "Show or switch the prompt theme: :theme [name]",
-    .run = run,
-};
+const Theme = @This();
 
-fn run(repl: *Repl, argument: []const u8, stdout: *std.Io.Writer) anyerror!void {
+interface: Command,
+repl: *Repl,
+
+pub fn init(repl: *Repl) Theme {
+    return .{
+        .interface = .{
+            .name = "theme",
+            .summary = "Show or switch the prompt theme: :theme [name]",
+            .vtable = &vtable,
+        },
+        .repl = repl,
+    };
+}
+
+pub fn command(self: *Theme) *Command {
+    return &self.interface;
+}
+
+const vtable: Command.VTable = .{ .run = run };
+
+fn run(c: *Command, argument: []const u8, stdout: *std.Io.Writer) anyerror!void {
+    const self: *Theme = @fieldParentPtr("interface", c);
+    const repl = self.repl;
     assert(@intFromPtr(repl) != 0);
     assert(@intFromPtr(stdout) != 0);
 
-    const level: ColorLevel = if (repl.terminal) |terminal| terminal.color_level else .none;
+    const level: ColorLevel = if (repl.terminal) |terminal| terminal.interface.color_level else .none;
     const arg = std.mem.trim(u8, argument, " \t");
 
     if (arg.len == 0) {

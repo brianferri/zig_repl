@@ -6,7 +6,7 @@
 const std = @import("std");
 const testing = std.testing;
 
-const Event = @import("Event.zig");
+const Event = @import("../device/Event.zig");
 const Parser = @import("Parser.zig");
 const Protocol = @import("Protocol.zig");
 

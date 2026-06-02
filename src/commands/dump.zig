@@ -4,7 +4,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const Session = @import("../Session.zig");
-const Spec = @import("Spec.zig").Spec;
+const Command = @import("Command.zig");
 const Pipeline = @import("../front/Pipeline.zig");
 const InputShape = @import("../front/InputShape.zig");
 const Diagnostic = @import("../render/Diagnostic.zig");
@@ -12,13 +12,31 @@ const Diagnostic = @import("../render/Diagnostic.zig");
 const Ast = std.zig.Ast;
 const Zir = std.zig.Zir;
 
-pub const spec: Spec(*Session) = .{
-    .name = "dump",
-    .summary = "Dump AST + ZIR for an expression: :dump <expr>",
-    .run = run,
-};
+const Dump = @This();
 
-fn run(session: *Session, argument: []const u8, stdout: *std.Io.Writer) anyerror!void {
+interface: Command,
+session: *Session,
+
+pub fn init(session: *Session) Dump {
+    return .{
+        .interface = .{
+            .name = "dump",
+            .summary = "Dump AST + ZIR for an expression: :dump <expr>",
+            .vtable = &vtable,
+        },
+        .session = session,
+    };
+}
+
+pub fn command(self: *Dump) *Command {
+    return &self.interface;
+}
+
+const vtable: Command.VTable = .{ .run = run };
+
+fn run(c: *Command, argument: []const u8, stdout: *std.Io.Writer) anyerror!void {
+    const self: *Dump = @fieldParentPtr("interface", c);
+    const session = self.session;
     assert(@intFromPtr(session) != 0);
     assert(@intFromPtr(stdout) != 0);
 
@@ -36,15 +54,19 @@ fn run(session: *Session, argument: []const u8, stdout: *std.Io.Writer) anyerror
     // isolation (the declarations are not persisted by `:dump`).
     if (try InputShape.splitTrailingExpr(session.gpa, trimmed)) |split| {
         try stdout.writeAll("=== declarations ===\n");
-        try dumpOne(session, split.decls, stdout);
+        try dumpInput(session, split.decls, stdout);
         try stdout.writeAll("\n=== trailing expression ===\n");
-        try dumpOne(session, split.expr, stdout);
+        try dumpInput(session, split.expr, stdout);
         return;
     }
-    try dumpOne(session, trimmed, stdout);
+    try dumpInput(session, trimmed, stdout);
 }
 
-fn dumpOne(session: *Session, input: []const u8, stdout: *std.Io.Writer) !void {
+/// Dump one input unit (no trailing-expression split): wrapped source,
+/// AST, then ZIR -- or the parse/ZIR diagnostics if the front end failed.
+/// Names resolve against `session`, so binding declarations into it first
+/// makes a later expression's dump resolve them.
+pub fn dumpInput(session: *Session, input: []const u8, stdout: *std.Io.Writer) !void {
     var result = Pipeline.runWithInjection(
         session.gpa,
         input,
