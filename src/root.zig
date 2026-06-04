@@ -24,29 +24,8 @@ test {
     _ = @import("drivers/tty/theme/root.zig");
     _ = @import("device/Color.zig");
     _ = @import("device/Device.zig");
-    _ = @import("terminal/Terminal.zig");
-    _ = @import("terminal/Parser.zig");
     _ = @import("device/Event.zig");
-    _ = @import("terminal/Protocol.zig");
-    _ = @import("terminal/Standard.zig");
-    _ = @import("terminal/Negotiate.zig");
-    _ = @import("terminal/standard/Csi.zig");
-    _ = @import("terminal/standard/Ss2.zig");
-    _ = @import("terminal/standard/Ss3.zig");
-    _ = @import("terminal/standard/Osc.zig");
-    _ = @import("terminal/standard/St.zig");
-    _ = @import("terminal/standard/StringCommand.zig");
-    _ = @import("terminal/protocol/Xterm.zig");
-    _ = @import("terminal/protocol/ModifyOtherKeys.zig");
-    _ = @import("terminal/protocol/Kitty.zig");
-    _ = @import("terminal/protocol/BracketedPaste.zig");
-    _ = @import("terminal/terminal_test.zig");
-    // Platform backends import OS-specific headers; pick the one
-    // matching the host so cross-target test runs stay clean.
-    _ = switch (@import("builtin").os.tag) {
-        .windows => @import("terminal/platform/Windows.zig"),
-        else => @import("terminal/platform/Posix.zig"),
-    };
+    _ = @import("terminal/root.zig");
     _ = @import("drivers/commands/Command.zig");
     _ = @import("drivers/commands/registry.zig");
     _ = @import("drivers/commands/help.zig");
