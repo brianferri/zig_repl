@@ -2,11 +2,11 @@
 //! The host writes an input line into wasm memory, calls `replEval`, then
 //! reads the rendered output back out -- there is no terminal, no
 //! `LineEditor` (the page's input box does the editing). It imports the
-//! core directly (eval, Session, InternPool, render, the command
-//! registry) and never the library root, which would pull in the posix
-//! TTY stack and fail to link for `wasm32-freestanding`. It lives at
-//! `src/` rather than `drivers/wasm/` so the module root covers the core
-//! tree (a module cannot `@import` above its root directory).
+//! core under `repl/` directly (eval, Session, InternPool, render, the
+//! command registry) and never the `repl` module root, which pulls in the
+//! posix TTY stack and would fail to link for `wasm32-freestanding`. It
+//! lives at `src/` -- above `repl/` -- so its module root covers the core
+//! tree it imports (a module cannot `@import` above its root directory).
 //!
 //! Reentrancy: the page calls `replEval` once per submitted line. The
 //! result buffer is a module global, reset at the start of each call and
@@ -14,13 +14,13 @@
 
 const std = @import("std");
 
-const eval = @import("eval.zig");
-const Session = @import("Session.zig");
-const InternPool = @import("sema/InternPool.zig");
-const InputShape = @import("front/InputShape.zig");
-const render_value = @import("render/Value.zig");
-const outline = @import("drivers/wasm/outline.zig");
-const Commands = @import("drivers/wasm/root.zig").commands;
+const eval = @import("repl/eval.zig");
+const Session = @import("repl/Session.zig");
+const InternPool = @import("repl/sema/InternPool.zig");
+const InputShape = @import("repl/front/InputShape.zig");
+const render_value = @import("repl/render/Value.zig");
+const outline = @import("repl/drivers/wasm/outline.zig");
+const Commands = @import("repl/drivers/wasm/root.zig").commands;
 
 // `wasm_allocator` requires the module be single-threaded (build.zig sets
 // it); it grows linear memory as needed, which detaches the host's view of
