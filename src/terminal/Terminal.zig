@@ -110,6 +110,11 @@ pub fn init(
     const protocols = try buildActive(gpa, &known_protocols, negotiation.bytes);
     errdefer gpa.free(protocols);
 
+    // Protocols hold transient state in file-scope singletons; clear the paste
+    // accumulator so this terminal can't inherit a mid-paste state left by a
+    // previous one in the same process (one terminal is live at a time).
+    BracketedPaste.instance = .{};
+
     for (protocols) |p| {
         if (p.setup_sequence.len == 0) continue;
         try writer.writeAll(p.setup_sequence);
