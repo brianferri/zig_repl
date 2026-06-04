@@ -2,11 +2,7 @@
 // (`Session`, Sema) and the tty driver `main.zig` runs against it.
 pub const Session = @import("Session.zig");
 pub const sema = @import("sema/root.zig");
-pub const drivers = struct {
-    pub const tty = struct {
-        pub const Repl = @import("drivers/tty/Repl.zig");
-    };
-};
+pub const Repl = @import("drivers/tty/Repl.zig");
 // `zig build test` only discovers tests in modules referenced from the root
 // file. Force inclusion of every source file's tests by referencing them at
 // comptime here.

@@ -14,6 +14,6 @@ pub fn main(init: std.process.Init) !void {
     defer session.deinit();
 
     // The tty driver wraps the core session with the terminal/IO surface.
-    var driver = try repl.drivers.tty.Repl.init(&session, init.io);
+    var driver = try repl.Repl.init(&session, init.io);
     return driver.run(init.environ_map);
 }
