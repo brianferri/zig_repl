@@ -8,3 +8,9 @@
 pub const Device = @import("Device.zig");
 pub const Event = @import("Event.zig");
 pub const Color = @import("Color.zig");
+
+test {
+    _ = Device;
+    _ = Event;
+    _ = Color;
+}
