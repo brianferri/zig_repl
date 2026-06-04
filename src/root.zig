@@ -22,9 +22,6 @@ test {
     _ = @import("drivers/mock/Device.zig");
     _ = @import("drivers/tty/Theme.zig");
     _ = @import("drivers/tty/theme/root.zig");
-    _ = @import("device/Color.zig");
-    _ = @import("device/Device.zig");
-    _ = @import("device/Event.zig");
     _ = @import("terminal/root.zig");
     _ = @import("drivers/commands/Command.zig");
     _ = @import("drivers/commands/registry.zig");

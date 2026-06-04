@@ -10,6 +10,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The input-device vocabulary (`Device`, `Event`, `Color`) -- a leaf that
+    // depends only on `std`, so frontends build on it without the tty stack.
+    const device_module = b.addModule("device", .{
+        .root_source_file = b.path("src/device/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    repl_module.addImport("device", device_module);
+
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -78,9 +87,12 @@ pub fn build(b: *std.Build) void {
 
     const module_tests = b.addTest(.{ .root_module = repl_module });
     const exe_tests = b.addTest(.{ .root_module = exe_module });
+    const device_tests = b.addTest(.{ .root_module = device_module });
     const run_module_tests = b.addRunArtifact(module_tests);
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    const run_device_tests = b.addRunArtifact(device_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_module_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_device_tests.step);
 }

@@ -5,7 +5,7 @@ const assert = std.debug.assert;
 
 const Repl = @import("Repl.zig");
 const themes = @import("theme/root.zig");
-const ColorLevel = @import("../../device/Color.zig").ColorLevel;
+const ColorLevel = @import("device").Color.ColorLevel;
 const Command = @import("../commands/Command.zig").Command;
 
 pub fn command(comptime Ctx: type) Command(Ctx) {

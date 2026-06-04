@@ -25,12 +25,12 @@ const std = @import("std");
 const assert = std.debug.assert;
 const builtin = @import("builtin");
 
-const Event = @import("../device/Event.zig");
+const Event = @import("device").Event;
 const Negotiate = @import("Negotiate.zig");
 const Parser = @import("Parser.zig");
 const Protocol = @import("Protocol.zig");
-const Device = @import("../device/Device.zig");
-const Color = @import("../device/Color.zig");
+const Device = @import("device").Device;
+const Color = @import("device").Color;
 
 const Kitty = @import("protocol/Kitty.zig");
 const ModifyOtherKeys = @import("protocol/ModifyOtherKeys.zig");

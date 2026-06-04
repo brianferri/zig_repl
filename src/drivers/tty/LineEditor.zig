@@ -19,10 +19,10 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const Device = @import("../../device/Device.zig");
-const Event = @import("../../device/Event.zig");
+const Device = @import("device").Device;
+const Event = @import("device").Event;
 const themes = @import("theme/root.zig");
-const ColorLevel = @import("../../device/Color.zig").ColorLevel;
+const ColorLevel = @import("device").Color.ColorLevel;
 
 const LineEditor = @This();
 

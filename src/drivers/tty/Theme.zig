@@ -13,7 +13,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const ColorLevel = @import("../../device/Color.zig").ColorLevel;
+const ColorLevel = @import("device").Color.ColorLevel;
 
 const Theme = @This();
 

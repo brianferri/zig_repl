@@ -23,7 +23,7 @@ const assert = std.debug.assert;
 const Protocol = @import("../Protocol.zig");
 const Standard = @import("../Standard.zig");
 
-const Event = @import("../../device/Event.zig");
+const Event = @import("device").Event;
 const Csi = @import("../standard/Csi.zig");
 
 const ModifyOtherKeys = @This();

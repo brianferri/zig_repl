@@ -9,9 +9,9 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const Device = @import("../../device/Device.zig");
-const Event = @import("../../device/Event.zig");
-const Color = @import("../../device/Color.zig");
+const Device = @import("device").Device;
+const Event = @import("device").Event;
+const Color = @import("device").Color;
 
 const Mock = @This();
 
