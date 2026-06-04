@@ -122,6 +122,11 @@ pub fn runWithInjection(
     var wrapped = try InputShape.wrapWithInjection(gpa, injection_prefix, input);
     errdefer wrapped.deinit(gpa);
 
+    // Reject pathologically nested input before the recursive parse can
+    // overflow the stack; surfaced as a parse-level rejection so the existing
+    // diagnostic paths handle it rather than the input trapping the host.
+    if (exceedsNestingDepth(wrapped.text)) return error.ParseError;
+
     var tree = try std.zig.Ast.parse(gpa, wrapped.text, .zig);
     errdefer tree.deinit(gpa);
 
@@ -129,6 +134,24 @@ pub fn runWithInjection(
     errdefer zir.deinit(gpa);
 
     return .{ .wrapped = wrapped, .tree = tree, .zir = zir };
+}
+
+/// Whether `source`'s bracket nesting exceeds `InputShape.max_nesting_depth`.
+/// Tokenizing keeps brackets inside strings and comments from counting.
+fn exceedsNestingDepth(source: [:0]const u8) bool {
+    var tokenizer = std.zig.Tokenizer.init(source);
+    var depth: u32 = 0;
+    while (true) {
+        switch (tokenizer.next().tag) {
+            .eof => return false,
+            .l_paren, .l_brace, .l_bracket => {
+                depth += 1;
+                if (depth > InputShape.max_nesting_depth) return true;
+            },
+            .r_paren, .r_brace, .r_bracket => depth -|= 1,
+            else => {},
+        }
+    }
 }
 
 /// Render `const <name> = undefined;\n` per session-bound decl,

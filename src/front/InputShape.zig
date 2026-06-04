@@ -38,6 +38,15 @@ const expression_suffix: []const u8 = ");\n";
 
 pub const max_input_bytes: u32 = 16 * 1024;
 
+/// Max bracket-nesting depth accepted. Parser, AstGen, and the Sema eval over
+/// the same bodies each recurse per nesting level -- several call frames per
+/// level for the heaviest construct (a labeled block). Past this the call stack
+/// overflows mid-parse (a hard trap on wasm, whose ceiling the stack size
+/// cannot raise) before any diagnostic runs, so the front end rejects it.
+/// Sized well under the observed wasm trap point with margin for browser
+/// engines; still ample for real code.
+pub const max_nesting_depth: u32 = 32;
+
 /// Classifies an input line by its first non-trivia token using
 /// std.zig.Tokenizer, so the grammar's own list of declaration-introducing
 /// keywords stays the source of truth.
