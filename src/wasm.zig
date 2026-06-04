@@ -19,6 +19,7 @@ const Session = @import("repl/Session.zig");
 const InternPool = @import("repl/sema/InternPool.zig");
 const InputShape = @import("repl/front/InputShape.zig");
 const render_value = @import("repl/render/Value.zig");
+const Type = @import("repl/sema/Type.zig");
 const outline = @import("repl/drivers/wasm/outline.zig");
 const Commands = @import("repl/drivers/wasm/root.zig").commands;
 
@@ -138,7 +139,7 @@ fn preview(input: []const u8) !void {
     try w.writeAll("=> ");
     try render_value.render(value, preview_session.intern_pool, w);
     try w.writeAll("   type: ");
-    try render_value.writeTypeName(value.typeOf(preview_session.intern_pool).toIndex(), preview_session.intern_pool, w);
+    try Type.print(value.typeOf(preview_session.intern_pool), preview_session.intern_pool, w);
     try w.writeByte('\n');
 }
 
