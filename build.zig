@@ -19,6 +19,16 @@ pub fn build(b: *std.Build) void {
     });
     repl_module.addImport("device", device_module);
 
+    // The raw-mode terminal input stack, built on `device`. Separate from the
+    // repl so the wasm frontend -- which never touches the tty -- omits it.
+    const terminal_module = b.addModule("terminal", .{
+        .root_source_file = b.path("src/terminal/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    terminal_module.addImport("device", device_module);
+    repl_module.addImport("terminal", terminal_module);
+
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -88,11 +98,14 @@ pub fn build(b: *std.Build) void {
     const module_tests = b.addTest(.{ .root_module = repl_module });
     const exe_tests = b.addTest(.{ .root_module = exe_module });
     const device_tests = b.addTest(.{ .root_module = device_module });
+    const terminal_tests = b.addTest(.{ .root_module = terminal_module });
     const run_module_tests = b.addRunArtifact(module_tests);
     const run_exe_tests = b.addRunArtifact(exe_tests);
     const run_device_tests = b.addRunArtifact(device_tests);
+    const run_terminal_tests = b.addRunArtifact(terminal_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_module_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_device_tests.step);
+    test_step.dependOn(&run_terminal_tests.step);
 }

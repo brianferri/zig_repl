@@ -11,7 +11,7 @@ const assert = std.debug.assert;
 
 const Session = @import("../../Session.zig");
 const LineEditor = @import("LineEditor.zig");
-const Terminal = @import("../../terminal/Terminal.zig");
+const Terminal = @import("terminal").Terminal;
 const themes = @import("theme/root.zig");
 const Commands = @import("root.zig").commands;
 const eval = @import("../../eval.zig");
