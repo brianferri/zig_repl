@@ -59,9 +59,13 @@ function draggable(gutter, onDrag) {
         const onUp = () => {
             gutter.removeEventListener("pointermove", onMove);
             gutter.removeEventListener("pointerup", onUp);
+            gutter.removeEventListener("pointercancel", onUp);
         };
         gutter.addEventListener("pointermove", onMove);
         gutter.addEventListener("pointerup", onUp);
+        // A cancelled gesture (touch interrupted, OS takeover) ends the drag
+        // too; without this the move listener would leak and keep resizing.
+        gutter.addEventListener("pointercancel", onUp);
     });
 }
 
