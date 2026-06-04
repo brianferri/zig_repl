@@ -837,3 +837,45 @@ test "compliance: optional across awkward payload widths" {
         try expectMatchesZig(testing.allocator, &.{decl});
     }
 }
+
+test "compliance: a comptime-known int coerces to a fixed-width int when it fits" {
+    // The operand is comptime-known, so the value-fits rule applies on both
+    // sides: a wider/in-range target accepts, an out-of-range one is rejected.
+    try expectMatchesZig(testing.allocator, &.{"@as(i64, @as(u32, 42))"});
+    try expectMatchesZig(testing.allocator, &.{"@as(i32, @as(u8, 200))"});
+    try expectBothReject(testing.allocator, &.{"@as(i8, @as(u32, 200))"});
+    try expectBothReject(testing.allocator, &.{"@as(u16, @as(u32, 70000))"});
+}
+
+test "compliance: a function return coerces to the declared return type" {
+    // A comptime-known return coerces value-based; a runtime (param-derived)
+    // return coerces type-based -- a widening succeeds, a type that can't
+    // represent the source is rejected -- each matching the compiler.
+    try expectMatchesZig(testing.allocator, &.{ "fn five() i32 { return 5; }", "five()" });
+    try expectMatchesZig(testing.allocator, &.{ "fn widen(a: u8) u32 { return a; }", "widen(7)" });
+    try expectBothReject(testing.allocator, &.{ "fn small() u8 { return 300; }", "small()" });
+    try expectBothReject(testing.allocator, &.{ "fn id(a: u32) i32 { return a; }", "id(7)" });
+    try expectBothReject(testing.allocator, &.{ "fn add(a: u32, b: u32) i32 { return a + b; }", "add(40, 2)" });
+}
+
+test "compliance: runtime-ness propagates through operations" {
+    // A value derived from a runtime parameter stays runtime through each kind
+    // of operation, so coercing it to a type that can't represent its source
+    // type is rejected (as the compiler rejects the body); a widening passes.
+    const a = testing.allocator;
+    try expectBothReject(a, &.{ "fn f(x: u32) i32 { return x & 1; }", "f(7)" }); // bitwise
+    try expectBothReject(a, &.{ "fn f(x: u32) i32 { return x << 1; }", "f(7)" }); // shift
+    try expectBothReject(a, &.{ "fn f(x: i32) i16 { return -x; }", "f(7)" }); // negate
+    try expectBothReject(a, &.{ "fn f(x: u8) i32 { return @as(u32, x); }", "f(7)" }); // coercion result stays runtime
+    try expectBothReject(a, &.{ "fn f(x: u32) i32 { return blk: { break :blk x; }; }", "f(7)" }); // compound passes it through
+
+    try expectMatchesZig(a, &.{ "fn f(x: u8) u32 { return x & 1; }", "f(7)" }); // widening through an op
+    try expectMatchesZig(a, &.{ "fn f(x: u8) u32 { return blk: { break :blk x; }; }", "f(7)" }); // compound keeps comptime/runtime intact
+}
+
+test "compliance: runtime float coercion is type-based" {
+    const a = testing.allocator;
+    try expectBothReject(a, &.{ "fn f(x: f64) f32 { return x; }", "f(1.5)" }); // narrowing
+    try expectBothReject(a, &.{ "fn f(x: u32) f32 { return x; }", "f(5)" }); // runtime int -> float
+    try expectMatchesZig(a, &.{ "fn f(x: f32) f64 { return x; }", "f(1.5)" }); // widening
+}

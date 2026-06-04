@@ -325,7 +325,7 @@ function renderExplorer() {
 // function, and a trailing expression to exercise the multi-segment outline.
 editor.value = `const x: u32 = 40;
 
-fn add(a: u32, b: u32) i32 {
+fn add(a: u32, b: u32) u32 {
     return a + b;
 }
 

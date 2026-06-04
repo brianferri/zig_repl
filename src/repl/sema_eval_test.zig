@@ -272,6 +272,44 @@ test "@as rejects values that don't fit in the target int type" {
     try expectEvalFails(gpa, &pool, "@as(u32, -1)", "does not fit in u32");
 }
 
+test "fn return rejects a runtime value whose type does not coerce" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    // `a` and `b` are non-comptime params, so `a + b` is a runtime u32; u32
+    // does not coerce to the i32 return type (type-based, regardless of the
+    // value), so the call is rejected -- as the compiler rejects the body.
+    var diag_buf: [4096]u8 = undefined;
+    try testing.expectError(error.AnalysisFail, evalSessionLines(gpa, &pool, ns, &.{
+        "fn add(a: u32, b: u32) i32 { return a + b; }",
+        "add(40, 2)",
+    }, &diag_buf));
+}
+
+test "fn return coerces a runtime value that widens, and a comptime value that fits" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    // Runtime u8 widens to u32 (type-based: u32 represents every u8).
+    var buf1: [4096]u8 = undefined;
+    const widened = (try evalSessionLines(gpa, &pool, ns, &.{
+        "fn widen(a: u8) u32 { return a; }",
+        "widen(7)",
+    }, &buf1)).?;
+    try testing.expectEqual(InternPool.Index.u32_type, pool.indexToKey(widened.index).int.ty);
+
+    // Comptime-known u32 coerces to i32 by the value-fits rule (no runtime
+    // operand involved), exactly as `const c: i32 = u;` does in Zig.
+    const ns2 = try pool.createNamespace(gpa, .none);
+    var buf2: [4096]u8 = undefined;
+    const narrowed = (try evalSessionLines(gpa, &pool, ns2, &.{"@as(i32, @as(u32, 42))"}, &buf2)).?;
+    try testing.expectEqual(InternPool.Index.i32_type, pool.indexToKey(narrowed.index).int.ty);
+}
+
 test "array_init rejects elements that don't fit the element type" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);

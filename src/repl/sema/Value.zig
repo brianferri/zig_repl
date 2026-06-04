@@ -10,6 +10,20 @@ const Type = @import("Type.zig");
 const Value = @This();
 
 index: InternPool.Index,
+/// Whether this value is comptime-known. The evaluator always has a concrete
+/// `index` (it substitutes a call's args to evaluate the body), so this is a
+/// *provenance* bit: a value built from literals and consts is comptime-known;
+/// one derived from a non-`comptime` parameter is not. Coercion needs it -- a
+/// comptime-known value coerces value-based (the value must fit), a runtime
+/// value type-based (the source *type* must coerce) -- so the body of
+/// `fn (a: u32) i32 { return a; }` is rejected as the compiler rejects it.
+///
+/// The compiler reads this structurally (a comptime value interns, a runtime
+/// one is an Air instruction with no constant: `resolveValue(ref) != null`).
+/// This evaluator has no Air, so it carries the bit. Seeded from the
+/// parameter's `comptime`-ness (`Block.Param.is_comptime` / FuncType
+/// `comptime_bits`) and ANDed through each operation that builds a value.
+is_comptime: bool = true,
 
 pub fn fromIndex(index: InternPool.Index) Value {
     assert(index != .none);

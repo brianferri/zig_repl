@@ -18,6 +18,7 @@ const Limb = std.math.big.Limb;
 
 const InternPool = @import("InternPool.zig");
 const Value = @import("Value.zig");
+const Type = @import("Type.zig");
 const arith = @import("arith.zig");
 const InputShape = @import("../front/InputShape.zig");
 const Session = @import("../Session.zig");
@@ -95,6 +96,19 @@ call_depth: u32 = 0,
 /// evalBody; consumed by `evalCall`'s catch. Garbage outside
 /// that transfer.
 return_value: Value = undefined,
+/// Declared return type of the function whose body is being evaluated, or
+/// `.none` at the top level. `evalCall` sets it around the body so the
+/// `ret_type` instruction (which AstGen emits to reference a non-trivial
+/// return type, e.g. `u23`) resolves to it. Mirrors `sema.fn_ret_ty` in
+/// src/Sema.zig.
+fn_ret_ty: InternPool.Index = .none,
+/// Accumulator for the comptime-known provenance of the instruction currently
+/// being evaluated: `resolveRef` ANDs in each operand it returns, and the eval
+/// loop snapshots it per instruction (reset to `true` around each `evalInst`)
+/// to fold into the result's `Value.is_comptime`. This is how runtime-ness
+/// propagates -- an instruction with any runtime operand yields a runtime
+/// value -- without every op having to thread it by hand.
+operand_comptime: bool = true,
 /// Read-only view of every previously-analysed line's ZIR. An entry is
 /// callable as a fn body when a Func value's `source_zir_id` references
 /// its index. Populated by the REPL driver; tests can leave this empty
@@ -332,8 +346,22 @@ fn evalBody(sema: *Sema, body: []const Zir.Inst.Index) Error!Value {
                 }
             },
             else => {
-                if (try sema.evalInst(inst, tag)) |result| {
-                    try sema.results.put(sema.gpa, inst, result);
+                // Snapshot operand provenance for this instruction only:
+                // reset, evaluate (resolveRef ANDs in each operand it reads),
+                // then fold the verdict into the result. Saved/restored so a
+                // nested body's operands don't leak into the enclosing
+                // instruction -- a compound op (block/loop) reads nothing
+                // directly here, so its passed-through value keeps its own
+                // provenance; a simple op inherits its operands'.
+                const saved_oc = sema.operand_comptime;
+                sema.operand_comptime = true;
+                const maybe = sema.evalInst(inst, tag);
+                const operands_comptime = sema.operand_comptime;
+                sema.operand_comptime = saved_oc;
+                if (try maybe) |result| {
+                    var r = result;
+                    r.is_comptime = r.is_comptime and operands_comptime;
+                    try sema.results.put(sema.gpa, inst, r);
                 }
             },
         }
@@ -464,6 +492,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .func, .func_inferred, .func_fancy => sema.evalFunc(inst),
         .typeof => sema.evalTypeof(inst),
         .typeof_builtin => sema.evalTypeofBuiltin(inst),
+        .ret_type => sema.evalRetType(),
         .call => sema.evalCall(inst, .direct),
         .field_call => sema.evalCall(inst, .field),
         .block_comptime => sema.evalBlockComptime(inst),
@@ -974,6 +1003,21 @@ fn refitIntToFixedWidth(
     }
     const idx = try sema.intern_pool.internIntValue(dest_ty, result_big);
     return .{ .index = idx };
+}
+
+/// Whether `dst` can represent every value of `src` -- Zig's implicit
+/// (runtime) int coercion rule. A signed dest needs a strictly wider bit
+/// count than an unsigned source (the extra bit holds the sign); an unsigned
+/// dest never accepts a signed source. Compiler reference:
+/// `coerceInMemoryAllowedInts` in src/Sema.zig.
+fn intCoercible(src: std.lang.Type.Int, dst: std.lang.Type.Int) bool {
+    return switch (dst.signedness) {
+        .unsigned => src.signedness == .unsigned and dst.bits >= src.bits,
+        .signed => switch (src.signedness) {
+            .signed => dst.bits >= src.bits,
+            .unsigned => dst.bits > src.bits,
+        },
+    };
 }
 
 /// Float binary arith for any width. The `inline else` switch on storage
@@ -2239,14 +2283,55 @@ fn coerceValueToType(
         return .{ .index = idx };
     }
 
-    if (value_type.index == .comptime_int_type and intTypeInfo(ip, dest_ty) != null) {
-        return try sema.refitIntToFixedWidth(value.index, dest_ty, op_name);
+    // Coercion into a fixed-width int. A runtime value follows Zig's type-based
+    // rule -- the dest type must represent every value of the source type,
+    // regardless of the concrete value -- so `u32 -> i32` is rejected. A
+    // comptime-known value follows the value-fits rule (`coerceExtra` keys on
+    // whether the value is known, src/Sema.zig), so the same `u32 -> i32` is
+    // accepted when the value fits. `refitIntToFixedWidth` re-tags the value
+    // and, on the comptime path, reports the out-of-range error.
+    if (key == .int) {
+        if (intTypeInfo(ip, dest_ty)) |dst| {
+            // A runtime int must satisfy the type-based rule. Its type is
+            // fixed-width (`comptime_int` is comptime-only); the `if` guards
+            // the rare edge of a `comptime_int` reaching here marked runtime,
+            // which then falls through to the value-fits path below.
+            if (!value.is_comptime) {
+                if (intTypeInfo(ip, value_type.index)) |src| {
+                    if (!intCoercible(src, dst)) {
+                        try sema.writer.print("{s}: expected ", .{op_name});
+                        try Type.print(.fromIndex(dest_ty), ip, sema.writer);
+                        try sema.writer.writeAll(", found ");
+                        try Type.print(.fromIndex(value_type.index), ip, sema.writer);
+                        try sema.writer.writeByte('\n');
+                        return error.AnalysisFail;
+                    }
+                }
+            }
+            var coerced = try sema.refitIntToFixedWidth(value.index, dest_ty, op_name);
+            coerced.is_comptime = value.is_comptime;
+            return coerced;
+        }
     }
 
     if (isFloatTypeIndex(dest_ty)) {
+        // A runtime value follows the type-based rule: a float widens to a
+        // wider-or-equal float; a narrowing, or a runtime int, needs an
+        // explicit @floatCast / @floatFromInt. A comptime-known value coerces
+        // by value via `coerceToTargetFloat` below.
+        if (!value.is_comptime) {
+            const widens = isFloatTypeIndex(value_type.index) and
+                numericBitSize(ip, value_type.index).? <= numericBitSize(ip, dest_ty).?;
+            if (!widens) {
+                try sema.writer.print("{s}: a runtime value does not coerce to ", .{op_name});
+                try Type.print(.fromIndex(dest_ty), ip, sema.writer);
+                try sema.writer.writeAll(" (needs @floatCast or @floatFromInt)\n");
+                return error.AnalysisFail;
+            }
+        }
         if (coerceToTargetFloat(key, dest_ty)) |coerced| {
             const idx = try ip.internFloat(coerced);
-            return .{ .index = idx };
+            return .{ .index = idx, .is_comptime = value.is_comptime };
         }
     }
 
@@ -2852,7 +2937,13 @@ fn resolveRef(sema: *Sema, ref: Zir.Inst.Ref) Error!Value {
     assert(ref != .none);
 
     if (ref.toIndex()) |inst_idx| {
-        if (sema.results.get(inst_idx)) |value| return value;
+        if (sema.results.get(inst_idx)) |value| {
+            // Fold this operand's provenance into the in-flight instruction's
+            // accumulator (see `operand_comptime`). Only instruction results
+            // can be runtime; the well-known refs below are always comptime.
+            sema.operand_comptime = sema.operand_comptime and value.is_comptime;
+            return value;
+        }
         try sema.writer.print(
             "internal error: unresolved instruction ref %{d}\n",
             .{@intFromEnum(inst_idx)},
@@ -3552,6 +3643,16 @@ fn failAnytypeParam(sema: *Sema) Error!?Value {
     return error.AnalysisFail;
 }
 
+/// `ret_type`: the declared return type of the function whose body is being
+/// evaluated. AstGen emits it to reference a non-trivial return type -- one
+/// computed in a `ret_ty_body` (e.g. `u23`) rather than a pre-interned ref
+/// like `i32` -- from within the body. `evalCall` sets `fn_ret_ty` around the
+/// body, so it is never `.none` here.
+fn evalRetType(sema: *Sema) Error!?Value {
+    assert(sema.fn_ret_ty != .none);
+    return .{ .index = sema.fn_ret_ty };
+}
+
 /// `.func` / `.func_inferred` / `.func_fancy`: build the Func
 /// type from the drained `params` + the resolved return
 /// type, intern both, return the Func value. Uses stdlib's
@@ -3679,6 +3780,11 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
         const arg_body = args_body[start..end];
         const raw = try sema.resolveInlineBody(arg_body, inst);
         arg_values[i] = try sema.coerceValueToType(raw, func_ty.param_types[i], "call arg");
+        // The parameter's value inside the body is comptime-known only if the
+        // parameter is declared `comptime`; otherwise it is runtime even when
+        // the call passed a comptime argument, so coercions of it (and values
+        // derived from it) follow Zig's runtime, type-based rule.
+        arg_values[i].is_comptime = func_ty.paramIsComptime(@intCast(i));
     }
 
     // Swap sema.zir to the func's source-ZIR snapshot when the
@@ -3733,6 +3839,12 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
         try sema.results.put(sema.gpa, p_inst, val);
     }
 
+    // Expose the return type to the body's `ret_type` instruction; restore
+    // the caller's on exit so nested calls each see their own.
+    const saved_ret_ty = sema.fn_ret_ty;
+    sema.fn_ret_ty = func_ty.return_type;
+    defer sema.fn_ret_ty = saved_ret_ty;
+
     // Fn body terminates via `return X;` (ret_node /
     // ret_implicit / ret_load) raising ComptimeReturn; catch it
     // and surface the stashed value. Bare resolveInlineBody
@@ -3740,7 +3852,14 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     if (sema.resolveInlineBody(info.body, func.zir_body_inst)) |val| {
         return val;
     } else |err| switch (err) {
-        error.ComptimeReturn => return sema.return_value,
+        // Coerce the returned value to the declared return type -- the
+        // coercion the compiler does in its `ret_node` handling against
+        // `fn_ret_ty`, which AstGen leaves to Sema. Done here (rather than a
+        // pushed/popped `fn_ret_ty` + per-ret-arm) since a call yields one
+        // return value. A return derived from a runtime parameter coerces
+        // type-based, so `fn (a: u32) i32 { return a; }` is rejected as the
+        // compiler rejects it; a comptime-known return coerces value-based.
+        error.ComptimeReturn => return try sema.coerceValueToType(sema.return_value, func_ty.return_type, "return"),
         else => |e| return e,
     }
 }
