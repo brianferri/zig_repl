@@ -20,68 +20,24 @@ const Limb = std.math.big.Limb;
 
 const InternPool = @import("InternPool.zig");
 
-/// `lhs + rhs` as a fresh `comptime_int` value in the pool. Workspace is sized
-/// to the bound documented on `BigIntMutable.add`:
-/// `@max(lhs.limbs.len, rhs.limbs.len) + 1` limbs.
+/// `lhs + rhs` as a fresh `comptime_int` value in the pool.
 pub fn internAdd(
     gpa: Allocator,
     intern_pool: *InternPool,
     lhs: BigIntConst,
     rhs: BigIntConst,
 ) Allocator.Error!InternPool.Index {
-    assert(@intFromPtr(intern_pool) != 0);
-    assert(lhs.limbs.len > 0);
-    assert(rhs.limbs.len > 0);
-
-    const workspace_len = @max(lhs.limbs.len, rhs.limbs.len) + 1;
-    const workspace = try gpa.alloc(Limb, workspace_len);
-    defer gpa.free(workspace);
-
-    var mutable: BigIntMutable = .{
-        .limbs = workspace,
-        .len = undefined,
-        .positive = undefined,
-    };
-    mutable.add(lhs, rhs);
-
-    assert(mutable.len > 0);
-    assert(mutable.len <= workspace_len);
-
-    const idx = try intern_pool.internComptimeInt(mutable.toConst());
-    assert(idx != .none);
-    return idx;
+    return runBinary(gpa, intern_pool, lhs, rhs, BigIntMutable.add);
 }
 
-/// `lhs - rhs` as a fresh `comptime_int` value in the pool. Workspace is
-/// sized to the bound documented on `BigIntMutable.sub`:
-/// `@max(lhs.limbs.len, rhs.limbs.len) + 1` limbs.
+/// `lhs - rhs` as a fresh `comptime_int` value in the pool.
 pub fn internSub(
     gpa: Allocator,
     intern_pool: *InternPool,
     lhs: BigIntConst,
     rhs: BigIntConst,
 ) Allocator.Error!InternPool.Index {
-    assert(@intFromPtr(intern_pool) != 0);
-    assert(lhs.limbs.len > 0);
-    assert(rhs.limbs.len > 0);
-
-    const workspace_len = @max(lhs.limbs.len, rhs.limbs.len) + 1;
-    const workspace = try gpa.alloc(Limb, workspace_len);
-    defer gpa.free(workspace);
-
-    var mutable: BigIntMutable = .{
-        .limbs = workspace,
-        .len = undefined,
-        .positive = undefined,
-    };
-    mutable.sub(lhs, rhs);
-
-    assert(mutable.len > 0);
-    assert(mutable.len <= workspace_len);
-
-    const idx = try intern_pool.internComptimeInt(mutable.toConst());
-    assert(idx != .none);
-    return idx;
+    return runBinary(gpa, intern_pool, lhs, rhs, BigIntMutable.sub);
 }
 
 /// `lhs * rhs` as a fresh `comptime_int` value in the pool. Workspace is
@@ -224,18 +180,14 @@ pub fn internRem(
     return idx;
 }
 
-/// Bitwise binary kernels: three near-identical pairs of workspace alloc +
-/// `BigIntMutable.bit*` + intern. The workspace bound `@max(lhs, rhs) + 1`
-/// covers every sign combination the stdlib documents (bitAnd reaches
-/// `@max + 1` for two negatives; bitOr / bitXor reach `@max + 1` for mixed
-/// signs). One bound for all three keeps the shared kernel uniform.
+/// `lhs & rhs` as a fresh `comptime_int` value in the pool.
 pub fn internBitAnd(
     gpa: Allocator,
     intern_pool: *InternPool,
     lhs: BigIntConst,
     rhs: BigIntConst,
 ) Allocator.Error!InternPool.Index {
-    return runBitwise(gpa, intern_pool, lhs, rhs, BigIntMutable.bitAnd);
+    return runBinary(gpa, intern_pool, lhs, rhs, BigIntMutable.bitAnd);
 }
 
 pub fn internBitOr(
@@ -244,7 +196,7 @@ pub fn internBitOr(
     lhs: BigIntConst,
     rhs: BigIntConst,
 ) Allocator.Error!InternPool.Index {
-    return runBitwise(gpa, intern_pool, lhs, rhs, BigIntMutable.bitOr);
+    return runBinary(gpa, intern_pool, lhs, rhs, BigIntMutable.bitOr);
 }
 
 pub fn internXor(
@@ -253,10 +205,16 @@ pub fn internXor(
     lhs: BigIntConst,
     rhs: BigIntConst,
 ) Allocator.Error!InternPool.Index {
-    return runBitwise(gpa, intern_pool, lhs, rhs, BigIntMutable.bitXor);
+    return runBinary(gpa, intern_pool, lhs, rhs, BigIntMutable.bitXor);
 }
 
-fn runBitwise(
+/// Shared kernel for the binary ops whose result fits
+/// `@max(lhs, rhs) + 1` limbs -- add, sub, and the bitwise ops. Allocates
+/// that workspace, runs the stdlib `BigIntMutable` op, and interns the
+/// result. The `+ 1` bound covers every sign combination stdlib documents
+/// (carry/borrow for add/sub; bitAnd for two negatives; bitOr/bitXor for
+/// mixed signs), so one bound serves all callers.
+fn runBinary(
     gpa: Allocator,
     intern_pool: *InternPool,
     lhs: BigIntConst,

@@ -173,18 +173,6 @@ pub const ComptimeAlloc = struct {
 /// `namespace` is the session-root NamespaceIndex (or `null` for
 /// test paths without session state -- `evalDeclVal` errors and
 /// `bindDecls` is a no-op in that mode).
-/// Walks the ZIR produced by AstGen for a single REPL line.
-///
-/// Two control-flow modes depending on what AstGen produced:
-///
-///   1. The line was wrapped as `const __repl_input = (<expr>);`.
-///      `findReplInputBody` locates that decl and evaluates its
-///      body. The result is the Value returned to the REPL prompt.
-///   2. The line is a raw declaration (`const x = ...;` etc.).
-///      `bindDecls` walks every top-level decl in the root struct,
-///      evaluates the value bodies, and binds them into the session
-///      namespace via `createNav` + `pub_decls.put`. Returns `null`
-///      because declarations don't produce a value-to-print.
 ///
 /// Session-owned state (gpa, intern_pool, root_namespace,
 /// pipelines) is read straight off `session`. Per-call inputs
