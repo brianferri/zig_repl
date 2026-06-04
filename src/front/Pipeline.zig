@@ -18,6 +18,18 @@ pub const Result = struct {
         result.* = undefined;
     }
 
+    /// Hand the analysed `zir` to the caller and free the rest -- the Ast
+    /// and wrapped source, which only the front end and diagnostics need.
+    /// Consumes the result; do not use it afterward.
+    pub fn takeZir(result: *Result, gpa: std.mem.Allocator) std.zig.Zir {
+        assert(@intFromPtr(result) != 0);
+        const zir = result.zir;
+        result.tree.deinit(gpa);
+        result.wrapped.deinit(gpa);
+        result.* = undefined;
+        return zir;
+    }
+
     pub fn hasParseErrors(result: *const Result) bool {
         assert(@intFromPtr(result) != 0);
         return result.tree.errors.len != 0;

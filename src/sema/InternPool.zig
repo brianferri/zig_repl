@@ -838,9 +838,9 @@ pub const Key = union(enum) {
         /// body. `maxInt` is the sentinel for "the currently-active
         /// `sema.zir`" -- used during a `analyze()` pass where the
         /// func is bound in the SAME ZIR being walked. After the
-        /// pass commits, Repl promotes that Pipeline.Result into
-        /// `Session.frozen_pipelines` and the next analyze sees the
-        /// func's `source_zir_id` resolved to a stable index.
+        /// pass commits, the driver appends that line's ZIR to
+        /// `Session.line_zir` and the next analyze sees the func's
+        /// `source_zir_id` resolved to a stable index.
         /// Mirrors the compiler's `TrackedInst.Index` purpose
         /// (cross-update body identity) at the storage layer.
         source_zir_id: u32 = std.math.maxInt(u32),
@@ -1411,7 +1411,7 @@ const FuncTypeRepr = extern struct {
 
 /// Extra-arena payload for `Item.Tag.func_decl`. Three u32 slots:
 /// the source ZIR snapshot id (matches `Sema.current_zir_id` at
-/// intern time; index into `Session.pipelines`), `ty`, and the
+/// intern time; index into `Session.line_zir`), `ty`, and the
 /// ZIR func-instruction index within that snapshot.
 const FuncDeclRepr = extern struct {
     source_zir_id: u32,

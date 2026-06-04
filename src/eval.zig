@@ -70,11 +70,13 @@ fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !O
 
     const value = try Sema.analyze(session, result.zir, diag);
 
-    // Commit so a Func bound here keeps its source ZIR for future
-    // cross-line calls; `result.wrapped.shape` is a value field, still
-    // readable after the append takes ownership.
+    // Keep only this line's ZIR: a Func bound here replays its body on a
+    // later cross-line call. Read the shape (a value) before `takeZir`
+    // consumes the result, then hand the ZIR to the session.
     const shape = result.wrapped.shape;
-    try session.pipelines.append(session.gpa, result);
     committed = true;
+    var zir = result.takeZir(session.gpa);
+    errdefer zir.deinit(session.gpa);
+    try session.line_zir.append(session.gpa, zir);
     return .{ .value = value, .shape = shape };
 }

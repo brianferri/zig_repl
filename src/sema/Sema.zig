@@ -20,7 +20,6 @@ const InternPool = @import("InternPool.zig");
 const Value = @import("Value.zig");
 const arith = @import("arith.zig");
 const InputShape = @import("../front/InputShape.zig");
-const Pipeline = @import("../front/Pipeline.zig");
 const Session = @import("../Session.zig");
 
 const Sema = @This();
@@ -96,12 +95,11 @@ call_depth: u32 = 0,
 /// evalBody; consumed by `evalCall`'s catch. Garbage outside
 /// that transfer.
 return_value: Value = undefined,
-/// Read-only view of all previously-analysed Pipeline.Results.
-/// Each entry's `.zir` is callable as a fn body when a Func
-/// value's `source_zir_id` references its index. Populated by
-/// the REPL driver; tests can leave this empty since they don't
-/// exercise cross-line calls.
-pipelines: []const Pipeline.Result = &.{},
+/// Read-only view of every previously-analysed line's ZIR. An entry is
+/// callable as a fn body when a Func value's `source_zir_id` references
+/// its index. Populated by the REPL driver; tests can leave this empty
+/// since they don't exercise cross-line calls.
+line_zir: []const Zir = &.{},
 /// The id THIS analyze pass's ZIR will have if registered. Used
 /// at evalFunc-intern time so the resulting Func's
 /// `source_zir_id` resolves correctly on future cross-line
@@ -175,12 +173,12 @@ pub const ComptimeAlloc = struct {
 /// `bindDecls` is a no-op in that mode).
 ///
 /// Session-owned state (gpa, intern_pool, root_namespace,
-/// pipelines) is read straight off `session`. Per-call inputs
+/// line_zir) is read straight off `session`. Per-call inputs
 /// (the ZIR to analyse + the diagnostic writer) are explicit
 /// parameters. `current_zir_id` is derived as
-/// `session.pipelines.items.len` -- the slot THIS pass's
-/// Pipeline.Result will occupy once committed by the REPL
-/// driver after a successful analyze.
+/// `session.line_zir.items.len` -- the slot THIS pass's ZIR
+/// will occupy once committed by the REPL driver after a
+/// successful analyze.
 pub fn analyze(session: *Session, zir: Zir, writer: *std.Io.Writer) Error!?Value {
     const gpa = session.gpa;
     const intern_pool = session.intern_pool;
@@ -207,8 +205,8 @@ pub fn analyze(session: *Session, zir: Zir, writer: *std.Io.Writer) Error!?Value
         .comptime_allocs = .empty,
         .namespace = namespace,
         .block = &top_block,
-        .pipelines = session.pipelines.items,
-        .current_zir_id = @intCast(session.pipelines.items.len),
+        .line_zir = session.line_zir.items,
+        .current_zir_id = @intCast(session.line_zir.items.len),
     };
     defer sema.results.deinit(gpa);
     defer sema.comptime_allocs.deinit(gpa);
@@ -3690,11 +3688,11 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     // caller's body see the caller's zir again.
     const caller_zir = sema.zir;
     if (func.source_zir_id != sema.current_zir_id) {
-        if (func.source_zir_id >= sema.pipelines.len) {
+        if (func.source_zir_id >= sema.line_zir.len) {
             try sema.writer.writeAll("call: function's source ZIR is no longer available\n");
             return error.AnalysisFail;
         }
-        sema.zir = sema.pipelines[func.source_zir_id].zir;
+        sema.zir = sema.line_zir[func.source_zir_id];
     }
     defer sema.zir = caller_zir;
 

@@ -9,7 +9,6 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const InternPool = @import("sema/InternPool.zig");
-const Pipeline = @import("front/Pipeline.zig");
 
 const Session = @This();
 
@@ -25,12 +24,13 @@ intern_pool: *InternPool,
 /// compiler's per-file-root namespace; future modules hang their own
 /// namespaces off this root via the `parent` chain.
 root_namespace: InternPool.NamespaceIndex,
-/// Every successfully-analysed Pipeline.Result stays here for
-/// the session lifetime. Function values store an index into
-/// this list (`Key.Func.source_zir_id`); call sites swap
-/// `sema.zir` to the matching snapshot when crossing line
-/// boundaries.
-pipelines: std.ArrayListUnmanaged(Pipeline.Result),
+/// Each successfully-analysed line's ZIR, kept for the session
+/// lifetime. Function values store an index into this list
+/// (`Key.Func.source_zir_id`); call sites swap `sema.zir` to the
+/// matching snapshot when crossing line boundaries. The session keeps
+/// only the ZIR -- the Ast and wrapped source the front end produced
+/// alongside it are released at commit.
+line_zir: std.ArrayListUnmanaged(std.zig.Zir),
 
 pub fn init(
     gpa: std.mem.Allocator,
@@ -41,13 +41,13 @@ pub fn init(
         .gpa = gpa,
         .intern_pool = intern_pool,
         .root_namespace = root_namespace,
-        .pipelines = .empty,
+        .line_zir = .empty,
     };
 }
 
 pub fn deinit(session: *Session) void {
     assert(@intFromPtr(session) != 0);
-    for (session.pipelines.items) |*p| p.deinit(session.gpa);
-    session.pipelines.deinit(session.gpa);
+    for (session.line_zir.items) |*z| z.deinit(session.gpa);
+    session.line_zir.deinit(session.gpa);
     session.* = undefined;
 }
