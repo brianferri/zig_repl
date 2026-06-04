@@ -11,10 +11,11 @@
 //!     node it lowered from (`node`), so the explorer binds an instruction to
 //!     its syntax by node identity rather than overlapping spans.
 //!
-//! Both views are rooted at the user's input: the front end wraps an
-//! expression as `const __repl_input = ( EXPR )` and injects prior session
-//! declarations ahead of it, so the AST roots at EXPR (unwrapping the synthetic
-//! decl + parens) and the ZIR walks only the last declaration.
+//! Both views are rooted at the user's input. The front end wraps an
+//! expression as `const __repl_input = ( EXPR )`, so its AST roots at EXPR
+//! (unwrapping the synthetic decl + parens). Mixed "declarations then a
+//! trailing expression" input is outlined as two runs merged into one view
+//! (see `writeJson`).
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -23,59 +24,104 @@ const Json = std.json.Stringify;
 
 const Pipeline = @import("../../front/Pipeline.zig");
 const Session = @import("../../Session.zig");
+const eval = @import("../../eval.zig");
 const InputShape = @import("../../front/InputShape.zig");
 const ZirWalk = @import("../../front/ZirWalk.zig");
 const ZirSummary = @import("../../render/ZirSummary.zig");
 
 const UserView = Pipeline.UserView;
 
-/// Run the front end on `input` against `session` and write the lowering as
-/// JSON `{ source, ast, zir }` to `w`. On a front-end failure the arrays are
-/// empty (the explorer falls back to diagnostics).
-pub fn writeJson(session: *Session, input: []const u8, w: *std.Io.Writer) !void {
-    var result = Pipeline.runWithInjection(
-        session.gpa,
-        input,
-        session.intern_pool,
-        .init(session.root_namespace),
-    ) catch {
-        try w.writeAll("{\"source\":\"\",\"ast\":[],\"zir\":[]}");
+/// Shift applied to a segment's emitted ids and spans when several segments
+/// share one outline (see `writeJson`): `id` moves the segment's AST node ids
+/// (and the ZIR `node` refs that key into them) past the previous segment's,
+/// and `byte` moves its spans to the segment's place in the full source.
+const Offset = struct {
+    id: u32 = 0,
+    byte: u32 = 0,
+};
+
+const Segment = struct {
+    result: *const Pipeline.Result,
+    off: Offset,
+};
+
+/// Outline `source` as JSON `{ source, ast, zir }` for the explorer, mapping
+/// every node/instruction to its byte range in `source`. On a front-end
+/// failure the arrays are empty (the explorer falls back to diagnostics).
+///
+/// "Declarations then a trailing expression" can't share one parse -- a
+/// container rejects a bare trailing expression -- so they are outlined as two
+/// runs and merged: the declarations bind into `session` so the expression's
+/// run resolves them, and the expression segment is shifted to sit after the
+/// declarations in both id and byte space.
+pub fn writeJson(session: *Session, source: []const u8, w: *std.Io.Writer) !void {
+    const split = InputShape.splitTrailingExpr(session.gpa, source) catch null;
+    if (split) |s| {
+        var decls = Pipeline.runWithInjection(session.gpa, s.decls, session.intern_pool, .init(session.root_namespace)) catch return emitEmpty(w);
+        defer decls.deinit(session.gpa);
+        // Bind the declarations so the expression run's ZIR resolves their
+        // names; a failed bind just leaves the expression's ZIR with the
+        // AstGen error (omitted), while both ASTs still emit.
+        _ = eval.run(session, s.decls, w) catch {};
+        var expr = Pipeline.runWithInjection(session.gpa, s.expr, session.intern_pool, .init(session.root_namespace)) catch return emitEmpty(w);
+        defer expr.deinit(session.gpa);
+        const expr_off: Offset = .{
+            .id = @intCast(decls.tree.nodes.len),
+            .byte = @intCast(@intFromPtr(s.expr.ptr) - @intFromPtr(source.ptr)),
+        };
+        try emitOutline(session.gpa, w, source, &.{
+            .{ .result = &decls, .off = .{} },
+            .{ .result = &expr, .off = expr_off },
+        });
         return;
-    };
+    }
+
+    var result = Pipeline.runWithInjection(session.gpa, source, session.intern_pool, .init(session.root_namespace)) catch return emitEmpty(w);
     defer result.deinit(session.gpa);
+    try emitOutline(session.gpa, w, source, &.{.{ .result = &result, .off = .{} }});
+}
 
-    const view = result.userView();
+fn emitEmpty(w: *std.Io.Writer) !void {
+    try w.writeAll("{\"source\":\"\",\"ast\":[],\"zir\":[]}");
+}
+
+/// Emit the merged `{ source, ast, zir }` for `segments` in order. Each
+/// segment's nodes map into injected/prelude bytes are dropped (no user-frame
+/// span); the rest are shifted by the segment's `off`.
+fn emitOutline(gpa: std.mem.Allocator, w: *std.Io.Writer, source: []const u8, segments: []const Segment) !void {
     var json: Json = .{ .writer = w, .options = .{ .emit_null_optional_fields = false } };
-
     try json.beginObject();
     try json.objectField("source");
-    try json.write(view.text);
+    try json.write(source);
 
     try json.objectField("ast");
     try json.beginArray();
-    if (!result.hasParseErrors()) {
-        // Every user declaration; one that maps into injected bytes (a bound
-        // declaration the expression pipeline prepends) is dropped by
-        // `emitAstNode`.
-        for (result.tree.rootDecls()) |decl| {
-            try emitAstNode(&json, result.tree, view, outlineNode(result.tree, decl));
+    for (segments) |seg| {
+        if (seg.result.hasParseErrors()) continue;
+        const tree = seg.result.tree;
+        const view = seg.result.userView();
+        for (tree.rootDecls()) |decl| {
+            try emitAstNode(&json, tree, view, outlineNode(tree, decl), seg.off);
         }
     }
     try json.endArray();
 
     try json.objectField("zir");
     try json.beginArray();
-    if (!result.hasParseErrors() and !result.hasZirErrors()) {
-        var scratch: std.Io.Writer.Allocating = .init(session.gpa);
+    for (segments) |seg| {
+        if (seg.result.hasParseErrors() or seg.result.hasZirErrors()) continue;
+        const zir = seg.result.zir;
+        const view = seg.result.userView();
+        var scratch: std.Io.Writer.Allocating = .init(gpa);
         defer scratch.deinit();
-        var sink: ZirSink = .{ .json = &json, .zir = result.zir, .scratch = &scratch };
-        const datas = result.zir.instructions.items(.data);
-        // Each user declaration; skip injected-prelude decls, whose own node
-        // maps into bytes the `UserView` hides.
-        for (result.zir.typeDecls(.main_struct_inst)) |decl_inst| {
+        var sink: ZirSink = .{ .json = &json, .zir = zir, .scratch = &scratch, .id_offset = seg.off.id };
+        const datas = zir.instructions.items(.data);
+        // Skip injected-prelude decls, whose own node maps into bytes the
+        // `UserView` hides.
+        for (zir.typeDecls(.main_struct_inst)) |decl_inst| {
             const decl_node = datas[@intFromEnum(decl_inst)].declaration.src_node;
-            if (view.translate(result.tree.nodeToSpan(decl_node)) == null) continue;
-            try ZirWalk.walkDecl(result.zir, decl_inst, &sink);
+            if (view.translate(seg.result.tree.nodeToSpan(decl_node)) == null) continue;
+            try ZirWalk.walkDecl(zir, decl_inst, &sink);
         }
     }
     try json.endArray();
@@ -105,20 +151,20 @@ fn isWrapperDecl(tree: Ast, decl: Ast.Node.Index) bool {
 /// Emit `node` and its children as a nested JSON object
 /// `{ id, label, lo, hi, children }`. A node mapping into injected bytes (no
 /// user-frame span) drops out with its subtree.
-fn emitAstNode(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index) anyerror!void {
+fn emitAstNode(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index, off: Offset) anyerror!void {
     const span = view.translate(tree.nodeToSpan(node)) orelse return;
     try json.beginObject();
     try json.objectField("id");
-    try json.write(@intFromEnum(node));
+    try json.write(@intFromEnum(node) + off.id);
     try json.objectField("label");
     try json.write(@tagName(tree.nodeTag(node)));
     try json.objectField("lo");
-    try json.write(span.start);
+    try json.write(span.start + off.byte);
     try json.objectField("hi");
-    try json.write(span.end);
+    try json.write(span.end + off.byte);
     try json.objectField("children");
     try json.beginArray();
-    try emitChildren(json, tree, view, node);
+    try emitChildren(json, tree, view, node, off);
     try json.endArray();
     try json.endObject();
 }
@@ -129,7 +175,7 @@ fn emitAstNode(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index) any
 /// an unhandled tag is a leaf rather than a guess. `fn_proto` itself is a leaf:
 /// a parameter's name is a token, not a node, so descending shows only the
 /// (often repeated) type expressions -- the signature reads better as text.
-fn emitChildren(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index) anyerror!void {
+fn emitChildren(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index, off: Offset) anyerror!void {
     switch (tree.nodeTag(node)) {
         // `lhs OP rhs` binary operators store both operands in `node_and_node`.
         .mul,
@@ -159,8 +205,8 @@ fn emitChildren(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index) an
         .greater_or_equal,
         => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
-            try emitAstNode(json, tree, view, lhs);
-            try emitAstNode(json, tree, view, rhs);
+            try emitAstNode(json, tree, view, lhs, off);
+            try emitAstNode(json, tree, view, rhs, off);
         },
 
         // `OP expr` prefix operators store the operand in `node`.
@@ -170,16 +216,16 @@ fn emitChildren(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index) an
         .bool_not,
         .address_of,
         .optional_type,
-        => try emitAstNode(json, tree, view, tree.nodeData(node).node),
+        => try emitAstNode(json, tree, view, tree.nodeData(node).node, off),
 
         // `( expr )` keeps the inner node in `node_and_token`.
-        .grouped_expression => try emitAstNode(json, tree, view, tree.nodeData(node).node_and_token[0]),
+        .grouped_expression => try emitAstNode(json, tree, view, tree.nodeData(node).node_and_token[0], off),
 
         // `fn proto body`: show the signature (as a leaf) then the body block.
         .fn_decl => {
             const proto, const body = tree.nodeData(node).node_and_node;
-            try emitAstNode(json, tree, view, proto);
-            try emitAstNode(json, tree, view, body);
+            try emitAstNode(json, tree, view, proto, off);
+            try emitAstNode(json, tree, view, body, off);
         },
 
         // `{ stmts }`: `blockStatements` unifies the two-statement and N
@@ -190,7 +236,7 @@ fn emitChildren(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index) an
         .block_two_semicolon,
         => {
             var buf: [2]Ast.Node.Index = undefined;
-            for (tree.blockStatements(&buf, node).?) |stmt| try emitAstNode(json, tree, view, stmt);
+            for (tree.blockStatements(&buf, node).?) |stmt| try emitAstNode(json, tree, view, stmt, off);
         },
 
         // `callee(args)`: `fullCall` unifies the one-arg and N-arg forms.
@@ -201,20 +247,20 @@ fn emitChildren(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index) an
         => {
             var buf: [1]Ast.Node.Index = undefined;
             const c = tree.fullCall(&buf, node).?;
-            try emitAstNode(json, tree, view, c.ast.fn_expr);
-            for (c.ast.params) |arg| try emitAstNode(json, tree, view, arg);
+            try emitAstNode(json, tree, view, c.ast.fn_expr, off);
+            for (c.ast.params) |arg| try emitAstNode(json, tree, view, arg, off);
         },
 
         // `return expr`: the value is optional (`return;` has none).
         .@"return" => {
-            if (tree.nodeData(node).opt_node.unwrap()) |operand| try emitAstNode(json, tree, view, operand);
+            if (tree.nodeData(node).opt_node.unwrap()) |operand| try emitAstNode(json, tree, view, operand, off);
         },
 
         // A declaration input is shown rooted at its decl; descend into the
         // initializer when present.
         .simple_var_decl => {
             if (tree.nodeData(node).opt_node_and_opt_node[1].unwrap()) |init| {
-                try emitAstNode(json, tree, view, init);
+                try emitAstNode(json, tree, view, init, off);
             }
         },
 
@@ -231,11 +277,13 @@ const ZirSink = struct {
     json: *Json,
     zir: Zir,
     scratch: *std.Io.Writer.Allocating,
+    /// Shift for the `node` refs so they key into this segment's AST ids
+    /// after they were moved past an earlier segment's (see `Offset`).
+    id_offset: u32 = 0,
 
-    // The explorer always outlines a wrapped expression, whose only
-    // declaration is the synthetic `__repl_input` the `UserView` otherwise
-    // hides. Emitting it would surface that injection, so the declaration is
-    // elided and its bodies become the top-level sections.
+    // Every declaration is elided and its bodies surface as the top-level
+    // sections: for the synthetic `__repl_input` wrapper this hides the
+    // injection; for a real `const` it matches how a lone declaration outlines.
     pub fn openDeclaration(self: *ZirSink, decl_inst: Zir.Inst.Index, base: Ast.Node.Index) !void {
         _ = self;
         _ = decl_inst;
@@ -268,7 +316,7 @@ const ZirSink = struct {
         const node = instNode(base, tag, data);
         try self.open(
             @tagName(tag),
-            if (node) |n| @intFromEnum(n) else null,
+            if (node) |n| @intFromEnum(n) + self.id_offset else null,
             if (detail.len > 0) detail else null,
         );
     }

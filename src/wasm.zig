@@ -144,9 +144,9 @@ fn preview(input: []const u8) !void {
 
 /// Emit the source-mapped lowering of `input` as JSON for the explorer:
 /// `{ source, ast, zir }`, each AST node / ZIR instruction carrying the
-/// user-text byte range it came from. Like `preview`, it binds leading
-/// declarations into a throwaway session so a trailing expression's
-/// lowering resolves them, then outlines just that expression.
+/// user-text byte range it came from. Runs in a throwaway session;
+/// declarations and a trailing expression are outlined together (see
+/// `outline.writeJson`).
 export fn replOutline(ptr: [*]u8, len: usize) void {
     if (!ready and !replInit()) return;
     defer gpa.free(ptr[0..len]);
@@ -170,16 +170,5 @@ fn buildOutline(input: []const u8) !void {
     var preview_session = Session.init(gpa, &preview_pool, root_namespace);
     defer preview_session.deinit();
 
-    var expr = trimmed;
-    if (try InputShape.splitTrailingExpr(gpa, trimmed)) |split| {
-        // Bind the declarations so the expression's lowering resolves them.
-        // A failed decl pass just leaves the names unbound (the ZIR then
-        // carries the AstGen error and is omitted); the AST still emits.
-        var scratch: std.Io.Writer.Allocating = .init(gpa);
-        defer scratch.deinit();
-        _ = eval.run(&preview_session, split.decls, &scratch.writer) catch {};
-        expr = split.expr;
-    }
-
-    try outline.writeJson(&preview_session, expr, w);
+    try outline.writeJson(&preview_session, trimmed, w);
 }

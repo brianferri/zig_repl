@@ -310,9 +310,9 @@ function renderExplorer() {
         return;
     }
     const data = outline(src);
-    // The outline reports offsets into its own `source` -- the trailing
-    // expression when declarations precede it, so a sub-slice of the editor.
-    // Locate it so editor selections land on the right span.
+    // The outline's `source` is the trimmed input; its offsets are relative to
+    // that. Locate it in the raw editor value so selections account for any
+    // leading whitespace the user typed.
     const base = Math.max(value.lastIndexOf(data.source), 0);
     indexSpans(data.ast, base);
     renderAst(outAst, data.ast, data.source);
