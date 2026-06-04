@@ -603,10 +603,7 @@ fn evalPassthroughUnNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// src/Sema/arith.zig:{add,sub,mul,divTrunc,divFloor,mod,rem}.
 fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     assert(@intFromPtr(sema) != 0);
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
@@ -1305,16 +1302,22 @@ fn resolveDestType(
     };
 }
 
+/// Decode the `Zir.Inst.Bin` payload (the `lhs` / `rhs` operand refs) of a
+/// `pl_node` instruction -- the wire shape every binary-op and cast builtin
+/// shares. Callers that require both operands present assert it themselves.
+fn binData(sema: *Sema, inst: Zir.Inst.Index) Zir.Inst.Bin {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    return sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+}
+
 /// `@floatCast(DestType, x)`: float-to-float width cast (widening or
 /// narrowing). All widths are accepted; narrowing loses precision but
 /// never errors. The pool's storage variant is selected by `DestType`.
 ///
 /// Compiler reference: src/Sema.zig:zirFloatCast.
 fn evalFloatCast(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
@@ -1342,10 +1345,7 @@ fn evalFloatCast(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///
 /// Compiler reference: src/Sema.zig:zirIntFromFloat.
 fn evalIntFromFloat(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
@@ -1425,10 +1425,7 @@ fn materialiseIntFromFloat(
 ///
 /// Compiler reference: src/Sema.zig:zirFloatFromInt.
 fn evalFloatFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
@@ -1457,10 +1454,7 @@ fn evalFloatFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///
 /// Compiler reference: src/Sema.zig:zirIntCast.
 fn evalIntCast(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
 
     const dest_type_index = try sema.resolveDestType(bin.lhs, "@intCast");
     const operand_value = try sema.resolveRef(bin.rhs);
@@ -1481,10 +1475,7 @@ fn evalIntCast(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///
 /// Compiler reference: src/Sema.zig:zirTruncate.
 fn evalTruncate(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
 
     const dest_type_index = try sema.resolveDestType(bin.lhs, "@truncate");
     const dest_info = intTypeInfo(sema.intern_pool, dest_type_index) orelse {
@@ -1523,10 +1514,7 @@ fn evalTruncate(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///
 /// Compiler reference: src/Sema.zig:zirBitCast.
 fn evalBitCast(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
 
     const dest_type_index = try sema.resolveDestType(bin.lhs, "@bitCast");
     const operand_value = try sema.resolveRef(bin.rhs);
@@ -1741,10 +1729,7 @@ fn evalShift(
     inst: Zir.Inst.Index,
     tag: Zir.Inst.Tag,
 ) Error!?Value {
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
@@ -1881,10 +1866,7 @@ fn runShlSat(
 /// Compiler reference: src/Sema.zig:zirBitBinOp -> src/Sema/arith.zig.
 fn evalBitwise(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     assert(@intFromPtr(sema) != 0);
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
@@ -1928,10 +1910,7 @@ fn evalComparison(
     op: std.math.CompareOperator,
 ) Error!?Value {
     assert(@intFromPtr(sema) != 0);
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
@@ -2167,10 +2146,7 @@ fn pushComptimeAlloc(
 /// surface "cannot assign to constant" -- same vocabulary the
 /// compiler uses.
 fn evalStoreNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
@@ -2330,10 +2306,7 @@ fn evalIntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// the array-type Index, which doubles as the value-of-type-`type`.
 /// Compiler reference: src/Sema.zig:zirArrayType (~7460).
 fn evalArrayType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
@@ -2349,10 +2322,7 @@ fn evalArrayType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// via `isVectorElemType`. Compiler reference: src/Sema.zig:zirVectorType
 /// (~7456).
 fn evalVectorType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
@@ -2695,10 +2665,7 @@ fn materializeConstPtr(sema: *Sema, value: Value) Error!Value {
 /// against the aggregate type's element count -- an out-of-range
 /// index is a comptime error here (we have no runtime panic path).
 fn evalElemPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
@@ -3276,10 +3243,7 @@ fn evalErrorValue(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// must resolve to types; `resolveDestType` enforces this. Mirrors
 /// the compiler's handler (`src/Sema.zig:zirErrorUnionType`).
 fn evalErrorUnionType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
