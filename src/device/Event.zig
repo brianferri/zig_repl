@@ -31,6 +31,15 @@ pub const Event = union(enum) {
     eof,
 };
 
+/// Clamp a raw wire codepoint to a Unicode scalar. Values above the
+/// Unicode maximum map to U+FFFD so a malformed wire form still yields a
+/// key event rather than tripping an unreachable. Real terminals don't
+/// emit these; this is fuzz-safety for the protocol parsers.
+pub fn clampCodepoint(raw: u32) u21 {
+    if (raw > 0x10ffff) return 0xfffd;
+    return @intCast(raw);
+}
+
 pub const Key = struct {
     /// Functional keys (arrows, F-keys) use the `key.*` constants
     /// below; character keys carry the typed codepoint directly.

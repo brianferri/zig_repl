@@ -24,14 +24,7 @@ fn parse(input: []const u8) Standard.Result {
     assert(input.len >= 2);
     assert(input[0] == 0x1b);
     assert(input[1] == ']');
-    var i: u32 = 2;
-    while (i < input.len) : (i += 1) {
-        if (input[i] == 0x07) {
-            return .{ .token = .{ .osc = input[2..i] }, .consumed = i + 1 };
-        }
-        if (input[i] == 0x1b and i + 1 < input.len and input[i + 1] == '\\') {
-            return .{ .token = .{ .osc = input[2..i] }, .consumed = i + 2 };
-        }
-    }
-    return .{ .token = null, .consumed = 0 };
+    const scan = Standard.scanStringTerminated(input) orelse
+        return .{ .token = null, .consumed = 0 };
+    return .{ .token = .{ .osc = input[2..scan.payload_end] }, .consumed = scan.consumed };
 }

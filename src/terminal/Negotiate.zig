@@ -22,6 +22,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Protocol = @import("Protocol.zig");
+const Csi = @import("standard/Csi.zig");
 
 pub const response_buffer_bytes: u32 = 512;
 
@@ -77,47 +78,29 @@ pub fn run(
             continue;
         }
         total += @intCast(n);
-        if (containsDa1Terminator(buffer[0..total])) break;
+        // DA1 reply: `ESC [ ? Pn ; ... ; Pn c`. The final `c` is the
+        // reliable terminator; intermediate parameters vary by terminal.
+        if (Csi.containsFinal(buffer[0..total], null, 'c')) break;
     }
 
     return .{
         .bytes = buffer[0..total],
-        .da1_terminated = containsDa1Terminator(buffer[0..total]),
+        .da1_terminated = Csi.containsFinal(buffer[0..total], null, 'c'),
     };
 }
 
-/// DA1 reply: `ESC [ ? Pn ; ... ; Pn c`. The final `c` is the
-/// reliable terminator; intermediate parameters vary by terminal.
-fn containsDa1Terminator(buf: []const u8) bool {
-    assert(buf.len <= response_buffer_bytes);
-    var i: u32 = 0;
-    while (i + 1 < buf.len) : (i += 1) {
-        if (buf[i] != 0x1b) continue;
-        if (buf[i + 1] != '[') continue;
-        var j: u32 = i + 2;
-        while (j < buf.len) : (j += 1) {
-            const b = buf[j];
-            if (b == 'c') return true;
-            // Any other CSI final byte before `c`: this CSI isn't a
-            // DA1 reply. Keep scanning.
-            if (b >= 0x40 and b <= 0x7e) break;
-        }
-    }
-    return false;
+test "DA1 termination: ESC[?6c matches" {
+    try std.testing.expect(Csi.containsFinal("\x1b[?6c", null, 'c'));
 }
 
-test "containsDa1Terminator: ESC[?6c matches" {
-    try std.testing.expect(containsDa1Terminator("\x1b[?6c"));
+test "DA1 termination: ESC[?6;22c matches" {
+    try std.testing.expect(Csi.containsFinal("\x1b[?6;22c", null, 'c'));
 }
 
-test "containsDa1Terminator: ESC[?6;22c matches" {
-    try std.testing.expect(containsDa1Terminator("\x1b[?6;22c"));
+test "DA1 termination: missing 'c' does not match" {
+    try std.testing.expect(!Csi.containsFinal("\x1b[?6", null, 'c'));
 }
 
-test "containsDa1Terminator: missing 'c' does not match" {
-    try std.testing.expect(!containsDa1Terminator("\x1b[?6"));
-}
-
-test "containsDa1Terminator: other CSI final byte does not match" {
-    try std.testing.expect(!containsDa1Terminator("\x1b[?6u"));
+test "DA1 termination: other CSI final byte does not match" {
+    try std.testing.expect(!Csi.containsFinal("\x1b[?6u", null, 'c'));
 }

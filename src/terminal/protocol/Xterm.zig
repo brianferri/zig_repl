@@ -108,9 +108,7 @@ fn interpretCsi(csi: Csi.Sequence) ?Event.Event {
     // Sequences with `?` / `>` / `<` private intermediates are
     // capability replies (DA1, progressive enhancement) -- not key
     // events; don't claim them here.
-    if (csi.hasIntermediate('?')) return null;
-    if (csi.hasIntermediate('>')) return null;
-    if (csi.hasIntermediate('<')) return null;
+    if (csi.hasPrivateLead()) return null;
 
     // xterm modifier convention: when present, modifiers live in
     // the second primary parameter and the leading position is the

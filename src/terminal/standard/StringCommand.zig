@@ -29,16 +29,9 @@ pub const apc: Standard = .{ .introducer = '_', .name = "APC", .parse = parse };
 fn parse(input: []const u8) Standard.Result {
     assert(input.len >= 2);
     assert(input[0] == 0x1b);
-    var i: u32 = 2;
-    while (i < input.len) : (i += 1) {
-        // ST (ESC \) is the canonical terminator. BEL (0x07) is
-        // accepted as xterm's alternate, mirroring OSC.
-        if (input[i] == 0x07) {
-            return .{ .token = null, .consumed = i + 1 };
-        }
-        if (input[i] == 0x1b and i + 1 < input.len and input[i + 1] == '\\') {
-            return .{ .token = null, .consumed = i + 2 };
-        }
-    }
-    return .{ .token = null, .consumed = 0 };
+    // The payload is recognised only to skip it; emit no token so the
+    // dispatcher drops the consumed bytes and pulls the next sequence.
+    const scan = Standard.scanStringTerminated(input) orelse
+        return .{ .token = null, .consumed = 0 };
+    return .{ .token = null, .consumed = scan.consumed };
 }

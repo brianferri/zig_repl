@@ -95,11 +95,7 @@ fn interpretU(csi: Csi.Sequence) ?Event.Event {
 }
 
 fn makePress(cp_raw: u32, modifiers: Event.Modifiers) Event.Event {
-    // Clamp out-of-Unicode codepoints to U+FFFD (replacement char)
-    // so a malformed wire form produces a key event we can ignore
-    // rather than crashing the editor.
-    const cp: u21 = if (cp_raw <= 0x10ffff) @intCast(cp_raw) else 0xfffd;
-    return .{ .key_press = .{ .codepoint = cp, .modifiers = modifiers } };
+    return .{ .key_press = .{ .codepoint = Event.clampCodepoint(cp_raw), .modifiers = modifiers } };
 }
 
 test "modifyOtherKeys: CSI 27;2;13~ -> Shift+Enter" {

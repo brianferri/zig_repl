@@ -52,9 +52,7 @@ fn tryInterpret(token: Standard.Token) ?Event.Event {
     if (token != .csi) return null;
     const csi = token.csi;
     if (csi.final != 'u') return null;
-    if (csi.hasIntermediate('?')) return null;
-    if (csi.hasIntermediate('>')) return null;
-    if (csi.hasIntermediate('<')) return null;
+    if (csi.hasPrivateLead()) return null;
     if (csi.params_count == 0) return null;
     return interpretKitty(csi);
 }
@@ -76,7 +74,7 @@ fn interpretKitty(csi: Csi.Sequence) ?Event.Event {
         1; // 1 = press default per spec
 
     const key: Event.Key = .{
-        .codepoint = clampCodepoint(cp_raw),
+        .codepoint = Event.clampCodepoint(cp_raw),
         .modifiers = Event.Modifiers.fromParam(modifier_param),
     };
 
@@ -89,36 +87,10 @@ fn interpretKitty(csi: Csi.Sequence) ?Event.Event {
 }
 
 fn vtableDetectSupport(_: *const Protocol, response: []const u8) bool {
-    return containsReply(response);
-}
-
-/// Kitty progressive-enhancement reply has the shape
-/// `ESC [ ? <decimal_flags> u`. The leading `?` discriminates it
-/// from a bare `ESC [ N u` keypress (which would be a Kitty key
-/// report, not a capability reply).
-fn containsReply(buf: []const u8) bool {
-    assert(buf.len < std.math.maxInt(u32));
-    var i: u32 = 0;
-    while (i + 2 < buf.len) : (i += 1) {
-        if (buf[i] != 0x1b) continue;
-        if (buf[i + 1] != '[') continue;
-        if (buf[i + 2] != '?') continue;
-        var j: u32 = i + 3;
-        while (j < buf.len) : (j += 1) {
-            const b = buf[j];
-            if (b == 'u') return true;
-            if (b >= 0x40 and b <= 0x7e) break;
-        }
-    }
-    return false;
-}
-
-fn clampCodepoint(raw: u32) u21 {
-    // Anything above U+10FFFF is malformed. Map to U+FFFD so an
-    // erroneous wire form still produces a key event rather than
-    // an unreachable. Real terminals don't emit this; fuzz-safety.
-    if (raw > 0x10ffff) return 0xfffd;
-    return @intCast(raw);
+    // The Kitty reply has the shape `ESC [ ? <decimal_flags> u`. The
+    // leading `?` discriminates it from a bare `ESC [ N u` keypress (a
+    // Kitty key report, not a capability reply).
+    return Csi.containsFinal(response, '?', 'u');
 }
 
 test "kitty: CSI 13;2u -> Shift+Enter key_press" {
@@ -184,16 +156,16 @@ test "kitty: ignores non-CSI tokens" {
     try std.testing.expect(tryInterpret(.{ .ss3 = .{ .final = 'A' } }) == null);
 }
 
-test "kitty: containsReply detects ESC[?5u" {
-    try std.testing.expect(containsReply("\x1b[?5u"));
+test "kitty: detection accepts ESC[?5u" {
+    try std.testing.expect(Csi.containsFinal("\x1b[?5u", '?', 'u'));
 }
 
-test "kitty: containsReply rejects bare ESC[5u (no '?')" {
-    try std.testing.expect(!containsReply("\x1b[5u"));
+test "kitty: detection rejects bare ESC[5u (no '?')" {
+    try std.testing.expect(!Csi.containsFinal("\x1b[5u", '?', 'u'));
 }
 
-test "kitty: containsReply finds reply embedded in DA1+other noise" {
-    try std.testing.expect(containsReply("\x1b[?5u\x1b[?6c"));
+test "kitty: detection finds the reply embedded in DA1+other noise" {
+    try std.testing.expect(Csi.containsFinal("\x1b[?5u\x1b[?6c", '?', 'u'));
 }
 
 test "kitty: protocol() returns a usable Protocol pointer" {

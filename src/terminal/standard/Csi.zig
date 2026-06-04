@@ -60,7 +60,41 @@ pub const Sequence = struct {
         }
         return false;
     }
+
+    /// Whether the sequence carries one of the private-use lead bytes
+    /// `?` `>` `<` that mark capability queries/replies rather than key
+    /// events. (`=`, the fourth private-lead byte, is unused by the
+    /// keyboard protocols, so it is not treated as one here.)
+    pub fn hasPrivateLead(seq: Sequence) bool {
+        return seq.hasIntermediate('?') or seq.hasIntermediate('>') or seq.hasIntermediate('<');
+    }
 };
+
+/// Whether `buf` contains a CSI sequence (`ESC [ ...`) whose final byte
+/// equals `final`. When `lead` is non-null, the byte right after `[` must
+/// equal it -- the private-use lead (e.g. `?`) on a capability reply.
+/// Used to spot one specific reply inside a batch of probe responses.
+pub fn containsFinal(buf: []const u8, lead: ?u8, final: u8) bool {
+    assert(buf.len < std.math.maxInt(u32));
+    var i: u32 = 0;
+    while (i + 1 < buf.len) : (i += 1) {
+        if (buf[i] != 0x1b) continue;
+        if (buf[i + 1] != '[') continue;
+        var j: u32 = i + 2;
+        if (lead) |l| {
+            if (j >= buf.len or buf[j] != l) continue;
+            j += 1;
+        }
+        while (j < buf.len) : (j += 1) {
+            const b = buf[j];
+            if (b == final) return true;
+            // Any other CSI final byte: this sequence isn't the one
+            // we're after. Stop and keep scanning from the next ESC.
+            if (b >= 0x40 and b <= 0x7e) break;
+        }
+    }
+    return false;
+}
 
 pub const standard: Standard = .{
     .introducer = '[',
