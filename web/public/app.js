@@ -321,8 +321,17 @@ function renderExplorer() {
 }
 
 // Seed the editor so the explorer is populated on load (kept in JS, not as
-// textarea markup, to leave the HTML cleanly indented).
-editor.value = "const x: u32 = 40;\nx + 2";
+// textarea markup, to leave the HTML cleanly indented). Mixes declarations, a
+// function, and a trailing expression to exercise the multi-segment outline.
+editor.value = `const x: u32 = 40;
+
+fn add(a: u32, b: u32) i32 {
+    return a + b;
+}
+
+const c = add(x, 2);
+
+c`;
 renderExplorer();
 
 // Readiness signal for automated harnesses: handlers attach only after the
