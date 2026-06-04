@@ -81,16 +81,6 @@ comptime_break_inst: Zir.Inst.Index = undefined,
 /// (lands with broader builtin coverage).
 branch_quota: u32 = default_branch_quota,
 branch_count: u32 = 0,
-/// Recursion-depth counter for `.call` / `.field_call`.
-/// Incremented at evalCall entry; decremented via defer at exit.
-/// Bounded by `call_depth_max` -- exceeding raises a structured
-/// "stack overflow during comptime call evaluation" diagnostic
-/// rather than blowing the host stack. The compiler doesn't use
-/// a fixed depth limit (it folds calls into branch_count via
-/// `emitBackwardBranch`-equivalent paths); the REPL has no
-/// branch-quota knob exposed on function-call paths yet, so a
-/// hard cap keeps unbounded recursion bounded.
-call_depth: u32 = 0,
 /// Value carried by an in-flight `error.ComptimeReturn`. Set by
 /// the `.ret_node` / `.ret_load` / `.ret_implicit` arms of
 /// evalBody; consumed by `evalCall`'s catch. Garbage outside
@@ -137,7 +127,6 @@ block: *Block = undefined,
 type_name_ctx: InternPool.NullTerminatedString = .empty,
 
 pub const default_branch_quota: u32 = 1000;
-pub const call_depth_max: u32 = 256;
 
 /// Mirrors the compiler's `Sema.Block` (src/Sema.zig). Today
 /// only `params` is populated -- the other compiler fields
@@ -164,7 +153,6 @@ pub const Block = struct {
 };
 
 pub const ComptimeAlloc = struct {
-    ty: InternPool.Index,
     val: Value,
     is_const: bool,
 };
@@ -558,7 +546,6 @@ fn evalInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// Compiler reference: src/Sema.zig:zirIntBig in the Zig compiler tree
 /// (carries the same TODO).
 fn evalIntBig(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const str = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str;
@@ -629,7 +616,6 @@ fn evalPassthroughUnNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// Compiler reference: src/Sema.zig:zirArithmetic ->
 /// src/Sema/arith.zig:{add,sub,mul,divTrunc,divFloor,mod,rem}.
 fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
@@ -943,12 +929,11 @@ fn runIntWrapSat(
     dest_ty: InternPool.Index,
     dest_info: std.lang.Type.Int,
 ) Error!?Value {
-    const limb_bits: usize = @bitSizeOf(std.math.big.Limb);
     // Worst-case `mul` output is `lhs.limbs.len + rhs.limbs.len`; add /
     // sub need `max + 1`. One worst-case buffer fits everything plus
     // one cushion limb for `saturate` to write its sentinel.
     const max_op_limbs = @max(lhs.limbs.len + rhs.limbs.len, @max(lhs.limbs.len, rhs.limbs.len) + 1);
-    const dest_limbs = (@as(usize, dest_info.bits) + limb_bits - 1) / limb_bits + 1;
+    const dest_limbs = std.math.big.int.calcTwosCompLimbCount(dest_info.bits) + 1;
     const workspace = try sema.gpa.alloc(std.math.big.Limb, @max(max_op_limbs, dest_limbs));
     defer sema.gpa.free(workspace);
 
@@ -1106,7 +1091,6 @@ fn unwrapDivResult(
     result: arith.DivError!InternPool.Index,
     op_name: []const u8,
 ) Error!InternPool.Index {
-    assert(@intFromPtr(sema) != 0);
     assert(op_name.len > 0);
 
     const idx = result catch |err| switch (err) {
@@ -1144,7 +1128,6 @@ const ShiftKernel = *const fn (
 ///
 /// Compiler reference: src/Sema.zig:zirBlock / zirBlockInline.
 fn evalBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
@@ -1161,7 +1144,6 @@ fn evalBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///
 /// Compiler reference: src/Sema.zig:zirCondbr.
 fn evalCondbr(sema: *Sema, inst: Zir.Inst.Index) Error!Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
@@ -1193,7 +1175,6 @@ fn evalCondbr(sema: *Sema, inst: Zir.Inst.Index) Error!Value {
 /// indices; we map directly to the opposite without going through Sema
 /// type machinery.
 fn evalBoolNot(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
@@ -1219,7 +1200,6 @@ fn evalBoolNot(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///
 /// Compiler reference: src/Sema.zig:zirBoolBr.
 fn evalBoolBr(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     assert(tag == .bool_br_and or tag == .bool_br_or);
 
@@ -1256,7 +1236,6 @@ fn evalBoolBr(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value
 ///
 /// Compiler reference: src/Sema.zig:zirTypeofLog2IntType -> log2IntType.
 fn evalTypeofLog2IntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
@@ -1295,7 +1274,6 @@ fn evalTypeofLog2IntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///
 /// Compiler reference: src/Sema.zig:zirAsNode -> analyzeAs.
 fn evalAsNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
@@ -1535,8 +1513,7 @@ fn evalTruncate(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const operand_big = operand_key.int.storage.toBigInt(&space);
 
-    const limb_bits: usize = @bitSizeOf(std.math.big.Limb);
-    const workspace_limbs: usize = (@as(usize, dest_info.bits) + limb_bits - 1) / limb_bits + 1;
+    const workspace_limbs: usize = std.math.big.int.calcTwosCompLimbCount(dest_info.bits) + 1;
     const workspace = try sema.gpa.alloc(std.math.big.Limb, workspace_limbs);
     defer sema.gpa.free(workspace);
 
@@ -1615,8 +1592,7 @@ fn reinterpretBitCast(
                 // complement view at the destination signedness.
                 var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
                 const big = int.storage.toBigInt(&space);
-                const limb_bits: usize = @bitSizeOf(std.math.big.Limb);
-                const workspace_limbs: usize = (@as(usize, info.bits) + limb_bits - 1) / limb_bits + 1;
+                const workspace_limbs: usize = std.math.big.int.calcTwosCompLimbCount(info.bits) + 1;
                 const workspace = try sema.gpa.alloc(std.math.big.Limb, workspace_limbs);
                 defer sema.gpa.free(workspace);
                 var mutable: std.math.big.int.Mutable = .{
@@ -1654,13 +1630,14 @@ fn intBitsAsU128(int: InternPool.Key.Int, bits: u16) Error!u128 {
     assert(bits <= 128);
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const big = int.storage.toBigInt(&space);
-    // toInt(u128) sign-checks; we want the two's-complement view. The
-    // limbs already hold the magnitude; flip the sign bit explicitly
-    // for negative values to land at the right u128 pattern.
-    if (big.positive) return big.toInt(u128) catch unreachable;
-    const magnitude: u128 = big.toInt(u128) catch unreachable;
-    const mask: u128 = if (bits == 128) ~@as(u128, 0) else (@as(u128, 1) << @intCast(bits)) - 1;
-    return (~magnitude + 1) & mask;
+    // Reinterpret as an unsigned `bits`-wide two's-complement value -- the
+    // same `truncate(.unsigned, bits)` the int->bits paths use -- so a
+    // negative value lands on its two's-complement pattern. Stack buffer, no
+    // allocation; `bits <= 128` so the result fits `u128`.
+    var buf: [std.math.big.int.calcTwosCompLimbCount(128) + 1]std.math.big.Limb = undefined;
+    var pattern: std.math.big.int.Mutable = .{ .limbs = &buf, .len = undefined, .positive = undefined };
+    pattern.truncate(big, .unsigned, bits);
+    return pattern.toConst().toInt(u128) catch unreachable;
 }
 
 fn floatBitsAsU128(float: InternPool.Key.Float) u128 {
@@ -1692,7 +1669,7 @@ fn internBitsAsInt(
     dest_ty: InternPool.Index,
     dest_info: std.lang.Type.Int,
 ) Error!Value {
-    var limbs_buf: [(128 + @bitSizeOf(std.math.big.Limb) - 1) / @bitSizeOf(std.math.big.Limb) + 1]std.math.big.Limb = undefined;
+    var limbs_buf: [std.math.big.int.calcTwosCompLimbCount(128) + 1]std.math.big.Limb = undefined;
     var mutable: std.math.big.int.Mutable = .{
         .limbs = &limbs_buf,
         .len = undefined,
@@ -1886,8 +1863,7 @@ fn runShlSat(
     const shift_amount = arith.shiftAmount(rhs) catch |err|
         return sema.reportShiftAmountError(err, op_name);
 
-    const limb_bits: usize = @bitSizeOf(std.math.big.Limb);
-    const max_limbs: usize = (@as(usize, dest_info.bits) + limb_bits - 1) / limb_bits + 1;
+    const max_limbs: usize = std.math.big.int.calcTwosCompLimbCount(dest_info.bits) + 1;
     const workspace = try sema.gpa.alloc(std.math.big.Limb, max_limbs);
     defer sema.gpa.free(workspace);
 
@@ -1907,7 +1883,6 @@ fn runShlSat(
 ///
 /// Compiler reference: src/Sema.zig:zirBitBinOp -> src/Sema/arith.zig.
 fn evalBitwise(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
@@ -1951,7 +1926,6 @@ fn evalComparison(
     inst: Zir.Inst.Index,
     op: std.math.CompareOperator,
 ) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
@@ -2164,7 +2138,6 @@ fn pushComptimeAlloc(
     const ip = sema.intern_pool;
     const alloc_index: u32 = @intCast(sema.comptime_allocs.items.len);
     try sema.comptime_allocs.append(sema.gpa, .{
-        .ty = child_ty,
         .val = val,
         .is_const = is_const,
     });
@@ -2209,7 +2182,7 @@ fn evalStoreNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr);
     const rhs_value = try sema.resolveRef(bin.rhs);
-    const coerced = try sema.coerceValueToType(rhs_value, alloc.ty, "store");
+    const coerced = try sema.coerceValueToType(rhs_value, alloc.val.typeOf(ip).toIndex(), "store");
     alloc.val = coerced;
     return .{ .index = .void_value };
 }
@@ -2247,7 +2220,6 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
 /// is asserted to be zero -- field/element pointers (non-zero offsets)
 /// arrive with aggregates.
 fn lookupComptimeAlloc(sema: *Sema, ptr: InternPool.Key.Ptr) Error!*ComptimeAlloc {
-    assert(@intFromPtr(sema) != 0);
 
     if (ptr.byte_offset != 0) {
         try sema.writer.writeAll("comptime_alloc lookup: pointer offset not yet supported\n");
@@ -2891,8 +2863,7 @@ fn runFixedWidthBitNot(
     var op_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const operand_big = operand_int.storage.toBigInt(&op_space);
 
-    const limb_bits: usize = @bitSizeOf(std.math.big.Limb);
-    const workspace_limbs: usize = (@as(usize, dest_info.bits) + limb_bits - 1) / limb_bits + 1;
+    const workspace_limbs: usize = std.math.big.int.calcTwosCompLimbCount(dest_info.bits) + 1;
     const workspace = try sema.gpa.alloc(std.math.big.Limb, workspace_limbs);
     defer sema.gpa.free(workspace);
 
@@ -2917,8 +2888,7 @@ fn runIntNegateWrap(
     var op_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const operand_big = operand_int.storage.toBigInt(&op_space);
 
-    const limb_bits: usize = @bitSizeOf(std.math.big.Limb);
-    const workspace_limbs: usize = (@as(usize, dest_info.bits) + limb_bits - 1) / limb_bits + 1;
+    const workspace_limbs: usize = std.math.big.int.calcTwosCompLimbCount(dest_info.bits) + 1;
     const workspace = try sema.gpa.alloc(std.math.big.Limb, workspace_limbs);
     defer sema.gpa.free(workspace);
 
@@ -3111,7 +3081,6 @@ fn lookupName(
     ns_idx: InternPool.NamespaceIndex,
     name: InternPool.NullTerminatedString,
 ) Error!?InternPool.Nav.Index {
-    assert(@intFromPtr(sema) != 0);
 
     var current: ?InternPool.NamespaceIndex = ns_idx;
     var depth: u32 = 0;
@@ -3134,7 +3103,6 @@ const max_namespace_chain: u32 = 1024;
 /// is skipped (the injection appears in every line's ZIR so the user
 /// can reference prior decls).
 fn bindDecls(sema: *Sema) Error!void {
-    assert(@intFromPtr(sema) != 0);
     assert(sema.namespace != null);
 
     const ns_idx = sema.namespace.?;
@@ -3471,7 +3439,6 @@ fn evalLoop(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///
 /// Compiler reference: src/Sema.zig:zirSwitchBlock ~9984.
 fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const tag = sema.zir.instructions.items(.tag)[@intFromEnum(inst)];
@@ -3620,7 +3587,6 @@ fn failSwitch(sema: *Sema, what: []const u8) Error!?Value {
 /// for the enclosing `.func` to drain. `.is_generic` params
 /// surface a structured diagnostic -- generics are unsupported.
 fn evalParam(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const pl_tok = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_tok;
@@ -3666,7 +3632,6 @@ fn evalRetType(sema: *Sema) Error!?Value {
 /// but doesn't affect the FuncType encoding today; it'll matter
 /// when error-set inference moves out of the per-fn analysis.
 fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const info = sema.zir.getFnInfo(inst);
@@ -3729,18 +3694,13 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// `.field_call` (`a.foo(x)`) needs type-method resolution which
 /// requires struct support; surfaces a structured diagnostic.
 fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, field }) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
-    if (sema.call_depth >= call_depth_max) {
-        try sema.writer.print(
-            "call: exceeded comptime call depth limit ({d}); likely unbounded recursion\n",
-            .{call_depth_max},
-        );
-        return error.AnalysisFail;
-    }
-    sema.call_depth += 1;
-    defer sema.call_depth -= 1;
+    // Bound recursion as the compiler does: every call is a backward branch
+    // against `branch_quota` (`analyzeCall` -> `emitBackwardBranch`), which
+    // also catches runaway non-recursive evaluation. Raise via
+    // `@setEvalBranchQuota` once that builtin lands.
+    try sema.emitBackwardBranch();
 
     if (kind == .field) {
         try sema.writer.writeAll("field_call: method-call resolution requires struct support\n");
@@ -3872,7 +3832,6 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
 /// run at comptime so the body resolves the same way as for
 /// `.block`.
 fn evalBlockComptime(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
@@ -3885,7 +3844,6 @@ fn evalBlockComptime(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// returns its type as a type-of-type value. Mirrors
 /// src/Sema.zig:zirTypeof ~16860.
 fn evalTypeof(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
@@ -3900,7 +3858,6 @@ fn evalTypeof(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// this inst), returns the resulting value's type. Mirrors
 /// src/Sema.zig:zirTypeofBuiltin ~16869.
 fn evalTypeofBuiltin(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    assert(@intFromPtr(sema) != 0);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
