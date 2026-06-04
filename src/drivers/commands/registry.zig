@@ -28,5 +28,19 @@ pub fn Registry(comptime mods: []const type, comptime Ctx: type) type {
         pub fn find(name: []const u8) ?Command(Ctx) {
             return all[index.get(name) orelse return null];
         }
+
+        /// Run a `:command` line against `ctx`. `command_line` is the text
+        /// after the leading `:` (`name [args]`); an unrecognised name is
+        /// reported to `w`. Each frontend's own line handling decides what
+        /// counts as a command line before delegating here.
+        pub fn dispatch(ctx: Ctx, command_line: []const u8, w: *std.Io.Writer) anyerror!void {
+            var iter = std.mem.splitScalar(u8, command_line, ' ');
+            const name = iter.first();
+            const cmd = find(name) orelse {
+                try w.print("unknown command: :{s}\n", .{name});
+                return;
+            };
+            try cmd.run(ctx, &all, iter.rest(), w);
+        }
     };
 }

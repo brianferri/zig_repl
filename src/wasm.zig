@@ -76,16 +76,7 @@ fn dispatch(input: []const u8) !void {
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
     if (trimmed.len == 0) return;
     if (trimmed[0] != ':') return evaluate(trimmed, w);
-
-    var iter = std.mem.splitScalar(u8, trimmed[1..], ' ');
-    const name = iter.first();
-    const argument = iter.rest();
-
-    const cmd = Commands.find(name) orelse {
-        try w.print("unknown command: :{s}\n", .{name});
-        return;
-    };
-    try cmd.run(&session, &Commands.all, argument, w);
+    try Commands.dispatch(&session, trimmed[1..], w);
 }
 
 fn evaluate(input: []const u8, w: *std.Io.Writer) !void {

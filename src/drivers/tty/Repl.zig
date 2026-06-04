@@ -146,16 +146,7 @@ fn dispatch(repl: *Repl, raw_line: []const u8, stdout: *std.Io.Writer) !void {
     const trimmed = std.mem.trim(u8, raw_line, " \t\r");
     if (trimmed.len == 0) return;
     if (trimmed[0] != ':') return repl.evaluate(trimmed, stdout);
-
-    var iter = std.mem.splitScalar(u8, trimmed[1..], ' ');
-    const name = iter.first();
-    const argument = iter.rest();
-
-    const cmd = Commands.find(name) orelse {
-        try stdout.print("unknown command: :{s}\n", .{name});
-        return;
-    };
-    try cmd.run(repl, &Commands.all, argument, stdout);
+    try Commands.dispatch(repl, trimmed[1..], stdout);
 }
 
 fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
