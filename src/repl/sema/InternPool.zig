@@ -669,10 +669,10 @@ pub const Key = union(enum) {
             size: Size = .one,
             /// `.none` means the pointee type's natural alignment; an explicit
             /// `*align(N) T` stores `Alignment.fromByteUnits(N)` verbatim, even
-            /// when N equals the natural alignment -- matching how the compiler
-            /// renders it. Normalising an equal-to-natural alignment back to
-            /// `.none` (so the two intern as one type) needs `abiAlignment`,
-            /// which awaits ABI-alignment support.
+            /// when N equals the natural alignment. The compiler renders an
+            /// explicit alignment verbatim too (`*align(4) u32`, not `*u32`),
+            /// so the stored value is not normalised against the pointee's ABI
+            /// alignment.
             alignment: Alignment = .none,
             is_const: bool = false,
             is_volatile: bool = false,
