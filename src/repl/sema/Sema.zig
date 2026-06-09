@@ -2373,7 +2373,6 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
 /// is asserted to be zero -- field/element pointers (non-zero offsets)
 /// arrive with aggregates.
 fn lookupComptimeAlloc(sema: *Sema, ptr: InternPool.Key.Ptr) Error!*ComptimeAlloc {
-
     if (ptr.byte_offset != 0) {
         try sema.writer.writeAll("comptime_alloc lookup: pointer offset not yet supported\n");
         return error.AnalysisFail;
@@ -3255,7 +3254,6 @@ fn lookupName(
     ns_idx: InternPool.NamespaceIndex,
     name: InternPool.NullTerminatedString,
 ) Error!?InternPool.Nav.Index {
-
     var current: ?InternPool.NamespaceIndex = ns_idx;
     var depth: u32 = 0;
     while (current) |idx| : (depth += 1) {

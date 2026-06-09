@@ -1805,7 +1805,6 @@ pub fn getOrPutString(
 /// terminated slice. Asserts the handle is in range; safe to call on
 /// `.empty` (returns the zero-length slice).
 pub fn stringSlice(pool: *const InternPool, string: NullTerminatedString) [:0]const u8 {
-
     const raw = @intFromEnum(string);
     assert(raw + 1 < pool.string_starts.items.len);
 
@@ -1827,7 +1826,6 @@ pub fn createNav(
     name: NullTerminatedString,
     fqn: NullTerminatedString,
 ) Allocator.Error!Nav.Index {
-
     const new_index_raw: u32 = @intCast(pool.navs.items.len);
     try pool.navs.append(gpa, .{
         .name = name,
@@ -1866,7 +1864,6 @@ pub fn createNamespace(
     gpa: Allocator,
     parent: OptionalNamespaceIndex,
 ) Allocator.Error!NamespaceIndex {
-
     const new_index_raw: u32 = @intCast(pool.namespaces.items.len);
     try pool.namespaces.append(gpa, .{
         .parent = parent,
@@ -1953,7 +1950,6 @@ pub fn createComptimeUnit(
     namespace: NamespaceIndex,
     zir_index: std.zig.Zir.Inst.Index,
 ) Allocator.Error!ComptimeUnit.Id {
-
     const new_index_raw: u32 = @intCast(pool.comptime_units.items.len);
     try pool.comptime_units.append(gpa, .{
         .zir_index = zir_index,
@@ -2965,7 +2961,6 @@ pub fn internErrorSetType(
     pool: *InternPool,
     names: []const NullTerminatedString,
 ) Allocator.Error!Index {
-
     const sorted = try pool.gpa.dupe(NullTerminatedString, names);
     defer pool.gpa.free(sorted);
     std.mem.sortUnstable(NullTerminatedString, sorted, {}, lessThanString);

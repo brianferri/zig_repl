@@ -325,16 +325,16 @@ test "compliance: @alignOf matches the host target ABI" {
     // 1), unlike `@sizeOf`.
     const a = testing.allocator;
     for ([_][]const u8{
-        "@alignOf(u8)",  "@alignOf(u32)", "@alignOf(u64)",          "@alignOf(u128)",
-        "@alignOf(i7)",  "@alignOf(bool)", "@alignOf(usize)",       "@alignOf(f32)",
-        "@alignOf(f64)", "@alignOf(*u8)", "@alignOf(*align(16) u8)", "@alignOf(comptime_int)",
+        "@alignOf(u8)",  "@alignOf(u32)",  "@alignOf(u64)",           "@alignOf(u128)",
+        "@alignOf(i7)",  "@alignOf(bool)", "@alignOf(usize)",         "@alignOf(f32)",
+        "@alignOf(f64)", "@alignOf(*u8)",  "@alignOf(*align(16) u8)", "@alignOf(comptime_int)",
     }) |expr| try expectMatchesZig(a, &.{expr});
 }
 
 test "compliance: @sizeOf matches the host target ABI" {
     const a = testing.allocator;
     for ([_][]const u8{
-        "@sizeOf(u8)",  "@sizeOf(u32)",  "@sizeOf(u64)", "@sizeOf(f16)",
+        "@sizeOf(u8)",   "@sizeOf(u32)",  "@sizeOf(u64)",    "@sizeOf(f16)",
         "@sizeOf(void)", "@sizeOf([]u8)", "@sizeOf([4]u16)", "@sizeOf(usize)",
     }) |expr| try expectMatchesZig(a, &.{expr});
     // A comptime-only type and an uninstantiable type have no size on either side.
