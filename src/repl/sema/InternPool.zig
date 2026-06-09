@@ -1064,18 +1064,8 @@ pub const Key = union(enum) {
                     .comptime_alloc => |slot| slot == y.base_addr.comptime_alloc,
                 };
             },
-            .error_set_type => |x| blk: {
-                const y = b.error_set_type;
-                if (x.names.len != y.names.len) break :blk false;
-                for (x.names, y.names) |xn, yn| if (xn != yn) break :blk false;
-                break :blk true;
-            },
-            .tuple_type => |x| blk: {
-                const y = b.tuple_type;
-                if (x.types.len != y.types.len) break :blk false;
-                for (x.types, y.types) |xt, yt| if (xt != yt) break :blk false;
-                break :blk true;
-            },
+            .error_set_type => |x| std.mem.eql(NullTerminatedString, x.names, b.error_set_type.names),
+            .tuple_type => |x| std.mem.eql(Index, x.types, b.tuple_type.types),
             .struct_type => |x| blk: {
                 const y = b.struct_type;
                 break :blk x.source_zir_id == y.source_zir_id and x.decl_inst == y.decl_inst;
@@ -1140,9 +1130,7 @@ pub const Key = union(enum) {
                 if (x.is_noinline != y.is_noinline) break :blk false;
                 if (@as(std.lang.CallingConvention.Tag, x.cc) !=
                     @as(std.lang.CallingConvention.Tag, y.cc)) break :blk false;
-                if (x.param_types.len != y.param_types.len) break :blk false;
-                for (x.param_types, y.param_types) |xp, yp| if (xp != yp) break :blk false;
-                break :blk true;
+                break :blk std.mem.eql(Index, x.param_types, y.param_types);
             },
             .func => |x| blk: {
                 const y = b.func;
@@ -1151,9 +1139,7 @@ pub const Key = union(enum) {
                 if (x.uncoerced_ty != y.uncoerced_ty) break :blk false;
                 if (x.zir_body_inst != y.zir_body_inst) break :blk false;
                 if (x.generic_owner != y.generic_owner) break :blk false;
-                if (x.comptime_args.len != y.comptime_args.len) break :blk false;
-                for (x.comptime_args, y.comptime_args) |xa, ya| if (xa != ya) break :blk false;
-                break :blk true;
+                break :blk std.mem.eql(Index, x.comptime_args, y.comptime_args);
             },
         };
     }
