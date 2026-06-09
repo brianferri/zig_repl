@@ -477,10 +477,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .struct_init_field_ptr => sema.evalStructInitFieldPtr(inst),
         .field_ptr_load => sema.evalFieldPtrLoad(inst),
         .opt_eu_base_ptr_init => sema.evalOptEuBasePtrInit(inst),
-        // Validates a `.{ ... }` init is complete and fills field defaults.
-        // Full explicit inits need no fix-up; missing-field / default-value
-        // detection is deferred, so this is a no-op for now.
-        .validate_ptr_struct_init => null,
+        .validate_ptr_struct_init => sema.evalValidatePtrStructInit(inst),
         .load => sema.evalLoad(inst),
         .decl_val => sema.evalDeclVal(inst),
         .decl_ref => sema.evalDeclRef(inst),
@@ -911,17 +908,21 @@ fn evalBinaryArithInt(
         .div_floor => try sema.unwrapDivResult(arith.internDivFloor(gpa, ip, lhs, rhs), "@divFloor"),
         .mod => try sema.unwrapDivResult(arith.internMod(gpa, ip, lhs, rhs), "@mod"),
         .rem => try sema.unwrapDivResult(arith.internRem(gpa, ip, lhs, rhs), "@rem"),
-        // `%` is `@rem` for non-negative operands; Zig rejects it when either
-        // operand is negative and directs to @rem / @mod (zirModRem's
-        // `lhs_maybe_negative`). Reject rather than silently compute @rem.
+        // `%` is `@rem`, but Zig rejects it only when an operand is negative
+        // AND the remainder is nonzero (mod/rem ambiguity); a negative operand
+        // with a zero remainder is fine. Mirrors zirModRem. `.positive` is true
+        // for zero, so `!positive` means strictly negative.
         .mod_rem => blk: {
-            // BigInt `.positive` is true for zero, so this rejects only strictly
-            // negative operands.
+            const rem_idx = try sema.unwrapDivResult(arith.internRem(gpa, ip, lhs, rhs), "%");
             if (!lhs.positive or !rhs.positive) {
-                try sema.writer.writeAll("%: use @rem or @mod for negative operands\n");
-                return error.AnalysisFail;
+                var rem_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+                const rem_nonzero = !ip.indexToKey(rem_idx).int.storage.toBigInt(&rem_space).eqlZero();
+                if (rem_nonzero) {
+                    try sema.writer.writeAll("%: use @rem or @mod for negative operands\n");
+                    return error.AnalysisFail;
+                }
             }
-            break :blk try sema.unwrapDivResult(arith.internRem(gpa, ip, lhs, rhs), "%");
+            break :blk rem_idx;
         },
         else => unreachable,
     };
@@ -1102,9 +1103,17 @@ fn computeFloatBin(
         },
         .mod => @mod(lhs, rhs),
         .rem => @rem(lhs, rhs),
-        // `%` on floats is the remainder (@rem), with no sign restriction --
-        // unlike signed ints, where the int kernel rejects it.
-        .mod_rem => @rem(lhs, rhs),
+        // `%` is `@rem`, rejected only when an operand is negative AND the
+        // remainder is nonzero -- the same mod/rem ambiguity rule the int
+        // kernel applies (zirModRem governs both).
+        .mod_rem => blk: {
+            const r = @rem(lhs, rhs);
+            if ((lhs < 0 or rhs < 0) and r != 0) {
+                try sema.writer.writeAll("%: use @rem or @mod for negative operands\n");
+                return error.AnalysisFail;
+            }
+            break :blk r;
+        },
         else => unreachable,
     };
 }
@@ -3034,6 +3043,69 @@ fn evalOptEuBasePtrInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     return try sema.resolveRef(un_node.operand);
+}
+
+/// `validate_ptr_struct_init`: after a `.{ ... }` init's explicit field stores,
+/// every field not written must get its default value, or -- if it has none --
+/// be a "missing field" error. The body is the list of `struct_init_field_ptr`
+/// instructions (one per explicit field), whose names give the set that was
+/// initialized. Mirrors zirValidatePtrStructInit -> validateStructInit.
+fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const datas = sema.zir.instructions.items(.data);
+    const extra = sema.zir.extraData(Zir.Inst.Block, datas[@intFromEnum(inst)].pl_node.payload_index);
+    const body = sema.zir.bodySlice(extra.end, extra.data.body_len);
+    if (body.len == 0) return null; // no fields -> nothing to default or check
+
+    const ip = sema.intern_pool;
+    const first = sema.zir.extraData(Zir.Inst.Field, datas[@intFromEnum(body[0])].pl_node.payload_index).data;
+    const object_ptr = try sema.resolveRef(first.lhs);
+    const struct_ty = ip.indexToKey(ip.indexToKey(object_ptr.index).ptr.ty).ptr_type.child;
+
+    // Names explicitly initialized -- byte slices into the current ZIR, valid
+    // across the source-ZIR swap below (a different ZIR's string table).
+    const stored = try sema.gpa.alloc([]const u8, body.len);
+    defer sema.gpa.free(stored);
+    for (body, stored) |field_ptr, *name| {
+        const fp = sema.zir.extraData(Zir.Inst.Field, datas[@intFromEnum(field_ptr)].pl_node.payload_index).data;
+        name.* = sema.zir.nullTerminatedString(fp.field_name_start);
+    }
+
+    const st = ip.indexToKey(struct_ty).struct_type;
+    const saved_zir = sema.zir;
+    const saved_id = sema.current_zir_id;
+    if (st.source_zir_id != sema.current_zir_id) {
+        if (st.source_zir_id >= sema.line_zir.len) {
+            try sema.writer.writeAll("struct init: defining ZIR is no longer available\n");
+            return error.AnalysisFail;
+        }
+        sema.zir = sema.line_zir[st.source_zir_id];
+        sema.current_zir_id = st.source_zir_id;
+    }
+    defer {
+        sema.zir = saved_zir;
+        sema.current_zir_id = saved_id;
+    }
+    var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
+    while (it.next()) |field| {
+        const name = sema.zir.nullTerminatedString(field.name);
+        if (sliceContainsName(stored, name)) continue;
+        const default_body = field.default_body orelse {
+            try sema.writer.print("missing struct field: {s}\n", .{name});
+            return error.AnalysisFail;
+        };
+        const field_ty = (try sema.resolveInlineBody(field.type_body, st.decl_inst)).index;
+        const raw = try sema.resolveInlineBody(default_body, st.decl_inst);
+        const value = try sema.coerceValueToType(raw, field_ty, "struct field default");
+        const alloc = try sema.lookupComptimeAlloc(ip.indexToKey(object_ptr.index).ptr);
+        alloc.val = try sema.setStructField(alloc.val, struct_ty, field.idx, value);
+    }
+    return null;
+}
+
+fn sliceContainsName(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
 }
 
 /// `ref operand`: materialise `operand`'s value into a fresh const

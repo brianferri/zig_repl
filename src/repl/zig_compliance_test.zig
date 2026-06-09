@@ -966,7 +966,9 @@ test "compliance: the % operator" {
     try expectMatchesZig(a, &.{"@as(u32, 17) % @as(u32, 8)"}); // fixed-width unsigned
     try expectMatchesZig(a, &.{"@as(i32, 7) % @as(i32, 3)"}); // signed but non-negative
     try expectMatchesZig(a, &.{"@as(f64, 5.5) % @as(f64, 2.0)"}); // float remainder
-    try expectBothReject(a, &.{"@as(i32, -7) % @as(i32, 3)"}); // negative -> use @rem/@mod
+    try expectMatchesZig(a, &.{"@as(i32, -9) % @as(i32, 3)"}); // negative but zero remainder is allowed
+    try expectBothReject(a, &.{"@as(i32, -7) % @as(i32, 3)"}); // negative + nonzero -> use @rem/@mod
+    try expectBothReject(a, &.{"@as(f64, -9.5) % @as(f64, 2.0)"}); // same rule governs floats
 }
 
 test "compliance: compound assignment" {
@@ -987,6 +989,15 @@ test "compliance: struct init and field access" {
     // Field values carry their declared type into arithmetic.
     try expectMatchesZig(a, &.{"blk: { const Q = struct { x: u32, y: u32 }; const q: Q = .{ .x = 10, .y = 32 }; break :blk q.x + q.y; }"});
     try expectMatchesZig(a, &.{"blk: { const R = struct { a: u8 }; const r: R = .{ .a = 250 }; break :blk r.a + 5; }"});
+}
+
+test "compliance: struct field defaults and missing-field validation" {
+    const a = testing.allocator;
+    const P = "const P = struct { a: u8, b: u16 = 99 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ P ++ " const p: P = .{ .a = 7 }; break :blk p.b; }"}); // default fills b
+    try expectMatchesZig(a, &.{"blk: { " ++ P ++ " const p: P = .{ .a = 7, .b = 5 }; break :blk p.b; }"}); // explicit overrides
+    // A field with no default left out is a compile error on both sides.
+    try expectBothReject(a, &.{"blk: { const Q = struct { a: u8, b: u16 }; const q: Q = .{ .a = 7 }; break :blk q.a; }"});
 }
 
 test "compliance: for loops (range and array)" {
