@@ -66,7 +66,13 @@ fn renderAggregate(
     // Tuples print with a leading dot (`.{ ... }`); arrays don't.
     if (pool.indexToKey(agg.ty) == .tuple_type) try writer.writeByte('.');
     try writer.writeAll("{ ");
-    const count: u64 = pool.aggregateElementCount(agg.ty);
+    // Element count from storage: `.elems` is its own length (structs, whose
+    // type carries no field count, always use this); only `.repeated_elem`
+    // needs the type's count.
+    const count: u64 = switch (agg.storage) {
+        .elems => |es| es.len,
+        .repeated_elem => pool.aggregateElementCount(agg.ty),
+    };
     var i: u64 = 0;
     while (i < count) : (i += 1) {
         if (i > 0) try writer.writeAll(", ");

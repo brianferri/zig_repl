@@ -703,6 +703,17 @@ pub const Key = union(enum) {
 
         pub const BaseAddr = union(enum) {
             comptime_alloc: ComptimeAllocIndex,
+            /// A pointer to a field of an auto-layout aggregate: `base` is the
+            /// parent pointer (a `.comptime_alloc`), `index` the field index.
+            /// Mirrors the compiler's `BaseAddr.field`, whose payload is the
+            /// shared `BaseIndex` (also used by `.arr_elem`, which we don't
+            /// model yet).
+            field: BaseIndex,
+
+            pub const BaseIndex = struct {
+                base: Index,
+                index: u64,
+            };
         };
     };
 
@@ -951,6 +962,10 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, @as(BaseTag, p.base_addr));
                 switch (p.base_addr) {
                     .comptime_alloc => |slot| std.hash.autoHash(&hasher, slot),
+                    .field => |f| {
+                        std.hash.autoHash(&hasher, f.base);
+                        std.hash.autoHash(&hasher, f.index);
+                    },
                 }
             },
             .error_set_type => |es| {
@@ -996,7 +1011,7 @@ pub const Key = union(enum) {
                 // hash at src/InternPool.zig ~3050 so `.elems = [I, I, I]`
                 // and `.repeated_elem = I` (same `ty`) hash identically
                 // and intern at one Index.
-                const count = aggregateElementCount(pool, agg.ty);
+                const count = aggregateLen(pool, agg);
                 var i: u64 = 0;
                 while (i < count) : (i += 1) {
                     std.hash.autoHash(&hasher, aggregateElementAt(agg, i));
@@ -1092,6 +1107,7 @@ pub const Key = union(enum) {
                 if (@as(BaseTag, x.base_addr) != @as(BaseTag, y.base_addr)) break :blk false;
                 break :blk switch (x.base_addr) {
                     .comptime_alloc => |slot| slot == y.base_addr.comptime_alloc,
+                    .field => |f| f.base == y.base_addr.field.base and f.index == y.base_addr.field.index,
                 };
             },
             .error_set_type => |x| std.mem.eql(NullTerminatedString, x.names, b.error_set_type.names),
@@ -1132,7 +1148,8 @@ pub const Key = union(enum) {
                 // src/InternPool.zig ~3057. `.elems = [I, I, I]` and
                 // `.repeated_elem = I` (same `ty`) compare equal even
                 // though their storage variants differ.
-                const count = aggregateElementCount(pool, x.ty);
+                const count = aggregateLen(pool, x);
+                if (count != aggregateLen(pool, y)) break :blk false;
                 var i: u64 = 0;
                 while (i < count) : (i += 1) {
                     if (aggregateElementAt(x, i) != aggregateElementAt(y, i)) {
@@ -1267,6 +1284,10 @@ const Item = struct {
         // comptime_alloc index, byte_offset_lo, byte_offset_hi).
         // Mirrors the compiler's `Item.Tag.ptr_comptime_alloc`.
         ptr_comptime_alloc,
+        // Pointer value with `BaseAddr.field`. data = extra index of 6 u32
+        // slots: ty, base ptr Index, index_lo, index_hi, byte_offset_lo,
+        // byte_offset_hi. Mirrors the compiler's `Item.Tag.ptr_field`.
+        ptr_field,
         // Error set type. data = extra index of `[names_len, name0,
         // name1, ...]` -- one u32 length followed by `names_len`
         // interned-string handles. Mirrors the compiler's
@@ -2194,6 +2215,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .undef => .{ .undef = @enumFromInt(item.data) },
         .type_pointer => ptrTypeFromExtra(pool, item.data),
         .ptr_comptime_alloc => ptrComptimeAllocFromExtra(pool, item.data),
+        .ptr_field => ptrFieldFromExtra(pool, item.data),
         .type_error_set => errorSetTypeFromExtra(pool, item.data),
         .type_tuple => tupleTypeFromExtra(pool, item.data),
         .type_struct => structTypeFromExtra(pool, item.data),
@@ -2333,12 +2355,14 @@ fn arrayTypeBigFromExtra(pool: *const InternPool, extra_index: u32) Key {
 }
 
 fn aggregateFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    assert(extra_index < pool.extra.items.len);
+    assert(extra_index + 2 <= pool.extra.items.len);
     const ty: Index = @enumFromInt(pool.extra.items[extra_index]);
-    const count64 = aggregateElementCount(pool, ty);
-    const count: u32 = @intCast(count64);
-    assert(extra_index + 1 + count <= pool.extra.items.len);
-    const raw_elems = pool.extra.items[extra_index + 1 ..][0..count];
+    // The element count is stored explicitly (not derived from the type) so a
+    // struct aggregate -- whose `struct_type` does not carry a field count --
+    // decodes without resolving layout.
+    const count: u32 = pool.extra.items[extra_index + 1];
+    assert(extra_index + 2 + count <= pool.extra.items.len);
+    const raw_elems = pool.extra.items[extra_index + 2 ..][0..count];
     return .{
         .aggregate = .{
             .ty = ty,
@@ -2388,6 +2412,18 @@ fn ptrComptimeAllocFromExtra(pool: *const InternPool, extra_index: u32) Key {
     return .{ .ptr = .{
         .ty = @enumFromInt(slice[0]),
         .base_addr = .{ .comptime_alloc = @enumFromInt(slice[1]) },
+        .byte_offset = byte_offset,
+    } };
+}
+
+fn ptrFieldFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    assert(extra_index + 6 <= pool.extra.items.len);
+    const slice = pool.extra.items[extra_index..][0..6];
+    const index = (@as(u64, slice[3]) << 32) | @as(u64, slice[2]);
+    const byte_offset = (@as(u64, slice[5]) << 32) | @as(u64, slice[4]);
+    return .{ .ptr = .{
+        .ty = @enumFromInt(slice[0]),
+        .base_addr = .{ .field = .{ .base = @enumFromInt(slice[1]), .index = index } },
         .byte_offset = byte_offset,
     } };
 }
@@ -2715,6 +2751,18 @@ fn emitPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!void {
             });
             pool.items.appendAssumeCapacity(.{ .tag = .ptr_comptime_alloc, .data = extra_index });
         },
+        .field => |f| {
+            const extra_index: u32 = @intCast(pool.extra.items.len);
+            try pool.extra.appendSlice(pool.gpa, &.{
+                @intFromEnum(p.ty),
+                @intFromEnum(f.base),
+                @as(u32, @truncate(f.index)),
+                @as(u32, @truncate(f.index >> 32)),
+                @as(u32, @truncate(p.byte_offset)),
+                @as(u32, @truncate(p.byte_offset >> 32)),
+            });
+            pool.items.appendAssumeCapacity(.{ .tag = .ptr_field, .data = extra_index });
+        },
     }
 }
 
@@ -2783,6 +2831,17 @@ pub fn aggregateElementCount(pool: *const InternPool, ty: Index) u64 {
     };
 }
 
+/// Element count of an aggregate *value* from its storage: `.elems` is its
+/// own length; `.repeated_elem` needs the type's count. Lets struct
+/// aggregates (whose `struct_type` is not in `aggregateElementCount`, since
+/// fields aren't stored in the Key) hash/compare without a type-side count.
+fn aggregateLen(pool: *const InternPool, agg: Key.Aggregate) u64 {
+    return switch (agg.storage) {
+        .elems => |es| es.len,
+        .repeated_elem => aggregateElementCount(pool, agg.ty),
+    };
+}
+
 /// Resolve element `i` from any storage flavor. Mirrors the
 /// per-element extraction the compiler does at
 /// `src/InternPool.zig` ~3057 inside the aggregate eql arm. Hash
@@ -2818,8 +2877,9 @@ fn emitAggregate(pool: *InternPool, agg: Key.Aggregate) Allocator.Error!void {
         },
         .elems => |elems| {
             const extra_index: u32 = @intCast(pool.extra.items.len);
-            try pool.extra.ensureUnusedCapacity(pool.gpa, 1 + elems.len);
+            try pool.extra.ensureUnusedCapacity(pool.gpa, 2 + elems.len);
             pool.extra.appendAssumeCapacity(@intFromEnum(agg.ty));
+            pool.extra.appendAssumeCapacity(@intCast(elems.len));
             for (elems) |e| pool.extra.appendAssumeCapacity(@intFromEnum(e));
             pool.items.appendAssumeCapacity(.{ .tag = .aggregate, .data = extra_index });
         },

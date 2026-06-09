@@ -978,6 +978,17 @@ test "compliance: compound assignment" {
     try expectMatchesZig(a, &.{"blk: { var i: u32 = 0; while (i < 5) : (i += 1) {} break :blk i; }"});
 }
 
+test "compliance: struct init and field access" {
+    const a = testing.allocator;
+    const P = "const P = struct { a: u8, b: u16 };";
+    // Out-of-order init must resolve fields by name, not position.
+    try expectMatchesZig(a, &.{"blk: { " ++ P ++ " const p: P = .{ .b = 8, .a = 7 }; break :blk p.a; }"});
+    try expectMatchesZig(a, &.{"blk: { " ++ P ++ " const p: P = .{ .b = 8, .a = 7 }; break :blk p.b; }"});
+    // Field values carry their declared type into arithmetic.
+    try expectMatchesZig(a, &.{"blk: { const Q = struct { x: u32, y: u32 }; const q: Q = .{ .x = 10, .y = 32 }; break :blk q.x + q.y; }"});
+    try expectMatchesZig(a, &.{"blk: { const R = struct { a: u8 }; const r: R = .{ .a = 250 }; break :blk r.a + 5; }"});
+}
+
 test "compliance: for loops (range and array)" {
     const a = testing.allocator;
     try expectMatchesZig(a, &.{"blk: { var s: u32 = 0; for (0..4) |i| { s += @intCast(i); } break :blk s; }"});

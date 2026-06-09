@@ -474,6 +474,13 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .alloc, .alloc_mut, .alloc_comptime_mut => sema.evalAlloc(inst),
         .make_ptr_const => sema.evalMakePtrConst(inst),
         .store_node => sema.evalStoreNode(inst),
+        .struct_init_field_ptr => sema.evalStructInitFieldPtr(inst),
+        .field_ptr_load => sema.evalFieldPtrLoad(inst),
+        .opt_eu_base_ptr_init => sema.evalOptEuBasePtrInit(inst),
+        // Validates a `.{ ... }` init is complete and fills field defaults.
+        // Full explicit inits need no fix-up; missing-field / default-value
+        // detection is deferred, so this is a no-op for now.
+        .validate_ptr_struct_init => null,
         .load => sema.evalLoad(inst),
         .decl_val => sema.evalDeclVal(inst),
         .decl_ref => sema.evalDeclRef(inst),
@@ -2221,6 +2228,12 @@ fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const p = key.ptr;
     const alloc_idx: u32 = switch (p.base_addr) {
         .comptime_alloc => |i| @intFromEnum(i),
+        // A field pointer's address needs the field's byte offset within the
+        // aggregate, which auto-layout structs don't expose here.
+        .field => {
+            try sema.writer.writeAll("@intFromPtr: address of a struct field not supported\n");
+            return error.AnalysisFail;
+        },
     };
     const ptr_ty = sema.intern_pool.indexToKey(p.ty).ptr_type;
     const natural: InternPool.Alignment = Type.fromIndex(ptr_ty.child).abiAlignment(sema.intern_pool) orelse .@"1";
@@ -2280,6 +2293,8 @@ fn evalMakePtrConst(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const p = ip.indexToKey(ptr.index).ptr;
     switch (p.base_addr) {
         .comptime_alloc => |idx| sema.comptime_allocs.items[@intFromEnum(idx)].is_const = true,
+        // A field pointer freezes the aggregate it projects from.
+        .field => |f| sema.comptime_allocs.items[@intFromEnum(ip.indexToKey(f.base).ptr.base_addr.comptime_alloc)].is_const = true,
     }
     const old = ip.indexToKey(p.ty).ptr_type;
     if (old.flags.is_const) return ptr;
@@ -2358,10 +2373,23 @@ fn evalStoreNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return error.AnalysisFail;
     }
 
-    const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr);
     const rhs_value = try sema.resolveRef(bin.rhs);
-    const coerced = try sema.coerceValueToType(rhs_value, alloc.val.typeOf(ip).toIndex(), "store");
-    alloc.val = coerced;
+    switch (ptr_key.ptr.base_addr) {
+        .comptime_alloc => {
+            const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr);
+            const coerced = try sema.coerceValueToType(rhs_value, alloc.val.typeOf(ip).toIndex(), "store");
+            alloc.val = coerced;
+        },
+        // Store into one field of a struct alloc: coerce to the field type
+        // (the field pointer's child) and rebuild the alloc's aggregate.
+        .field => |f| {
+            const base = ip.indexToKey(f.base).ptr;
+            const struct_ty = ip.indexToKey(base.ty).ptr_type.child;
+            const coerced = try sema.coerceValueToType(rhs_value, ptr_ty_key.ptr_type.child, "store");
+            const base_alloc = try sema.lookupComptimeAlloc(base);
+            base_alloc.val = try sema.setStructField(base_alloc.val, struct_ty, @intCast(f.index), coerced);
+        },
+    }
     return .{ .index = .void_value };
 }
 
@@ -2874,6 +2902,138 @@ fn evalStructDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .decl_inst = inst,
         .name = name,
     }) };
+}
+
+/// Resolve a struct field by name to its index and type. Iterates the struct
+/// decl's fields via the stdlib `iterateFields`, matching name bytes; the field
+/// type is its type body evaluated in the struct's source ZIR (swapped in for a
+/// cross-line struct, as `evalCall` does for functions). Returns null if no
+/// field matches. Field types that reference the defining line's locals are out
+/// of scope -- the swapped frame shares the session namespace but not that
+/// line's per-instruction results.
+fn structFieldByName(
+    sema: *Sema,
+    struct_ty: InternPool.Index,
+    name: []const u8,
+) Error!?struct { index: u32, ty: InternPool.Index } {
+    const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
+    const saved_zir = sema.zir;
+    const saved_id = sema.current_zir_id;
+    if (st.source_zir_id != sema.current_zir_id) {
+        if (st.source_zir_id >= sema.line_zir.len) {
+            try sema.writer.writeAll("struct field: defining ZIR is no longer available\n");
+            return error.AnalysisFail;
+        }
+        sema.zir = sema.line_zir[st.source_zir_id];
+        sema.current_zir_id = st.source_zir_id;
+    }
+    defer {
+        sema.zir = saved_zir;
+        sema.current_zir_id = saved_id;
+    }
+    var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
+    while (it.next()) |field| {
+        if (std.mem.eql(u8, sema.zir.nullTerminatedString(field.name), name)) {
+            const ty = (try sema.resolveInlineBody(field.type_body, st.decl_inst)).index;
+            return .{ .index = field.idx, .ty = ty };
+        }
+    }
+    return null;
+}
+
+/// A struct type's declared field count (read straight from its source ZIR's
+/// `field_names`; no field bodies are evaluated).
+fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
+    const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
+    const zir = if (st.source_zir_id == sema.current_zir_id)
+        sema.zir
+    else if (st.source_zir_id < sema.line_zir.len)
+        sema.line_zir[st.source_zir_id]
+    else {
+        try sema.writer.writeAll("struct field count: defining ZIR is no longer available\n");
+        return error.AnalysisFail;
+    };
+    return @intCast(zir.getStructDecl(st.decl_inst).field_names.len);
+}
+
+/// `struct_init_field_ptr`: `&object.field`, the pointer each field value is
+/// stored through during `.{ ... }` init. Resolves the field by name to its
+/// index and builds a `.field` pointer into the struct alloc. Mirrors
+/// zirStructInitFieldPtr -> fieldPtr -> structFieldPtrByIndex (the auto-layout
+/// `.field` representation).
+fn evalStructInitFieldPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.Field, pl_node.payload_index).data;
+    const name = sema.zir.nullTerminatedString(extra.field_name_start);
+    const object_ptr = try sema.resolveRef(extra.lhs);
+    const struct_ty = sema.intern_pool.indexToKey(sema.intern_pool.indexToKey(object_ptr.index).ptr.ty).ptr_type.child;
+    const fld = (try sema.structFieldByName(struct_ty, name)) orelse {
+        try sema.writer.print("struct init: no field named '{s}'\n", .{name});
+        return error.AnalysisFail;
+    };
+    const field_ptr_ty = try sema.intern_pool.internPtrType(.{ .child = fld.ty, .flags = .{ .size = .one } });
+    const field_ptr = try sema.intern_pool.internPtr(.{
+        .ty = field_ptr_ty,
+        .base_addr = .{ .field = .{ .base = object_ptr.index, .index = fld.index } },
+        .byte_offset = 0,
+    });
+    return .{ .index = field_ptr };
+}
+
+/// `field_ptr_load`: read `object.field`. Resolves the field index by name and
+/// returns the corresponding element of the struct alloc's aggregate value.
+/// Mirrors zirFieldPtrLoad -> fieldPtrLoad.
+fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.Field, pl_node.payload_index).data;
+    const name = sema.zir.nullTerminatedString(extra.field_name_start);
+    const object_ptr = try sema.resolveRef(extra.lhs);
+    const struct_ty = sema.intern_pool.indexToKey(sema.intern_pool.indexToKey(object_ptr.index).ptr.ty).ptr_type.child;
+    const fld = (try sema.structFieldByName(struct_ty, name)) orelse {
+        try sema.writer.print("field access: no field named '{s}'\n", .{name});
+        return error.AnalysisFail;
+    };
+    const struct_val = try sema.loadValue(object_ptr);
+    const agg = sema.intern_pool.indexToKey(struct_val.index).aggregate;
+    return .{ .index = InternPool.aggregateElementAt(agg, fld.index) };
+}
+
+/// Write `elem` into field `index` of a struct alloc's value, returning the new
+/// aggregate. An `undef` alloc materialises an all-`undef` aggregate of the
+/// right arity first; an existing aggregate is copied with one element
+/// replaced. Whole-aggregate read-modify-write -- the compiler mutates in place
+/// via `MutableValue`, which this comptime-only evaluator does not model.
+fn setStructField(
+    sema: *Sema,
+    old: Value,
+    struct_ty: InternPool.Index,
+    index: u32,
+    elem: Value,
+) Error!Value {
+    const ip = sema.intern_pool;
+    const count = try sema.structFieldCount(struct_ty);
+    const elems = try sema.gpa.alloc(InternPool.Index, count);
+    defer sema.gpa.free(elems);
+    const old_key = ip.indexToKey(old.index);
+    if (old_key == .aggregate) {
+        for (elems, 0..) |*e, i| e.* = InternPool.aggregateElementAt(old_key.aggregate, i);
+    } else {
+        @memset(elems, .undef);
+    }
+    elems[index] = elem.index;
+    return .{ .index = try ip.internAggregate(.{ .ty = struct_ty, .storage = .{ .elems = elems } }) };
+}
+
+/// `opt_eu_base_ptr_init`: strips the optional/error-union payload base before a
+/// result-location init. For a plain struct/array the operand is already the
+/// base, so this is the identity, mirroring `optEuBasePtrInit`'s non-opt/EU
+/// path.
+fn evalOptEuBasePtrInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    return try sema.resolveRef(un_node.operand);
 }
 
 /// `ref operand`: materialise `operand`'s value into a fresh const
