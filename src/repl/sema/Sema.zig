@@ -2128,17 +2128,7 @@ fn evalPtrType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// encoding. Shared by pointer types (`*align(N) T`) and decl alignment
 /// (`var x: T align(N)`).
 fn alignmentFromValue(sema: *Sema, value: Value, op_name: []const u8) Error!InternPool.Alignment {
-    const coerced = try sema.coerceValueToType(value, .usize_type, op_name);
-    const key = sema.intern_pool.indexToKey(coerced.index);
-    if (key != .int) {
-        try sema.writer.print("{s}: alignment must be an integer\n", .{op_name});
-        return error.AnalysisFail;
-    }
-    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const bytes = key.int.storage.toBigInt(&space).toInt(u64) catch {
-        try sema.writer.print("{s}: alignment out of range\n", .{op_name});
-        return error.AnalysisFail;
-    };
+    const bytes = try sema.resolveUsizeInt(value, op_name);
     if (bytes == 0 or !std.math.isPowerOfTwo(bytes)) {
         try sema.writer.print("{s}: alignment '{d}' is not a power of two\n", .{ op_name, bytes });
         return error.AnalysisFail;
@@ -2919,7 +2909,13 @@ fn evalElemPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// comptime-known integers in every shape AstGen emits here.
 fn resolveArrayLen(sema: *Sema, ref: Zir.Inst.Ref, op_name: []const u8) Error!u64 {
     assert(ref != .none);
-    const value = try sema.resolveRef(ref);
+    return sema.resolveUsizeInt(try sema.resolveRef(ref), op_name);
+}
+
+/// Coerce `value` to `usize` and read it as a `u64`. The comptime-known
+/// integers that lengths, indices, and alignments are built from always fit.
+/// Shared by `resolveArrayLen` (lengths / indices) and `alignmentFromValue`.
+fn resolveUsizeInt(sema: *Sema, value: Value, op_name: []const u8) Error!u64 {
     const coerced = try sema.coerceValueToType(value, .usize_type, op_name);
     const key = sema.intern_pool.indexToKey(coerced.index);
     if (key != .int) {
@@ -2927,8 +2923,7 @@ fn resolveArrayLen(sema: *Sema, ref: Zir.Inst.Ref, op_name: []const u8) Error!u6
         return error.AnalysisFail;
     }
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const big = key.int.storage.toBigInt(&space);
-    return big.toInt(u64) catch {
+    return key.int.storage.toBigInt(&space).toInt(u64) catch {
         try sema.writer.print("{s}: value out of usize range\n", .{op_name});
         return error.AnalysisFail;
     };
