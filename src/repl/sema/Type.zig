@@ -137,12 +137,20 @@ pub const PrintError = std.Io.Writer.Error || std.mem.Allocator.Error;
 /// Write `ty`'s Zig surface-syntax name with no trailing newline (`*const u8`,
 /// `error{A,B}!u32`, `fn (u8) void`), recursing on container children. The
 /// single type-name printer, the analogue of the compiler's `Type.print`
-/// (src/Type.zig); covers the supported cases (no sentinel / align /
-/// address_space / vector_index / bit_range prefixes).
+/// (src/Type.zig). Pointer sentinels and `align(N)` are printed; pointer
+/// `address_space` / `vector_index` / `bit_range` prefixes are not yet covered.
 pub fn print(ty: Type, pool: *const InternPool, writer: *std.Io.Writer) PrintError!void {
     assert(ty.index != .none);
     switch (pool.indexToKey(ty.index)) {
-        .simple_type => |st| try writer.print("{s}", .{@tagName(st)}),
+        // Most simple types print as their tag name; the three literal types
+        // have surface-syntax names that differ from the tag, matching the
+        // compiler's Type.print (src/Type.zig).
+        .simple_type => |st| switch (st) {
+            .null => try writer.writeAll("@TypeOf(null)"),
+            .undefined => try writer.writeAll("@TypeOf(undefined)"),
+            .enum_literal => try writer.writeAll("@EnumLiteral()"),
+            else => try writer.print("{s}", .{@tagName(st)}),
+        },
         .int_type => |it| try writer.print("{c}{d}", .{
             @as(u8, switch (it.signedness) {
                 .signed => 'i',

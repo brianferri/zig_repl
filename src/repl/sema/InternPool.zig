@@ -1409,10 +1409,6 @@ const PtrTypeRepr = extern struct {
     flags: u32,
 };
 
-/// Extra-arena payload for `Item.Tag.ptr_comptime_alloc`. Four u32
-/// slots: ty, comptime-alloc index, and the 64-bit byte_offset split
-/// into lo/hi u32s. Mirrors the compiler's `Tag.PtrComptimeAlloc` --
-/// allocations born in Sema rather than backed by a declaration.
 /// Extra-arena header for `Item.Tag.type_function`. Three u32
 /// slots followed by optional `comptime_bits` / `noalias_bits`
 /// and `param_types[params_len]`. The compiler's
@@ -1520,6 +1516,10 @@ const RepeatedRepr = extern struct {
     elem_val: u32,
 };
 
+/// Extra-arena payload for `Item.Tag.ptr_comptime_alloc`. Four u32 slots: ty,
+/// comptime-alloc index, and the 64-bit byte_offset split into lo/hi u32s.
+/// Mirrors the compiler's `Tag.PtrComptimeAlloc` -- allocations born in Sema
+/// rather than backed by a declaration.
 const PtrComptimeAllocRepr = extern struct {
     ty: u32,
     alloc_index: u32,
