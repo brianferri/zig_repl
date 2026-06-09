@@ -1219,7 +1219,14 @@ test "ptr_type: extensions we do not yet support fail with a structured diagnost
     defer pool.deinit();
 
     try expectEvalFails(gpa, &pool, "[*:0]const u8", "sentinel-terminated pointers not yet supported");
-    try expectEvalFails(gpa, &pool, "*align(8) u32", "align / address_space / bit_range not yet supported");
+}
+
+test "ptr_type: a non-power-of-two alignment is rejected" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalFails(gpa, &pool, "*align(3) u8", "alignment '3' is not a power of two");
 }
 
 test "bit_not on fixed-width ints" {

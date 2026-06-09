@@ -309,6 +309,23 @@ pub const Alignment = enum(u6) {
     @"64" = 6,
     none = std.math.maxInt(u6),
     _,
+
+    /// Power-of-two byte count -> log2 alignment; `0` maps to `.none`
+    /// (natural alignment). Mirrors the compiler's `Alignment.fromByteUnits`.
+    pub fn fromByteUnits(n: u64) Alignment {
+        if (n == 0) return .none;
+        assert(std.math.isPowerOfTwo(n));
+        return @enumFromInt(@ctz(n));
+    }
+
+    /// log2 alignment -> byte count, or `null` for `.none`. Mirrors the
+    /// compiler's `Alignment.toByteUnits`.
+    pub fn toByteUnits(a: Alignment) ?u64 {
+        return switch (a) {
+            .none => null,
+            else => @as(u64, 1) << @intFromEnum(a),
+        };
+    }
 };
 
 /// A `comptime { ... }` top-level block. Mirrors the compiler's
@@ -638,11 +655,11 @@ pub const Key = union(enum) {
         };
     };
 
-    /// Pointer type. A minimal subset of the compiler's
-    /// `Key.PtrType` -- shape matches but the flag field carries only
-    /// what `alloc` / `store` / `load` need (size, is_const, address
-    /// space). Sentinel and alignment are wired alongside
-    /// aggregates.
+    /// Pointer type. A subset of the compiler's `Key.PtrType` -- shape
+    /// matches but the flag field carries only what the supported pointer
+    /// syntax needs (size, alignment, is_const, is_volatile, is_allowzero,
+    /// address_space). The compiler's `vector_index` and the `packed_offset`
+    /// (bit-range) field are omitted until their syntax is handled.
     pub const PtrType = struct {
         child: Index,
         sentinel: Index = .none,
@@ -650,11 +667,18 @@ pub const Key = union(enum) {
 
         pub const Flags = packed struct(u32) {
             size: Size = .one,
+            /// `.none` means the pointee type's natural alignment; an explicit
+            /// `*align(N) T` stores `Alignment.fromByteUnits(N)` verbatim, even
+            /// when N equals the natural alignment -- matching how the compiler
+            /// renders it. Normalising an equal-to-natural alignment back to
+            /// `.none` (so the two intern as one type) needs `abiAlignment`,
+            /// which awaits ABI-alignment support.
+            alignment: Alignment = .none,
             is_const: bool = false,
             is_volatile: bool = false,
             is_allowzero: bool = false,
             address_space: AddressSpace = .generic,
-            _reserved: u22 = 0,
+            _reserved: u16 = 0,
         };
 
         // Reuse stdlib's enums verbatim -- same shape as the compiler's

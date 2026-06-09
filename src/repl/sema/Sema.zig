@@ -62,6 +62,10 @@ results: std.AutoHashMapUnmanaged(Zir.Inst.Index, Value),
 /// through a const pointer with the same error vocabulary the
 /// compiler uses ("cannot assign to constant").
 comptime_allocs: std.ArrayListUnmanaged(ComptimeAlloc),
+/// Bump cursor for the modeled address space `@intFromPtr` draws from. Starts
+/// above zero so no alloc lands on the null address; advanced per addressed
+/// alloc, rounded up to the alloc's alignment. Synthetic -- see `evalIntFromPtr`.
+comptime_address_cursor: u64 = 0x1000,
 /// Current lookup scope. `null` for test paths that don't construct
 /// a session; REPL passes the session-root index so `evalDeclVal`
 /// can resolve cross-line names via the parent chain.
@@ -155,6 +159,12 @@ pub const Block = struct {
 pub const ComptimeAlloc = struct {
     val: Value,
     is_const: bool,
+    /// A synthetic address in `Sema`'s modeled address space, assigned lazily
+    /// on the first `@intFromPtr`, then stable for the slot. `null` until then.
+    /// The compiler has no comptime address (it defers `@intFromPtr` of a
+    /// comptime alloc to a runtime op); this is a REPL extension so alignment
+    /// is observable -- see `evalIntFromPtr`.
+    address: ?u64 = null,
 };
 
 /// Walks the ZIR produced by AstGen for a single REPL line.
@@ -428,6 +438,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .div_trunc,
         .mod,
         .rem,
+        .mod_rem,
         .addwrap,
         .subwrap,
         .mulwrap,
@@ -458,6 +469,9 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .negate, .negate_wrap => sema.evalNegate(inst, tag),
         .bit_not => sema.evalBitNot(inst),
         .ptr_type => sema.evalPtrType(inst),
+        .align_of => sema.evalAlignOf(inst),
+        .size_of => sema.evalSizeOf(inst),
+        .int_from_ptr => sema.evalIntFromPtr(inst),
         .alloc => sema.evalAlloc(inst, true),
         .alloc_mut, .alloc_comptime_mut => sema.evalAlloc(inst, false),
         .store_node => sema.evalStoreNode(inst),
@@ -889,6 +903,18 @@ fn evalBinaryArithInt(
         .div_floor => try sema.unwrapDivResult(arith.internDivFloor(gpa, ip, lhs, rhs), "@divFloor"),
         .mod => try sema.unwrapDivResult(arith.internMod(gpa, ip, lhs, rhs), "@mod"),
         .rem => try sema.unwrapDivResult(arith.internRem(gpa, ip, lhs, rhs), "@rem"),
+        // `%` is `@rem` for non-negative operands; Zig rejects it when either
+        // operand is negative and directs to @rem / @mod (zirModRem's
+        // `lhs_maybe_negative`). Reject rather than silently compute @rem.
+        .mod_rem => blk: {
+            // BigInt `.positive` is true for zero, so this rejects only strictly
+            // negative operands.
+            if (!lhs.positive or !rhs.positive) {
+                try sema.writer.writeAll("%: use @rem or @mod for negative operands\n");
+                return error.AnalysisFail;
+            }
+            break :blk try sema.unwrapDivResult(arith.internRem(gpa, ip, lhs, rhs), "%");
+        },
         else => unreachable,
     };
 
@@ -1068,6 +1094,9 @@ fn computeFloatBin(
         },
         .mod => @mod(lhs, rhs),
         .rem => @rem(lhs, rhs),
+        // `%` on floats is the remainder (@rem), with no sign restriction --
+        // unlike signed ints, where the int kernel rejects it.
+        .mod_rem => @rem(lhs, rhs),
         else => unreachable,
     };
 }
@@ -2055,13 +2084,22 @@ fn evalPtrType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         try sema.writer.writeAll("ptr_type: sentinel-terminated pointers not yet supported\n");
         return error.AnalysisFail;
     }
-    if (inst_data.flags.has_align or inst_data.flags.has_addrspace or inst_data.flags.has_bit_range) {
-        try sema.writer.writeAll("ptr_type: align / address_space / bit_range not yet supported\n");
+    if (inst_data.flags.has_addrspace or inst_data.flags.has_bit_range) {
+        try sema.writer.writeAll("ptr_type: address_space / bit_range not yet supported\n");
         return error.AnalysisFail;
     }
 
-    const payload = sema.zir.extraData(Zir.Inst.PtrType, inst_data.payload_index).data;
+    const extra = sema.zir.extraData(Zir.Inst.PtrType, inst_data.payload_index);
+    const payload = extra.data;
     assert(payload.elem_type != .none);
+
+    // The optional extensions trail the payload as `Ref` slots in `extra`,
+    // in the order sentinel, align, addrspace, bit_range (zirPtrType). With
+    // sentinel rejected above, the align ref -- when present -- is the first.
+    const alignment: InternPool.Alignment = if (inst_data.flags.has_align)
+        try sema.alignmentFromValue(try sema.resolveRef(@enumFromInt(sema.zir.extra[extra.end])), "ptr_type")
+    else
+        .none;
 
     const child_ty = try sema.resolveDestType(payload.elem_type, "ptr_type");
     assert(child_ty != .none);
@@ -2075,11 +2113,140 @@ fn evalPtrType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
                 .slice => .slice,
                 .c => .c,
             },
+            .alignment = alignment,
             .is_const = !inst_data.flags.is_mutable,
             .is_volatile = inst_data.flags.is_volatile,
             .is_allowzero = inst_data.flags.is_allowzero,
             .address_space = .generic,
         },
+    });
+    return .{ .index = idx };
+}
+
+/// Convert an `align(N)` operand value to an `Alignment`. `N` is a comptime
+/// integer; Zig requires it be a power of two (`validateAlign`), so a
+/// non-power-of-two surfaces a diagnostic rather than corrupting the log2
+/// encoding. Shared by pointer types (`*align(N) T`) and decl alignment
+/// (`var x: T align(N)`).
+fn alignmentFromValue(sema: *Sema, value: Value, op_name: []const u8) Error!InternPool.Alignment {
+    const coerced = try sema.coerceValueToType(value, .usize_type, op_name);
+    const key = sema.intern_pool.indexToKey(coerced.index);
+    if (key != .int) {
+        try sema.writer.print("{s}: alignment must be an integer\n", .{op_name});
+        return error.AnalysisFail;
+    }
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const bytes = key.int.storage.toBigInt(&space).toInt(u64) catch {
+        try sema.writer.print("{s}: alignment out of range\n", .{op_name});
+        return error.AnalysisFail;
+    };
+    if (bytes == 0 or !std.math.isPowerOfTwo(bytes)) {
+        try sema.writer.print("{s}: alignment '{d}' is not a power of two\n", .{ op_name, bytes });
+        return error.AnalysisFail;
+    }
+    return InternPool.Alignment.fromByteUnits(bytes);
+}
+
+/// `@alignOf(T)`: the host ABI alignment of `T`, as a `comptime_int`. Mirrors
+/// zirAlignOf -- only `noreturn` is rejected (uninstantiable); every other
+/// modelled type yields its alignment (a comptime-only type yields 1).
+fn evalAlignOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const ty = try sema.resolveDestType(un_node.operand, "@alignOf");
+    if (ty == .noreturn_type) {
+        try sema.writer.writeAll("@alignOf: no align available for uninstantiable type 'noreturn'\n");
+        return error.AnalysisFail;
+    }
+    const alignment = Type.fromIndex(ty).abiAlignment(sema.intern_pool) orelse {
+        try sema.writer.writeAll("@alignOf: type not yet supported\n");
+        return error.AnalysisFail;
+    };
+    const idx = try sema.intern_pool.internInt(.{
+        .ty = .comptime_int_type,
+        .storage = .{ .u64 = alignment.toByteUnits().? },
+    });
+    return .{ .index = idx };
+}
+
+/// `@sizeOf(T)`: the host ABI byte size of `T`, as a `comptime_int`. Mirrors
+/// zirSizeOf -- `noreturn` is uninstantiable and comptime-only types have no
+/// size, so both are rejected; `void` (one possible value) is `0`.
+fn evalSizeOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const ty = try sema.resolveDestType(un_node.operand, "@sizeOf");
+    const key = sema.intern_pool.indexToKey(ty);
+    // noreturn is uninstantiable; comptime-only types (and opaque) have no
+    // runtime size. zirSizeOf rejects all of these before measuring; we reject
+    // them rather than let `abiSize`'s 0 (the compiler's value for these
+    // unsized simple types) masquerade as a real size.
+    if (key == .simple_type) switch (key.simple_type) {
+        .noreturn => {
+            try sema.writer.writeAll("@sizeOf: no size available for uninstantiable type 'noreturn'\n");
+            return error.AnalysisFail;
+        },
+        .comptime_int, .comptime_float, .type, .null, .undefined, .enum_literal, .anyopaque => {
+            try sema.writer.print("@sizeOf: no size available for type '{s}'\n", .{@tagName(key.simple_type)});
+            return error.AnalysisFail;
+        },
+        else => {},
+    };
+    const size = Type.fromIndex(ty).abiSize(sema.intern_pool) orelse {
+        try sema.writer.writeAll("@sizeOf: type not yet supported\n");
+        return error.AnalysisFail;
+    };
+    const idx = try sema.intern_pool.internInt(.{
+        .ty = .comptime_int_type,
+        .storage = .{ .u64 = size },
+    });
+    return .{ .index = idx };
+}
+
+/// `@intFromPtr(p)`: the pointer's address as `usize`.
+///
+/// Deliberate deviation from the compiler: `zirIntFromPtr` returns a comptime
+/// value only for a pointer with a literal address (`@ptrFromInt`); a
+/// comptime-alloc pointer has none, so the compiler defers to a runtime op
+/// (codegen assigns the address). This evaluator has no runtime, so it assigns
+/// the alloc a stable address in a modeled address space -- the bump cursor
+/// rounded up to the pointer's alignment (explicit `align(N)`, else the
+/// pointee's natural alignment). This makes alignment observable
+/// (`@intFromPtr(&x) % @alignOf(T) == 0`). The address is REPL-synthetic: it
+/// will not equal a real `zig run` address, so only the alignment invariant is
+/// meaningful -- the address value itself is not comparable to the compiler.
+fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const ptr = try sema.resolveRef(un_node.operand);
+    const key = sema.intern_pool.indexToKey(ptr.index);
+    if (key != .ptr) {
+        try sema.writer.writeAll("@intFromPtr: operand is not a pointer\n");
+        return error.AnalysisFail;
+    }
+    const p = key.ptr;
+    const alloc_idx: u32 = switch (p.base_addr) {
+        .comptime_alloc => |i| @intFromEnum(i),
+    };
+    const ptr_ty = sema.intern_pool.indexToKey(p.ty).ptr_type;
+    const natural: InternPool.Alignment = Type.fromIndex(ptr_ty.child).abiAlignment(sema.intern_pool) orelse .@"1";
+    const align_bytes: u64 = ptr_ty.flags.alignment.toByteUnits() orelse natural.toByteUnits().?;
+
+    const slot = &sema.comptime_allocs.items[alloc_idx];
+    const base = slot.address orelse base: {
+        const aligned = std.mem.alignForward(u64, sema.comptime_address_cursor, align_bytes);
+        const size = Type.fromIndex(ptr_ty.child).abiSize(sema.intern_pool) orelse 1;
+        sema.comptime_address_cursor = aligned + @max(size, 1);
+        slot.address = aligned;
+        break :base aligned;
+    };
+
+    const idx = try sema.intern_pool.internInt(.{
+        .ty = .usize_type,
+        .storage = .{ .u64 = base + p.byte_offset },
     });
     return .{ .index = idx };
 }
@@ -2106,19 +2273,28 @@ fn evalAlloc(sema: *Sema, inst: Zir.Inst.Index, is_const: bool) Error!?Value {
 
     const child_ty = try sema.resolveDestType(un_node.operand, "alloc");
     const undef_idx = try sema.intern_pool.get(.{ .undef = child_ty });
-    return try sema.pushComptimeAlloc(child_ty, .{ .index = undef_idx }, is_const);
+    return try sema.pushComptimeAlloc(child_ty, .{ .index = undef_idx }, is_const, .none);
 }
 
 /// Append a comptime-alloc slot holding `val` (of type `child_ty`)
-/// and return a single-item pointer to it (`*T` / `*const T` per
-/// `is_const`). The one place that turns "a value needs an address"
-/// into a slot + pointer: shared by `alloc` (undef slot) and the
+/// and return a single-item pointer to it (`*align(N) T` / `*const T` per
+/// `is_const` and `alignment`). The one place that turns "a value needs an
+/// address" into a slot + pointer: shared by `alloc` (undef slot) and the
 /// ref-producing tags (`ref`, `decl_ref`, `array_init_ref`).
+///
+/// The slot is a *copy* of `val`, not the address of any pre-existing
+/// storage. That is sound only because store-through-a-pointer
+/// (`validate_deref` + deref-store) is unimplemented, so a `decl_ref`'s
+/// `is_const = false` pointer can never be written through. When deref-store
+/// lands, a mutable decl pointer must target the decl's real storage (a
+/// `.nav`-style base address) -- writing through this copy would leave the
+/// decl unchanged, a silent divergence from the compiler.
 fn pushComptimeAlloc(
     sema: *Sema,
     child_ty: InternPool.Index,
     val: Value,
     is_const: bool,
+    alignment: InternPool.Alignment,
 ) Error!Value {
     assert(child_ty != .none);
     assert(val.index != .none);
@@ -2132,7 +2308,7 @@ fn pushComptimeAlloc(
 
     const ptr_ty = try ip.internPtrType(.{
         .child = child_ty,
-        .flags = .{ .size = .one, .is_const = is_const },
+        .flags = .{ .size = .one, .is_const = is_const, .alignment = alignment },
     });
     const ptr_idx = try ip.internPtr(.{
         .ty = ptr_ty,
@@ -2702,11 +2878,13 @@ fn evalRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// Store `value` in a fresh const comptime-alloc slot and return a
 /// `*const T` pointer to it. Shared by `ref` (pointer to an inline
-/// value), `decl_ref` (pointer to a session binding), and
-/// `array_init_ref` (pointer to a fresh aggregate).
+/// value) and `array_init_ref` (pointer to a fresh aggregate) -- both
+/// address a temporary, which the compiler also types `*const` at natural
+/// alignment. `decl_ref` does NOT use this: a pointer to a binding carries
+/// the decl's own constness and alignment.
 fn materializeConstPtr(sema: *Sema, value: Value) Error!Value {
     const child_ty = Value.typeOf(value, sema.intern_pool).index;
-    return try sema.pushComptimeAlloc(child_ty, value, true);
+    return try sema.pushComptimeAlloc(child_ty, value, true, .none);
 }
 
 /// `elem_ptr_load lhs, rhs`: load the aggregate behind pointer
@@ -3015,22 +3193,29 @@ fn wellKnownRefToValue(ref: Zir.Inst.Ref) ?Value {
 /// names are in scope before AstGen runs, so a missing name would
 /// be a structural bug in wrap-injection itself.
 fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    return try sema.lookupDeclValue(inst, "decl_val");
+    const resolved = try sema.lookupDeclResolved(inst, "decl_val");
+    return .{ .index = resolved.value };
 }
 
-/// `decl_ref name`: AstGen emits this (rather than `decl_val`) when
-/// the use site needs a pointer -- e.g. `a[i]` takes `&a` first.
-/// Resolve the binding's value, then hand back a `*const T` to a
-/// materialised slot. Compiler reference: src/Sema.zig:zirDeclRef.
+/// `decl_ref name`: AstGen emits this (rather than `decl_val`) when the use
+/// site needs a pointer -- e.g. `a[i]` takes `&a` first, or `&x`. The pointer
+/// carries the binding's own constness and alignment (`var`/`const` and
+/// `align(N)`), so `@TypeOf(&x)` matches the compiler. Compiler reference:
+/// src/Sema.zig:zirDeclRef.
 fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    const value = try sema.lookupDeclValue(inst, "decl_ref");
-    return try sema.materializeConstPtr(value);
+    const resolved = try sema.lookupDeclResolved(inst, "decl_ref");
+    return try sema.pushComptimeAlloc(
+        resolved.type,
+        .{ .index = resolved.value },
+        resolved.@"const",
+        resolved.@"align",
+    );
 }
 
-/// Resolve a `str_tok` decl name against the session namespace to
-/// its bound value. Shared by `decl_val` (returns the value) and
-/// `decl_ref` (wraps it in a pointer).
-fn lookupDeclValue(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error!Value {
+/// Resolve a `str_tok` decl name against the session namespace to its
+/// resolved Nav. Shared by `decl_val` (reads `.value`) and `decl_ref` (also
+/// reads `.@"const"` / `.@"align"` for the pointer type).
+fn lookupDeclResolved(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error!InternPool.Nav.Resolved {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const data = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok;
@@ -3058,7 +3243,7 @@ fn lookupDeclValue(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error
             );
             return error.AnalysisFail;
         }
-        return Value{ .index = resolved.value };
+        return resolved;
     }
 
     try sema.writer.print("{s} '{s}': not found in scope\n", .{ op_name, name_bytes });
@@ -3179,10 +3364,18 @@ fn bindValueDecl(
     else
         Value.typeOf(final_value, sema.intern_pool).index;
 
+    // `var x: T align(N)`: the declared alignment, resolved from its body
+    // (which breaks to the decl inst, like the type/value bodies). `.none`
+    // means natural alignment.
+    const declared_align: InternPool.Alignment = if (unwrapped.align_body) |ab|
+        try sema.alignmentFromValue(try sema.resolveInlineBody(ab, decl_inst), "decl align")
+    else
+        .none;
+
     const nav_idx = try sema.intern_pool.createNav(sema.gpa, name, fqn);
     sema.intern_pool.navPtr(nav_idx).resolved = .{
         .type = final_type,
-        .@"align" = .none,
+        .@"align" = declared_align,
         .@"linksection" = .none,
         .@"addrspace" = .generic,
         .@"const" = unwrapped.kind == .@"const",

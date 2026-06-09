@@ -307,6 +307,52 @@ test "compliance: ptr_type nested *const *const u32 renders identically" {
     try expectMatchesZig(testing.allocator, &.{"*const *const u32"});
 }
 
+test "compliance: aligned pointer types render as Zig prints" {
+    // An explicit `align(N)` prints verbatim -- even when N equals the
+    // pointee's natural alignment, Zig does not fold it away.
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"*align(4) u8"});
+    try expectMatchesZig(a, &.{"*align(16) u32"});
+    try expectMatchesZig(a, &.{"*align(8) const u32"}); // align prints before const
+    try expectMatchesZig(a, &.{"[]align(2) i16"}); // slice carries alignment
+    try expectMatchesZig(a, &.{"*align(1) u8"}); // natural alignment still printed
+}
+
+test "compliance: @alignOf matches the host target ABI" {
+    // `@alignOf` resolves the host ABI alignment (the target `zig run` uses
+    // with no `-target`). `@alignOf` of a pointer is the pointer's own
+    // alignment, not the pointee's. A comptime-only type is accepted (yields
+    // 1), unlike `@sizeOf`.
+    const a = testing.allocator;
+    for ([_][]const u8{
+        "@alignOf(u8)",  "@alignOf(u32)", "@alignOf(u64)",          "@alignOf(u128)",
+        "@alignOf(i7)",  "@alignOf(bool)", "@alignOf(usize)",       "@alignOf(f32)",
+        "@alignOf(f64)", "@alignOf(*u8)", "@alignOf(*align(16) u8)", "@alignOf(comptime_int)",
+    }) |expr| try expectMatchesZig(a, &.{expr});
+}
+
+test "compliance: @sizeOf matches the host target ABI" {
+    const a = testing.allocator;
+    for ([_][]const u8{
+        "@sizeOf(u8)",  "@sizeOf(u32)",  "@sizeOf(u64)", "@sizeOf(f16)",
+        "@sizeOf(void)", "@sizeOf([]u8)", "@sizeOf([4]u16)", "@sizeOf(usize)",
+    }) |expr| try expectMatchesZig(a, &.{expr});
+    // A comptime-only type and an uninstantiable type have no size on either side.
+    try expectBothReject(a, &.{"@sizeOf(comptime_int)"});
+    try expectBothReject(a, &.{"@sizeOf(noreturn)"});
+}
+
+test "compliance: &decl carries the binding's constness and alignment" {
+    // `&x` types as the binding's own pointer: mutable for `var`, const for
+    // `const`, with the declared `align(N)`. A bare `var` is `*T` (not the
+    // `*const T` an address-of-temporary produces).
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{ "var x: u32 = 5;", "@TypeOf(&x)" }); // var -> *u32
+    try expectMatchesZig(a, &.{ "const z: u32 = 5;", "@TypeOf(&z)" }); // const -> *const u32
+    try expectMatchesZig(a, &.{ "var w: u32 align(4) = 5;", "@TypeOf(&w)" }); // var + align
+    try expectMatchesZig(a, &.{ "const c: u8 align(16) = 1;", "@TypeOf(&c)" }); // const + align
+}
+
 test "compliance: @as(type, *const u8) is identity on type-of-type" {
     try expectMatchesZig(testing.allocator, &.{"@as(type, *const u8)"});
 }
@@ -912,6 +958,26 @@ test "compliance: a generic return coerces a runtime value type-based" {
     const make = "fn make(comptime T: type, x: u16) T { return x; }";
     try expectMatchesZig(a, &.{ make, "make(u16, 300)" }); // same width, passes
     try expectBothReject(a, &.{ make, "make(u8, 5)" }); // narrowing rejected though 5 fits u8
+}
+
+test "compliance: the % operator" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"17 % 8"}); // comptime_int
+    try expectMatchesZig(a, &.{"@as(u32, 17) % @as(u32, 8)"}); // fixed-width unsigned
+    try expectMatchesZig(a, &.{"@as(i32, 7) % @as(i32, 3)"}); // signed but non-negative
+    try expectMatchesZig(a, &.{"@as(f64, 5.5) % @as(f64, 2.0)"}); // float remainder
+    try expectBothReject(a, &.{"@as(i32, -7) % @as(i32, 3)"}); // negative -> use @rem/@mod
+}
+
+test "compliance: @intFromPtr honors the pointer's alignment" {
+    // The REPL's address is synthetic (it won't equal a real `zig run`
+    // address), but both sides honor `@intFromPtr(&x) % align == 0`: zig's
+    // address is aligned by the linker, the REPL's by construction. This is a
+    // shared-invariant check, not address-value parity.
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{ "var x: u32 align(8) = 5;", "@intFromPtr(&x) % 8" });
+    try expectMatchesZig(a, &.{ "var w: u64 align(16) = 5;", "@intFromPtr(&w) % 16" });
+    try expectMatchesZig(a, &.{ "var p: u32 = 5;", "@intFromPtr(&p) % @alignOf(u32)" });
 }
 
 test "compliance: a type-returning generic function and composition" {

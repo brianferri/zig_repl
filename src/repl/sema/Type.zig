@@ -3,6 +3,7 @@
 //! and gives type-related helpers a place to live.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 const InternPool = @import("InternPool.zig");
@@ -25,6 +26,109 @@ pub const void_type: Type = .{ .index = .void_type };
 pub const bool_type: Type = .{ .index = .bool_type };
 pub const type_type: Type = .{ .index = .type_type };
 pub const comptime_int_type: Type = .{ .index = .comptime_int_type };
+
+/// The host target -- the one `zig run` selects with no `-target`, so the ABI
+/// results below match it. The whole REPL is compiled for, and evaluates as,
+/// this single target.
+const target: *const std.Target = &builtin.target;
+
+/// ABI alignment of `ty`, or `null` for a type whose layout this subset does
+/// not model yet (struct / vector / optional / tuple / error / fn). Mirrors
+/// the compiler's `Type.abiAlignment` (src/Type.zig) arm-for-arm over the
+/// modelled Keys, delegating to the same `std.zig.target` / `std.Target`
+/// rules. Comptime-only and `noreturn` types return a real alignment here (as
+/// the compiler's function does); `@alignOf` guards `noreturn` separately.
+pub fn abiAlignment(ty: Type, pool: *const InternPool) ?InternPool.Alignment {
+    return switch (pool.indexToKey(ty.index)) {
+        .int_type => |it| if (it.bits == 0)
+            .@"1"
+        else
+            .fromByteUnits(std.zig.target.intAlignment(target, it.bits)),
+        .ptr_type, .anyframe_type => ptrAbiAlignment(),
+        .array_type => |at| abiAlignment(fromIndex(at.child), pool),
+        .simple_type => |t| switch (t) {
+            .bool, .void, .noreturn, .anyopaque, .type, .comptime_int, .comptime_float, .null, .undefined, .enum_literal => .@"1",
+            .anyerror => null, // error-set ABI not modelled yet
+            .usize, .isize => .fromByteUnits(std.zig.target.intAlignment(target, target.ptrBitWidth())),
+            .c_char => cTypeAlign(.char),
+            .c_short => cTypeAlign(.short),
+            .c_ushort => cTypeAlign(.ushort),
+            .c_int => cTypeAlign(.int),
+            .c_uint => cTypeAlign(.uint),
+            .c_long => cTypeAlign(.long),
+            .c_ulong => cTypeAlign(.ulong),
+            .c_longlong => cTypeAlign(.longlong),
+            .c_ulonglong => cTypeAlign(.ulonglong),
+            .c_longdouble => cTypeAlign(.longdouble),
+            .f16 => .@"2",
+            .f32 => cTypeAlign(.float),
+            .f64 => if (target.cTypeBitSize(.double) == 64) cTypeAlign(.double) else .@"8",
+            .f80 => if (target.cTypeBitSize(.longdouble) == 80) cTypeAlign(.longdouble) else .fromByteUnits(std.zig.target.intAlignment(target, 80)),
+            .f128 => if (target.cTypeBitSize(.longdouble) == 128) cTypeAlign(.longdouble) else .@"16",
+            // An internal generic-return marker, never a real `@alignOf` operand.
+            .generic_poison => unreachable,
+        },
+        else => null,
+    };
+}
+
+/// ABI byte size of `ty`, or `null` for an unmodelled layout (same set as
+/// `abiAlignment`). Mirrors the compiler's `Type.abiSize` over the modelled
+/// Keys. Comptime-only and uninstantiable simple types return `0` here as the
+/// compiler's function does; `@sizeOf` rejects them before calling.
+pub fn abiSize(ty: Type, pool: *const InternPool) ?u64 {
+    return switch (pool.indexToKey(ty.index)) {
+        .int_type => |it| std.zig.target.intByteSize(target, it.bits),
+        .ptr_type => |pt| switch (pt.flags.size) {
+            .slice => ptrByteSize() * 2,
+            .one, .many, .c => ptrByteSize(),
+        },
+        .anyframe_type => ptrByteSize(),
+        .array_type => |at| blk: {
+            const child = abiSize(fromIndex(at.child), pool) orelse break :blk null;
+            break :blk at.lenIncludingSentinel() * child;
+        },
+        .simple_type => |t| switch (t) {
+            .void, .noreturn, .anyopaque, .type, .comptime_int, .comptime_float, .null, .undefined, .enum_literal => 0,
+            .anyerror => null,
+            .bool => 1,
+            .usize, .isize => ptrByteSize(),
+            .c_char => target.cTypeByteSize(.char),
+            .c_short => target.cTypeByteSize(.short),
+            .c_ushort => target.cTypeByteSize(.ushort),
+            .c_int => target.cTypeByteSize(.int),
+            .c_uint => target.cTypeByteSize(.uint),
+            .c_long => target.cTypeByteSize(.long),
+            .c_ulong => target.cTypeByteSize(.ulong),
+            .c_longlong => target.cTypeByteSize(.longlong),
+            .c_ulonglong => target.cTypeByteSize(.ulonglong),
+            .c_longdouble => target.cTypeByteSize(.longdouble),
+            .f16 => 2,
+            .f32 => 4,
+            .f64 => 8,
+            .f80 => if (target.cTypeBitSize(.longdouble) == 80) target.cTypeByteSize(.longdouble) else std.zig.target.intByteSize(target, 80),
+            .f128 => 16,
+            .generic_poison => unreachable,
+        },
+        else => null,
+    };
+}
+
+/// `Alignment.fromByteUnits(target.cTypeAlignment(c))` -- the compiler's
+/// `cTypeAlign` helper, inlined for the two `abi*` switches.
+fn cTypeAlign(c: std.Target.CType) InternPool.Alignment {
+    return .fromByteUnits(target.cTypeAlignment(c));
+}
+
+/// Pointer ABI alignment/size for the host: the pointer's byte width. Mirrors
+/// the compiler's `ptrAbiAlignment` / `ptrAbiSize`, which (off the eZ80, whose
+/// 24-bit pointers we never host) is exactly the pointer's byte width.
+fn ptrAbiAlignment() InternPool.Alignment {
+    return .fromByteUnits(ptrByteSize());
+}
+fn ptrByteSize() u64 {
+    return @divExact(target.ptrBitWidth(), 8);
+}
 
 /// Errors writing a type name: I/O, plus the allocation the `error{...}` name
 /// sort needs (it dupes the names slice to order them alphabetically).
@@ -83,6 +187,9 @@ fn printPtr(pt: InternPool.Key.PtrType, pool: *const InternPool, writer: *std.Io
         .c => "[*c]",
     });
     if (pt.flags.is_allowzero and pt.flags.size != .c) try writer.writeAll("allowzero ");
+    // An explicit alignment prints `align(N)`; natural alignment (`.none`)
+    // is omitted, matching the compiler's pointer printer.
+    if (pt.flags.alignment.toByteUnits()) |bytes| try writer.print("align({d}) ", .{bytes});
     if (pt.flags.is_const) try writer.writeAll("const ");
     if (pt.flags.is_volatile) try writer.writeAll("volatile ");
     try print(fromIndex(pt.child), pool, writer);
