@@ -476,7 +476,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .switch_block_err_union,
         => sema.evalSwitchBlock(inst),
         .param, .param_comptime => sema.evalParam(inst, tag),
-        .param_anytype, .param_anytype_comptime => sema.failAnytypeParam(),
+        .param_anytype, .param_anytype_comptime => return sema.failAnytypeParam(),
         .func, .func_inferred, .func_fancy => sema.evalFunc(inst),
         .typeof => sema.evalTypeof(inst),
         .typeof_builtin => sema.evalTypeofBuiltin(inst),
@@ -509,7 +509,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .validate_array_init_result_ty => sema.evalValidateArrayInitResultTy(inst),
         .ref => sema.evalRef(inst),
         .elem_ptr_load => sema.evalElemPtrLoad(inst),
-        inline else => |unhandled| sema.reportUnsupportedTag(unhandled),
+        inline else => |unhandled| return sema.reportUnsupportedTag(unhandled),
     };
 }
 
@@ -3564,7 +3564,7 @@ fn integerInRange(sema: *Sema, x: Value, lo: Value, hi: Value) Error!bool {
     return x_big.order(lo_big) != .lt and x_big.order(hi_big) != .gt;
 }
 
-fn failSwitch(sema: *Sema, what: []const u8) Error!?Value {
+fn failSwitch(sema: *Sema, what: []const u8) Error {
     try sema.writer.print("unsupported switch construct: {s}\n", .{what});
     return error.AnalysisFail;
 }
@@ -3592,7 +3592,7 @@ fn evalParam(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value 
     return null;
 }
 
-fn failAnytypeParam(sema: *Sema) Error!?Value {
+fn failAnytypeParam(sema: *Sema) Error {
     try sema.writer.writeAll("anytype parameters not yet supported\n");
     return error.AnalysisFail;
 }
@@ -3916,7 +3916,7 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     }
 }
 
-fn reportUnsupportedTag(sema: *Sema, comptime tag: Zir.Inst.Tag) Error!?Value {
+fn reportUnsupportedTag(sema: *Sema, comptime tag: Zir.Inst.Tag) Error {
     try sema.writer.print("unsupported ZIR instruction: {s}\n", .{@tagName(tag)});
     return error.AnalysisFail;
 }

@@ -2789,7 +2789,10 @@ pub fn aggregateElementCount(pool: *const InternPool, ty: Index) u64 {
 pub fn aggregateElementAt(agg: Key.Aggregate, i: u64) Index {
     return switch (agg.storage) {
         .repeated_elem => |e| e,
-        .elems => |es| es[@intCast(i)],
+        .elems => |es| blk: {
+            assert(i < es.len);
+            break :blk es[@intCast(i)];
+        },
     };
 }
 
