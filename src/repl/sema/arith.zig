@@ -51,7 +51,6 @@ pub fn internMul(
     lhs: BigIntConst,
     rhs: BigIntConst,
 ) Allocator.Error!InternPool.Index {
-    assert(@intFromPtr(intern_pool) != 0);
     assert(lhs.limbs.len > 0);
     assert(rhs.limbs.len > 0);
 
@@ -90,7 +89,6 @@ pub fn internNegate(
     operand: BigIntConst,
 ) Allocator.Error!InternPool.Index {
     _ = gpa;
-    assert(@intFromPtr(intern_pool) != 0);
     assert(operand.limbs.len > 0);
 
     // operand.limbs may alias the pool's big_int_limbs buffer; InternPool's
@@ -221,7 +219,6 @@ fn runBinary(
     rhs: BigIntConst,
     op: *const fn (*BigIntMutable, BigIntConst, BigIntConst) void,
 ) Allocator.Error!InternPool.Index {
-    assert(@intFromPtr(intern_pool) != 0);
     assert(lhs.limbs.len > 0);
     assert(rhs.limbs.len > 0);
 
@@ -303,7 +300,6 @@ fn runShift(
     workspace_len: usize,
     direction: enum { left, right },
 ) Allocator.Error!InternPool.Index {
-    assert(@intFromPtr(intern_pool) != 0);
     assert(lhs.limbs.len > 0);
 
     const workspace = try gpa.alloc(Limb, workspace_len);
@@ -709,7 +705,6 @@ fn computeDivPair(
     rhs: BigIntConst,
     comptime kind: enum { trunc, floor },
 ) DivError!DivPair {
-    assert(@intFromPtr(intern_pool) != 0);
     assert(lhs.limbs.len > 0);
     assert(rhs.limbs.len > 0);
 

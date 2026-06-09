@@ -229,8 +229,7 @@ pub const Nav = struct {
         @"addrspace": std.lang.AddressSpace,
         @"const": bool,
         @"threadlocal": bool,
-        /// True IFF this Nav is the binding for an `extern` decl.
-        /// Set once FFI lands; false until then.
+        /// True IFF this Nav binds an `extern` decl (`linkage == .@"extern"`).
         is_extern_decl: bool,
         /// The decl's value. Compiler shape: `.none` is the
         /// "type resolved but value not yet" sentinel -- NOT an
@@ -1785,7 +1784,6 @@ pub fn getOrPutString(
     gpa: Allocator,
     bytes: []const u8,
 ) Allocator.Error!NullTerminatedString {
-    assert(@intFromPtr(pool) != 0);
     assert(std.mem.indexOfScalar(u8, bytes, 0) == null);
 
     if (bytes.len == 0) return .empty;
@@ -1807,7 +1805,6 @@ pub fn getOrPutString(
 /// terminated slice. Asserts the handle is in range; safe to call on
 /// `.empty` (returns the zero-length slice).
 pub fn stringSlice(pool: *const InternPool, string: NullTerminatedString) [:0]const u8 {
-    assert(@intFromPtr(pool) != 0);
 
     const raw = @intFromEnum(string);
     assert(raw + 1 < pool.string_starts.items.len);
@@ -1830,7 +1827,6 @@ pub fn createNav(
     name: NullTerminatedString,
     fqn: NullTerminatedString,
 ) Allocator.Error!Nav.Index {
-    assert(@intFromPtr(pool) != 0);
 
     const new_index_raw: u32 = @intCast(pool.navs.items.len);
     try pool.navs.append(gpa, .{
@@ -1847,7 +1843,6 @@ pub fn createNav(
 /// callers typically read one or two fields; mutable access goes
 /// through `navPtr` instead.
 pub fn getNav(pool: *const InternPool, index: Nav.Index) Nav {
-    assert(@intFromPtr(pool) != 0);
     const raw: u32 = @intFromEnum(index);
     assert(raw < pool.navs.items.len);
     return pool.navs.items[raw];
@@ -1858,7 +1853,6 @@ pub fn getNav(pool: *const InternPool, index: Nav.Index) Nav {
 /// is valid until the next `createNav` that triggers a resize --
 /// keep the dereference local.
 pub fn navPtr(pool: *InternPool, index: Nav.Index) *Nav {
-    assert(@intFromPtr(pool) != 0);
     const raw: u32 = @intFromEnum(index);
     assert(raw < pool.navs.items.len);
     return &pool.navs.items[raw];
@@ -1872,7 +1866,6 @@ pub fn createNamespace(
     gpa: Allocator,
     parent: OptionalNamespaceIndex,
 ) Allocator.Error!NamespaceIndex {
-    assert(@intFromPtr(pool) != 0);
 
     const new_index_raw: u32 = @intCast(pool.namespaces.items.len);
     try pool.namespaces.append(gpa, .{
@@ -1893,7 +1886,6 @@ pub fn createNamespace(
 /// (`pub_decls.put` / `test_decls.append`) goes through this pointer.
 /// Valid until the next `createNamespace`-induced resize.
 pub fn namespacePtr(pool: *InternPool, index: NamespaceIndex) *Namespace {
-    assert(@intFromPtr(pool) != 0);
     const raw: u32 = @intFromEnum(index);
     assert(raw < pool.namespaces.items.len);
     return &pool.namespaces.items[raw];
@@ -1961,7 +1953,6 @@ pub fn createComptimeUnit(
     namespace: NamespaceIndex,
     zir_index: std.zig.Zir.Inst.Index,
 ) Allocator.Error!ComptimeUnit.Id {
-    assert(@intFromPtr(pool) != 0);
 
     const new_index_raw: u32 = @intCast(pool.comptime_units.items.len);
     try pool.comptime_units.append(gpa, .{
@@ -1974,7 +1965,6 @@ pub fn createComptimeUnit(
 
 /// Read a recorded `ComptimeUnit` by id.
 pub fn getComptimeUnit(pool: *const InternPool, id: ComptimeUnit.Id) ComptimeUnit {
-    assert(@intFromPtr(pool) != 0);
     const raw: u32 = @intFromEnum(id);
     assert(raw < pool.comptime_units.items.len);
     return pool.comptime_units.items[raw];
@@ -2975,7 +2965,6 @@ pub fn internErrorSetType(
     pool: *InternPool,
     names: []const NullTerminatedString,
 ) Allocator.Error!Index {
-    assert(@intFromPtr(pool) != 0);
 
     const sorted = try pool.gpa.dupe(NullTerminatedString, names);
     defer pool.gpa.free(sorted);
@@ -3340,7 +3329,6 @@ pub fn internIntValue(
 }
 
 fn limbsAliasPool(pool: *const InternPool, limbs: []const std.math.big.Limb) bool {
-    assert(@intFromPtr(pool) != 0);
     if (limbs.len == 0) return false;
 
     const buffer = pool.big_int_limbs.allocatedSlice();

@@ -202,7 +202,6 @@ pub fn analyze(session: *Session, zir: Zir, writer: *std.Io.Writer) Error!?Value
     // bindDecls path) and is unaffected by the suppressed items, so
     // the stronger `!hasCompileErrors()` assertion has been
     // intentionally relaxed.
-    assert(@intFromPtr(intern_pool) != 0);
     assert(zir.instructions.len > 0);
 
     var top_block: Block = .{};
@@ -370,8 +369,8 @@ fn evalBody(sema: *Sema, body: []const Zir.Inst.Index) Error!Value {
 /// Mirrors src/Sema.zig:emitBackwardBranch at src/Sema.zig:25436.
 /// Increments `branch_count`; on overflow past `branch_quota`,
 /// emits the same diagnostic AstGen does and aborts via
-/// `error.AnalysisFail`. Raise the limit at runtime through
-/// `@setEvalBranchQuota` once the comptime evaluator lands.
+/// `error.AnalysisFail`. The limit will be raisable through
+/// `@setEvalBranchQuota` once that builtin lands.
 fn emitBackwardBranch(sema: *Sema) Error!void {
     sema.branch_count += 1;
     if (sema.branch_count > sema.branch_quota) {
