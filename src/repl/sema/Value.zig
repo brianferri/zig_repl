@@ -53,11 +53,10 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
         .func => |f| .{ .index = f.ty },
         .opt => |o| .{ .index = o.ty },
         .aggregate => |agg| .{ .index = agg.ty },
-        // Every remaining Key denotes a type (`type_value` and the bare
-        // type Keys); a type's own type is `type`. The value Keys above
-        // are exhaustive, so anything reaching here is a type -- the
-        // assert turns a future unclassified value Key into a loud crash
-        // rather than a silent `.type_type`.
+        // Every remaining Key is a type used as a value, whose own type is
+        // `type`. The value Keys above are exhaustive, so anything reaching
+        // here is a type -- the assert turns a future unclassified value Key
+        // into a loud crash rather than a silent `.type_type`.
         else => blk: {
             assert(key.isType());
             break :blk .type_type;

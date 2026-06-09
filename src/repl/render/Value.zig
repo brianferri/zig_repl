@@ -35,7 +35,6 @@ pub fn render(
         },
         .simple_value => |sv| writer.print("{s}\n", .{simpleValueText(sv)}),
         .undef => writer.writeAll("undefined\n"),
-        .type_value => |ty_idx| renderTypeRef(ty_idx, pool, writer),
         .opt => |o| if (o.val == .none)
             writer.writeAll("null\n")
         else

@@ -487,9 +487,6 @@ pub const Key = union(enum) {
     /// `.undefined_type` here; the well-known `Index.undef` slot stores
     /// exactly that shape. Mirrors the compiler's `Key.undef`.
     undef: Index,
-    /// A value whose runtime type is `type` and whose payload is the
-    /// interned type itself.
-    type_value: Index,
     /// A pointer type (`*T`, `*const T`, `[*]T`, `[]T`, etc.). Mirrors
     /// the compiler's `Key.PtrType` -- the same shape but a subset of
     /// the flag set; we carry what the current alloc/store/load
@@ -912,7 +909,6 @@ pub const Key = union(enum) {
                 }
             },
             .undef => |ty| std.hash.autoHash(&hasher, ty),
-            .type_value => |t| std.hash.autoHash(&hasher, t),
             .ptr_type => |pt| {
                 std.hash.autoHash(&hasher, pt.child);
                 std.hash.autoHash(&hasher, pt.sentinel);
@@ -1052,7 +1048,6 @@ pub const Key = union(enum) {
                 };
             },
             .undef => |x| x == b.undef,
-            .type_value => |x| x == b.type_value,
             .ptr_type => |x| blk: {
                 const y = b.ptr_type;
                 if (x.child != y.child) break :blk false;
@@ -1171,7 +1166,6 @@ pub const Key = union(enum) {
     /// be classified here.
     pub fn isType(key: Key) bool {
         return switch (key) {
-            .type_value,
             .simple_type,
             .int_type,
             .anyframe_type,
@@ -1248,7 +1242,6 @@ const Item = struct {
         float_c_longdouble_f128, // ty = .c_longdouble_type; storage f128, data = extra index of Float128
         float_comptime_float, // ty = .comptime_float_type; data = extra index of Float128
         undef, // data = Index of the value's type (`undefined_type` for untyped)
-        type_value, // data = Index of the interned type
         // Pointer type. data = extra index of PtrTypeRepr (3 u32 slots:
         // child, sentinel, flags). Mirrors the compiler's
         // `Item.Tag.type_pointer`.
@@ -2103,10 +2096,6 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .simple_value => |s| appendSimpleValue(pool, s),
         .int_type => |it| appendIntType(pool, it.signedness, it.bits),
         .anyframe_type => |child| appendAnyframeType(pool, child),
-        .type_value => |t| pool.items.appendAssumeCapacity(.{
-            .tag = .type_value,
-            .data = @intFromEnum(t),
-        }),
         .undef => |ty| {
             assert(ty != .none);
             pool.items.appendAssumeCapacity(.{
@@ -2199,7 +2188,6 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
             .storage = .{ .f128 = floatFromExtra(pool, Float128, item.data).get() },
         } },
         .undef => .{ .undef = @enumFromInt(item.data) },
-        .type_value => .{ .type_value = @enumFromInt(item.data) },
         .type_pointer => ptrTypeFromExtra(pool, item.data),
         .ptr_comptime_alloc => ptrComptimeAllocFromExtra(pool, item.data),
         .type_error_set => errorSetTypeFromExtra(pool, item.data),
@@ -3387,15 +3375,6 @@ fn addBigIntAssumingSafe(
 
 pub fn internComptimeInt(pool: *InternPool, value: BigIntConst) Allocator.Error!Index {
     return pool.internIntValue(.comptime_int_type, value);
-}
-
-/// Intern a value whose runtime type is `type` and whose payload is the
-/// interned type identified by `ty`. This is how Sema returns "the
-/// expression evaluated to a type" results (e.g. `@TypeOf(x)` or the
-/// type computed by `typeof_log2_int_type`).
-pub fn internTypeValue(pool: *InternPool, ty: Index) Allocator.Error!Index {
-    assert(ty != .none);
-    return pool.get(.{ .type_value = ty });
 }
 
 pub fn itemCount(pool: *const InternPool) u32 {

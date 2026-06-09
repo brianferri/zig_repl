@@ -1245,8 +1245,8 @@ fn evalTypeofLog2IntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand_type = Value.typeOf(operand, sema.intern_pool);
 
     if (operand_type.index == .comptime_int_type) {
-        const idx = try sema.intern_pool.internTypeValue(.comptime_int_type);
-        return .{ .index = idx };
+        // A type used as a value is its own Index (a value of type `type`).
+        return .{ .index = .comptime_int_type };
     }
 
     const operand_type_key = sema.intern_pool.indexToKey(operand_type.index);
@@ -1254,8 +1254,7 @@ fn evalTypeofLog2IntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         const bits = operand_type_key.int_type.bits;
         const log2_bits: u16 = if (bits == 0) 0 else std.math.log2_int_ceil(u16, bits);
         const log2_type = try sema.intern_pool.internIntType(.unsigned, log2_bits);
-        const idx = try sema.intern_pool.internTypeValue(log2_type);
-        return .{ .index = idx };
+        return .{ .index = log2_type };
     }
 
     try sema.writer.writeAll("typeof_log2_int_type: non-integer operand not yet supported\n");
@@ -1287,15 +1286,9 @@ fn evalAsNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return try sema.coerceValueToType(operand_value, dest_type_index, "@as");
 }
 
-/// Resolve a `Zir.Inst.Ref` that should identify a type. Accepts both
-/// shapes the pool uses to represent "this value names a type":
-///
-///   * A `type_value` Key wrapping the target Index (the dynamic case
-///     for synthesized types).
-///   * A bare type Key whose own Index is the type slot --
-///     `simple_type` / `int_type` / `ptr_type` / `anyframe_type`. Per
-///     `Value.typeOf`, these surface a value of type `type`, so the
-///     Index itself doubles as the type identifier.
+/// Resolve a `Zir.Inst.Ref` that should identify a type. A type used as a
+/// value is its own Index -- a value of type `type` (per `Value.typeOf`), so
+/// any Key that `Key.isType` accepts is itself the type identifier.
 ///
 /// Used by every cast builtin (`@as` / `@floatCast` / `@intCast` /
 /// `@truncate` / `@bitCast` / `@intFromFloat` / `@floatFromInt`) to
@@ -1308,18 +1301,13 @@ fn resolveDestType(
     assert(ref != .none);
     const dest_value = try sema.resolveRef(ref);
     const key = sema.intern_pool.indexToKey(dest_value.index);
-    // `type_value` wraps its type; a bare type Key is its own type. Any
-    // other type Key (per `Key.isType`) is itself the destination. The
-    // earlier hand-maintained accept-list had drifted out of this set
-    // (missing `struct_type`, `func_type`); deriving from `isType` keeps
-    // it in lockstep.
-    return switch (key) {
-        .type_value => |t| t,
-        else => if (key.isType()) dest_value.index else blk: {
-            try sema.writer.print("{s}: destination is not a type\n", .{op_name});
-            break :blk error.AnalysisFail;
-        },
-    };
+    // A type used as a value is its own Index (per `Key.isType` /
+    // `Value.typeOf`), so any type Key is itself the destination. Deriving
+    // from `isType` keeps this in lockstep with that single type/value
+    // partition rather than a hand-maintained accept-list.
+    if (key.isType()) return dest_value.index;
+    try sema.writer.print("{s}: destination is not a type\n", .{op_name});
+    return error.AnalysisFail;
 }
 
 /// Decode the `Zir.Inst.Bin` payload (the `lhs` / `rhs` operand refs) of a
