@@ -969,6 +969,23 @@ test "compliance: the % operator" {
     try expectBothReject(a, &.{"@as(i32, -7) % @as(i32, 3)"}); // negative -> use @rem/@mod
 }
 
+test "compliance: compound assignment" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"blk: { var s: u32 = 5; s += 1; break :blk s; }"});
+    try expectMatchesZig(a, &.{"blk: { var s: i32 = 5; s -= 8; break :blk s; }"});
+    try expectMatchesZig(a, &.{"blk: { var s: u32 = 5; s *= 3; break :blk s; }"});
+    try expectMatchesZig(a, &.{"blk: { var s: u32 = 9; s /= 2; break :blk s; }"});
+    try expectMatchesZig(a, &.{"blk: { var i: u32 = 0; while (i < 5) : (i += 1) {} break :blk i; }"});
+}
+
+test "compliance: for loops (range and array)" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"blk: { var s: u32 = 0; for (0..4) |i| { s += @intCast(i); } break :blk s; }"});
+    try expectMatchesZig(a, &.{"blk: { var s: u32 = 0; for (2..5) |i| { s += @intCast(i); } break :blk s; }"});
+    try expectMatchesZig(a, &.{"blk: { const arr = [_]u8{ 10, 20, 30 }; var s: u32 = 0; for (arr) |x| { s += x; } break :blk s; }"});
+    try expectMatchesZig(a, &.{"blk: { var s: u32 = 0; for (0..3) |i| { for (0..3) |j| { s += @intCast(i * j); } } break :blk s; }"});
+}
+
 test "compliance: @intFromPtr honors the pointer's alignment" {
     // The REPL's address is synthetic (it won't equal a real `zig run`
     // address), but both sides honor `@intFromPtr(&x) % align == 0`: zig's

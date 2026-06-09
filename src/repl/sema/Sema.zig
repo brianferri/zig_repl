@@ -471,8 +471,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .align_of => sema.evalAlignOf(inst),
         .size_of => sema.evalSizeOf(inst),
         .int_from_ptr => sema.evalIntFromPtr(inst),
-        .alloc => sema.evalAlloc(inst, true),
-        .alloc_mut, .alloc_comptime_mut => sema.evalAlloc(inst, false),
+        .alloc, .alloc_mut, .alloc_comptime_mut => sema.evalAlloc(inst),
+        .make_ptr_const => sema.evalMakePtrConst(inst),
         .store_node => sema.evalStoreNode(inst),
         .load => sema.evalLoad(inst),
         .decl_val => sema.evalDeclVal(inst),
@@ -484,6 +484,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .err_union_payload_unsafe => sema.evalErrUnionPayloadUnsafe(inst),
         .is_non_err => sema.evalIsNonErr(inst),
         .loop => sema.evalLoop(inst),
+        .for_len => sema.evalForLen(inst),
         .switch_block,
         .switch_block_ref,
         .switch_block_err_union,
@@ -522,6 +523,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .validate_array_init_result_ty => sema.evalValidateArrayInitResultTy(inst),
         .ref => sema.evalRef(inst),
         .elem_ptr_load => sema.evalElemPtrLoad(inst),
+        .elem_val => sema.evalElemVal(inst),
         inline else => |unhandled| return sema.reportUnsupportedTag(unhandled),
     };
 }
@@ -2244,17 +2246,14 @@ fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// entry in `comptime_allocs`, initialise to a typed `undef`, and
 /// return a `Key.ptr` whose `BaseAddr = .comptime_alloc = index`.
 ///
-/// Compiler reference: src/Sema.zig:zirAlloc (~3723) /
-/// src/Sema.zig:zirAllocMut (~3755) / analyzeComptimeAlloc (~33069).
-/// The compiler distinguishes `alloc` (const) from `alloc_mut` via
-/// the resulting pointer type's `is_const` flag -- not via a separate
-/// runtime instruction. We do the same: both paths reach `evalAlloc`
-/// with `is_const` set; the only behavioural difference is whether
-/// `store_node` will accept writes through the resulting pointer.
-/// Modelled as `bool` to match `std.lang.Type.Pointer.is_const`
-/// and `Zir.Inst.alloc.is_const` rather than introduce a REPL-local
-/// two-state enum.
-fn evalAlloc(sema: *Sema, inst: Zir.Inst.Index, is_const: bool) Error!?Value {
+/// All three start MUTABLE -- `alloc` is not const, despite naming a
+/// `const` declaration. AstGen emits a separate `make_ptr_const` once a
+/// `const`'s value is fully initialised (`evalMakePtrConst`); a `var` and the
+/// for-loop index counter (an `alloc` that is incremented) never get one and
+/// stay writable. Compiler reference: src/Sema.zig:zirAlloc / zirAllocMut /
+/// analyzeComptimeAlloc, and Zir.zig's note that `alloc_mut` is "the same as
+/// `alloc` except mutable, so make_ptr_const need not be used".
+fn evalAlloc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
@@ -2262,7 +2261,33 @@ fn evalAlloc(sema: *Sema, inst: Zir.Inst.Index, is_const: bool) Error!?Value {
 
     const child_ty = try sema.resolveDestType(un_node.operand, "alloc");
     const undef_idx = try sema.intern_pool.get(.{ .undef = child_ty });
-    return try sema.pushComptimeAlloc(child_ty, .{ .index = undef_idx }, is_const, .none);
+    return try sema.pushComptimeAlloc(child_ty, .{ .index = undef_idx }, false, .none);
+}
+
+/// `make_ptr_const`: freeze an `alloc`'s pointer to `*const T` once the value
+/// is fully initialised. AstGen emits it for a `const` local (an `alloc` is
+/// mutable until then); it marks the comptime-alloc const so later stores are
+/// rejected and returns a const-typed pointer to the same slot. Mirrors
+/// zirMakePtrConst's "preserve the comptime alloc, just make the pointer
+/// const" branch (the anon-decl promotion is a runtime-codegen optimisation
+/// this comptime evaluator does not need).
+fn evalMakePtrConst(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const ptr = try sema.resolveRef(un_node.operand);
+    const ip = sema.intern_pool;
+    const p = ip.indexToKey(ptr.index).ptr;
+    switch (p.base_addr) {
+        .comptime_alloc => |idx| sema.comptime_allocs.items[@intFromEnum(idx)].is_const = true,
+    }
+    const old = ip.indexToKey(p.ty).ptr_type;
+    if (old.flags.is_const) return ptr;
+    var flags = old.flags;
+    flags.is_const = true;
+    const const_ty = try ip.internPtrType(.{ .child = old.child, .sentinel = old.sentinel, .flags = flags });
+    const const_ptr = try ip.internPtr(.{ .ty = const_ty, .base_addr = p.base_addr, .byte_offset = p.byte_offset });
+    return .{ .index = const_ptr };
 }
 
 /// Append a comptime-alloc slot holding `val` (of type `child_ty`)
@@ -2885,16 +2910,37 @@ fn evalElemPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
+    const array_value = try sema.loadValue(try sema.resolveRef(bin.lhs));
+    return try sema.aggregateElement(array_value, bin.rhs);
+}
+
+/// `elem_val`: `indexable[index]` by value (the `for (a) |x|` capture and
+/// direct indexing of an aggregate value). Same element read as
+/// `elem_ptr_load`, but the operand is the aggregate value rather than a
+/// pointer to it -- if it does arrive as a pointer, load through it first.
+fn evalElemVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const bin = sema.binData(inst);
+    assert(bin.lhs != .none);
+    assert(bin.rhs != .none);
+
+    const lhs = try sema.resolveRef(bin.lhs);
+    const array_value = if (sema.intern_pool.indexToKey(lhs.index) == .ptr)
+        try sema.loadValue(lhs)
+    else
+        lhs;
+    return try sema.aggregateElement(array_value, bin.rhs);
+}
+
+/// Read element `index_ref` of an aggregate value, with a bounds check.
+/// Shared by `elem_ptr_load` and `elem_val`.
+fn aggregateElement(sema: *Sema, array_value: Value, index_ref: Zir.Inst.Ref) Error!Value {
     const ip = sema.intern_pool;
-    const ptr_value = try sema.resolveRef(bin.lhs);
-    const array_value = try sema.loadValue(ptr_value);
     const agg_key = ip.indexToKey(array_value.index);
     if (agg_key != .aggregate) {
         try sema.writer.writeAll("elem access: operand is not an indexable aggregate\n");
         return error.AnalysisFail;
     }
-
-    const index = try sema.resolveArrayLen(bin.rhs, "elem access");
+    const index = try sema.resolveArrayLen(index_ref, "elem access");
     const count = ip.aggregateElementCount(agg_key.aggregate.ty);
     if (index >= count) {
         try sema.writer.print("index out of bounds: index {d}, len {d}\n", .{ index, count });
@@ -3596,6 +3642,55 @@ fn evalLoop(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return try sema.resolveInlineBody(body, inst);
 }
 
+/// `for_len`: the iteration count of a `for` loop -- the length shared by its
+/// inputs. The `MultiOp` operands are pairs: `[start, end]` for a range,
+/// `[indexable, .none]` for an array/slice (its element count). All inputs are
+/// comptime-known here; mismatched lengths are rejected, as the compiler does.
+/// The rest of the for loop desugars to primitives already handled (the `|i|`
+/// capture is just a `load` of the index counter). Mirrors zirForLen.
+fn evalForLen(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.MultiOp, pl_node.payload_index);
+    const operands = sema.zir.refSlice(extra.end, extra.data.operands_len);
+    const pairs: []const [2]Zir.Inst.Ref =
+        @as([*]const [2]Zir.Inst.Ref, @ptrCast(operands.ptr))[0..@divExact(operands.len, 2)];
+
+    var len: ?u64 = null;
+    for (pairs) |pair| {
+        if (pair[0] == .none) continue;
+        const arg_len: u64 = if (pair[1] == .none) blk: {
+            const obj = try sema.resolveRef(pair[0]);
+            const key = sema.intern_pool.indexToKey(obj.index);
+            if (key != .aggregate) {
+                try sema.writer.writeAll("for: operand is not a range or indexable\n");
+                return error.AnalysisFail;
+            }
+            break :blk sema.intern_pool.aggregateElementCount(key.aggregate.ty);
+        } else blk: {
+            const start = try sema.resolveUsizeInt(try sema.resolveRef(pair[0]), "for range start");
+            const end = try sema.resolveUsizeInt(try sema.resolveRef(pair[1]), "for range end");
+            if (end < start) {
+                try sema.writer.writeAll("for: range end is before range start\n");
+                return error.AnalysisFail;
+            }
+            break :blk end - start;
+        };
+        if (len) |existing| {
+            if (existing != arg_len) {
+                try sema.writer.writeAll("for: non-matching loop lengths\n");
+                return error.AnalysisFail;
+            }
+        } else len = arg_len;
+    }
+    const idx = try sema.intern_pool.internInt(.{
+        .ty = .usize_type,
+        .storage = .{ .u64 = len orelse 0 },
+    });
+    return .{ .index = idx };
+}
+
 /// `switch_block` family: resolve the operand, walk cases via
 /// stdlib's `zir.getSwitchBlock`, evaluate the matching prong body.
 /// Handles all three tag flavors:
@@ -4173,6 +4268,16 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
         .tuple_decl => return sema.evalTupleDecl(extended),
         .struct_decl => return sema.evalStructDecl(inst),
+
+        // The result type for a compound assignment (`s += x`, `s -= x`): the
+        // lhs's own type, against which the rhs is coerced before the arith +
+        // store-back. Mirrors zirInplaceArithResultTy's non-pointer case;
+        // pointer arithmetic (its `[*]T`/`[*c]T` special cases) is unsupported,
+        // so a pointer lhs yields its own type and the following arith rejects it.
+        .inplace_arith_result_ty => {
+            const lhs = try sema.resolveRef(@enumFromInt(extended.operand));
+            return Value{ .index = Value.typeOf(lhs, sema.intern_pool).index };
+        },
 
         // Bridge into std.lang.* (CallingConvention, AtomicOrder,
         // AddressSpace, ...). Compiler reference:
