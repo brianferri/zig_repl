@@ -3670,17 +3670,32 @@ fn evalRetType(sema: *Sema) Error!?Value {
 /// error-set flag (`.func_inferred`) is observed via `getFnInfo`
 /// but doesn't affect the FuncType encoding today; it'll matter
 /// when error-set inference moves out of the per-fn analysis.
+/// Resolve a function's declared return type from its ZIR: a pre-interned
+/// `ret_ty_ref` (e.g. `i32`), else a computed `ret_ty_body` (e.g. `u23`),
+/// else `void`. `break_target` is the func inst the body breaks to. For a
+/// generic signature the ref/body references an unbound param, so this is
+/// meaningful only after `evalCall` binds the comptime args; at definition
+/// time `evalFunc` stores the poison marker instead.
+fn resolveDeclaredRetType(sema: *Sema, info: Zir.FnInfo, break_target: Zir.Inst.Index) Error!InternPool.Index {
+    if (info.ret_ty_ref != .none) return (try sema.resolveRef(info.ret_ty_ref)).index;
+    if (info.ret_ty_body.len > 0) return (try sema.resolveInlineBody(info.ret_ty_body, break_target)).index;
+    return .void_type;
+}
+
 fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const info = sema.zir.getFnInfo(inst);
 
-    const ret_ty: InternPool.Index = if (info.ret_ty_ref != .none)
-        (try sema.resolveRef(info.ret_ty_ref)).index
-    else if (info.ret_ty_body.len > 0)
-        (try sema.resolveInlineBody(info.ret_ty_body, inst)).index
+    // A generic signature's return type depends on a comptime argument
+    // (`fn make(comptime T: type) T`): its ref/body points at a param that
+    // has no value until a call binds one. Store the poison marker now;
+    // `evalCall` re-resolves the concrete type per instantiation. Mirrors
+    // funcCommon (src/Sema.zig), which interns generic_poison_type here.
+    const ret_ty: InternPool.Index = if (info.ret_ty_is_generic)
+        .generic_poison_type
     else
-        InternPool.Index.void_type;
+        try sema.resolveDeclaredRetType(info, inst);
 
     const params = try sema.gpa.alloc(InternPool.Index, sema.block.params.items.len);
     defer sema.gpa.free(params);
@@ -3814,9 +3829,15 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     }
 
     // Expose the return type to the body's `ret_type` instruction; restore
-    // the caller's on exit so nested calls each see their own.
+    // the caller's on exit so nested calls each see their own. A generic
+    // return was stored as the poison marker at definition (`evalFunc`); now
+    // that the comptime args are bound, the param ref/body it points at
+    // re-resolves to the concrete type for this instantiation.
     const saved_ret_ty = sema.fn_ret_ty;
-    sema.fn_ret_ty = func_ty.return_type;
+    sema.fn_ret_ty = if (func_ty.return_type == .generic_poison_type)
+        try sema.resolveDeclaredRetType(info, func.zir_body_inst)
+    else
+        func_ty.return_type;
     defer sema.fn_ret_ty = saved_ret_ty;
 
     // Fn body terminates via `return X;` (ret_node /
@@ -3833,7 +3854,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
         // return value. A return derived from a runtime parameter coerces
         // type-based, so `fn (a: u32) i32 { return a; }` is rejected as the
         // compiler rejects it; a comptime-known return coerces value-based.
-        error.ComptimeReturn => return try sema.coerceValueToType(sema.return_value, func_ty.return_type, "return"),
+        error.ComptimeReturn => return try sema.coerceValueToType(sema.return_value, sema.fn_ret_ty, "return"),
         else => |e| return e,
     }
 }

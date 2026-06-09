@@ -879,3 +879,48 @@ test "compliance: runtime float coercion is type-based" {
     try expectBothReject(a, &.{ "fn f(x: u32) f32 { return x; }", "f(5)" }); // runtime int -> float
     try expectMatchesZig(a, &.{ "fn f(x: f32) f64 { return x; }", "f(1.5)" }); // widening
 }
+
+test "compliance: a generic return type resolves per instantiation" {
+    // `fn make(comptime T: type) T`: the return type is unknown at definition
+    // (poison) and re-resolves to the comptime argument when the call binds it,
+    // so the body's return coerces against the concrete type of that call.
+    const a = testing.allocator;
+    const make = "fn make(comptime T: type) T { return 300; }";
+    try expectMatchesZig(a, &.{ make, "make(u16)" }); // 300 fits u16
+    try expectMatchesZig(a, &.{ make, "@TypeOf(make(u16))" }); // instantiated type, not poison
+    try expectBothReject(a, &.{ make, "make(u8)" }); // 300 does not fit u8
+}
+
+test "compliance: a generic return body computes through arithmetic and @as" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{ "fn make(comptime T: type) T { return 1 + 2; }", "make(u8)" });
+    try expectMatchesZig(a, &.{ "fn make(comptime T: type) T { return @as(T, 7) * 2; }", "make(u8)" });
+}
+
+test "compliance: a generic return body assigns and mutates a T-typed local" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{ "fn make(comptime T: type) T { var x: T = 10; x = x + 5; return x; }", "make(u8)" });
+    try expectMatchesZig(a, &.{ "fn make(comptime T: type) T { const n: T = 3; return n; }", "make(i32)" });
+}
+
+test "compliance: a generic return coerces a runtime value type-based" {
+    // A runtime (concrete-param-derived) value returned through a generic type
+    // coerces against the re-resolved type *type-based*, not value-based: the
+    // narrowing is rejected even when the value would fit, exactly as the
+    // runtime-coercion path rejects a non-generic narrowing.
+    const a = testing.allocator;
+    const make = "fn make(comptime T: type, x: u16) T { return x; }";
+    try expectMatchesZig(a, &.{ make, "make(u16, 300)" }); // same width, passes
+    try expectBothReject(a, &.{ make, "make(u8, 5)" }); // narrowing rejected though 5 fits u8
+}
+
+test "compliance: a type-returning generic function and composition" {
+    // `fn Id(comptime T: type) type` returns a type value; feeding it as the
+    // type argument of another generic resolves both instantiations.
+    const a = testing.allocator;
+    const id = "fn Id(comptime T: type) type { return T; }";
+    const make = "fn make(comptime T: type) T { return 200 + 100; }";
+    try expectMatchesZig(a, &.{ id, "Id(u8)" });
+    try expectMatchesZig(a, &.{ id, make, "@TypeOf(make(Id(u16)))" });
+    try expectMatchesZig(a, &.{ id, make, "make(Id(u16))" });
+}

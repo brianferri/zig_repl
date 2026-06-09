@@ -5,10 +5,10 @@
 //! Reference: src/InternPool.zig in the Zig compiler tree.
 //! The well-known `Index` set, `SimpleType`/`SimpleValue` shape, and
 //! `Item.Tag` naming mirror the compiler so the port reads against it
-//! directly. Compiler-internal markers (`adhoc_inferred_error_set`,
-//! `generic_poison`) plus the convenience pointer/slice/vector well-knowns
-//! are deliberately deferred -- they need Key variants (`ptr_type`,
-//! `vector_type`, etc.) that land alongside their handlers.
+//! directly. The `adhoc_inferred_error_set` marker plus the convenience
+//! pointer/slice/vector well-knowns are deliberately deferred -- they need
+//! Key variants (`ptr_type`, `vector_type`, etc.) that land alongside their
+//! handlers.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -79,6 +79,12 @@ pub const Index = enum(u32) {
     null_type,
     undefined_type,
     enum_literal_type,
+    /// A type that is unknown until a generic function is instantiated:
+    /// the declared type of a generic parameter or return whose value
+    /// depends on a comptime argument. `evalFunc` stores it as a func's
+    /// return type when AstGen marks the signature generic; `evalCall`
+    /// re-resolves the concrete type once the comptime args are bound.
+    generic_poison_type,
 
     // Values.
     /// `undefined` (untyped)
@@ -109,7 +115,7 @@ pub const Index = enum(u32) {
     /// (inclusive) is a type whose Key shape can be looked up via `get`
     /// without further checks. Dynamic indices fall outside this range.
     pub const first_type: Index = .u0_type;
-    pub const last_type: Index = .enum_literal_type;
+    pub const last_type: Index = .generic_poison_type;
     pub const first_value: Index = .undef;
     pub const last_value: Index = .bool_false;
 
@@ -452,6 +458,7 @@ pub const SimpleType = enum(u32) {
     null = @intFromEnum(Index.null_type),
     undefined = @intFromEnum(Index.undefined_type),
     enum_literal = @intFromEnum(Index.enum_literal_type),
+    generic_poison = @intFromEnum(Index.generic_poison_type),
 };
 
 /// Mirrors compiler `InternPool.SimpleValue`. Same identity trick as `SimpleType`.
@@ -2000,6 +2007,7 @@ const static_keys: [first_dynamic_index]Key = .{
     .{ .simple_type = .null },
     .{ .simple_type = .undefined },
     .{ .simple_type = .enum_literal },
+    .{ .simple_type = .generic_poison },
 
     // Untyped `undefined` -- same shape as the compiler.
     .{ .undef = .undefined_type },
