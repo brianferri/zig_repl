@@ -2243,57 +2243,8 @@ fn coerceValueToType(
         return .{ .index = idx };
     }
 
-    // Coercion into a fixed-width int. A runtime value follows Zig's type-based
-    // rule -- the dest type must represent every value of the source type,
-    // regardless of the concrete value -- so `u32 -> i32` is rejected. A
-    // comptime-known value follows the value-fits rule (`coerceExtra` keys on
-    // whether the value is known, src/Sema.zig), so the same `u32 -> i32` is
-    // accepted when the value fits. `refitIntToFixedWidth` re-tags the value
-    // and, on the comptime path, reports the out-of-range error.
-    if (key == .int) {
-        if (intTypeInfo(ip, dest_ty)) |dst| {
-            // A runtime int must satisfy the type-based rule. Its type is
-            // fixed-width (`comptime_int` is comptime-only); the `if` guards
-            // the rare edge of a `comptime_int` reaching here marked runtime,
-            // which then falls through to the value-fits path below.
-            if (!value.is_comptime) {
-                if (intTypeInfo(ip, value_type.index)) |src| {
-                    if (!intCoercible(src, dst)) {
-                        try sema.writer.print("{s}: expected ", .{op_name});
-                        try Type.print(.fromIndex(dest_ty), ip, sema.writer);
-                        try sema.writer.writeAll(", found ");
-                        try Type.print(.fromIndex(value_type.index), ip, sema.writer);
-                        try sema.writer.writeByte('\n');
-                        return error.AnalysisFail;
-                    }
-                }
-            }
-            var coerced = try sema.refitIntToFixedWidth(value.index, dest_ty, op_name);
-            coerced.is_comptime = value.is_comptime;
-            return coerced;
-        }
-    }
-
-    if (isFloatTypeIndex(dest_ty)) {
-        // A runtime value follows the type-based rule: a float widens to a
-        // wider-or-equal float; a narrowing, or a runtime int, needs an
-        // explicit @floatCast / @floatFromInt. A comptime-known value coerces
-        // by value via `coerceToTargetFloat` below.
-        if (!value.is_comptime) {
-            const widens = isFloatTypeIndex(value_type.index) and
-                numericBitSize(ip, value_type.index).? <= numericBitSize(ip, dest_ty).?;
-            if (!widens) {
-                try sema.writer.print("{s}: a runtime value does not coerce to ", .{op_name});
-                try Type.print(.fromIndex(dest_ty), ip, sema.writer);
-                try sema.writer.writeAll(" (needs @floatCast or @floatFromInt)\n");
-                return error.AnalysisFail;
-            }
-        }
-        if (coerceToTargetFloat(key, dest_ty)) |coerced| {
-            const idx = try ip.internFloat(coerced);
-            return .{ .index = idx, .is_comptime = value.is_comptime };
-        }
-    }
+    if (try sema.coerceToFixedWidthInt(value, dest_ty, op_name)) |coerced| return coerced;
+    if (try sema.coerceToFloat(value, dest_ty, op_name)) |coerced| return coerced;
 
     // Coercion into an error-union type: an error value becomes the
     // `.err` arm; any other value coerces to the payload type and
@@ -2312,6 +2263,62 @@ fn coerceValueToType(
 
     try sema.writer.print("{s}: cannot coerce value to destination type\n", .{op_name});
     return error.AnalysisFail;
+}
+
+/// Coerce `value` to a fixed-width int `dest_ty`, or `null` if `dest_ty` isn't
+/// one (caller falls through). A runtime value follows Zig's type-based rule
+/// -- the dest must represent every value of the source type, so `u32 -> i32`
+/// is rejected -- while a comptime-known value follows the value-fits rule
+/// (`coerceExtra` keys on whether the value is known, src/Sema.zig);
+/// `refitIntToFixedWidth` re-tags and reports out-of-range.
+fn coerceToFixedWidthInt(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_name: []const u8) Error!?Value {
+    const ip = sema.intern_pool;
+    if (ip.indexToKey(value.index) != .int) return null;
+    const dst = intTypeInfo(ip, dest_ty) orelse return null;
+    // A runtime int's type is fixed-width (`comptime_int` is comptime-only);
+    // the `if` guards the rare edge of a `comptime_int` here marked runtime,
+    // which then falls through to the value-fits path.
+    if (!value.is_comptime) {
+        const value_type = Value.typeOf(value, ip);
+        if (intTypeInfo(ip, value_type.index)) |src| {
+            if (!intCoercible(src, dst)) {
+                try sema.writer.print("{s}: expected ", .{op_name});
+                try Type.print(.fromIndex(dest_ty), ip, sema.writer);
+                try sema.writer.writeAll(", found ");
+                try Type.print(.fromIndex(value_type.index), ip, sema.writer);
+                try sema.writer.writeByte('\n');
+                return error.AnalysisFail;
+            }
+        }
+    }
+    var coerced = try sema.refitIntToFixedWidth(value.index, dest_ty, op_name);
+    coerced.is_comptime = value.is_comptime;
+    return coerced;
+}
+
+/// Coerce `value` to a float `dest_ty`, or `null` if `dest_ty` isn't a float
+/// or the operand isn't a coercible number (caller falls through). A runtime
+/// value widens to a wider-or-equal float; a narrowing or a runtime int needs
+/// an explicit @floatCast / @floatFromInt. A comptime value coerces by value.
+fn coerceToFloat(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_name: []const u8) Error!?Value {
+    if (!isFloatTypeIndex(dest_ty)) return null;
+    const ip = sema.intern_pool;
+    if (!value.is_comptime) {
+        const value_type = Value.typeOf(value, ip);
+        const widens = isFloatTypeIndex(value_type.index) and
+            numericBitSize(ip, value_type.index).? <= numericBitSize(ip, dest_ty).?;
+        if (!widens) {
+            try sema.writer.print("{s}: a runtime value does not coerce to ", .{op_name});
+            try Type.print(.fromIndex(dest_ty), ip, sema.writer);
+            try sema.writer.writeAll(" (needs @floatCast or @floatFromInt)\n");
+            return error.AnalysisFail;
+        }
+    }
+    if (coerceToTargetFloat(ip.indexToKey(value.index), dest_ty)) |coerced| {
+        const idx = try ip.internFloat(coerced);
+        return .{ .index = idx, .is_comptime = value.is_comptime };
+    }
+    return null;
 }
 
 fn coerceToOptional(
@@ -3482,7 +3489,11 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             else => null,
         };
 
-    const operand_ty = Value.typeOf(operand, sema.intern_pool).index;
+    const op: SwitchOperand = .{
+        .value = operand,
+        .ty = Value.typeOf(operand, sema.intern_pool).index,
+        .err_name = operand_err_name,
+    };
 
     var extra_index: usize = sw.end;
     var it = sw.iterateCases();
@@ -3492,45 +3503,8 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
         if (case.prong_info.capture != .none) return sema.failSwitch("prong capture");
 
-        var matched = false;
-        for (case.item_infos) |item_info| {
-            switch (item_info.unwrap()) {
-                .body_len => |body_len| {
-                    const item_body = sema.zir.bodySlice(extra_index, body_len);
-                    extra_index += body_len;
-                    if (matched) continue;
-                    const item_raw = try sema.resolveInlineBody(item_body, inst);
-                    const item_coerced = try sema.coerceValueToType(item_raw, operand_ty, "switch case");
-                    if (item_coerced.index == operand.index) matched = true;
-                },
-                .under => matched = true,
-                .error_value => |item_err_name| {
-                    // Item names live in zir.string_bytes; the operand's
-                    // error name lives in the intern pool. Compare bytes.
-                    if (operand_err_name) |op| {
-                        const op_bytes = sema.intern_pool.stringSlice(op);
-                        const item_bytes = sema.zir.nullTerminatedString(item_err_name);
-                        if (std.mem.eql(u8, op_bytes, item_bytes)) matched = true;
-                    }
-                },
-                .enum_literal => return sema.failSwitch("enum_literal switch items"),
-            }
-        }
-
-        for (case.range_infos) |range_pair| {
-            const lo_len = range_pair[0].bodyLen() orelse 0;
-            const hi_len = range_pair[1].bodyLen() orelse 0;
-            const lo_body = sema.zir.bodySlice(extra_index, lo_len);
-            extra_index += lo_len;
-            const hi_body = sema.zir.bodySlice(extra_index, hi_len);
-            extra_index += hi_len;
-            if (matched) continue;
-            const lo_raw = try sema.resolveInlineBody(lo_body, inst);
-            const hi_raw = try sema.resolveInlineBody(hi_body, inst);
-            const lo_co = try sema.coerceValueToType(lo_raw, operand_ty, "switch range");
-            const hi_co = try sema.coerceValueToType(hi_raw, operand_ty, "switch range");
-            if (try integerInRange(sema, operand, lo_co, hi_co)) matched = true;
-        }
+        var matched = try sema.matchSwitchItems(inst, case.item_infos, op, &extra_index, false);
+        matched = try sema.matchSwitchRanges(inst, case.range_infos, op, &extra_index, matched);
 
         if (matched) return try sema.resolveInlineBody(prong_body, inst);
     }
@@ -3542,6 +3516,83 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     try sema.writer.writeAll("switch: no matching case and no else\n");
     return error.AnalysisFail;
+}
+
+/// The switch operand viewed three ways the case-matchers need: its value
+/// (for equality against each item), its type (to coerce items/ranges to),
+/// and its error name if any (to match `error_value` items).
+const SwitchOperand = struct {
+    value: Value,
+    ty: InternPool.Index,
+    err_name: ?InternPool.NullTerminatedString,
+};
+
+/// Match a case's scalar items against `op`, advancing `extra_index` past
+/// every item body regardless of `matched` -- the cursor must pass them all,
+/// only the comparison short-circuits. Returns whether any item (or an
+/// earlier one, via `matched`) matched.
+fn matchSwitchItems(
+    sema: *Sema,
+    inst: Zir.Inst.Index,
+    item_infos: []const Zir.Inst.SwitchBlock.ItemInfo,
+    op: SwitchOperand,
+    extra_index: *usize,
+    matched: bool,
+) Error!bool {
+    var hit = matched;
+    for (item_infos) |item_info| {
+        switch (item_info.unwrap()) {
+            .body_len => |body_len| {
+                const item_body = sema.zir.bodySlice(extra_index.*, body_len);
+                extra_index.* += body_len;
+                if (hit) continue;
+                const item_raw = try sema.resolveInlineBody(item_body, inst);
+                const item_coerced = try sema.coerceValueToType(item_raw, op.ty, "switch case");
+                if (item_coerced.index == op.value.index) hit = true;
+            },
+            .under => hit = true,
+            .error_value => |item_err_name| {
+                // Item names live in zir.string_bytes; the operand's
+                // error name lives in the intern pool. Compare bytes.
+                if (op.err_name) |opn| {
+                    const op_bytes = sema.intern_pool.stringSlice(opn);
+                    const item_bytes = sema.zir.nullTerminatedString(item_err_name);
+                    if (std.mem.eql(u8, op_bytes, item_bytes)) hit = true;
+                }
+            },
+            .enum_literal => return sema.failSwitch("enum_literal switch items"),
+        }
+    }
+    return hit;
+}
+
+/// Match a case's `lo...hi` ranges against `op`, advancing `extra_index`
+/// past every endpoint body. Like `matchSwitchItems`, the cursor walks all
+/// bodies even once matched.
+fn matchSwitchRanges(
+    sema: *Sema,
+    inst: Zir.Inst.Index,
+    range_infos: []const [2]Zir.Inst.SwitchBlock.ItemInfo,
+    op: SwitchOperand,
+    extra_index: *usize,
+    matched: bool,
+) Error!bool {
+    var hit = matched;
+    for (range_infos) |range_pair| {
+        const lo_len = range_pair[0].bodyLen() orelse 0;
+        const hi_len = range_pair[1].bodyLen() orelse 0;
+        const lo_body = sema.zir.bodySlice(extra_index.*, lo_len);
+        extra_index.* += lo_len;
+        const hi_body = sema.zir.bodySlice(extra_index.*, hi_len);
+        extra_index.* += hi_len;
+        if (hit) continue;
+        const lo_raw = try sema.resolveInlineBody(lo_body, inst);
+        const hi_raw = try sema.resolveInlineBody(hi_body, inst);
+        const lo_co = try sema.coerceValueToType(lo_raw, op.ty, "switch range");
+        const hi_co = try sema.coerceValueToType(hi_raw, op.ty, "switch range");
+        if (try integerInRange(sema, op.value, lo_co, hi_co)) hit = true;
+    }
+    return hit;
 }
 
 /// `lo <= x <= hi` over the integer-key BigInt representations.
@@ -3720,20 +3771,8 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     // holds end-offsets; arg N's body is args_body[start..end] where
     // start is `args_len` for N=0 or `args_body[N-1]` otherwise.
     const args_body: []const Zir.Inst.Index = @ptrCast(sema.zir.extra[extra.end..]);
-    var arg_values = try sema.gpa.alloc(Value, args_len);
+    const arg_values = try sema.evalCallArgs(inst, func_ty, args_body);
     defer sema.gpa.free(arg_values);
-    for (0..args_len) |i| {
-        const start = if (i == 0) args_len else @intFromEnum(args_body[i - 1]);
-        const end = @intFromEnum(args_body[i]);
-        const arg_body = args_body[start..end];
-        const raw = try sema.resolveInlineBody(arg_body, inst);
-        arg_values[i] = try sema.coerceValueToType(raw, func_ty.param_types[i], "call arg");
-        // The parameter's value inside the body is comptime-known only if the
-        // parameter is declared `comptime`; otherwise it is runtime even when
-        // the call passed a comptime argument, so coercions of it (and values
-        // derived from it) follow Zig's runtime, type-based rule.
-        arg_values[i].is_comptime = func_ty.paramIsComptime(@intCast(i));
-    }
 
     // Swap sema.zir to the func's source-ZIR snapshot when the
     // call crosses a REPL line boundary. The common same-line
@@ -3753,21 +3792,8 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     // Extract the body + param insts via getFnInfo on the
     // possibly-swapped sema.zir.
     const info = sema.zir.getFnInfo(func.zir_body_inst);
-    const tags = sema.zir.instructions.items(.tag);
-    var param_insts = try sema.gpa.alloc(Zir.Inst.Index, args_len);
+    const param_insts = try sema.collectParamInsts(info, args_len);
     defer sema.gpa.free(param_insts);
-    var pi: u32 = 0;
-    for (info.param_body) |param_inst| {
-        switch (tags[@intFromEnum(param_inst)]) {
-            .param, .param_comptime, .param_anytype, .param_anytype_comptime => {
-                if (pi >= args_len) break;
-                param_insts[pi] = param_inst;
-                pi += 1;
-            },
-            else => continue,
-        }
-    }
-    assert(pi == args_len);
 
     // Each call frame needs its own results map. The fn body's
     // intermediate instruction results (n - 1, the inner call's
@@ -3810,6 +3836,55 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
         error.ComptimeReturn => return try sema.coerceValueToType(sema.return_value, func_ty.return_type, "return"),
         else => |e| return e,
     }
+}
+
+/// Resolve and coerce each call argument to its declared parameter type.
+/// Returns a freshly allocated slice (caller frees). Each result's
+/// `is_comptime` is seeded from the parameter's `comptime`-ness: a
+/// non-`comptime` parameter is runtime inside the body even when the call
+/// site passed a comptime argument, so coercions of it (and values derived
+/// from it) follow Zig's runtime, type-based rule.
+fn evalCallArgs(
+    sema: *Sema,
+    inst: Zir.Inst.Index,
+    func_ty: InternPool.Key.FuncType,
+    args_body: []const Zir.Inst.Index,
+) Error![]Value {
+    const args_len: u32 = @intCast(func_ty.param_types.len);
+    const arg_values = try sema.gpa.alloc(Value, args_len);
+    errdefer sema.gpa.free(arg_values);
+    for (0..args_len) |i| {
+        const start = if (i == 0) args_len else @intFromEnum(args_body[i - 1]);
+        const end = @intFromEnum(args_body[i]);
+        const arg_body = args_body[start..end];
+        const raw = try sema.resolveInlineBody(arg_body, inst);
+        arg_values[i] = try sema.coerceValueToType(raw, func_ty.param_types[i], "call arg");
+        arg_values[i].is_comptime = func_ty.paramIsComptime(@intCast(i));
+    }
+    return arg_values;
+}
+
+/// Collect the function body's parameter instructions into a freshly
+/// allocated slice (caller frees), one per argument in declaration order.
+/// AstGen interleaves non-`param` insts in the param body; only the four
+/// `param*` tags name a parameter binding.
+fn collectParamInsts(sema: *Sema, info: Zir.FnInfo, args_len: u32) Error![]Zir.Inst.Index {
+    const tags = sema.zir.instructions.items(.tag);
+    const param_insts = try sema.gpa.alloc(Zir.Inst.Index, args_len);
+    errdefer sema.gpa.free(param_insts);
+    var pi: u32 = 0;
+    for (info.param_body) |param_inst| {
+        switch (tags[@intFromEnum(param_inst)]) {
+            .param, .param_comptime, .param_anytype, .param_anytype_comptime => {
+                if (pi >= args_len) break;
+                param_insts[pi] = param_inst;
+                pi += 1;
+            },
+            else => continue,
+        }
+    }
+    assert(pi == args_len);
+    return param_insts;
 }
 
 /// `.block_comptime`: identical to `.block` for our comptime-only
