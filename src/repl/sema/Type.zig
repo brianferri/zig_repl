@@ -65,7 +65,12 @@ pub fn print(ty: Type, pool: *const InternPool, writer: *std.Io.Writer) PrintErr
         .tuple_type => |tt| try printTuple(tt, pool, writer),
         // `name` is the fully-qualified name baked at creation, printed verbatim.
         .struct_type => |st| try writer.writeAll(pool.stringSlice(st.name)),
-        else => try writer.writeAll("<type>"),
+        // Unhandled *type* Keys (enum/union/opaque, ...) aren't rendered yet.
+        // A value Key reaching a type printer is a bug, so assert it's a type.
+        else => |other| {
+            assert(other.isType());
+            try writer.writeAll("<type>");
+        },
     }
 }
 
@@ -163,8 +168,18 @@ fn printErrorUnion(eu: InternPool.Key.ErrorUnionType, pool: *const InternPool, w
 }
 
 fn printErrorSet(es: InternPool.Key.ErrorSetType, pool: *const InternPool, writer: *std.Io.Writer) PrintError!void {
-    const sorted = try pool.gpa.dupe(InternPool.NullTerminatedString, es.names);
-    defer pool.gpa.free(sorted);
+    // Display wants the members byte-sorted, but the pool stores them id-sorted,
+    // so a sortable copy is needed. A stack buffer holds the common small set
+    // (0-alloc); only an unusually large error set falls back to the heap.
+    var stack_buf: [32]InternPool.NullTerminatedString = undefined;
+    const on_heap = es.names.len > stack_buf.len;
+    const sorted = if (on_heap)
+        try pool.gpa.dupe(InternPool.NullTerminatedString, es.names)
+    else sorted: {
+        @memcpy(stack_buf[0..es.names.len], es.names);
+        break :sorted stack_buf[0..es.names.len];
+    };
+    defer if (on_heap) pool.gpa.free(sorted);
     std.mem.sortUnstable(InternPool.NullTerminatedString, sorted, pool, lessThanByBytes);
 
     try writer.writeAll("error{");
