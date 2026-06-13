@@ -44,6 +44,21 @@ pub fn run(session: *Session, input: []const u8, diag: *std.Io.Writer) !Outcome 
     return analyzeSegment(session, input, diag);
 }
 
+/// Run `input` for an interactive prompt and resolve its diagnostics. `run`
+/// already writes parse/ZIR/analysis errors to `diag`, so those are swallowed
+/// here (the prompt keeps going); an expression that produced no value writes
+/// the "(no value)" marker. Returns the Value the caller should render, or
+/// null when there is nothing to display. Host errors (OOM, writer) are fatal.
+pub fn report(session: *Session, input: []const u8, diag: *std.Io.Writer) !?Value {
+    const outcome = run(session, input, diag) catch |err| switch (err) {
+        error.ParseError, error.ZirError, error.AnalysisFail => return null,
+        else => |e| return e,
+    };
+    if (outcome.value) |value| return value;
+    if (outcome.shape == .expression) try diag.writeAll("(no value)\n");
+    return null;
+}
+
 /// One wrapped segment: front end + Sema + commit. Parse/ZIR errors are
 /// rendered to `diag` and returned as `error.ParseError`/`error.ZirError`;
 /// `Sema.analyze` writes its own diagnostics to `diag` and returns

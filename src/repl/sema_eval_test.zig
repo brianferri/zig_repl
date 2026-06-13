@@ -59,6 +59,32 @@ test "int literal fitting in u64" {
     try expectEvalDecimal(gpa, &pool, "1234567890", "1234567890");
 }
 
+test "eval.report: value for an expression, null otherwise, errors swallowed" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+
+    var buf: [4096]u8 = undefined;
+
+    // An expression yields its value and writes nothing.
+    var w_expr = std.Io.Writer.fixed(&buf);
+    try testing.expect((try eval.report(&session, "1 + 2", &w_expr)) != null);
+    try testing.expectEqual(@as(usize, 0), w_expr.end);
+
+    // A declaration yields no value and no "(no value)" marker.
+    var w_decl = std.Io.Writer.fixed(&buf);
+    try testing.expect((try eval.report(&session, "const x = 1;", &w_decl)) == null);
+    try testing.expectEqual(@as(usize, 0), w_decl.end);
+
+    // A parse error is swallowed (null) with diagnostics already written.
+    var w_err = std.Io.Writer.fixed(&buf);
+    try testing.expect((try eval.report(&session, "1 +", &w_err)) == null);
+    try testing.expect(w_err.end > 0);
+}
+
 test "int_big literal: 2^128 round-trip" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);

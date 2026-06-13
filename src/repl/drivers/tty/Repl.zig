@@ -152,18 +152,9 @@ fn dispatch(repl: *Repl, raw_line: []const u8, stdout: *std.Io.Writer) !void {
 fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
     assert(input.len > 0);
     assert(input.len <= input_buffer_bytes);
-
-    const outcome = eval.run(repl.session, input, stdout) catch |err| switch (err) {
-        // The driver already rendered these to stdout; continue the REPL.
-        error.ParseError, error.ZirError, error.AnalysisFail => return,
-        else => |e| return e, // host errors (OOM, writer) are fatal
-    };
-    if (outcome.value) |value| {
+    if (try eval.report(repl.session, input, stdout)) |value| {
         try renderValue(value, repl.session.intern_pool, stdout);
-        return;
     }
-    // Expression shape with no result is a Sema-side gap.
-    if (outcome.shape == .expression) try stdout.writeAll("(no value)\n");
 }
 
 test "echoInput: interactive mode writes nothing (repl echoes via line discipline)" {

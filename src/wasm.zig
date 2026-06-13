@@ -81,16 +81,9 @@ fn dispatch(input: []const u8) !void {
 }
 
 fn evaluate(input: []const u8, w: *std.Io.Writer) !void {
-    const outcome = eval.run(&session, input, w) catch |err| switch (err) {
-        // The driver already rendered these into the result buffer.
-        error.ParseError, error.ZirError, error.AnalysisFail => return,
-        else => |e| return e,
-    };
-    if (outcome.value) |value| {
+    if (try eval.report(&session, input, w)) |value| {
         try render_value.render(value, session.intern_pool, w);
-        return;
     }
-    if (outcome.shape == .expression) try w.writeAll("(no value)\n");
 }
 
 /// Evaluate `input` for the explorer: the value and its type, computed in
