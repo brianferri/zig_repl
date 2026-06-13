@@ -27,6 +27,5 @@ pub const VTable = struct {
 };
 
 pub fn readEvent(d: *Device) anyerror!?Event.Event {
-    assert(@intFromPtr(d.vtable) != 0);
     return d.vtable.readEvent(d);
 }

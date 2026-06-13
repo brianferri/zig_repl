@@ -52,7 +52,6 @@ pub fn run(
     protocols: []const *Protocol,
     buffer: []u8,
 ) Result {
-    assert(@intFromPtr(writer) != 0);
     assert(buffer.len >= response_buffer_bytes);
 
     const empty: Result = .{ .bytes = &.{}, .da1_terminated = false };

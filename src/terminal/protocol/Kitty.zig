@@ -42,7 +42,6 @@ pub fn protocol() *Protocol {
 }
 
 fn vtableTryInterpret(p: *Protocol, token: Standard.Token) Protocol.Result {
-    assert(@intFromPtr(p) != 0);
     const self: *Kitty = @fieldParentPtr("interface", p);
     assert(@intFromPtr(self) == @intFromPtr(&instance));
     return if (tryInterpret(token)) |e| .{ .event = e } else .not_mine;

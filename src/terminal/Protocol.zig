@@ -69,12 +69,10 @@ pub const VTable = struct {
 };
 
 pub fn tryInterpret(p: *Protocol, token: Token) Result {
-    assert(@intFromPtr(p.vtable) != 0);
     return p.vtable.tryInterpret(p, token);
 }
 
 pub fn detectSupport(p: *const Protocol, response: []const u8) bool {
-    assert(@intFromPtr(p.vtable) != 0);
     return p.vtable.detectSupport(p, response);
 }
 

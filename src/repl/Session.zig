@@ -46,7 +46,6 @@ pub fn init(
 }
 
 pub fn deinit(session: *Session) void {
-    assert(@intFromPtr(session) != 0);
     for (session.line_zir.items) |*z| z.deinit(session.gpa);
     session.line_zir.deinit(session.gpa);
     session.* = undefined;

@@ -99,7 +99,6 @@ pub fn init(_: std.mem.Allocator, _: std.Io) Error!Windows {
 }
 
 pub fn deinit(self: *Windows, _: std.mem.Allocator) void {
-    assert(@intFromPtr(self) != 0);
     self.restore();
     self.* = undefined;
 }
@@ -110,7 +109,6 @@ pub fn deinit(self: *Windows, _: std.mem.Allocator) void {
 /// caller's read loop. Kept in the signature for API parity with
 /// `Posix.setRawMode`.
 pub fn setRawMode(self: *Windows, comptime phase: enum { probe, interactive }) Error!void {
-    assert(@intFromPtr(self) != 0);
     assert(live);
     _ = phase;
 
@@ -130,7 +128,6 @@ pub fn setRawMode(self: *Windows, comptime phase: enum { probe, interactive }) E
 }
 
 pub fn restore(self: *Windows) void {
-    assert(@intFromPtr(self) != 0);
     if (saved_input_mode) |m| _ = SetConsoleMode(self.stdin_handle, m);
     if (saved_output_mode) |m| _ = SetConsoleMode(self.stdout_handle, m);
     if (saved_codepage) |cp| _ = SetConsoleOutputCP(cp);
@@ -145,7 +142,6 @@ pub fn restore(self: *Windows) void {
 }
 
 pub fn read(self: *Windows, buf: []u8) Error!usize {
-    assert(@intFromPtr(self) != 0);
     assert(buf.len > 0);
     var n: Dword = 0;
     if (ReadFile(self.stdin_handle, buf.ptr, @intCast(buf.len), &n, null) == .FALSE) {

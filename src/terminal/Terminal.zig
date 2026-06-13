@@ -91,8 +91,6 @@ pub fn init(
     writer: *std.Io.Writer,
     environ: *const std.process.Environ.Map,
 ) !Terminal {
-    assert(@intFromPtr(writer) != 0);
-
     var backend = try PlatformBackend.init(gpa, io);
     errdefer backend.deinit(gpa);
 
@@ -149,7 +147,6 @@ fn vtableReadEvent(d: *Device) anyerror!?Event.Event {
 }
 
 pub fn deinit(term: *Terminal) void {
-    assert(@intFromPtr(term) != 0);
 
     // Teardown in reverse priority -- the most-derived protocol's
     // teardown fires first (e.g. a protocol-stack pop sequence)
@@ -177,7 +174,6 @@ pub fn deinit(term: *Terminal) void {
 /// Read the next high-level Event. Returns `null` on stdin EOF.
 /// Blocks until at least one event is available.
 pub fn readEvent(term: *Terminal) !?Event.Event {
-    assert(@intFromPtr(term) != 0);
     while (true) {
         if (try term.parsePending()) |event| return event;
         // If the buffer's already full but the parser produced
@@ -236,7 +232,6 @@ fn buildActive(
     var list: std.ArrayListUnmanaged(*Protocol) = .empty;
     errdefer list.deinit(gpa);
     for (known) |p| {
-        assert(@intFromPtr(p) != 0);
         if (Protocol.detectSupport(p, response)) try list.append(gpa, p);
     }
     assert(list.items.len <= known.len);

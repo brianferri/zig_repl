@@ -69,7 +69,6 @@ original: posix.termios,
 signals_installed: bool,
 
 pub fn init(_: std.mem.Allocator, io: std.Io) Error!Posix {
-    assert(@intFromPtr(io.vtable) != 0);
     if (live) return error.AlreadyLive;
     assert(saved_termios == null);
 
@@ -93,7 +92,6 @@ pub fn init(_: std.mem.Allocator, io: std.Io) Error!Posix {
 }
 
 pub fn deinit(self: *Posix, _: std.mem.Allocator) void {
-    assert(@intFromPtr(self) != 0);
     self.restore();
     closeFd(self.io, self.tty_fd);
     self.* = undefined;
@@ -103,7 +101,6 @@ pub fn deinit(self: *Posix, _: std.mem.Allocator) void {
 /// switch resolves at compile time, leaving one specialized
 /// function per phase with no runtime branch.
 pub fn setRawMode(self: *Posix, comptime phase: enum { probe, interactive }) Error!void {
-    assert(@intFromPtr(self) != 0);
     assert(live);
     var raw = self.original;
     clearCookedFlags(&raw);
@@ -121,7 +118,6 @@ pub fn setRawMode(self: *Posix, comptime phase: enum { probe, interactive }) Err
 }
 
 pub fn restore(self: *Posix) void {
-    assert(@intFromPtr(self) != 0);
     if (saved_termios) |orig| {
         // Cleanup-path swallow: failing tcsetattr during deinit
         // would only leak raw-mode state into the user's shell.
@@ -138,13 +134,11 @@ pub fn restore(self: *Posix) void {
 }
 
 pub fn read(self: *Posix, buf: []u8) Error!usize {
-    assert(@intFromPtr(self) != 0);
     assert(buf.len > 0);
     return posix.read(self.tty_fd, buf) catch error.ReadFailed;
 }
 
 fn clearCookedFlags(raw: *posix.termios) void {
-    assert(@intFromPtr(raw) != 0);
     raw.iflag.IGNBRK = false;
     raw.iflag.BRKINT = false;
     raw.iflag.PARMRK = false;

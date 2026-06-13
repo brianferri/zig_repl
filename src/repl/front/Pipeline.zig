@@ -11,7 +11,6 @@ pub const Result = struct {
     zir: std.zig.Zir,
 
     pub fn deinit(result: *Result, gpa: std.mem.Allocator) void {
-        assert(@intFromPtr(result) != 0);
         result.zir.deinit(gpa);
         result.tree.deinit(gpa);
         result.wrapped.deinit(gpa);
@@ -22,7 +21,6 @@ pub const Result = struct {
     /// and wrapped source, which only the front end and diagnostics need.
     /// Consumes the result; do not use it afterward.
     pub fn takeZir(result: *Result, gpa: std.mem.Allocator) std.zig.Zir {
-        assert(@intFromPtr(result) != 0);
         const zir = result.zir;
         result.tree.deinit(gpa);
         result.wrapped.deinit(gpa);
@@ -31,18 +29,15 @@ pub const Result = struct {
     }
 
     pub fn hasParseErrors(result: *const Result) bool {
-        assert(@intFromPtr(result) != 0);
         return result.tree.errors.len != 0;
     }
 
     pub fn hasZirErrors(result: *const Result) bool {
-        assert(@intFromPtr(result) != 0);
         if (!result.zir.hasCompileErrors()) return false;
         return ZirErrors.countActionable(result.zir, result.tree) > 0;
     }
 
     pub fn source(result: *const Result) [:0]const u8 {
-        assert(@intFromPtr(result) != 0);
         return result.wrapped.text;
     }
 
@@ -50,7 +45,6 @@ pub const Result = struct {
     /// Diagnostic renderers translate wrapped positions into this
     /// frame so the user never sees the wrap prefix or suffix.
     pub fn userView(result: *const Result) UserView {
-        assert(@intFromPtr(result) != 0);
         return .{
             .text = result.wrapped.userText(),
             .offset_in_source = result.wrapped.user_offset,
