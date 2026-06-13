@@ -204,7 +204,10 @@ pub const Nav = struct {
     name: NullTerminatedString,
     /// Fully-qualified name, including any parent-namespace prefix.
     /// For the session root the parent prefix is empty, so `fqn` and
-    /// `name` typically agree.
+    /// `name` typically agree. Mirrors the compiler's `Nav.fqn`, which
+    /// feeds `@typeName` and qualified diagnostics; the REPL has no reader
+    /// yet (the qualified name reaches the struct namer via
+    /// `Sema.type_name_ctx`), so it is populated ahead of that consumer.
     fqn: NullTerminatedString,
     /// Populated IFF this Nav is resolved by semantic analysis. The
     /// compiler uses `analysis != null` to mean "Nav exists but not
@@ -658,8 +661,10 @@ pub const Key = union(enum) {
     /// matches but the flag field carries only what the supported pointer
     /// syntax needs (size, alignment, is_const, is_volatile, is_allowzero,
     /// address_space). The compiler's `vector_index` and the `packed_offset`
-    /// (bit-range) field are omitted until their syntax is handled.
-    pub const PtrType = struct {
+    /// (bit-range) field are omitted until their syntax is handled. An
+    /// `extern struct` to match the compiler's `Key.PtrType` layout
+    /// discipline.
+    pub const PtrType = extern struct {
         child: Index,
         sentinel: Index = .none,
         flags: Flags = .{},
@@ -755,8 +760,9 @@ pub const Key = union(enum) {
     /// is the interned identifier and is what global error-id
     /// comparison ultimately keys on (matching the compiler's global
     /// error table contract: `error.Foo` from two different sets
-    /// share the same name interning).
-    pub const Error = struct {
+    /// share the same name interning). An `extern struct` to match the
+    /// compiler's `Key.Error` layout discipline.
+    pub const Error = extern struct {
         ty: Index,
         name: NullTerminatedString,
     };
@@ -2061,7 +2067,10 @@ fn populateWellKnown(pool: *InternPool) Allocator.Error!void {
         // Identity of static_keys position to Index enum value is
         // load-bearing: SimpleType / SimpleValue variant values are pinned
         // via `@intFromEnum(Index.X)`, and Sema's `wellKnownRefToValue`
-        // assumes positions 0..44 match `Zir.Inst.Ref`'s well-known set.
+        // assumes the Index prefix through `enum_literal_type` matches
+        // `Zir.Inst.Ref`'s well-known set. `generic_poison_type` (the next
+        // slot) is pinned here too but diverges from Zir, so Sema maps it
+        // by name.
         assert(@intFromEnum(index) == expected_position);
     }
 }

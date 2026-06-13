@@ -3421,7 +3421,7 @@ fn internTypedWellKnownRef(sema: *Sema, ref: Zir.Inst.Ref) Error!?Value {
 /// by construction. Pure integer identity, no lookup.
 ///
 /// Our parity is partial -- the type-prefix of `Index` through
-/// `enum_literal_type` (positions 0..44) mirrors the compiler's
+/// `enum_literal_type` mirrors the compiler's
 /// `Index` enum exactly, so we use the compiler's identity pattern
 /// directly for that range. Positions beyond it diverge until further
 /// compliance steps add the ptr/slice/vector wells and the typed

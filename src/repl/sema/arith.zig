@@ -210,7 +210,7 @@ pub fn internXor(
 /// `@max(lhs, rhs) + 1` limbs -- add, sub, and the bitwise ops. Allocates
 /// that workspace, runs the stdlib `BigIntMutable` op, and interns the
 /// result. The `+ 1` bound covers every sign combination stdlib documents
-/// (carry/borrow for add/sub; bitAnd for two negatives; bitOr/bitXor for
+/// (carry/borrow for add/sub; bitAnd for two negatives; bitXor for
 /// mixed signs), so one bound serves all callers.
 fn runBinary(
     gpa: Allocator,
