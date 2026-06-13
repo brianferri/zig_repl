@@ -2064,13 +2064,8 @@ fn populateWellKnown(pool: *InternPool) Allocator.Error!void {
 
     inline for (static_keys, 0..) |key, expected_position| {
         const index = try pool.get(key);
-        // Identity of static_keys position to Index enum value is
-        // load-bearing: SimpleType / SimpleValue variant values are pinned
-        // via `@intFromEnum(Index.X)`, and Sema's `wellKnownRefToValue`
-        // assumes the Index prefix through `enum_literal_type` matches
-        // `Zir.Inst.Ref`'s well-known set. `generic_poison_type` (the next
-        // slot) is pinned here too but diverges from Zir, so Sema maps it
-        // by name.
+        // Sema's wellKnownRefToValue maps a Zir.Inst.Ref to its Index by this
+        // position, so the ordering is load-bearing across that boundary.
         assert(@intFromEnum(index) == expected_position);
     }
 }
