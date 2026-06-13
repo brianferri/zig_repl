@@ -100,8 +100,7 @@ fn interpretGround(b: u8) ?Event.Event {
 }
 
 fn interpretCsi(csi: Csi.Sequence) ?Event.Event {
-    assert(csi.final >= 0x40);
-    assert(csi.final <= 0x7e);
+    assert(Csi.isFinal(csi.final));
     assert(csi.params_count <= Csi.max_params);
     assert(csi.intermediates_count <= Csi.max_intermediates);
     // Sequences with `?` / `>` / `<` private intermediates are

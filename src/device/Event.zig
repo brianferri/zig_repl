@@ -31,8 +31,8 @@ pub const Event = union(enum) {
     eof,
 };
 
-/// Clamp a raw wire codepoint to a Unicode scalar. Values above the
-/// Unicode maximum map to U+FFFD so a malformed wire form still yields a
+/// Clamp a raw wire value to a Unicode code point (0..0x10FFFF). Values
+/// above the Unicode maximum map to U+FFFD so a malformed wire form still yields a
 /// key event rather than tripping an unreachable. Real terminals don't
 /// emit these; this is fuzz-safety for the protocol parsers.
 pub fn clampCodepoint(raw: u32) u21 {

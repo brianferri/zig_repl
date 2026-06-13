@@ -15,7 +15,7 @@
 //!
 //! Adding a new protocol is therefore a single-file change: drop a
 //! new file under `protocol/`, register it in the
-//! `all_protocols` list in `Terminal.zig`. No edits to a separate
+//! `known_protocols` list in `Terminal.zig`. No edits to a separate
 //! capabilities module, no edits to a separate dispatcher table.
 
 const std = @import("std");

@@ -15,7 +15,7 @@
 //! analogously.
 //!
 //! Adding a new probed protocol = write its file under `protocol/`
-//! and register it in `Terminal.allProtocols`. This module never
+//! and register it in `Terminal.known_protocols`. This module never
 //! changes; per-protocol probe logic lives in the protocol's own
 //! `detectSupport` vtable function.
 

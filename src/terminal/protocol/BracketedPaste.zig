@@ -17,7 +17,7 @@
 //! Backing storage is a fixed-size file-scope buffer (64 KiB).
 //! Pastes past the cap are silently truncated; bracketed-paste
 //! payloads above 64 KiB are unusual and a polished editor would
-//! refuse them outright. Static storage means `allProtocols` can
+//! refuse them outright. Static storage means `known_protocols` can
 //! be a `const`-not-a-fn -- no allocator threading required.
 
 const std = @import("std");
@@ -130,8 +130,7 @@ fn pushBytes(self: *BracketedPaste, bytes: []const u8) void {
 }
 
 fn reconstructCsi(self: *BracketedPaste, csi: Csi.Sequence) void {
-    assert(csi.final >= 0x40);
-    assert(csi.final <= 0x7e);
+    assert(Csi.isFinal(csi.final));
     assert(csi.params_count <= Csi.max_params);
     self.pushBytes("\x1b[");
     var num_buf: [10]u8 = undefined;

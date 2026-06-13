@@ -193,31 +193,36 @@ pub fn readEvent(term: *Terminal) !?Event.Event {
 /// on success. Returns `null` when the buffer holds no complete
 /// sequence; the caller must read more bytes.
 fn parsePending(term: *Terminal) !?Event.Event {
-    if (term.read_buffer_len == 0) return null;
-    const result = Parser.parse(term.read_buffer[0..term.read_buffer_len]);
-    if (result.token == null) return null;
-    const consumed = result.consumed;
-    assert(consumed > 0);
-    std.mem.copyForwards(
-        u8,
-        term.read_buffer[0..],
-        term.read_buffer[consumed..term.read_buffer_len],
-    );
-    term.read_buffer_len -= consumed;
+    // Each pass consumes >0 bytes from a finite buffer, so the loop is
+    // bounded by the buffered byte count; it ends on an empty buffer or an
+    // incomplete sequence.
+    while (true) {
+        if (term.read_buffer_len == 0) return null;
+        const result = Parser.parse(term.read_buffer[0..term.read_buffer_len]);
+        if (result.token == null) return null;
+        const consumed = result.consumed;
+        assert(consumed > 0);
+        std.mem.copyForwards(
+            u8,
+            term.read_buffer[0..],
+            term.read_buffer[consumed..term.read_buffer_len],
+        );
+        term.read_buffer_len -= consumed;
 
-    for (term.protocols) |p| {
-        switch (Protocol.tryInterpret(p, result.token.?)) {
-            .not_mine => continue,
-            // Stateful protocol claimed it (bracketed paste mid-
-            // accumulation) but has no event yet -- pull the next
-            // token without offering it to other protocols.
-            .consumed => return try term.parsePending(),
-            .event => |event| return event,
+        for (term.protocols) |p| {
+            switch (Protocol.tryInterpret(p, result.token.?)) {
+                .not_mine => continue,
+                // Stateful protocol claimed it (bracketed paste mid-
+                // accumulation) but has no event yet -- pull the next
+                // token without offering it to other protocols.
+                .consumed => break,
+                .event => |event| return event,
+            }
         }
+        // The token produced no event -- either a stateful protocol
+        // consumed it or nobody claimed it (e.g. an OSC reply nobody cares
+        // about). Drop it and parse the next one from the buffer.
     }
-    // No protocol claimed (e.g. an OSC reply nobody cares about);
-    // drop the token and try again from the buffer.
-    return try term.parsePending();
 }
 
 /// Build the active-protocol slice from the negotiation response.

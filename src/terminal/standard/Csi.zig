@@ -70,6 +70,13 @@ pub const Sequence = struct {
     }
 };
 
+/// Whether `b` is a CSI final byte (0x40..0x7E, ECMA-48 sec 5.4). A final
+/// terminates the sequence; any other byte after the parameters/intermediates
+/// is malformed.
+pub fn isFinal(b: u8) bool {
+    return b >= 0x40 and b <= 0x7e;
+}
+
 /// Whether `buf` contains a CSI sequence (`ESC [ ...`) whose final byte
 /// equals `final`. When `lead` is non-null, the byte right after `[` must
 /// equal it -- the private-use lead (e.g. `?`) on a capability reply.
@@ -90,7 +97,7 @@ pub fn containsFinal(buf: []const u8, lead: ?u8, final: u8) bool {
             if (b == final) return true;
             // Any other CSI final byte: this sequence isn't the one
             // we're after. Stop and keep scanning from the next ESC.
-            if (b >= 0x40 and b <= 0x7e) break;
+            if (isFinal(b)) break;
         }
     }
     return false;
@@ -117,7 +124,7 @@ fn parse(input: []const u8) Standard.Result {
 
     if (cursor >= input.len) return .{ .token = null, .consumed = 0 };
     const final = input[cursor];
-    if (final < 0x40 or final > 0x7E) {
+    if (!isFinal(final)) {
         return .{ .token = null, .consumed = @intCast(cursor + 1) };
     }
     csi.final = final;
