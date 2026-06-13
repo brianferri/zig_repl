@@ -5,6 +5,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 pub const Theme = @import("../Theme.zig");
+const ColorLevel = @import("device").Color.ColorLevel;
 
 /// Every registered theme.
 pub const themes = [_]*const Theme{
@@ -15,6 +16,15 @@ pub const themes = [_]*const Theme{
 
 /// The theme used when none is chosen.
 pub const default = themes[0];
+
+/// Write every registered theme name to `w`, colored to `level` and
+/// comma-separated. The caller supplies any surrounding label and newline.
+pub fn writeList(w: *std.Io.Writer, level: ColorLevel) !void {
+    for (themes, 0..) |theme, i| {
+        if (i != 0) try w.writeAll(", ");
+        try theme.primary.color.write(w, theme.name, level);
+    }
+}
 
 /// Resolve a registered theme by name, or null if there is none.
 pub fn byName(name: []const u8) ?*const Theme {

@@ -41,10 +41,7 @@ pub fn command(comptime Ctx: type) Command(Ctx) {
                 try stdout.writeByte('\n');
 
                 try stdout.writeAll("themes:    ");
-                for (themes.themes, 0..) |theme, i| {
-                    if (i != 0) try stdout.writeAll(", ");
-                    try theme.primary.color.write(stdout, theme.name, level);
-                }
+                try themes.writeList(stdout, level);
                 try stdout.writeByte('\n');
             }
         }.run,

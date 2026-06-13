@@ -42,9 +42,6 @@ fn report(repl: *Repl, stdout: *std.Io.Writer, level: ColorLevel) !void {
     assert(@intFromPtr(stdout) != 0);
     try stdout.print("theme: {s}\n", .{repl.theme.name});
     try stdout.writeAll("available: ");
-    for (themes.themes, 0..) |theme, i| {
-        if (i != 0) try stdout.writeAll(", ");
-        try theme.primary.color.write(stdout, theme.name, level);
-    }
+    try themes.writeList(stdout, level);
     try stdout.writeByte('\n');
 }
