@@ -1,27 +1,25 @@
-//! Wasm frontend entry: a line-in / text-out REPL the browser drives.
-//! The host writes an input line into wasm memory, calls `replEval`, then
-//! reads the rendered output back out -- there is no terminal, no
-//! `LineEditor` (the page's input box does the editing). It imports the
-//! core under `repl/` directly (eval, Session, InternPool, render, the
-//! command registry) and never the `repl` module root, which pulls in the
-//! posix TTY stack and would fail to link for `wasm32-freestanding`. It
-//! lives at `src/` -- above `repl/` -- so its module root covers the core
-//! tree it imports (a module cannot `@import` above its root directory).
+//! Wasm frontend entry: a line-in / text-out REPL the browser drives. The
+//! host writes an input line into wasm memory, calls `replEval`, then reads
+//! the rendered output back out -- there is no terminal, no `LineEditor` (the
+//! page's input box does the editing). It builds on the `repl` core module and
+//! the `drivers_wasm` driver, neither of which pulls in the posix tty stack.
 //!
-//! Reentrancy: the page calls `replEval` once per submitted line. The
-//! result buffer is a module global, reset at the start of each call and
-//! read via `replResultPtr` / `replResultLen` before the next.
+//! Reentrancy: the page calls `replEval` once per submitted line. The result
+//! buffer is a module global, reset at the start of each call and read via
+//! `replResultPtr` / `replResultLen` before the next.
 
 const std = @import("std");
+const repl = @import("repl");
+const drivers_wasm = @import("drivers_wasm");
 
-const eval = @import("repl/eval.zig");
-const Session = @import("repl/Session.zig");
-const InternPool = @import("repl/sema/InternPool.zig");
-const InputShape = @import("repl/front/InputShape.zig");
-const render_value = @import("repl/render/Value.zig");
-const Type = @import("repl/sema/Type.zig");
-const outline = @import("repl/drivers/wasm/outline.zig");
-const Commands = @import("repl/drivers/wasm/root.zig").commands;
+const eval = repl.eval;
+const Session = repl.Session;
+const InternPool = repl.sema.InternPool;
+const InputShape = repl.front.InputShape;
+const render_value = repl.render.Value;
+const Type = repl.sema.Type;
+const outline = drivers_wasm.outline;
+const Commands = drivers_wasm.commands;
 
 // `wasm_allocator` requires the module be single-threaded (build.zig sets
 // it); it grows linear memory as needed, which detaches the host's view of

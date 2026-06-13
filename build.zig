@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const repl_module = b.addModule("repl", .{
+    const repl = b.createModule(.{
         .root_source_file = b.path("src/repl/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -12,29 +12,37 @@ pub fn build(b: *std.Build) void {
 
     // The input-device vocabulary (`Device`, `Event`, `Color`) -- a leaf that
     // depends only on `std`, so frontends build on it without the tty stack.
-    const device_module = b.addModule("device", .{
+    const device = b.createModule(.{
         .root_source_file = b.path("src/device/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    repl_module.addImport("device", device_module);
 
     // The raw-mode terminal input stack, built on `device`. Separate from the
     // repl so the wasm frontend -- which never touches the tty -- omits it.
-    const terminal_module = b.addModule("terminal", .{
+    const terminal = b.createModule(.{
         .root_source_file = b.path("src/terminal/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    terminal_module.addImport("device", device_module);
-    repl_module.addImport("terminal", terminal_module);
+    terminal.addImport("device", device);
+
+    const tty = b.createModule(.{
+        .root_source_file = b.path("src/repl/drivers/tty/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tty.addImport("repl", repl);
+    tty.addImport("terminal", terminal);
+    tty.addImport("device", device);
 
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "repl", .module = repl_module },
+            .{ .name = "repl", .module = repl },
+            .{ .name = "tty", .module = tty },
         },
     });
     exe_module.link_libc = true;
@@ -57,7 +65,7 @@ pub fn build(b: *std.Build) void {
 
     const docs_obj = b.addObject(.{
         .name = "zig_repl",
-        .root_module = repl_module,
+        .root_module = repl,
     });
     const install_docs = b.addInstallDirectory(.{
         .source_dir = docs_obj.getEmittedDocs(),
@@ -68,6 +76,23 @@ pub fn build(b: *std.Build) void {
     docs_step.dependOn(&install_docs.step);
 
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+
+    const repl_wasm = b.createModule(.{
+        .root_source_file = b.path("src/repl/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .single_threaded = true,
+        .link_libc = false,
+    });
+    const drivers_wasm = b.createModule(.{
+        .root_source_file = b.path("src/repl/drivers/wasm/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .single_threaded = true,
+        .link_libc = false,
+    });
+    drivers_wasm.addImport("repl", repl_wasm);
+
     const wasm = b.addExecutable(.{
         .name = "zig_repl",
         .root_module = b.createModule(.{
@@ -76,6 +101,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .single_threaded = true,
             .link_libc = false,
+            .imports = &.{
+                .{ .name = "repl", .module = repl_wasm },
+                .{ .name = "drivers_wasm", .module = drivers_wasm },
+            },
         }),
     });
     wasm.rdynamic = true;
@@ -95,17 +124,15 @@ pub fn build(b: *std.Build) void {
     wasm_step.dependOn(&install_wasm.step);
     wasm_step.dependOn(&install_web.step);
 
-    const module_tests = b.addTest(.{ .root_module = repl_module });
+    const repl_tests = b.addTest(.{ .root_module = repl });
+    const tty_tests = b.addTest(.{ .root_module = tty });
     const exe_tests = b.addTest(.{ .root_module = exe_module });
-    const device_tests = b.addTest(.{ .root_module = device_module });
-    const terminal_tests = b.addTest(.{ .root_module = terminal_module });
-    const run_module_tests = b.addRunArtifact(module_tests);
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-    const run_device_tests = b.addRunArtifact(device_tests);
-    const run_terminal_tests = b.addRunArtifact(terminal_tests);
+    const device_tests = b.addTest(.{ .root_module = device });
+    const terminal_tests = b.addTest(.{ .root_module = terminal });
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_module_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
-    test_step.dependOn(&run_device_tests.step);
-    test_step.dependOn(&run_terminal_tests.step);
+    test_step.dependOn(&b.addRunArtifact(repl_tests).step);
+    test_step.dependOn(&b.addRunArtifact(tty_tests).step);
+    test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+    test_step.dependOn(&b.addRunArtifact(device_tests).step);
+    test_step.dependOn(&b.addRunArtifact(terminal_tests).step);
 }

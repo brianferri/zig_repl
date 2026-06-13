@@ -64,8 +64,8 @@ fn vtableReadEvent(d: *Device) anyerror!?Event.Event {
 // device, `Terminal`, needs a raw-mode tty.
 
 const testing = std.testing;
-const LineEditor = @import("../tty/LineEditor.zig");
-const themes = @import("../tty/theme/root.zig");
+const LineEditor = @import("../LineEditor.zig");
+const themes = @import("../theme/root.zig");
 
 fn pushKeys(dev: *Mock, bytes: []const u8) !void {
     for (bytes) |b| try dev.push(.{ .key_press = .{ .codepoint = b } });

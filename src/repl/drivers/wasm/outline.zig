@@ -22,12 +22,13 @@ const Ast = std.zig.Ast;
 const Zir = std.zig.Zir;
 const Json = std.json.Stringify;
 
-const Pipeline = @import("../../front/Pipeline.zig");
-const Session = @import("../../Session.zig");
-const eval = @import("../../eval.zig");
-const InputShape = @import("../../front/InputShape.zig");
-const ZirWalk = @import("../../front/ZirWalk.zig");
-const ZirSummary = @import("../../render/ZirSummary.zig");
+const repl = @import("repl");
+const Pipeline = repl.front.Pipeline;
+const Session = repl.Session;
+const eval = repl.eval;
+const InputShape = repl.front.InputShape;
+const ZirWalk = repl.front.ZirWalk;
+const ZirSummary = repl.render.ZirSummary;
 
 const UserView = Pipeline.UserView;
 

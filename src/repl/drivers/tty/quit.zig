@@ -4,7 +4,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const Repl = @import("Repl.zig");
-const Command = @import("../commands/Command.zig").Command;
+const Command = @import("repl").commands.Command;
 
 pub fn command(comptime Ctx: type) Command(Ctx) {
     return .{

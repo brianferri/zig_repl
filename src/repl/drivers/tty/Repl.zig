@@ -9,13 +9,14 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const Session = @import("../../Session.zig");
+const core = @import("repl");
+const Session = core.Session;
+const eval = core.eval;
+const renderValue = core.render.Value.render;
 const LineEditor = @import("LineEditor.zig");
 const Terminal = @import("terminal").Terminal;
 const themes = @import("theme/root.zig");
 const Commands = @import("root.zig").commands;
-const eval = @import("../../eval.zig");
-const renderValue = @import("../../render/Value.zig").render;
 
 const Repl = @This();
 

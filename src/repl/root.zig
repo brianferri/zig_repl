@@ -1,23 +1,22 @@
-// Root of the native executable's module: the frontend-agnostic core
-// (`Session`, Sema) and the tty driver `main.zig` runs against it.
+//! Core shared by the tty and wasm frontends. They are separate modules that
+//! import this one; it names no frontend driver, so each frontend links only
+//! the surface it needs (the wasm target never pulls the posix tty stack).
+
 pub const Session = @import("Session.zig");
+pub const eval = @import("eval.zig");
 pub const sema = @import("sema/root.zig");
-pub const Repl = @import("drivers/tty/Repl.zig");
-// `zig build test` only discovers tests in modules referenced from the root
-// file. Force inclusion of every source file's tests by referencing them at
-// comptime here.
+pub const front = @import("front/root.zig");
+pub const render = @import("render/root.zig");
+/// Generic command framework (`:name` dispatch). Frontends register their own
+/// command set with `commands.Registry`; the frontend-specific
+/// commands live in the frontend modules.
+pub const commands = @import("drivers/commands/root.zig");
+
+// `zig build test` only discovers tests in files referenced from a module
+// root. The tty driver's files are forced from its own module root.
 test {
     _ = @import("Session.zig");
     _ = @import("eval.zig");
-    _ = @import("drivers/tty/Repl.zig");
-    _ = @import("drivers/tty/root.zig");
-    _ = @import("drivers/tty/quit.zig");
-    _ = @import("drivers/tty/theme.zig");
-    _ = @import("drivers/tty/terminal.zig");
-    _ = @import("drivers/tty/LineEditor.zig");
-    _ = @import("drivers/mock/Device.zig");
-    _ = @import("drivers/tty/Theme.zig");
-    _ = @import("drivers/tty/theme/root.zig");
     _ = @import("drivers/commands/Command.zig");
     _ = @import("drivers/commands/registry.zig");
     _ = @import("drivers/commands/help.zig");

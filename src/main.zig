@@ -1,5 +1,6 @@
 const std = @import("std");
 const repl = @import("repl");
+const tty = @import("tty");
 
 pub fn main(init: std.process.Init) !void {
     // InternPool is externally owned; Session borrows it.
@@ -14,6 +15,6 @@ pub fn main(init: std.process.Init) !void {
     defer session.deinit();
 
     // The tty driver wraps the core session with the terminal/IO surface.
-    var driver = try repl.Repl.init(&session, init.io);
+    var driver = try tty.Repl.init(&session, init.io);
     return driver.run(init.environ_map);
 }

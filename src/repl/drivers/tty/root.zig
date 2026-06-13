@@ -1,12 +1,13 @@
-//! The TTY frontend's command set, in the order `:help` lists them. Each entry
-//! is a command module; registering one is writing its module and adding an
-//! `@import` to this list. The registry derives the lookup and dispatch from
-//! the list, with the `*Repl` as every command's context.
+//! The tty frontend module: the line-driven REPL over the raw-mode terminal.
+//! `commands` is its command set in the order `:help` lists them; registering
+//! one is writing its module and adding an `@import` here.
 
-const Registry = @import("../commands/registry.zig").Registry;
-const help = @import("../commands/help.zig");
-const dump = @import("../commands/dump.zig");
-const Repl = @import("Repl.zig");
+const repl = @import("repl");
+const Registry = repl.commands.Registry;
+const help = repl.commands.help;
+const dump = repl.commands.dump;
+
+pub const Repl = @import("Repl.zig");
 
 pub const commands = Registry(&[_]type{
     help,
@@ -15,3 +16,14 @@ pub const commands = Registry(&[_]type{
     @import("theme.zig"),
     @import("terminal.zig"),
 }, *Repl);
+
+test {
+    _ = @import("Repl.zig");
+    _ = @import("quit.zig");
+    _ = @import("theme.zig");
+    _ = @import("terminal.zig");
+    _ = @import("LineEditor.zig");
+    _ = @import("Theme.zig");
+    _ = @import("theme/root.zig");
+    _ = @import("mock/Device.zig");
+}

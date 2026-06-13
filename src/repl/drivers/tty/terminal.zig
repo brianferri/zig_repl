@@ -6,7 +6,7 @@ const assert = std.debug.assert;
 
 const Repl = @import("Repl.zig");
 const themes = @import("theme/root.zig");
-const Command = @import("../commands/Command.zig").Command;
+const Command = @import("repl").commands.Command;
 
 pub fn command(comptime Ctx: type) Command(Ctx) {
     return .{

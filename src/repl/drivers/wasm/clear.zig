@@ -5,7 +5,7 @@
 
 const std = @import("std");
 
-const Command = @import("../commands/Command.zig").Command;
+const Command = @import("repl").commands.Command;
 
 /// Provided by the page's import object (`env.replClearOutput`): clears the
 /// scrolling output element. The wasm side only signals intent; the DOM
