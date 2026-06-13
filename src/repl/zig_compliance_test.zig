@@ -49,7 +49,7 @@ fn runViaRepl(
     var out_writer = Io.Writer.fixed(&out_buf);
     try render.render(value, &pool, &out_writer);
 
-    const raw = out_buf[0 .. out_writer.buffer.len - out_writer.unusedCapacityLen()];
+    const raw = out_writer.buffered();
     return try gpa.dupe(u8, std.mem.trimEnd(u8, raw, "\n"));
 }
 

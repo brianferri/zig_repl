@@ -237,7 +237,7 @@ fn expectEvalFails(
     const sema_result = Sema.analyze(&session, result.zir, &writer);
     try testing.expectError(error.AnalysisFail, sema_result);
 
-    const written = diag_buf[0 .. writer.buffer.len - writer.unusedCapacityLen()];
+    const written = writer.buffered();
     try testing.expect(std.mem.indexOf(u8, written, expected_diagnostic_substring) != null);
 }
 
@@ -900,7 +900,7 @@ fn expectEvalTypeName(
     var render_writer = std.Io.Writer.fixed(&render_buf);
     try @import("render/Value.zig").render(value, intern_pool, &render_writer);
 
-    const rendered_raw = render_buf[0 .. render_writer.buffer.len - render_writer.unusedCapacityLen()];
+    const rendered_raw = render_writer.buffered();
     const rendered = std.mem.trimEnd(u8, rendered_raw, "\n");
     try testing.expectEqualStrings(expected, rendered);
 }
@@ -1336,7 +1336,6 @@ test "alloc/store/load: wrap arith through a stored var" {
     );
 }
 
-/// Multi-input session harness: runs each line through
 /// Run a sequence of session inputs through the shared `eval.run` driver,
 /// persisting bindings in `namespace`. Returns the final input's Value (or
 /// null when it was a declaration). Diagnostics for the (unexpected) error
@@ -1541,7 +1540,7 @@ fn renderZirDiagnostic(
     var writer = std.Io.Writer.fixed(out_buf);
     try Diagnostic.renderZirErrors(gpa, result.zir, result.tree, result.userView(), &writer);
 
-    return out_buf[0 .. writer.buffer.len - writer.unusedCapacityLen()];
+    return writer.buffered();
 }
 
 test "diagnostic: shadow rejection renders main error in user frame" {

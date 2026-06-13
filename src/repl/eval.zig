@@ -11,6 +11,7 @@
 //! commit, and no session lifecycle (see `evalSource` in sema_eval_test).
 
 const std = @import("std");
+const assert = std.debug.assert;
 
 const Pipeline = @import("front/Pipeline.zig");
 const InputShape = @import("front/InputShape.zig");
@@ -34,6 +35,8 @@ pub const Outcome = struct {
 /// the declaration pass fails, its error propagates and the expression
 /// pass is skipped -- it would only reference unbound names.
 pub fn run(session: *Session, input: []const u8, diag: *std.Io.Writer) !Outcome {
+    assert(input.len > 0);
+    assert(input.len <= InputShape.max_input_bytes);
     if (try InputShape.splitTrailingExpr(session.gpa, input)) |split| {
         _ = try analyzeSegment(session, split.decls, diag);
         return analyzeSegment(session, split.expr, diag);
@@ -47,6 +50,8 @@ pub fn run(session: *Session, input: []const u8, diag: *std.Io.Writer) !Outcome 
 /// `error.AnalysisFail`. On success the pipeline is committed so a later
 /// segment/line can reference what it bound.
 fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !Outcome {
+    assert(input.len > 0);
+    assert(input.len <= InputShape.max_input_bytes);
     var result = Pipeline.runWithInjection(
         session.gpa,
         input,
