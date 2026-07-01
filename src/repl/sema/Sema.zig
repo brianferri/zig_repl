@@ -2213,6 +2213,16 @@ fn evalSizeOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = idx };
 }
 
+/// Reserve the next `size` bytes of the modeled address space at `align_bytes`
+/// alignment and return the aligned base. Advances `comptime_address_cursor`.
+/// The one place that hands out a synthetic address, shared by the pointer
+/// bases that need one (`@intFromPtr` of a comptime alloc or a decl).
+fn nextSyntheticAddress(sema: *Sema, align_bytes: u64, size: u64) u64 {
+    const aligned = std.mem.alignForward(u64, sema.comptime_address_cursor, align_bytes);
+    sema.comptime_address_cursor = aligned + @max(size, 1);
+    return aligned;
+}
+
 /// `@intFromPtr(p)`: the pointer's address as `usize`.
 ///
 /// Deliberate deviation from the compiler: `zirIntFromPtr` returns a comptime
@@ -2246,8 +2256,7 @@ fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .comptime_alloc => |i| blk: {
             const slot = &sema.comptime_allocs.items[@intFromEnum(i)];
             break :blk slot.address orelse addr: {
-                const aligned = std.mem.alignForward(u64, sema.comptime_address_cursor, align_bytes);
-                sema.comptime_address_cursor = aligned + @max(size, 1);
+                const aligned = sema.nextSyntheticAddress(align_bytes, size);
                 slot.address = aligned;
                 break :addr aligned;
             };
@@ -2257,11 +2266,7 @@ fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         // `@intFromPtr(&x)` is a comptime error there). Synthesize an aligned
         // address so the alignment invariant holds; it is not cached, since no
         // comptime-valid use observes the address value itself.
-        .nav => blk: {
-            const aligned = std.mem.alignForward(u64, sema.comptime_address_cursor, align_bytes);
-            sema.comptime_address_cursor = aligned + @max(size, 1);
-            break :blk aligned;
-        },
+        .nav => sema.nextSyntheticAddress(align_bytes, size),
         // A field pointer's address needs the field's byte offset within the
         // aggregate, which auto-layout structs don't expose here.
         .field => {
@@ -4223,7 +4228,7 @@ fn evalParam(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value 
     const ty: InternPool.Index = if (extra.data.type.is_generic)
         .generic_poison_type
     else
-        (try sema.resolveInlineBody(sema.zir.bodySlice(extra.end, extra.data.type.body_len), inst)).index;
+        try sema.resolveParamType(inst);
     try sema.block.params.append(sema.gpa, .{
         .ty = ty,
         .is_comptime = tag == .param_comptime,
