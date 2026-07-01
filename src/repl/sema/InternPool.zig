@@ -694,13 +694,10 @@ pub const Key = union(enum) {
     };
 
     /// Pointer value. `ty` is the pointer's type (always a `ptr_type`
-    /// Index). `base_addr` identifies the storage region; `byte_offset`
-    /// is the offset within that region. The current subset is
-    /// `.comptime_alloc` only; later features add `.nav` (declarations),
-    /// `.uav` (anonymous addressable values), `.int` (`@ptrFromInt`),
-    /// `.eu_payload`, `.opt_payload`, `.comptime_field`, etc. as their
-    /// dependent ZIR tags land. Variant naming mirrors the compiler's
-    /// `Key.Ptr.BaseAddr` (`src/InternPool.zig`).
+    /// Index). `base_addr` identifies the storage the pointer addresses and
+    /// `byte_offset` the offset within it. `BaseAddr` is a subset of the
+    /// compiler's `Key.Ptr.BaseAddr` (`src/InternPool.zig`); variants are
+    /// added as their dependent ZIR tags land.
     pub const Ptr = struct {
         ty: Index,
         base_addr: BaseAddr,
@@ -708,6 +705,11 @@ pub const Key = union(enum) {
 
         pub const BaseAddr = union(enum) {
             comptime_alloc: ComptimeAllocIndex,
+            /// A pointer to a declaration's storage (`&x` where `x` is a decl).
+            /// Reading resolves the Nav's value; a comptime store through it is
+            /// rejected -- the decl is runtime storage the compiler defers to
+            /// codegen. Mirrors the compiler's `BaseAddr.nav`.
+            nav: Nav.Index,
             /// A pointer to a field of an auto-layout aggregate: `base` is the
             /// parent pointer (a `.comptime_alloc`), `index` the field index.
             /// Mirrors the compiler's `BaseAddr.field`, whose payload is the
@@ -968,6 +970,7 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, @as(BaseTag, p.base_addr));
                 switch (p.base_addr) {
                     .comptime_alloc => |slot| std.hash.autoHash(&hasher, slot),
+                    .nav => |nav| std.hash.autoHash(&hasher, nav),
                     .field => |f| {
                         std.hash.autoHash(&hasher, f.base);
                         std.hash.autoHash(&hasher, f.index);
@@ -1113,6 +1116,7 @@ pub const Key = union(enum) {
                 if (@as(BaseTag, x.base_addr) != @as(BaseTag, y.base_addr)) break :blk false;
                 break :blk switch (x.base_addr) {
                     .comptime_alloc => |slot| slot == y.base_addr.comptime_alloc,
+                    .nav => |nav| nav == y.base_addr.nav,
                     .field => |f| f.base == y.base_addr.field.base and f.index == y.base_addr.field.index,
                 };
             },
@@ -1290,6 +1294,9 @@ const Item = struct {
         // comptime_alloc index, byte_offset_lo, byte_offset_hi).
         // Mirrors the compiler's `Item.Tag.ptr_comptime_alloc`.
         ptr_comptime_alloc,
+        // Pointer value with `BaseAddr.nav`. data = extra index of a
+        // PtrNavRepr. Mirrors the compiler's `Item.Tag.ptr_nav`.
+        ptr_nav,
         // Pointer value with `BaseAddr.field`. data = extra index of 6 u32
         // slots: ty, base ptr Index, index_lo, index_hi, byte_offset_lo,
         // byte_offset_hi. Mirrors the compiler's `Item.Tag.ptr_field`.
@@ -1529,6 +1536,16 @@ const RepeatedRepr = extern struct {
 const PtrComptimeAllocRepr = extern struct {
     ty: u32,
     alloc_index: u32,
+    byte_offset_lo: u32,
+    byte_offset_hi: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.ptr_nav`. Four u32 slots: ty, nav index,
+/// and the 64-bit byte_offset split into lo/hi u32s. Mirrors the compiler's
+/// `Tag.PtrNav` -- a pointer backed by a declaration rather than a Sema alloc.
+const PtrNavRepr = extern struct {
+    ty: u32,
+    nav_index: u32,
     byte_offset_lo: u32,
     byte_offset_hi: u32,
 };
@@ -2219,6 +2236,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .undef => .{ .undef = @enumFromInt(item.data) },
         .type_pointer => ptrTypeFromExtra(pool, item.data),
         .ptr_comptime_alloc => ptrComptimeAllocFromExtra(pool, item.data),
+        .ptr_nav => ptrNavFromExtra(pool, item.data),
         .ptr_field => ptrFieldFromExtra(pool, item.data),
         .type_error_set => errorSetTypeFromExtra(pool, item.data),
         .type_tuple => tupleTypeFromExtra(pool, item.data),
@@ -2416,6 +2434,18 @@ fn ptrComptimeAllocFromExtra(pool: *const InternPool, extra_index: u32) Key {
     return .{ .ptr = .{
         .ty = @enumFromInt(slice[0]),
         .base_addr = .{ .comptime_alloc = @enumFromInt(slice[1]) },
+        .byte_offset = byte_offset,
+    } };
+}
+
+fn ptrNavFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const fields = comptime @divExact(@sizeOf(PtrNavRepr), @sizeOf(u32));
+    assert(extra_index + fields <= pool.extra.items.len);
+    const slice = pool.extra.items[extra_index..][0..fields];
+    const byte_offset = (@as(u64, slice[3]) << 32) | @as(u64, slice[2]);
+    return .{ .ptr = .{
+        .ty = @enumFromInt(slice[0]),
+        .base_addr = .{ .nav = @enumFromInt(slice[1]) },
         .byte_offset = byte_offset,
     } };
 }
@@ -2754,6 +2784,16 @@ fn emitPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!void {
                 @as(u32, @truncate(p.byte_offset >> 32)),
             });
             pool.items.appendAssumeCapacity(.{ .tag = .ptr_comptime_alloc, .data = extra_index });
+        },
+        .nav => |nav| {
+            const extra_index: u32 = @intCast(pool.extra.items.len);
+            try pool.extra.appendSlice(pool.gpa, &.{
+                @intFromEnum(p.ty),
+                @intFromEnum(nav),
+                @as(u32, @truncate(p.byte_offset)),
+                @as(u32, @truncate(p.byte_offset >> 32)),
+            });
+            pool.items.appendAssumeCapacity(.{ .tag = .ptr_nav, .data = extra_index });
         },
         .field => |f| {
             const extra_index: u32 = @intCast(pool.extra.items.len);

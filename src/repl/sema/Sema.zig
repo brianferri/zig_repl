@@ -478,6 +478,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .field_ptr_load => sema.evalFieldPtrLoad(inst),
         .opt_eu_base_ptr_init => sema.evalOptEuBasePtrInit(inst),
         .validate_ptr_struct_init => sema.evalValidatePtrStructInit(inst),
+        .validate_deref => sema.evalValidateDeref(inst),
         .load => sema.evalLoad(inst),
         .decl_val => sema.evalDeclVal(inst),
         .decl_ref => sema.evalDeclRef(inst),
@@ -2235,8 +2236,32 @@ fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return error.AnalysisFail;
     }
     const p = key.ptr;
-    const alloc_idx: u32 = switch (p.base_addr) {
-        .comptime_alloc => |i| @intFromEnum(i),
+    const ip = sema.intern_pool;
+    const ptr_ty = ip.indexToKey(p.ty).ptr_type;
+    const natural: InternPool.Alignment = Type.fromIndex(ptr_ty.child).abiAlignment(ip) orelse .@"1";
+    const align_bytes: u64 = ptr_ty.flags.alignment.toByteUnits() orelse natural.toByteUnits().?;
+    const size: u64 = Type.fromIndex(ptr_ty.child).abiSize(ip) orelse 1;
+
+    const base: u64 = switch (p.base_addr) {
+        .comptime_alloc => |i| blk: {
+            const slot = &sema.comptime_allocs.items[@intFromEnum(i)];
+            break :blk slot.address orelse addr: {
+                const aligned = std.mem.alignForward(u64, sema.comptime_address_cursor, align_bytes);
+                sema.comptime_address_cursor = aligned + @max(size, 1);
+                slot.address = aligned;
+                break :addr aligned;
+            };
+        },
+        // A decl pointer has no Sema slot; zig folds `@intFromPtr(&x) % align`
+        // through the known alignment rather than a concrete address (a bare
+        // `@intFromPtr(&x)` is a comptime error there). Synthesize an aligned
+        // address so the alignment invariant holds; it is not cached, since no
+        // comptime-valid use observes the address value itself.
+        .nav => blk: {
+            const aligned = std.mem.alignForward(u64, sema.comptime_address_cursor, align_bytes);
+            sema.comptime_address_cursor = aligned + @max(size, 1);
+            break :blk aligned;
+        },
         // A field pointer's address needs the field's byte offset within the
         // aggregate, which auto-layout structs don't expose here.
         .field => {
@@ -2244,20 +2269,8 @@ fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             return error.AnalysisFail;
         },
     };
-    const ptr_ty = sema.intern_pool.indexToKey(p.ty).ptr_type;
-    const natural: InternPool.Alignment = Type.fromIndex(ptr_ty.child).abiAlignment(sema.intern_pool) orelse .@"1";
-    const align_bytes: u64 = ptr_ty.flags.alignment.toByteUnits() orelse natural.toByteUnits().?;
 
-    const slot = &sema.comptime_allocs.items[alloc_idx];
-    const base = slot.address orelse base: {
-        const aligned = std.mem.alignForward(u64, sema.comptime_address_cursor, align_bytes);
-        const size = Type.fromIndex(ptr_ty.child).abiSize(sema.intern_pool) orelse 1;
-        sema.comptime_address_cursor = aligned + @max(size, 1);
-        slot.address = aligned;
-        break :base aligned;
-    };
-
-    const idx = try sema.intern_pool.internInt(.{
+    const idx = try ip.internInt(.{
         .ty = .usize_type,
         .storage = .{ .u64 = base + p.byte_offset },
     });
@@ -2302,6 +2315,10 @@ fn evalMakePtrConst(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const p = ip.indexToKey(ptr.index).ptr;
     switch (p.base_addr) {
         .comptime_alloc => |idx| sema.comptime_allocs.items[@intFromEnum(idx)].is_const = true,
+        // make_ptr_const's operand is always an `alloc` result -- the compiler
+        // reads `ptr.base_addr.comptime_alloc` directly (src/Sema.zig
+        // zirMakePtrConst), never a nav, so a decl pointer cannot reach here.
+        .nav => unreachable,
         // A field pointer freezes the aggregate it projects from.
         .field => |f| sema.comptime_allocs.items[@intFromEnum(ip.indexToKey(f.base).ptr.base_addr.comptime_alloc)].is_const = true,
     }
@@ -2314,19 +2331,11 @@ fn evalMakePtrConst(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = const_ptr };
 }
 
-/// Append a comptime-alloc slot holding `val` (of type `child_ty`)
-/// and return a single-item pointer to it (`*align(N) T` / `*const T` per
-/// `is_const` and `alignment`). The one place that turns "a value needs an
-/// address" into a slot + pointer: shared by `alloc` (undef slot) and the
-/// ref-producing tags (`ref`, `decl_ref`, `array_init_ref`).
-///
-/// The slot is a *copy* of `val`, not the address of any pre-existing
-/// storage. That is sound only because store-through-a-pointer
-/// (`validate_deref` + deref-store) is unimplemented, so a `decl_ref`'s
-/// `is_const = false` pointer can never be written through. When deref-store
-/// lands, a mutable decl pointer must target the decl's real storage (a
-/// `.nav`-style base address) -- writing through this copy would leave the
-/// decl unchanged, a silent divergence from the compiler.
+/// Append a comptime-alloc slot holding `val` (of type `child_ty`) and return a
+/// single-item pointer to it (`*align(N) T` / `*const T` per `is_const` and
+/// `alignment`). The one place that turns "a value needs an address" into a
+/// slot + pointer: shared by `alloc` (undef slot) and the const-ref tags
+/// (`ref`, `array_init_ref`), whose pointers are read-only temporaries.
 fn pushComptimeAlloc(
     sema: *Sema,
     child_ty: InternPool.Index,
@@ -2354,6 +2363,50 @@ fn pushComptimeAlloc(
         .byte_offset = 0,
     });
     return .{ .index = ptr_idx };
+}
+
+/// `validate_deref ptr`: AstGen emits this before a `ptr.*` load or a
+/// `ptr.* = value` store to check the operand can be dereferenced. Mirrors
+/// `src/Sema.zig:zirValidateDeref`: rejects non-pointers, many/slice pointers
+/// (which require index syntax), and the deref of an undefined pointer. The
+/// compiler's one-possible-value exception to the undef check is omitted --
+/// this evaluator has no OPV classifier, and an undef deref is a hard error
+/// for every pointee it currently models. Produces no value.
+fn evalValidateDeref(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
+
+    const ip = sema.intern_pool;
+    const operand = try sema.resolveRef(un_node.operand);
+    const operand_ty = operand.typeOf(ip);
+    const ty_key = ip.indexToKey(operand_ty.toIndex());
+    if (ty_key != .ptr_type) {
+        try sema.writer.writeAll("cannot dereference non-pointer type '");
+        try operand_ty.print(ip, sema.writer);
+        try sema.writer.writeAll("'\n");
+        return error.AnalysisFail;
+    }
+    switch (ty_key.ptr_type.flags.size) {
+        .one, .c => {},
+        .many => {
+            try sema.writer.writeAll("index syntax required for unknown-length pointer type '");
+            try operand_ty.print(ip, sema.writer);
+            try sema.writer.writeAll("'\n");
+            return error.AnalysisFail;
+        },
+        .slice => {
+            try sema.writer.writeAll("index syntax required for slice type '");
+            try operand_ty.print(ip, sema.writer);
+            try sema.writer.writeAll("'\n");
+            return error.AnalysisFail;
+        },
+    }
+    if (ip.indexToKey(operand.index) == .undef) {
+        try sema.writer.writeAll("cannot dereference undefined value\n");
+        return error.AnalysisFail;
+    }
+    return .{ .index = .void_value };
 }
 
 /// `store_node ptr, value`: deref `ptr` to find its `comptime_alloc`
@@ -2389,6 +2442,13 @@ fn evalStoreNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const coerced = try sema.coerceValueToType(rhs_value, alloc.val.typeOf(ip).toIndex(), "store");
             alloc.val = coerced;
         },
+        // A `.nav` pointer addresses a declaration's storage, which is runtime;
+        // the compiler defers the store to codegen and cannot perform it at
+        // comptime. This evaluator has no runtime stage, so it rejects.
+        .nav => {
+            try sema.writer.writeAll("unable to evaluate comptime expression: store through a pointer to a declaration\n");
+            return error.AnalysisFail;
+        },
         // Store into one field of a struct alloc: coerce to the field type
         // (the field pointer's child) and rebuild the alloc's aggregate.
         .field => |f| {
@@ -2416,17 +2476,24 @@ fn evalLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return try sema.loadValue(ptr_value);
 }
 
-/// Dereference a Key.ptr Value through its backing comptime_alloc
-/// slot. Shared by `evalLoad` (ZIR `.load` arm) and the ptr-form
-/// switch operand (`switch_block_ref`).
+/// Dereference a Key.ptr Value through its backing storage: a comptime-alloc
+/// slot, or a declaration's resolved value for a `.nav` base. Shared by
+/// `evalLoad` (ZIR `.load` arm) and the ptr-form switch operand
+/// (`switch_block_ref`).
 fn loadValue(sema: *Sema, ptr: Value) Error!Value {
-    const ptr_key = sema.intern_pool.indexToKey(ptr.index);
+    const ip = sema.intern_pool;
+    const ptr_key = ip.indexToKey(ptr.index);
     if (ptr_key != .ptr) {
         try sema.writer.writeAll("internal error: load through non-pointer value\n");
         return error.AnalysisFail;
     }
-    const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr);
-    return alloc.val;
+    switch (ptr_key.ptr.base_addr) {
+        .nav => |nav| return .{ .index = ip.getNav(nav).resolved.?.value },
+        else => {
+            const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr);
+            return alloc.val;
+        },
+    }
 }
 
 /// Locate the `ComptimeAlloc` entry referenced by a `Key.Ptr`. Returns
@@ -3464,8 +3531,8 @@ fn wellKnownRefToValue(ref: Zir.Inst.Ref) ?Value {
 /// names are in scope before AstGen runs, so a missing name would
 /// be a structural bug in wrap-injection itself.
 fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    const resolved = try sema.lookupDeclResolved(inst, "decl_val");
-    return .{ .index = resolved.value };
+    const found = try sema.lookupDecl(inst, "decl_val");
+    return .{ .index = found.resolved.value };
 }
 
 /// `decl_ref name`: AstGen emits this (rather than `decl_val`) when the use
@@ -3474,19 +3541,29 @@ fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// `align(N)`), so `@TypeOf(&x)` matches the compiler. Compiler reference:
 /// src/Sema.zig:zirDeclRef.
 fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    const resolved = try sema.lookupDeclResolved(inst, "decl_ref");
-    return try sema.pushComptimeAlloc(
-        resolved.type,
-        .{ .index = resolved.value },
-        resolved.@"const",
-        resolved.@"align",
-    );
+    const found = try sema.lookupDecl(inst, "decl_ref");
+    const ip = sema.intern_pool;
+    const ptr_ty = try ip.internPtrType(.{
+        .child = found.resolved.type,
+        .flags = .{ .size = .one, .is_const = found.resolved.@"const", .alignment = found.resolved.@"align" },
+    });
+    const ptr_idx = try ip.internPtr(.{
+        .ty = ptr_ty,
+        .base_addr = .{ .nav = found.nav },
+        .byte_offset = 0,
+    });
+    return .{ .index = ptr_idx };
 }
 
 /// Resolve a `str_tok` decl name against the session namespace to its
 /// resolved Nav. Shared by `decl_val` (reads `.value`) and `decl_ref` (also
 /// reads `.@"const"` / `.@"align"` for the pointer type).
-fn lookupDeclResolved(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error!InternPool.Nav.Resolved {
+const DeclLookup = struct {
+    nav: InternPool.Nav.Index,
+    resolved: InternPool.Nav.Resolved,
+};
+
+fn lookupDecl(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error!DeclLookup {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const data = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok;
@@ -3514,7 +3591,7 @@ fn lookupDeclResolved(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Er
             );
             return error.AnalysisFail;
         }
-        return resolved;
+        return .{ .nav = nav_idx, .resolved = resolved };
     }
 
     try sema.writer.print("{s} '{s}': not found in scope\n", .{ op_name, name_bytes });

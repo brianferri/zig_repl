@@ -377,6 +377,18 @@ test "compliance: two independent var slots do not alias" {
     try expectMatchesZig(testing.allocator, &.{"blk: { var a: u8 = 1; var b: u8 = 2; a = 10; b = 20; break :blk a + b; }"});
 }
 
+test "compliance: store through a pointer mutates the pointee" {
+    try expectMatchesZig(testing.allocator, &.{"blk: { var y: u32 = 1; const p = &y; p.* = 5; break :blk y; }"});
+}
+
+test "compliance: load through a pointer reads the current value" {
+    try expectMatchesZig(testing.allocator, &.{"blk: { var y: u32 = 1; const p = &y; p.* = 9; break :blk p.*; }"});
+}
+
+test "compliance: read-modify-write through a pointer" {
+    try expectMatchesZig(testing.allocator, &.{"blk: { var y: i32 = 10; const p = &y; p.* = p.* - 3; break :blk y; }"});
+}
+
 test "compliance: error value prints identically to zig" {
     try expectMatchesZig(testing.allocator, &.{"error.Foo"});
 }

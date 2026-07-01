@@ -1362,6 +1362,24 @@ test "alloc/store/load: wrap arith through a stored var" {
     );
 }
 
+test "store through a pointer to a declaration is a comptime-only rejection" {
+    // The compiler performs this store at runtime; a comptime-only evaluator
+    // has no runtime stage, so `&x` (a `.nav` pointer) rejects the store rather
+    // than silently mutating a copy of the decl.
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+
+    var diag_buf: [4096]u8 = @splat(0);
+    const result = evalSessionLines(gpa, &pool, ns, &.{
+        "var x: u32 = 1;",
+        "blk: { const p = &x; p.* = 5; break :blk x; }",
+    }, &diag_buf);
+    try testing.expectError(error.AnalysisFail, result);
+    try testing.expect(std.mem.indexOf(u8, &diag_buf, "store through a pointer to a declaration") != null);
+}
+
 /// Run a sequence of session inputs through the shared `eval.run` driver,
 /// persisting bindings in `namespace`. Returns the final input's Value (or
 /// null when it was a declaration). Diagnostics for the (unexpected) error
