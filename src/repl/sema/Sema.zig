@@ -4209,27 +4209,37 @@ fn failSwitch(sema: *Sema, what: []const u8) Error {
     return error.AnalysisFail;
 }
 
-/// `.param` / `.param_comptime`: evaluate the param's type body
-/// (break_target is the param inst itself, mirroring
-/// src/Sema.zig:zirParam ~9031) and push onto `params`
-/// for the enclosing `.func` to drain. `.is_generic` params
-/// surface a structured diagnostic -- generics are unsupported.
+/// `.param` / `.param_comptime`: evaluate the param's type body (break_target
+/// is the param inst itself, mirroring src/Sema.zig:zirParam ~9031) and push
+/// onto `params` for the enclosing `.func` to drain. A `.is_generic` param --
+/// its type depends on a prior comptime param (`x: T`) -- can't be resolved
+/// until a call binds one, so it stores `generic_poison_type` and `evalCall`
+/// re-resolves it per instantiation, exactly as the generic return type is.
 fn evalParam(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const pl_tok = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_tok;
     const extra = sema.zir.extraData(Zir.Inst.Param, pl_tok.payload_index);
-    if (extra.data.type.is_generic) {
-        try sema.writer.writeAll("generic parameter types not yet supported\n");
-        return error.AnalysisFail;
-    }
-    const body = sema.zir.bodySlice(extra.end, extra.data.type.body_len);
-    const ty_value = try sema.resolveInlineBody(body, inst);
+    const ty: InternPool.Index = if (extra.data.type.is_generic)
+        .generic_poison_type
+    else
+        (try sema.resolveInlineBody(sema.zir.bodySlice(extra.end, extra.data.type.body_len), inst)).index;
     try sema.block.params.append(sema.gpa, .{
-        .ty = ty_value.index,
+        .ty = ty,
         .is_comptime = tag == .param_comptime,
     });
     return null;
+}
+
+/// Re-resolve a generic parameter's declared type at call time. Its type body
+/// references prior comptime params, which are bound in `results` by the time
+/// this runs, so `resolveInlineBody` yields the concrete type for this
+/// instantiation. The parameter analogue of `resolveDeclaredRetType`.
+fn resolveParamType(sema: *Sema, param_inst: Zir.Inst.Index) Error!InternPool.Index {
+    const pl_tok = sema.zir.instructions.items(.data)[@intFromEnum(param_inst)].pl_tok;
+    const extra = sema.zir.extraData(Zir.Inst.Param, pl_tok.payload_index);
+    const body = sema.zir.bodySlice(extra.end, extra.data.type.body_len);
+    return (try sema.resolveInlineBody(body, param_inst)).index;
 }
 
 fn failAnytypeParam(sema: *Sema) Error {
@@ -4375,8 +4385,8 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     // holds end-offsets; arg N's body is args_body[start..end] where
     // start is `args_len` for N=0 or `args_body[N-1]` otherwise.
     const args_body: []const Zir.Inst.Index = @ptrCast(sema.zir.extra[extra.end..]);
-    const arg_values = try sema.evalCallArgs(inst, func_ty, args_body);
-    defer sema.gpa.free(arg_values);
+    const raw_args = try sema.evalCallArgs(inst, args_len, args_body);
+    defer sema.gpa.free(raw_args);
 
     // Swap sema.zir to the func's source-ZIR snapshot when the
     // call crosses a REPL line boundary. The common same-line
@@ -4413,7 +4423,18 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
         sema.results.deinit(sema.gpa);
         sema.results = saved_results;
     }
-    for (param_insts, arg_values) |p_inst, val| {
+    // Bind params in declaration order, coercing each argument to its
+    // parameter type. A generic param stored the poison marker at definition;
+    // its type body references earlier comptime params, which are already bound
+    // here, so re-resolve the concrete type for this instantiation first.
+    for (param_insts, raw_args, 0..) |p_inst, raw, i| {
+        const declared = func_ty.param_types[i];
+        const param_ty = if (declared == .generic_poison_type)
+            try sema.resolveParamType(p_inst)
+        else
+            declared;
+        var val = try sema.coerceValueToType(raw, param_ty, "call arg");
+        val.is_comptime = func_ty.paramIsComptime(@intCast(i));
         try sema.results.put(sema.gpa, p_inst, val);
     }
 
@@ -4448,28 +4469,22 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     }
 }
 
-/// Resolve and coerce each call argument to its declared parameter type.
-/// Returns a freshly allocated slice (caller frees). Each result's
-/// `is_comptime` is seeded from the parameter's `comptime`-ness: a
-/// non-`comptime` parameter is runtime inside the body even when the call
-/// site passed a comptime argument, so coercions of it (and values derived
-/// from it) follow Zig's runtime, type-based rule.
+/// Resolve each call argument to a raw (uncoerced) Value in the caller's
+/// scope. Returns a freshly allocated slice (caller frees). Coercion to the
+/// parameter type happens in `evalCall` once the callee's ZIR is in scope,
+/// because a generic parameter's type is only known there, per instantiation.
 fn evalCallArgs(
     sema: *Sema,
     inst: Zir.Inst.Index,
-    func_ty: InternPool.Key.FuncType,
+    args_len: u32,
     args_body: []const Zir.Inst.Index,
 ) Error![]Value {
-    const args_len: u32 = @intCast(func_ty.param_types.len);
     const arg_values = try sema.gpa.alloc(Value, args_len);
     errdefer sema.gpa.free(arg_values);
     for (0..args_len) |i| {
         const start = if (i == 0) args_len else @intFromEnum(args_body[i - 1]);
         const end = @intFromEnum(args_body[i]);
-        const arg_body = args_body[start..end];
-        const raw = try sema.resolveInlineBody(arg_body, inst);
-        arg_values[i] = try sema.coerceValueToType(raw, func_ty.param_types[i], "call arg");
-        arg_values[i].is_comptime = func_ty.paramIsComptime(@intCast(i));
+        arg_values[i] = try sema.resolveInlineBody(args_body[start..end], inst);
     }
     return arg_values;
 }

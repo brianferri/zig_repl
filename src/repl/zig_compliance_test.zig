@@ -972,6 +972,21 @@ test "compliance: a generic return coerces a runtime value type-based" {
     try expectBothReject(a, &.{ make, "make(u8, 5)" }); // narrowing rejected though 5 fits u8
 }
 
+test "compliance: a generic parameter type resolves per instantiation" {
+    const a = testing.allocator;
+    const id = "fn id(comptime T: type, x: T) T { return x; }";
+    try expectMatchesZig(a, &.{ id, "id(u8, 5)" });
+    try expectMatchesZig(a, &.{ id, "id(i32, -7)" });
+    try expectMatchesZig(a, &.{ id, "@TypeOf(id(u16, 1))" }); // instantiated param type, not poison
+    try expectBothReject(a, &.{ id, "id(u8, 300)" }); // 300 does not fit u8
+}
+
+test "compliance: generic and concrete parameters mix in one signature" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{ "fn add(comptime T: type, x: T, y: T) T { return x + y; }", "add(u16, 40, 2)" });
+    try expectMatchesZig(a, &.{ "fn f(comptime T: type, x: T, y: u8) T { return x + y; }", "f(u16, 40, 2)" });
+}
+
 test "compliance: the % operator" {
     const a = testing.allocator;
     try expectMatchesZig(a, &.{"17 % 8"}); // comptime_int
