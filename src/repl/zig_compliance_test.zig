@@ -1017,6 +1017,9 @@ test "compliance: multi-arg @TypeOf peer-resolves the operand types" {
     const a = testing.allocator;
     try expectMatchesZig(a, &.{"@TypeOf(1, 2, 3)"}); // all comptime_int
     try expectMatchesZig(a, &.{"@TypeOf(@as(u8, 1), @as(u16, 2))"}); // wider int wins
+    try expectMatchesZig(a, &.{"@TypeOf(@as(f32, 1), @as(f64, 2))"}); // wider float wins
+    try expectMatchesZig(a, &.{"@TypeOf(1, @as(f32, 2))"}); // comptime_int coerces to the float
+    try expectBothReject(a, &.{"@TypeOf(@as(i32, 5), 1.5)"}); // fixed int + comptime_float has no peer
 }
 
 test "compliance: std.math.clamp-style anytype generic with @TypeOf(v, lo, hi)" {
@@ -1027,6 +1030,7 @@ test "compliance: std.math.clamp-style anytype generic with @TypeOf(v, lo, hi)" 
     try expectMatchesZig(a, &.{ clamp, "clamp(5, 0, 10)" });
     try expectMatchesZig(a, &.{ clamp, "clamp(15, 0, 10)" });
     try expectMatchesZig(a, &.{ clamp, "clamp(@as(i32, -5), @as(i32, 0), @as(i32, 10))" });
+    try expectMatchesZig(a, &.{ clamp, "clamp(@as(f64, 1.5), @as(f64, 0.0), @as(f64, 1.0))" });
 }
 
 test "compliance: the % operator" {

@@ -4579,14 +4579,20 @@ fn evalTypeofPeer(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
 /// Peer-resolve two operands and return whichever one carries the peer type
 /// (the peer type is always one of the operand types for the cases modeled).
 /// Same type wins trivially; a mixed int pair resolves through the shared
-/// `resolveNumericPairToInt` rule. Other mixes (e.g. float peers) are not yet
-/// modeled and surface a diagnostic.
+/// `resolveNumericPairToInt` rule, a pair involving a float through
+/// `coerceNumericPairToFloat` (whose coerced values carry the common type).
+/// Other mixes surface a diagnostic.
 fn peerResolvePair(sema: *Sema, a: Value, b: Value) Error!Value {
     const ip = sema.intern_pool;
+    const a_key = ip.indexToKey(a.index);
+    const b_key = ip.indexToKey(b.index);
     const a_ty = Value.typeOf(a, ip).index;
     if (a_ty == Value.typeOf(b, ip).index) return a;
-    if (resolveNumericPairToInt(ip, ip.indexToKey(a.index), ip.indexToKey(b.index))) |peer| {
+    if (resolveNumericPairToInt(ip, a_key, b_key)) |peer| {
         return if (a_ty == peer.ty) a else b;
+    }
+    if (coerceNumericPairToFloat(a_key, b_key)) |pair| {
+        return if (a_ty == pair[0].ty) a else b;
     }
     try sema.writer.writeAll("@TypeOf: no peer type for the given operands\n");
     return error.AnalysisFail;
