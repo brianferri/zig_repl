@@ -1173,6 +1173,21 @@ test "compliance: field pointers (&x.field and chained access)" {
     try expectBothReject(a, &.{"blk: { const P = struct { x: u8 }; const p: P = .{ .x = 9 }; const px = &p.x; px.* = 1; break :blk p.x; }"});
 }
 
+test "compliance: type-inferred locals (var y = expr)" {
+    // `var`/`const` with no written type infer it from the initializer via
+    // alloc_inferred + store_to_inferred_ptr + resolve_inferred_alloc.
+    const a = testing.allocator;
+    // Inferred `var`, then mutated.
+    try expectMatchesZig(a, &.{"blk: { var x: u8 = 5; x += 1; var y = x; y += 1; break :blk y; }"});
+    // Inferred `const`.
+    try expectMatchesZig(a, &.{"blk: { var x: u8 = 5; x += 1; const y = x; break :blk y; }"});
+    // Inferred `var` of a struct, then a field mutated.
+    const S = "const S = struct { a: u8, b: u8 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ S ++ " var s = S{ .a = 1, .b = 2 }; s.a = 10; break :blk s.a + s.b; }"});
+    // An inferred `const` is not writable: mutating a field is rejected on both sides.
+    try expectBothReject(a, &.{"blk: { const Q = struct { a: u8 }; const q = Q{ .a = 1 }; q.a = 2; break :blk q.a; }"});
+}
+
 test "compliance: for loops (range and array)" {
     const a = testing.allocator;
     try expectMatchesZig(a, &.{"blk: { var s: u32 = 0; for (0..4) |i| { s += @intCast(i); } break :blk s; }"});

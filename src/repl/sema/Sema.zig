@@ -477,6 +477,10 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .size_of => sema.evalSizeOf(inst),
         .int_from_ptr => sema.evalIntFromPtr(inst),
         .alloc, .alloc_mut, .alloc_comptime_mut => sema.evalAlloc(inst),
+        .alloc_inferred, .alloc_inferred_comptime => sema.evalAllocInferred(true),
+        .alloc_inferred_mut, .alloc_inferred_comptime_mut => sema.evalAllocInferred(false),
+        .store_to_inferred_ptr => sema.evalStoreToInferredPtr(inst),
+        .resolve_inferred_alloc => sema.evalResolveInferredAlloc(inst),
         .make_ptr_const => sema.evalMakePtrConst(inst),
         .store_node => sema.evalStoreNode(inst),
         .struct_init_field_ptr, .field_ptr => sema.evalFieldPtr(inst),
@@ -2378,6 +2382,52 @@ fn pushComptimeAlloc(
         .byte_offset = 0,
     });
     return .{ .index = ptr_idx };
+}
+
+/// `alloc_inferred` / `alloc_inferred_mut` / `alloc_inferred_comptime[_mut]`: a
+/// `var`/`const` whose type is inferred from its initializer (`var y = expr`).
+/// The type is unknown here, so reserve a slot holding a poison placeholder and
+/// return a pointer to it; `store_to_inferred_ptr` then fills the slot and fixes
+/// the pointer's element type, and `resolve_inferred_alloc` returns the finished
+/// pointer. Mirrors zirAllocInferred[Comptime] -- a comptime-only evaluator always
+/// takes the compiler's comptime-inferred-alloc path. `_mut` variants are writable.
+fn evalAllocInferred(sema: *Sema, comptime is_const: bool) Error!?Value {
+    const placeholder = try sema.intern_pool.get(.{ .undef = .generic_poison_type });
+    return try sema.pushComptimeAlloc(.generic_poison_type, .{ .index = placeholder }, is_const, .none);
+}
+
+/// `store_to_inferred_ptr lhs, rhs`: the single store that gives an inferred
+/// alloc its type. Fill the reserved slot with `rhs` and rebuild the pointer with
+/// `rhs`'s type as the element type, then bind that typed pointer as the alloc
+/// instruction's result so `resolve_inferred_alloc` returns it. Mirrors
+/// storeToInferredAllocComptime -- the comptime path: one store, value known, so
+/// the element type is exactly the operand's type (no peer resolution needed).
+fn evalStoreToInferredPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const ptr = try sema.resolveRef(bin.lhs);
+    const operand = try sema.resolveRef(bin.rhs);
+
+    const p = ip.indexToKey(ptr.index).ptr;
+    const slot = try sema.lookupComptimeAlloc(p);
+    slot.val = operand;
+
+    const ptr_ty = try ip.internPtrType(.{
+        .child = operand.typeOf(ip).toIndex(),
+        .flags = .{ .size = .one, .is_const = slot.is_const },
+    });
+    const typed_ptr = try ip.internPtr(.{ .ty = ptr_ty, .base_addr = p.base_addr, .byte_offset = 0 });
+    try sema.results.put(sema.gpa, bin.lhs.toIndex().?, .{ .index = typed_ptr });
+    return .{ .index = .void_value };
+}
+
+/// `resolve_inferred_alloc operand`: the inferred alloc's type is already fixed by
+/// its `store_to_inferred_ptr`, so return the retyped pointer bound there. Mirrors
+/// zirResolveInferredAlloc's comptime arm ("the work was already done").
+fn evalResolveInferredAlloc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    return try sema.resolveRef(un_node.operand);
 }
 
 /// `validate_deref ptr`: AstGen emits this before a `ptr.*` load or a
