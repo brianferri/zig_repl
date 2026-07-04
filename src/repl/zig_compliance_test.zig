@@ -1013,6 +1013,22 @@ test "compliance: anytype params over comptime, fixed-width, and multi-statement
     try expectMatchesZig(a, &.{ "fn sq(x: anytype) @TypeOf(x) { const y = x * x; return y; }", "sq(@as(u8, 9))" });
 }
 
+test "compliance: multi-arg @TypeOf peer-resolves the operand types" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"@TypeOf(1, 2, 3)"}); // all comptime_int
+    try expectMatchesZig(a, &.{"@TypeOf(@as(u8, 1), @as(u16, 2))"}); // wider int wins
+}
+
+test "compliance: std.math.clamp-style anytype generic with @TypeOf(v, lo, hi)" {
+    // The real std.math.clamp signature: three anytype params peer-resolved for
+    // the return type, dispatched by comparison.
+    const a = testing.allocator;
+    const clamp = "fn clamp(v: anytype, lo: anytype, hi: anytype) @TypeOf(v, lo, hi) { return if (v < lo) lo else if (v > hi) hi else v; }";
+    try expectMatchesZig(a, &.{ clamp, "clamp(5, 0, 10)" });
+    try expectMatchesZig(a, &.{ clamp, "clamp(15, 0, 10)" });
+    try expectMatchesZig(a, &.{ clamp, "clamp(@as(i32, -5), @as(i32, 0), @as(i32, 10))" });
+}
+
 test "compliance: the % operator" {
     const a = testing.allocator;
     try expectMatchesZig(a, &.{"17 % 8"}); // comptime_int

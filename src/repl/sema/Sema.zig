@@ -4554,6 +4554,44 @@ fn evalTypeof(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return Value{ .index = Value.typeOf(operand, sema.intern_pool).index };
 }
 
+/// `typeof_peer`: `@TypeOf(a, b, ...)` -- the peer-resolved type of several
+/// operands. AstGen puts the operand expressions in a body (evaluated for its
+/// instruction results) followed by their refs. Mirrors `src/Sema.zig`
+/// zirTypeofPeer: run the body, then fold peer resolution across the operands.
+fn evalTypeofPeer(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const extra = sema.zir.extraData(Zir.Inst.TypeOfPeer, extended.operand);
+    const body = sema.zir.bodySlice(extra.data.body_index, extra.data.body_len);
+    // Evaluate the operand expressions; the body's break value is unused (we
+    // read the operands by ref below, as the compiler does).
+    _ = try sema.resolveInlineBody(body, inst);
+
+    const args = sema.zir.refSlice(extra.end, extended.small);
+    assert(args.len > 0);
+
+    var acc = try sema.resolveRef(args[0]);
+    for (args[1..]) |arg_ref| {
+        acc = try sema.peerResolvePair(acc, try sema.resolveRef(arg_ref));
+    }
+    return Value{ .index = Value.typeOf(acc, ip).index };
+}
+
+/// Peer-resolve two operands and return whichever one carries the peer type
+/// (the peer type is always one of the operand types for the cases modeled).
+/// Same type wins trivially; a mixed int pair resolves through the shared
+/// `resolveNumericPairToInt` rule. Other mixes (e.g. float peers) are not yet
+/// modeled and surface a diagnostic.
+fn peerResolvePair(sema: *Sema, a: Value, b: Value) Error!Value {
+    const ip = sema.intern_pool;
+    const a_ty = Value.typeOf(a, ip).index;
+    if (a_ty == Value.typeOf(b, ip).index) return a;
+    if (resolveNumericPairToInt(ip, ip.indexToKey(a.index), ip.indexToKey(b.index))) |peer| {
+        return if (a_ty == peer.ty) a else b;
+    }
+    try sema.writer.writeAll("@TypeOf: no peer type for the given operands\n");
+    return error.AnalysisFail;
+}
+
 /// `.typeof_builtin`: `@TypeOf(...)` body-form -- AstGen wraps
 /// the operand expression in an Inst.Block so the type-context
 /// (`is_typeof`) can short-circuit certain analyses. Resolves
@@ -4607,6 +4645,7 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
         .tuple_decl => return sema.evalTupleDecl(extended),
         .struct_decl => return sema.evalStructDecl(inst),
+        .typeof_peer => return sema.evalTypeofPeer(extended, inst),
 
         // The result type for a compound assignment (`s += x`, `s -= x`): the
         // lhs's own type, against which the rhs is coerced before the arith +
