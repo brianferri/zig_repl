@@ -1529,6 +1529,14 @@ const RepeatedRepr = extern struct {
     elem_val: u32,
 };
 
+/// Extra-arena payload for `Item.Tag.type_struct`. Three u32 slots: the nominal
+/// identity (source_zir_id, decl_inst) and the interned name handle.
+const StructTypeRepr = extern struct {
+    source_zir_id: u32,
+    decl_inst: u32,
+    name: u32,
+};
+
 /// Extra-arena payload for `Item.Tag.ptr_comptime_alloc`. Four u32 slots: ty,
 /// comptime-alloc index, and the 64-bit byte_offset split into lo/hi u32s.
 /// Mirrors the compiler's `Tag.PtrComptimeAlloc` -- allocations born in Sema
@@ -2272,14 +2280,11 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
 }
 
 fn ptrTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const fields = comptime @divExact(@sizeOf(PtrTypeRepr), @sizeOf(u32));
-    assert(extra_index + fields <= pool.extra.items.len);
-    const slice = pool.extra.items[extra_index..][0..fields];
-    const repr: PtrTypeRepr = .{ .child = slice[0], .sentinel = slice[1], .flags = slice[2] };
+    const r = pool.extraData(PtrTypeRepr, extra_index);
     return .{ .ptr_type = .{
-        .child = @enumFromInt(repr.child),
-        .sentinel = @enumFromInt(repr.sentinel),
-        .flags = @bitCast(repr.flags),
+        .child = @enumFromInt(r.child),
+        .sentinel = @enumFromInt(r.sentinel),
+        .flags = @bitCast(r.flags),
     } };
 }
 
@@ -2298,12 +2303,11 @@ fn tupleTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
 }
 
 fn structTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    assert(extra_index + 3 <= pool.extra.items.len);
-    const slice = pool.extra.items[extra_index..][0..3];
+    const r = pool.extraData(StructTypeRepr, extra_index);
     return .{ .struct_type = .{
-        .source_zir_id = slice[0],
-        .decl_inst = @enumFromInt(slice[1]),
-        .name = @enumFromInt(slice[2]),
+        .source_zir_id = r.source_zir_id,
+        .decl_inst = @enumFromInt(r.decl_inst),
+        .name = @enumFromInt(r.name),
     } };
 }
 
@@ -2325,65 +2329,52 @@ fn errorSetTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
 }
 
 fn errFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const fields = comptime @divExact(@sizeOf(ErrRepr), @sizeOf(u32));
-    assert(extra_index + fields <= pool.extra.items.len);
-    const slice = pool.extra.items[extra_index..][0..fields];
+    const r = pool.extraData(ErrRepr, extra_index);
     return .{ .err = .{
-        .ty = @enumFromInt(slice[0]),
-        .name = @enumFromInt(slice[1]),
+        .ty = @enumFromInt(r.ty),
+        .name = @enumFromInt(r.name),
     } };
 }
 
 fn errorUnionTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const fields = comptime @divExact(@sizeOf(ErrorUnionTypeRepr), @sizeOf(u32));
-    assert(extra_index + fields <= pool.extra.items.len);
-    const slice = pool.extra.items[extra_index..][0..fields];
+    const r = pool.extraData(ErrorUnionTypeRepr, extra_index);
     return .{ .error_union_type = .{
-        .error_set_type = @enumFromInt(slice[0]),
-        .payload_type = @enumFromInt(slice[1]),
+        .error_set_type = @enumFromInt(r.error_set),
+        .payload_type = @enumFromInt(r.payload),
     } };
 }
 
 fn arrayTypeSmallFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const fields = comptime @divExact(@sizeOf(VectorTypeRepr), @sizeOf(u32));
-    assert(extra_index + fields <= pool.extra.items.len);
-    const slice = pool.extra.items[extra_index..][0..fields];
+    const r = pool.extraData(VectorTypeRepr, extra_index);
     return .{ .array_type = .{
-        .len = slice[0],
-        .child = @enumFromInt(slice[1]),
+        .len = r.len,
+        .child = @enumFromInt(r.child),
         .sentinel = .none,
     } };
 }
 
 fn vectorTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const fields = comptime @divExact(@sizeOf(VectorTypeRepr), @sizeOf(u32));
-    assert(extra_index + fields <= pool.extra.items.len);
-    const slice = pool.extra.items[extra_index..][0..fields];
+    const r = pool.extraData(VectorTypeRepr, extra_index);
     return .{ .vector_type = .{
-        .len = slice[0],
-        .child = @enumFromInt(slice[1]),
+        .len = r.len,
+        .child = @enumFromInt(r.child),
     } };
 }
 
 fn optPayloadFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const fields = comptime @divExact(@sizeOf(OptPayloadRepr), @sizeOf(u32));
-    assert(extra_index + fields <= pool.extra.items.len);
-    const slice = pool.extra.items[extra_index..][0..fields];
+    const r = pool.extraData(OptPayloadRepr, extra_index);
     return .{ .opt = .{
-        .ty = @enumFromInt(slice[0]),
-        .val = @enumFromInt(slice[1]),
+        .ty = @enumFromInt(r.ty),
+        .val = @enumFromInt(r.val),
     } };
 }
 
 fn arrayTypeBigFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const fields = comptime @divExact(@sizeOf(ArrayTypeBigRepr), @sizeOf(u32));
-    assert(extra_index + fields <= pool.extra.items.len);
-    const slice = pool.extra.items[extra_index..][0..fields];
-    const len: u64 = (@as(u64, slice[1]) << 32) | @as(u64, slice[0]);
+    const r = pool.extraData(ArrayTypeBigRepr, extra_index);
     return .{ .array_type = .{
-        .len = len,
-        .child = @enumFromInt(slice[2]),
-        .sentinel = @enumFromInt(slice[3]),
+        .len = (@as(u64, r.len_hi) << 32) | r.len_lo,
+        .child = @enumFromInt(r.child),
+        .sentinel = @enumFromInt(r.sentinel),
     } };
 }
 
@@ -2408,32 +2399,26 @@ fn aggregateFromExtra(pool: *const InternPool, extra_index: u32) Key {
 }
 
 fn repeatedFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const fields = comptime @divExact(@sizeOf(RepeatedRepr), @sizeOf(u32));
-    assert(extra_index + fields <= pool.extra.items.len);
-    const slice = pool.extra.items[extra_index..][0..fields];
+    const r = pool.extraData(RepeatedRepr, extra_index);
     return .{ .aggregate = .{
-        .ty = @enumFromInt(slice[0]),
-        .storage = .{ .repeated_elem = @enumFromInt(slice[1]) },
+        .ty = @enumFromInt(r.ty),
+        .storage = .{ .repeated_elem = @enumFromInt(r.elem_val) },
     } };
 }
 
 fn errorUnionErrFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const fields = comptime @divExact(@sizeOf(ErrorUnionErrRepr), @sizeOf(u32));
-    assert(extra_index + fields <= pool.extra.items.len);
-    const slice = pool.extra.items[extra_index..][0..fields];
+    const r = pool.extraData(ErrorUnionErrRepr, extra_index);
     return .{ .error_union = .{
-        .ty = @enumFromInt(slice[0]),
-        .val = .{ .err_name = @enumFromInt(slice[1]) },
+        .ty = @enumFromInt(r.ty),
+        .val = .{ .err_name = @enumFromInt(r.err_name) },
     } };
 }
 
 fn errorUnionPayloadFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const fields = comptime @divExact(@sizeOf(ErrorUnionPayloadRepr), @sizeOf(u32));
-    assert(extra_index + fields <= pool.extra.items.len);
-    const slice = pool.extra.items[extra_index..][0..fields];
+    const r = pool.extraData(ErrorUnionPayloadRepr, extra_index);
     return .{ .error_union = .{
-        .ty = @enumFromInt(slice[0]),
-        .val = .{ .payload = @enumFromInt(slice[1]) },
+        .ty = @enumFromInt(r.ty),
+        .val = .{ .payload = @enumFromInt(r.payload) },
     } };
 }
 
@@ -2779,11 +2764,10 @@ pub fn internFloat(pool: *InternPool, float: Key.Float) Allocator.Error!Index {
 /// child Index, sentinel Index, packed-flags as u32.
 fn emitPtrType(pool: *InternPool, pt: Key.PtrType) Allocator.Error!void {
     assert(pt.child != .none);
-    const extra_index: u32 = @intCast(pool.extra.items.len);
-    try pool.extra.appendSlice(pool.gpa, &.{
-        @intFromEnum(pt.child),
-        @intFromEnum(pt.sentinel),
-        @as(u32, @bitCast(pt.flags)),
+    const extra_index = try pool.addExtra(PtrTypeRepr{
+        .child = @intFromEnum(pt.child),
+        .sentinel = @intFromEnum(pt.sentinel),
+        .flags = @bitCast(pt.flags),
     });
     pool.items.appendAssumeCapacity(.{ .tag = .type_pointer, .data = extra_index });
 }
@@ -2853,11 +2837,10 @@ fn emitTupleType(pool: *InternPool, tt: Key.TupleType) Allocator.Error!void {
 /// Emit a `type_struct` Item. Three u32 slots: source_zir_id,
 /// decl_inst, name.
 fn emitStructType(pool: *InternPool, st: Key.StructType) Allocator.Error!void {
-    const extra_index: u32 = @intCast(pool.extra.items.len);
-    try pool.extra.appendSlice(pool.gpa, &.{
-        st.source_zir_id,
-        @intFromEnum(st.decl_inst),
-        @intFromEnum(st.name),
+    const extra_index = try pool.addExtra(StructTypeRepr{
+        .source_zir_id = st.source_zir_id,
+        .decl_inst = @intFromEnum(st.decl_inst),
+        .name = @intFromEnum(st.name),
     });
     pool.items.appendAssumeCapacity(.{ .tag = .type_struct, .data = extra_index });
 }
@@ -2866,10 +2849,9 @@ fn emitStructType(pool: *InternPool, st: Key.StructType) Allocator.Error!void {
 fn emitErr(pool: *InternPool, e: Key.Error) Allocator.Error!void {
     assert(e.ty != .none);
 
-    const extra_index: u32 = @intCast(pool.extra.items.len);
-    try pool.extra.appendSlice(pool.gpa, &.{
-        @intFromEnum(e.ty),
-        @intFromEnum(e.name),
+    const extra_index = try pool.addExtra(ErrRepr{
+        .ty = @intFromEnum(e.ty),
+        .name = @intFromEnum(e.name),
     });
     pool.items.appendAssumeCapacity(.{ .tag = .error_set_error, .data = extra_index });
 }
@@ -2928,10 +2910,9 @@ fn emitAggregate(pool: *InternPool, agg: Key.Aggregate) Allocator.Error!void {
     assert(agg.ty != .none);
     switch (agg.storage) {
         .repeated_elem => |elem| {
-            const extra_index: u32 = @intCast(pool.extra.items.len);
-            try pool.extra.appendSlice(pool.gpa, &.{
-                @intFromEnum(agg.ty),
-                @intFromEnum(elem),
+            const extra_index = try pool.addExtra(RepeatedRepr{
+                .ty = @intFromEnum(agg.ty),
+                .elem_val = @intFromEnum(elem),
             });
             pool.items.appendAssumeCapacity(.{ .tag = .repeated, .data = extra_index });
         },
@@ -2956,20 +2937,18 @@ fn emitAggregate(pool: *InternPool, agg: Key.Aggregate) Allocator.Error!void {
 fn emitArrayType(pool: *InternPool, at: Key.ArrayType) Allocator.Error!void {
     assert(at.child != .none);
     if (at.sentinel == .none and at.len <= std.math.maxInt(u32)) {
-        const extra_index: u32 = @intCast(pool.extra.items.len);
-        try pool.extra.appendSlice(pool.gpa, &.{
-            @intCast(at.len),
-            @intFromEnum(at.child),
+        const extra_index = try pool.addExtra(VectorTypeRepr{
+            .len = @intCast(at.len),
+            .child = @intFromEnum(at.child),
         });
         pool.items.appendAssumeCapacity(.{ .tag = .type_array_small, .data = extra_index });
         return;
     }
-    const extra_index: u32 = @intCast(pool.extra.items.len);
-    try pool.extra.appendSlice(pool.gpa, &.{
-        @truncate(at.len),
-        @truncate(at.len >> 32),
-        @intFromEnum(at.child),
-        @intFromEnum(at.sentinel),
+    const extra_index = try pool.addExtra(ArrayTypeBigRepr{
+        .len_lo = @truncate(at.len),
+        .len_hi = @truncate(at.len >> 32),
+        .child = @intFromEnum(at.child),
+        .sentinel = @intFromEnum(at.sentinel),
     });
     pool.items.appendAssumeCapacity(.{ .tag = .type_array_big, .data = extra_index });
 }
@@ -2977,10 +2956,9 @@ fn emitArrayType(pool: *InternPool, at: Key.ArrayType) Allocator.Error!void {
 /// Emit a `type_vector` Item. Two u32 slots: `len`, `child`.
 fn emitVectorType(pool: *InternPool, vt: Key.VectorType) Allocator.Error!void {
     assert(vt.child != .none);
-    const extra_index: u32 = @intCast(pool.extra.items.len);
-    try pool.extra.appendSlice(pool.gpa, &.{
-        vt.len,
-        @intFromEnum(vt.child),
+    const extra_index = try pool.addExtra(VectorTypeRepr{
+        .len = vt.len,
+        .child = @intFromEnum(vt.child),
     });
     pool.items.appendAssumeCapacity(.{ .tag = .type_vector, .data = extra_index });
 }
@@ -3007,10 +2985,9 @@ fn emitOpt(pool: *InternPool, o: Key.Opt) Allocator.Error!void {
         });
         return;
     }
-    const extra_index: u32 = @intCast(pool.extra.items.len);
-    try pool.extra.appendSlice(pool.gpa, &.{
-        @intFromEnum(o.ty),
-        @intFromEnum(o.val),
+    const extra_index = try pool.addExtra(OptPayloadRepr{
+        .ty = @intFromEnum(o.ty),
+        .val = @intFromEnum(o.val),
     });
     pool.items.appendAssumeCapacity(.{ .tag = .opt_payload, .data = extra_index });
 }
@@ -3020,10 +2997,9 @@ fn emitErrorUnionType(pool: *InternPool, eu: Key.ErrorUnionType) Allocator.Error
     assert(eu.error_set_type != .none);
     assert(eu.payload_type != .none);
 
-    const extra_index: u32 = @intCast(pool.extra.items.len);
-    try pool.extra.appendSlice(pool.gpa, &.{
-        @intFromEnum(eu.error_set_type),
-        @intFromEnum(eu.payload_type),
+    const extra_index = try pool.addExtra(ErrorUnionTypeRepr{
+        .error_set = @intFromEnum(eu.error_set_type),
+        .payload = @intFromEnum(eu.payload_type),
     });
     pool.items.appendAssumeCapacity(.{ .tag = .type_error_union, .data = extra_index });
 }
@@ -3033,19 +3009,18 @@ fn emitErrorUnionType(pool: *InternPool, eu: Key.ErrorUnionType) Allocator.Error
 fn emitErrorUnion(pool: *InternPool, eu: Key.ErrorUnion) Allocator.Error!void {
     assert(eu.ty != .none);
 
-    const extra_index: u32 = @intCast(pool.extra.items.len);
     switch (eu.val) {
         .err_name => |name| {
-            try pool.extra.appendSlice(pool.gpa, &.{
-                @intFromEnum(eu.ty),
-                @intFromEnum(name),
+            const extra_index = try pool.addExtra(ErrorUnionErrRepr{
+                .ty = @intFromEnum(eu.ty),
+                .err_name = @intFromEnum(name),
             });
             pool.items.appendAssumeCapacity(.{ .tag = .error_union_error, .data = extra_index });
         },
         .payload => |idx| {
-            try pool.extra.appendSlice(pool.gpa, &.{
-                @intFromEnum(eu.ty),
-                @intFromEnum(idx),
+            const extra_index = try pool.addExtra(ErrorUnionPayloadRepr{
+                .ty = @intFromEnum(eu.ty),
+                .payload = @intFromEnum(idx),
             });
             pool.items.appendAssumeCapacity(.{ .tag = .error_union_payload, .data = extra_index });
         },
