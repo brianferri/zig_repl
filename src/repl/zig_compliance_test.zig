@@ -1202,6 +1202,25 @@ test "compliance: @enumFromInt and result-typed enum literals" {
     try expectBothReject(a, &.{"blk: { " ++ E ++ " const e: E = .z; break :blk @intFromEnum(e); }"});
 }
 
+test "compliance: explicit enum tag types and values" {
+    const a = testing.allocator;
+    // An explicit tag type with auto-numbered fields.
+    try expectMatchesZig(a, &.{"blk: { const E = enum(u8) { a, b, c }; break :blk @intFromEnum(E.c); }"});
+    // Explicit values, with auto-increment resuming after each.
+    const V = "const E = enum(u8) { a = 5, b, c = 10 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ V ++ " break :blk @intFromEnum(E.b); }"}); // 6
+    try expectMatchesZig(a, &.{"blk: { " ++ V ++ " break :blk @intFromEnum(E.c); }"}); // 10
+    // A value beyond u8 needs a wider tag type.
+    try expectMatchesZig(a, &.{"blk: { const E = enum(u16) { a = 300, b = 301 }; break :blk @intFromEnum(E.a); }"});
+    // @enumFromInt matches against the actual tag values, not positions.
+    const W = "const E = enum(u8) { a = 5, b = 10 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ W ++ " const e: E = @enumFromInt(10); break :blk @intFromEnum(e); }"});
+    // An integer matching no explicit tag value is rejected on both sides.
+    try expectBothReject(a, &.{"blk: { " ++ W ++ " const e: E = @enumFromInt(7); break :blk @intFromEnum(e); }"});
+    // A field value that overflows the tag type is a compile error on both sides.
+    try expectBothReject(a, &.{"blk: { const E = enum(u8) { a = 300 }; break :blk @intFromEnum(E.a); }"});
+}
+
 test "compliance: nested struct types capture an enclosing local (closure_get)" {
     // A struct whose field type names a local from the enclosing scope captures
     // that local (closure_capture); the field body reads it via closure_get.

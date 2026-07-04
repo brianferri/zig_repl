@@ -3212,42 +3212,82 @@ fn enumIntTagType(sema: *Sema, field_count: u32) Error!InternPool.Index {
     return try sema.intern_pool.internIntType(.unsigned, bits);
 }
 
-/// Resolve enum field `name` to its `enum_tag` value: the field's declaration
-/// order as an integer of the enum's tag type. Iterates the enum decl's
-/// `field_names` in its source ZIR, like `structFieldByName`. Returns null if no
-/// field matches. Explicit field values and explicit tag types are not yet read.
-fn enumTagByName(sema: *Sema, enum_ty: InternPool.Index, name: []const u8) Error!?Value {
+/// How to select an enum tag: by field name (`E.b`) or by integer value
+/// (`@enumFromInt`). Both walk the same field iteration, so one helper serves both.
+const EnumMatch = union(enum) { name: []const u8, value: i128 };
+
+/// Resolve an enum tag by name or by integer value, returning its `enum_tag`.
+/// Walks the decl's fields in order, assigning each its value: an explicit
+/// `= expr` body, else one past the previous (0 for the first). The tag type is
+/// an explicit `enum(T)` body, else the auto smallest-unsigned. Returns null if
+/// nothing matches. Mirrors the compiler's enum field resolution plus
+/// `nameIndex` / `tagValueIndex`. `this_type` is set so a value body may use
+/// `@This()`.
+fn enumLookup(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?Value {
     const ip = sema.intern_pool;
     const et = ip.indexToKey(enum_ty).enum_type;
     const frame = try sema.enterSourceZir(et.source_zir_id, "enum field");
     defer frame.restore(sema);
+    const saved_this = sema.this_type;
+    sema.this_type = enum_ty;
+    defer sema.this_type = saved_this;
+
     const decl = sema.zir.getEnumDecl(et.decl_inst);
-    if (decl.field_value_body_lens != null or decl.tag_type_body != null) {
-        try sema.writer.writeAll("enum: explicit values and tag types are not yet supported\n");
-        return error.AnalysisFail;
-    }
-    const tag_ty = try sema.enumIntTagType(@intCast(decl.field_names.len));
-    for (decl.field_names, 0..) |fname, idx| {
-        if (!std.mem.eql(u8, sema.zir.nullTerminatedString(fname), name)) continue;
-        const int = try ip.internInt(.{ .ty = tag_ty, .storage = .{ .u64 = idx } });
+    const tag_ty = if (decl.tag_type_body) |body|
+        (try sema.resolveInlineBody(body, et.decl_inst)).index
+    else
+        try sema.enumIntTagType(@intCast(decl.field_names.len));
+
+    var it = decl.iterateFields();
+    var next_auto: i128 = 0;
+    while (it.next()) |field| {
+        const cur: i128 = if (field.value_body) |body| blk: {
+            const raw = try sema.resolveInlineBody(body, et.decl_inst);
+            break :blk sema.intAsI128(raw.index) orelse {
+                try sema.writer.writeAll("enum: tag value is not an integer\n");
+                return error.AnalysisFail;
+            };
+        } else next_auto;
+        next_auto = cur + 1;
+        const matched = switch (match) {
+            .name => |n| std.mem.eql(u8, sema.zir.nullTerminatedString(field.name), n),
+            .value => |v| cur == v,
+        };
+        if (!matched) continue;
+        // Coerce the value to the tag type (its range check rejects a value the
+        // tag type can't hold, as the compiler's field-value coercion does).
+        const i64v = std.math.cast(i64, cur) orelse {
+            try sema.writer.writeAll("enum: tag value out of supported range\n");
+            return error.AnalysisFail;
+        };
+        const raw = try ip.internInt(.{ .ty = .comptime_int_type, .storage = .{ .i64 = i64v } });
+        const int = (try sema.coerceValueToType(.{ .index = raw }, tag_ty, "enum tag")).index;
         return .{ .index = try ip.internEnumTag(.{ .ty = enum_ty, .int = int }) };
     }
     return null;
 }
 
-/// An enum type's declared field (tag) count, read from its source ZIR.
-fn enumFieldCount(sema: *Sema, enum_ty: InternPool.Index) Error!u32 {
-    const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
-    const frame = try sema.enterSourceZir(et.source_zir_id, "enum field count");
-    defer frame.restore(sema);
-    return @intCast(sema.zir.getEnumDecl(et.decl_inst).field_names.len);
+/// A name-keyed enum tag lookup (`E.b`, `.b`). Thin wrapper over `enumLookup`.
+fn enumTagByName(sema: *Sema, enum_ty: InternPool.Index, name: []const u8) Error!?Value {
+    return sema.enumLookup(enum_ty, .{ .name = name });
 }
 
-/// `enum_from_int lhs, rhs`: `@enumFromInt(n)` -- build the enum tag whose
-/// integer value is `n`. `lhs` is the destination enum type (from the result
-/// type), `rhs` the integer. For an auto-numbered enum the valid tags are
-/// `0..field_count`, so an out-of-range value is rejected as the compiler's
-/// `enumHasInt` check does. Mirrors zirEnumFromInt's exhaustive comptime arm.
+/// The integer value of an `int` Key as `i128`, or null if it is not an integer
+/// or does not fit. Used to read explicit enum tag values and `@enumFromInt` args.
+fn intAsI128(sema: *Sema, index: InternPool.Index) ?i128 {
+    const key = sema.intern_pool.indexToKey(index);
+    if (key != .int) return null;
+    return switch (key.int.storage) {
+        .u64 => |v| @as(i128, v),
+        .i64 => |v| @as(i128, v),
+        .big_int => |b| b.toInt(i128) catch null,
+    };
+}
+
+/// `enum_from_int lhs, rhs`: `@enumFromInt(n)` -- the enum tag whose integer value
+/// is `n`. `lhs` is the destination enum type, `rhs` the integer. A value with no
+/// matching tag is rejected as the compiler's `enumHasInt` check does. Mirrors
+/// zirEnumFromInt's exhaustive comptime arm.
 fn evalEnumFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
@@ -3258,24 +3298,14 @@ fn evalEnumFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return error.AnalysisFail;
     }
     const operand = try sema.resolveRef(bin.rhs);
-    const int_key = ip.indexToKey(operand.index);
-    if (int_key != .int) {
+    const value = sema.intAsI128(operand.index) orelse {
         try sema.writer.writeAll("@enumFromInt: operand is not an integer\n");
         return error.AnalysisFail;
-    }
-    const field_count = try sema.enumFieldCount(dest_ty);
-    const value: u64 = switch (int_key.int.storage) {
-        .u64 => |v| v,
-        .i64 => |v| if (v >= 0) @intCast(v) else field_count, // negative -> out of range
-        .big_int => |b| b.toInt(u64) catch field_count, // too large -> out of range
     };
-    if (value >= field_count) {
-        const name = ip.stringSlice(ip.indexToKey(dest_ty).enum_type.name);
-        try sema.writer.print("enum '{s}' has no tag with value '{d}'\n", .{ name, value });
-        return error.AnalysisFail;
-    }
-    const int = try ip.internInt(.{ .ty = try sema.enumIntTagType(field_count), .storage = .{ .u64 = value } });
-    return .{ .index = try ip.internEnumTag(.{ .ty = dest_ty, .int = int }) };
+    if (try sema.enumLookup(dest_ty, .{ .value = value })) |tag| return tag;
+    const name = ip.stringSlice(ip.indexToKey(dest_ty).enum_type.name);
+    try sema.writer.print("enum '{s}' has no tag with value '{d}'\n", .{ name, value });
+    return error.AnalysisFail;
 }
 
 /// `decl_literal` / `decl_literal_no_coerce`: `.name` resolved against the known
