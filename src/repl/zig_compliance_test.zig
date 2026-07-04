@@ -1131,6 +1131,26 @@ test "compliance: struct field defaults and missing-field validation" {
     try expectBothReject(a, &.{"blk: { const Q = struct { a: u8, b: u16 }; const q: Q = .{ .a = 7 }; break :blk q.a; }"});
 }
 
+test "compliance: explicit-type struct init (T{ ... })" {
+    // The `T{ .a = ... }` form (struct_init) parallels the result-location
+    // `.{ ... }` form: same defaults, same missing/unknown-field validation.
+    const a = testing.allocator;
+    const S = "const S = struct { a: u8, b: u8 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ S ++ " const s = S{ .a = 1, .b = 2 }; break :blk s.a + s.b; }"});
+    // A defaulted field left out is filled; an explicit value overrides it.
+    const D = "const D = struct { a: u8, b: u16 = 99 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ D ++ " const d = D{ .a = 7 }; break :blk d.b; }"});
+    // `T{}` takes every field's default (struct_init_empty).
+    try expectMatchesZig(a, &.{"blk: { const E = struct { a: u8 = 3, b: u8 = 4 }; const e = E{}; break :blk e.a + e.b; }"});
+    // A temporary's field, read directly (struct_init_ref).
+    try expectMatchesZig(a, &.{"blk: { " ++ S ++ " break :blk (S{ .a = 5, .b = 6 }).b; }"});
+    // Missing a non-defaulted field, an unknown field, and an out-of-range
+    // value are compile errors on both sides.
+    try expectBothReject(a, &.{"blk: { " ++ S ++ " const s = S{ .a = 1 }; break :blk s.a; }"});
+    try expectBothReject(a, &.{"blk: { const Q = struct { a: u8 }; const q = Q{ .a = 1, .b = 2 }; break :blk q.a; }"});
+    try expectBothReject(a, &.{"blk: { const Q = struct { a: u8 }; const q = Q{ .a = 300 }; break :blk q.a; }"});
+}
+
 test "compliance: for loops (range and array)" {
     const a = testing.allocator;
     try expectMatchesZig(a, &.{"blk: { var s: u32 = 0; for (0..4) |i| { s += @intCast(i); } break :blk s; }"});
