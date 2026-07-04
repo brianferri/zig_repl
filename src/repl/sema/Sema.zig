@@ -495,7 +495,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .switch_block_err_union,
         => sema.evalSwitchBlock(inst),
         .param, .param_comptime => sema.evalParam(inst, tag),
-        .param_anytype, .param_anytype_comptime => return sema.failAnytypeParam(),
+        .param_anytype, .param_anytype_comptime => sema.evalParamAnytype(tag),
         .func, .func_inferred, .func_fancy => sema.evalFunc(inst),
         .typeof => sema.evalTypeof(inst),
         .typeof_builtin => sema.evalTypeofBuiltin(inst),
@@ -4247,9 +4247,16 @@ fn resolveParamType(sema: *Sema, param_inst: Zir.Inst.Index) Error!InternPool.In
     return (try sema.resolveInlineBody(body, param_inst)).index;
 }
 
-fn failAnytypeParam(sema: *Sema) Error {
-    try sema.writer.writeAll("anytype parameters not yet supported\n");
-    return error.AnalysisFail;
+/// `.param_anytype` / `.param_anytype_comptime`: an `anytype` parameter has no
+/// declared type -- its type is the argument's, bound per call. Store the poison
+/// marker like a generic param; `evalCall` resolves it to the argument's own
+/// type at the call site. Mirrors `src/Sema.zig:zirParamAnytype`.
+fn evalParamAnytype(sema: *Sema, tag: Zir.Inst.Tag) Error!?Value {
+    try sema.block.params.append(sema.gpa, .{
+        .ty = .generic_poison_type,
+        .is_comptime = tag == .param_anytype_comptime,
+    });
+    return null;
 }
 
 /// `ret_type`: the declared return type of the function whose body is being
@@ -4428,16 +4435,19 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
         sema.results.deinit(sema.gpa);
         sema.results = saved_results;
     }
-    // Bind params in declaration order, coercing each argument to its
-    // parameter type. A generic param stored the poison marker at definition;
-    // its type body references earlier comptime params, which are already bound
-    // here, so re-resolve the concrete type for this instantiation first.
+    // Bind params in declaration order, coercing each argument to its parameter
+    // type. A poison marker means the type was unknown at definition: a generic
+    // param re-resolves its type body against the now-bound comptime params; an
+    // `anytype` param (no type body) takes the argument's own type.
+    const param_tags = sema.zir.instructions.items(.tag);
     for (param_insts, raw_args, 0..) |p_inst, raw, i| {
         const declared = func_ty.param_types[i];
-        const param_ty = if (declared == .generic_poison_type)
-            try sema.resolveParamType(p_inst)
-        else
-            declared;
+        const param_ty = if (declared != .generic_poison_type)
+            declared
+        else switch (param_tags[@intFromEnum(p_inst)]) {
+            .param_anytype, .param_anytype_comptime => raw.typeOf(sema.intern_pool).toIndex(),
+            else => try sema.resolveParamType(p_inst),
+        };
         var val = try sema.coerceValueToType(raw, param_ty, "call arg");
         val.is_comptime = func_ty.paramIsComptime(@intCast(i));
         try sema.results.put(sema.gpa, p_inst, val);

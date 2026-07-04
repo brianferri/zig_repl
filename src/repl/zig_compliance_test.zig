@@ -987,6 +987,32 @@ test "compliance: generic and concrete parameters mix in one signature" {
     try expectMatchesZig(a, &.{ "fn f(comptime T: type, x: T, y: u8) T { return x + y; }", "f(u16, 40, 2)" });
 }
 
+test "compliance: an anytype parameter takes the argument's type per call" {
+    const a = testing.allocator;
+    const dbl = "fn dbl(x: anytype) @TypeOf(x) { return x + x; }";
+    try expectMatchesZig(a, &.{ dbl, "dbl(21)" }); // comptime_int
+    try expectMatchesZig(a, &.{ dbl, "dbl(@as(u8, 100))" }); // u8, no overflow
+    try expectMatchesZig(a, &.{ dbl, "@TypeOf(dbl(@as(u16, 3)))" }); // instantiated type
+    try expectMatchesZig(a, &.{ "fn add(x: anytype, y: anytype) @TypeOf(x) { return x + y; }", "add(@as(u8, 40), @as(u8, 2))" });
+}
+
+test "compliance: an anytype generic dispatches over the argument type (math.order-style)" {
+    // Models std.math.order: one anytype comparison generic, instantiated over
+    // comptime_int and float arguments.
+    const a = testing.allocator;
+    const cmp = "fn cmp(a: anytype, b: anytype) i8 { return if (a < b) -1 else if (a > b) 1 else 0; }";
+    try expectMatchesZig(a, &.{ cmp, "cmp(3, 7)" });
+    try expectMatchesZig(a, &.{ cmp, "cmp(9, 4)" });
+    try expectMatchesZig(a, &.{ cmp, "cmp(5, 5)" });
+    try expectMatchesZig(a, &.{ cmp, "cmp(@as(f64, 1.5), @as(f64, 2.5))" });
+}
+
+test "compliance: anytype params over comptime, fixed-width, and multi-statement bodies" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{ "fn tw(comptime x: anytype) @TypeOf(x) { return x + x; }", "tw(21)" });
+    try expectMatchesZig(a, &.{ "fn sq(x: anytype) @TypeOf(x) { const y = x * x; return y; }", "sq(@as(u8, 9))" });
+}
+
 test "compliance: the % operator" {
     const a = testing.allocator;
     try expectMatchesZig(a, &.{"17 % 8"}); // comptime_int
