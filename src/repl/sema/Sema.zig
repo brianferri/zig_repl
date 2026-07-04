@@ -3591,8 +3591,21 @@ fn wellKnownRefToValue(ref: Zir.Inst.Ref) ?Value {
 /// names are in scope before AstGen runs, so a missing name would
 /// be a structural bug in wrap-injection itself.
 fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    const found = try sema.lookupDecl(inst, "decl_val");
-    return .{ .index = found.resolved.value };
+    // `lookupIdentifier` walks the namespace chain innermost-first: a struct
+    // member's body resolves a bare sibling name (`fn total() { return sum2(); }`)
+    // against the enclosing struct before the outer (file / session) scope, so an
+    // inner decl shadows a same-named outer one. Mirror that order: `this_type`
+    // (the enclosing container, set around member evaluation) first, session next.
+    if (sema.this_type != .none) {
+        const name = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir);
+        if (try sema.structDeclByName(sema.this_type, name)) |val| return val;
+    }
+    if (try sema.lookupDecl(inst, "decl_val")) |found| {
+        return .{ .index = found.resolved.value };
+    }
+    const name = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir);
+    try sema.writer.print("decl_val '{s}': not found in scope\n", .{name});
+    return error.AnalysisFail;
 }
 
 /// `decl_ref name`: AstGen emits this (rather than `decl_val`) when the use
@@ -3601,7 +3614,11 @@ fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// `align(N)`), so `@TypeOf(&x)` matches the compiler. Compiler reference:
 /// src/Sema.zig:zirDeclRef.
 fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    const found = try sema.lookupDecl(inst, "decl_ref");
+    const found = (try sema.lookupDecl(inst, "decl_ref")) orelse {
+        const name = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir);
+        try sema.writer.print("decl_ref '{s}': not found in scope\n", .{name});
+        return error.AnalysisFail;
+    };
     const ip = sema.intern_pool;
     const ptr_ty = try ip.internPtrType(.{
         .child = found.resolved.type,
@@ -3623,7 +3640,7 @@ const DeclLookup = struct {
     resolved: InternPool.Nav.Resolved,
 };
 
-fn lookupDecl(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error!DeclLookup {
+fn lookupDecl(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error!?DeclLookup {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const data = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok;
@@ -3654,8 +3671,9 @@ fn lookupDecl(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error!Decl
         return .{ .nav = nav_idx, .resolved = resolved };
     }
 
-    try sema.writer.print("{s} '{s}': not found in scope\n", .{ op_name, name_bytes });
-    return error.AnalysisFail;
+    // Not a session binding. The caller decides whether to fall back (e.g. to
+    // an enclosing struct's declarations) or to report it unresolved.
+    return null;
 }
 
 /// Walk `ns_idx`'s parent chain and return the first Nav.Index whose
@@ -4428,7 +4446,10 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     // `f` in the object: a struct-type object (`P.decl(x)`) calls the
     // declaration with no receiver; a struct-value object (`p.method(x)`) binds
     // the value as the method's first argument.
-    const callee_value: Value, const self_val: ?Value, const explicit_len: u32, const args_body: []const Zir.Inst.Index = switch (kind) {
+    // `enclosing_ty` is the struct whose declaration is being called, or `.none`
+    // for a direct call whose namespace is not named at the call site. It becomes
+    // `@This()` / the bare-sibling-name namespace for the callee's body.
+    const callee_value: Value, const self_val: ?Value, const explicit_len: u32, const args_body: []const Zir.Inst.Index, const enclosing_ty: InternPool.Index = switch (kind) {
         .direct => blk: {
             const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
             const extra = sema.zir.extraData(Zir.Inst.Call, pl_node.payload_index);
@@ -4437,6 +4458,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
                 null,
                 extra.data.flags.args_len,
                 @ptrCast(sema.zir.extra[extra.end..]),
+                .none,
             };
         },
         .field => blk: {
@@ -4451,7 +4473,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
                     try sema.writer.print("field_call: struct has no declaration '{s}'\n", .{name});
                     return error.AnalysisFail;
                 };
-                break :blk .{ callee, null, extra.data.flags.args_len, args_slice };
+                break :blk .{ callee, null, extra.data.flags.args_len, args_slice, object.index };
             }
             // `p.method(x)`: the object is a struct value -> bind it as the receiver.
             const struct_ty = object.typeOf(sema.intern_pool).toIndex();
@@ -4463,7 +4485,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
                 try sema.writer.print("field_call: struct has no method '{s}'\n", .{name});
                 return error.AnalysisFail;
             };
-            break :blk .{ callee, object, extra.data.flags.args_len, args_slice };
+            break :blk .{ callee, object, extra.data.flags.args_len, args_slice, struct_ty };
         },
     };
 
@@ -4485,6 +4507,14 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     }
     const raw_args = try sema.evalCallArgs(inst, self_val, explicit_len, args_body);
     defer sema.gpa.free(raw_args);
+
+    // The callee's body sees its container as `@This()` and resolves bare
+    // sibling-declaration names (`fn total() { return sum2(...); }`) against it.
+    // Args above were evaluated in the caller's scope, so this is set only now.
+    // `.none` for a direct call whose namespace the call site does not name.
+    const saved_this = sema.this_type;
+    sema.this_type = enclosing_ty;
+    defer sema.this_type = saved_this;
 
     // Swap sema.zir to the func's source-ZIR snapshot when the
     // call crosses a REPL line boundary. The common same-line

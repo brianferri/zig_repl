@@ -1100,6 +1100,19 @@ test "compliance: methods compose -- call each other and take struct args" {
     try expectMatchesZig(a, &.{"blk: { " ++ Vec ++ " const p: Vec = .{ .x = 2, .y = 3 }; const q: Vec = .{ .x = 4, .y = 5 }; break :blk p.dot(q); }"});
 }
 
+test "compliance: a body resolves a bare sibling declaration in its container" {
+    // A member body naming a sibling by bare identifier (no `Self.`/`self.`)
+    // resolves it in the enclosing container, matching the compiler's
+    // innermost-first `lookupIdentifier` over the namespace chain.
+    const a = testing.allocator;
+    // Method body -> sibling static decl.
+    const S = "const S = struct { a: u8, b: u8, fn sum2(x: u8, y: u8) u8 { return x + y; } fn total(self: @This()) u8 { return sum2(self.a, self.b); } };";
+    try expectMatchesZig(a, &.{"blk: { " ++ S ++ " const s: S = .{ .a = 20, .b = 22 }; break :blk s.total(); }"});
+    // Static decl body -> sibling static decl.
+    const P = "const P = struct { fn a() u8 { return 7; } fn b() u8 { return a() + 1; } };";
+    try expectMatchesZig(a, &.{"blk: { " ++ P ++ " break :blk P.b(); }"});
+}
+
 test "compliance: declaration and field access do not cross" {
     // A declaration is reachable through the type, a field through a value --
     // never the other way (mirrors the compiler's fieldVal split).
