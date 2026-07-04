@@ -2995,6 +2995,37 @@ fn evalStructDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     }) };
 }
 
+/// A saved `(zir, current_zir_id)` pair, put back by `restore`. The compiler
+/// keeps one persistent `Zir` per file and never swaps; the REPL retains each
+/// line's ZIR separately, so a struct or function defined on an earlier line is
+/// inspected by temporarily viewing its source ZIR, then restoring the caller's.
+const ZirFrame = struct {
+    zir: Zir,
+    id: u32,
+
+    fn restore(frame: ZirFrame, sema: *Sema) void {
+        sema.zir = frame.zir;
+        sema.current_zir_id = frame.id;
+    }
+};
+
+/// View the ZIR of the line that defined `source_zir_id` (a no-op when it is the
+/// current line), returning the previous frame; the caller `defer`s `.restore`.
+/// `ctx` names the operation for the diagnostic when that line's ZIR is no longer
+/// retained -- a REPL-only failure, since the compiler never discards a file's ZIR.
+fn enterSourceZir(sema: *Sema, source_zir_id: u32, ctx: []const u8) Error!ZirFrame {
+    const frame: ZirFrame = .{ .zir = sema.zir, .id = sema.current_zir_id };
+    if (source_zir_id != sema.current_zir_id) {
+        if (source_zir_id >= sema.line_zir.len) {
+            try sema.writer.print("{s}: defining ZIR is no longer available\n", .{ctx});
+            return error.AnalysisFail;
+        }
+        sema.zir = sema.line_zir[source_zir_id];
+        sema.current_zir_id = source_zir_id;
+    }
+    return frame;
+}
+
 /// Resolve a struct field by name to its index and type. Iterates the struct
 /// decl's fields via the stdlib `iterateFields`, matching name bytes; the field
 /// type is its type body evaluated in the struct's source ZIR (swapped in for a
@@ -3008,20 +3039,8 @@ fn structFieldByName(
     name: []const u8,
 ) Error!?struct { index: u32, ty: InternPool.Index } {
     const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
-    const saved_zir = sema.zir;
-    const saved_id = sema.current_zir_id;
-    if (st.source_zir_id != sema.current_zir_id) {
-        if (st.source_zir_id >= sema.line_zir.len) {
-            try sema.writer.writeAll("struct field: defining ZIR is no longer available\n");
-            return error.AnalysisFail;
-        }
-        sema.zir = sema.line_zir[st.source_zir_id];
-        sema.current_zir_id = st.source_zir_id;
-    }
-    defer {
-        sema.zir = saved_zir;
-        sema.current_zir_id = saved_id;
-    }
+    const frame = try sema.enterSourceZir(st.source_zir_id, "struct field");
+    defer frame.restore(sema);
     var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
     while (it.next()) |field| {
         if (std.mem.eql(u8, sema.zir.nullTerminatedString(field.name), name)) {
@@ -3079,20 +3098,8 @@ fn evalStructInitFieldPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// members (`comptime` blocks, tests) are skipped.
 fn structDeclByName(sema: *Sema, struct_ty: InternPool.Index, name: []const u8) Error!?Value {
     const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
-    const saved_zir = sema.zir;
-    const saved_id = sema.current_zir_id;
-    if (st.source_zir_id != sema.current_zir_id) {
-        if (st.source_zir_id >= sema.line_zir.len) {
-            try sema.writer.writeAll("struct decl: defining ZIR is no longer available\n");
-            return error.AnalysisFail;
-        }
-        sema.zir = sema.line_zir[st.source_zir_id];
-        sema.current_zir_id = st.source_zir_id;
-    }
-    defer {
-        sema.zir = saved_zir;
-        sema.current_zir_id = saved_id;
-    }
+    const frame = try sema.enterSourceZir(st.source_zir_id, "struct decl");
+    defer frame.restore(sema);
     for (sema.zir.typeDecls(st.decl_inst)) |decl_inst| {
         const unwrapped = sema.zir.getDeclaration(decl_inst);
         if (unwrapped.name == .empty) continue;
@@ -3204,20 +3211,8 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     }
 
     const st = ip.indexToKey(struct_ty).struct_type;
-    const saved_zir = sema.zir;
-    const saved_id = sema.current_zir_id;
-    if (st.source_zir_id != sema.current_zir_id) {
-        if (st.source_zir_id >= sema.line_zir.len) {
-            try sema.writer.writeAll("struct init: defining ZIR is no longer available\n");
-            return error.AnalysisFail;
-        }
-        sema.zir = sema.line_zir[st.source_zir_id];
-        sema.current_zir_id = st.source_zir_id;
-    }
-    defer {
-        sema.zir = saved_zir;
-        sema.current_zir_id = saved_id;
-    }
+    const frame = try sema.enterSourceZir(st.source_zir_id, "struct init");
+    defer frame.restore(sema);
     var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
     while (it.next()) |field| {
         const name = sema.zir.nullTerminatedString(field.name);
@@ -3344,20 +3339,8 @@ fn evalStructInitEmpty(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 fn finishStructInit(sema: *Sema, struct_ty: InternPool.Index, elems: []InternPool.Index, comptime is_ref: bool) Error!Value {
     const ip = sema.intern_pool;
     const st = ip.indexToKey(struct_ty).struct_type;
-    const saved_zir = sema.zir;
-    const saved_id = sema.current_zir_id;
-    if (st.source_zir_id != sema.current_zir_id) {
-        if (st.source_zir_id >= sema.line_zir.len) {
-            try sema.writer.writeAll("struct init: defining ZIR is no longer available\n");
-            return error.AnalysisFail;
-        }
-        sema.zir = sema.line_zir[st.source_zir_id];
-        sema.current_zir_id = st.source_zir_id;
-    }
-    defer {
-        sema.zir = saved_zir;
-        sema.current_zir_id = saved_id;
-    }
+    const frame = try sema.enterSourceZir(st.source_zir_id, "struct init");
+    defer frame.restore(sema);
     var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
     while (it.next()) |field| {
         if (elems[field.idx] != .none) continue;
