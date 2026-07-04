@@ -169,6 +169,38 @@ fn expectBothReject(gpa: std.mem.Allocator, inputs: []const []const u8) !void {
     }
 }
 
+/// Run `inputs` through the REPL, expect rejection, and assert the emitted
+/// diagnostic contains `needle`. Unlike `expectBothReject`, this pins the REPL's
+/// own wording so a message regression is caught. It is not compared to `zig`'s
+/// text (whose type names differ); `needle` is the compiler-aligned phrasing the
+/// message is expected to carry.
+fn expectReplDiagnostic(gpa: std.mem.Allocator, inputs: []const []const u8, needle: []const u8) !void {
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+
+    var diag: std.Io.Writer.Allocating = .init(gpa);
+    defer diag.deinit();
+
+    var rejected = false;
+    for (inputs) |source| {
+        _ = eval.run(&session, source, &diag.writer) catch |err| switch (err) {
+            error.ParseError, error.ZirError, error.AnalysisFail => {
+                rejected = true;
+                break;
+            },
+            else => return err,
+        };
+    }
+    try testing.expect(rejected);
+    if (std.mem.indexOf(u8, diag.written(), needle) == null) {
+        std.debug.print("diagnostic did not contain '{s}':\n{s}\n", .{ needle, diag.written() });
+        return error.TestDiagnosticMismatch;
+    }
+}
+
 const assert = std.debug.assert;
 
 test "compliance: comptime_int arithmetic" {
@@ -1219,6 +1251,42 @@ test "compliance: explicit enum tag types and values" {
     try expectBothReject(a, &.{"blk: { " ++ W ++ " const e: E = @enumFromInt(7); break :blk @intFromEnum(e); }"});
     // A field value that overflows the tag type is a compile error on both sides.
     try expectBothReject(a, &.{"blk: { const E = enum(u8) { a = 300 }; break :blk @intFromEnum(E.a); }"});
+}
+
+test "compliance: enum equality and switch" {
+    const a = testing.allocator;
+    const E = "const E = enum { a, b, c };";
+    // Equality compares tags; ordering is not defined for enums.
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const e = E.b; break :blk e == E.b; }"});
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const e = E.b; break :blk e != E.a; }"});
+    // Switch dispatches on the tag; a multi-tag prong and an else both work.
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const e = E.c; break :blk switch (e) { .a => 10, .b => 20, .c => 30 }; }"});
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const e = E.a; break :blk switch (e) { .a, .b => 1, .c => 2 }; }"});
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const e = E.c; break :blk switch (e) { .a => 100, else => 200 }; }"});
+    // Switch over an explicit-value enum matches by tag identity, not value.
+    try expectMatchesZig(a, &.{"blk: { const V = enum(u8) { lo = 5, hi = 10 }; break :blk switch (V.hi) { .lo => 100, .hi => 200 }; }"});
+    // A case naming a tag the enum lacks is rejected on both sides. The operand
+    // does not match the first prong, so the REPL reaches (and rejects) the bad
+    // one; the compiler rejects it as an invalid tag regardless.
+    try expectBothReject(a, &.{"blk: { " ++ E ++ " const e = E.c; break :blk switch (e) { .a => 1, .z => 2, else => 3 }; }"});
+}
+
+test "compliance: a member body takes the address of a sibling declaration" {
+    // `&k` inside a method body resolves `k` in the enclosing container, like a
+    // bare `k` does -- decl_ref and decl_val share the same lookup.
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"blk: { const S = struct { const k: u8 = 7; fn go() u8 { const p = &k; return p.*; } }; break :blk S.go(); }"});
+}
+
+test "compliance: diagnostics match the compiler's wording" {
+    // These conditions are compile errors on both sides; pin the REPL's message to
+    // the compiler's phrasing (not compared to zig's text, whose type names differ).
+    const a = testing.allocator;
+    try expectReplDiagnostic(a, &.{"blk: { const arr = [_]u8{ 1, 2, 3 }; break :blk arr[5]; }"}, "index 5 outside array of length 3");
+    try expectReplDiagnostic(a, &.{"@as(u8, 7) / @as(u8, 0)"}, "division by zero here causes illegal behavior");
+    try expectReplDiagnostic(a, &.{"blk: { break :blk @as(i32, -7) % @as(i32, 3); }"}, "signed integers and floats must use @rem or @mod");
+    try expectReplDiagnostic(a, &.{"blk: { const S = struct { fn f(x: u32) u8 { return x; } }; break :blk S.f(5); }"}, "expected type 'u8', found 'u32'");
+    try expectReplDiagnostic(a, &.{"blk: { const S = struct { fn f(x: u8) u8 { return x; } }; break :blk S.f(1, 2); }"}, "expected 1 argument(s), found 2");
 }
 
 test "compliance: nested struct types capture an enclosing local (closure_get)" {

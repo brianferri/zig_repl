@@ -939,7 +939,11 @@ fn evalBinaryArithInt(
                 var rem_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
                 const rem_nonzero = !ip.indexToKey(rem_idx).int.storage.toBigInt(&rem_space).eqlZero();
                 if (rem_nonzero) {
-                    try sema.writer.writeAll("%: use @rem or @mod for negative operands\n");
+                    try sema.writer.writeAll("remainder division with '");
+                    try Type.print(.fromIndex(lhs_int.ty), ip, sema.writer);
+                    try sema.writer.writeAll("' and '");
+                    try Type.print(.fromIndex(rhs_int.ty), ip, sema.writer);
+                    try sema.writer.writeAll("': signed integers and floats must use @rem or @mod\n");
                     return error.AnalysisFail;
                 }
             }
@@ -1108,7 +1112,7 @@ fn computeFloatBin(
         else => {},
     }
     if (rhs == 0) {
-        try sema.writer.print("error: {s}: division by zero\n", .{floatDivOpName(tag)});
+        try sema.writer.writeAll("division by zero here causes illegal behavior\n");
         return error.AnalysisFail;
     }
     return switch (tag) {
@@ -1130,7 +1134,13 @@ fn computeFloatBin(
         .mod_rem => blk: {
             const r = @rem(lhs, rhs);
             if ((lhs < 0 or rhs < 0) and r != 0) {
-                try sema.writer.writeAll("%: use @rem or @mod for negative operands\n");
+                // `@typeName(FloatT)` is the concrete float type (exact for a
+                // fixed-width float; a comptime_float operand widened to f128 here
+                // reads as f128 rather than comptime_float).
+                try sema.writer.print(
+                    "remainder division with '{s}' and '{s}': signed integers and floats must use @rem or @mod\n",
+                    .{ @typeName(FloatT), @typeName(FloatT) },
+                );
                 return error.AnalysisFail;
             }
             break :blk r;
@@ -1139,17 +1149,6 @@ fn computeFloatBin(
     };
 }
 
-fn floatDivOpName(tag: Zir.Inst.Tag) []const u8 {
-    return switch (tag) {
-        .div => "/",
-        .div_trunc => "@divTrunc",
-        .div_floor => "@divFloor",
-        .div_exact => "@divExact",
-        .mod => "@mod",
-        .rem => "@rem",
-        else => unreachable,
-    };
-}
 
 /// Translate an arith.DivError into either a successful Index or a written
 /// runtime-style diagnostic + AnalysisFail.
@@ -1163,7 +1162,7 @@ fn unwrapDivResult(
     const idx = result catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DivisionByZero => {
-            try sema.writer.print("error: {s}: division by zero\n", .{op_name});
+            try sema.writer.writeAll("division by zero here causes illegal behavior\n");
             return error.AnalysisFail;
         },
         error.DivisionNotExact => {
@@ -1992,6 +1991,25 @@ fn evalComparison(
     const lhs_key = ip.indexToKey(lhs_value.index);
     const rhs_key = ip.indexToKey(rhs_value.index);
 
+    // Enum tags compare by identity: interning is canonical, so equal tags share
+    // an Index. Only `==`/`!=` are defined for enums (ordering is a type error,
+    // which AstGen rejects before here). Mirrors cmpScalar's enum path.
+    if (lhs_key == .enum_tag and rhs_key == .enum_tag) {
+        if (lhs_key.enum_tag.ty != rhs_key.enum_tag.ty) {
+            try sema.writer.print("{s}: enum operands have different types\n", .{op_name});
+            return error.AnalysisFail;
+        }
+        const equal = lhs_value.index == rhs_value.index;
+        return switch (op) {
+            .eq => .{ .index = if (equal) .bool_true else .bool_false },
+            .neq => .{ .index = if (equal) .bool_false else .bool_true },
+            else => {
+                try sema.writer.print("{s}: operator not allowed for enum operands\n", .{op_name});
+                return error.AnalysisFail;
+            },
+        };
+    }
+
     // Comparison doesn't need to re-fit, so it only cares that peer
     // resolution found a common int type -- the bignum values compare
     // exactly across signedness and width.
@@ -2653,11 +2671,11 @@ fn coerceToFixedWidthInt(sema: *Sema, value: Value, dest_ty: InternPool.Index, o
         const value_type = Value.typeOf(value, ip);
         if (intTypeInfo(ip, value_type.index)) |src| {
             if (!intCoercible(src, dst)) {
-                try sema.writer.print("{s}: expected ", .{op_name});
+                try sema.writer.writeAll("expected type '");
                 try Type.print(.fromIndex(dest_ty), ip, sema.writer);
-                try sema.writer.writeAll(", found ");
+                try sema.writer.writeAll("', found '");
                 try Type.print(.fromIndex(value_type.index), ip, sema.writer);
-                try sema.writer.writeByte('\n');
+                try sema.writer.writeAll("'\n");
                 return error.AnalysisFail;
             }
         }
@@ -3730,7 +3748,7 @@ fn aggregateElement(sema: *Sema, array_value: Value, index_ref: Zir.Inst.Ref) Er
     const index = try sema.resolveArrayLen(index_ref, "elem access");
     const count = ip.aggregateElementCount(agg_key.aggregate.ty);
     if (index >= count) {
-        try sema.writer.print("index out of bounds: index {d}, len {d}\n", .{ index, count });
+        try sema.writer.print("index {d} outside array of length {d}\n", .{ index, count });
         return error.AnalysisFail;
     }
     return .{ .index = InternPool.aggregateElementAt(agg_key.aggregate, index) };
@@ -4042,6 +4060,15 @@ fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// `align(N)`), so `@TypeOf(&x)` matches the compiler. Compiler reference:
 /// src/Sema.zig:zirDeclRef.
 fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    // Same innermost-first resolution as `evalDeclVal`: a bare sibling name binds
+    // in the enclosing container before the session scope (`zirDeclRef` and
+    // `zirDeclVal` share one `lookupIdentifier`). A sibling decl has no Nav, so a
+    // pointer to it materialises a const slot holding its comptime value -- the
+    // comptime analog of the compiler's `analyzeNavRef` decl pointer.
+    if (sema.this_type != .none) {
+        const name = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir);
+        if (try sema.structDeclByName(sema.this_type, name)) |val| return try sema.materializeConstPtr(val);
+    }
     const found = (try sema.lookupDecl(inst, "decl_ref")) orelse {
         const name = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir);
         try sema.writer.print("decl_ref '{s}': not found in scope\n", .{name});
@@ -4655,7 +4682,23 @@ fn matchSwitchItems(
                     if (std.mem.eql(u8, op_bytes, item_bytes)) hit = true;
                 }
             },
-            .enum_literal => return sema.failSwitch("enum_literal switch items"),
+            // A `.tag` prong on an enum switch. The compiler resolves each item via
+            // `analyzeDeclLiteral` against the operand type (`resolveSwitchItem`);
+            // `enumTagByName` is that same tag lookup. Compare by identity -- interned
+            // tags are canonical. Like the other item kinds, an item in a prong the
+            // operand never reaches is not evaluated (the evaluator returns on the
+            // first matching prong), so a bad tag there is not caught, unlike the
+            // compiler's whole-switch validation.
+            .enum_literal => |name_idx| {
+                if (hit) continue;
+                if (sema.intern_pool.indexToKey(op.ty) != .enum_type) {
+                    return sema.failSwitch("enum-literal case on a non-enum operand");
+                }
+                const name = sema.zir.nullTerminatedString(name_idx);
+                const tag = (try sema.enumTagByName(op.ty, name)) orelse
+                    return sema.failBadMemberAccess(op.ty, name);
+                if (tag.index == op.value.index) hit = true;
+            },
         }
     }
     return hit;
@@ -4930,7 +4973,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     const args_len = explicit_len + @as(u32, @intFromBool(self_val != null));
     if (func_ty.param_types.len != args_len) {
         try sema.writer.print(
-            "call: expected {d} args, got {d}\n",
+            "expected {d} argument(s), found {d}\n",
             .{ func_ty.param_types.len, args_len },
         );
         return error.AnalysisFail;
