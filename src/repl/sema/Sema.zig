@@ -479,7 +479,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .alloc, .alloc_mut, .alloc_comptime_mut => sema.evalAlloc(inst),
         .make_ptr_const => sema.evalMakePtrConst(inst),
         .store_node => sema.evalStoreNode(inst),
-        .struct_init_field_ptr => sema.evalStructInitFieldPtr(inst),
+        .struct_init_field_ptr, .field_ptr => sema.evalFieldPtr(inst),
         .field_ptr_load => sema.evalFieldPtrLoad(inst),
         .opt_eu_base_ptr_init => sema.evalOptEuBasePtrInit(inst),
         .validate_ptr_struct_init => sema.evalValidatePtrStructInit(inst),
@@ -2504,6 +2504,13 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
     }
     switch (ptr_key.ptr.base_addr) {
         .nav => |nav| return .{ .index = ip.getNav(nav).resolved.?.value },
+        // A field pointer (`&l.a`, or the intermediate in `l.a.x`): load the
+        // aggregate behind the base pointer, then project the field. The base may
+        // itself be a nav, alloc, or another field pointer, so recurse.
+        .field => |f| {
+            const parent = try sema.loadValue(.{ .index = f.base });
+            return .{ .index = InternPool.aggregateElementAt(ip.indexToKey(parent.index).aggregate, @intCast(f.index)) };
+        },
         else => {
             const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr);
             return alloc.val;
@@ -3026,6 +3033,26 @@ fn enterSourceZir(sema: *Sema, source_zir_id: u32, ctx: []const u8) Error!ZirFra
     return frame;
 }
 
+/// The compiler's `failWithBadStructFieldAccess` diagnostic: a field lookup that
+/// misses names both the field and the struct. Shared by every field-access site
+/// (`field_ptr`, field loads, struct init) so the wording is one message keyed on
+/// the struct -- not a per-syntax context string. Mirrors src/Sema.zig.
+fn failBadStructFieldAccess(sema: *Sema, struct_ty: InternPool.Index, name: []const u8) Error {
+    const st_name = sema.intern_pool.stringSlice(sema.intern_pool.indexToKey(struct_ty).struct_type.name);
+    sema.writer.print("no field named '{s}' in struct '{s}'\n", .{ name, st_name }) catch |e| return e;
+    return error.AnalysisFail;
+}
+
+/// The compiler's `failWithBadMemberAccess` diagnostic: a namespace (declaration)
+/// lookup that misses names the container and the member. Used for `T.member` and
+/// the static `T.decl()` call. The REPL has only struct containers, so the kind is
+/// always "struct". Mirrors src/Sema.zig.
+fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: []const u8) Error {
+    const ct_name = sema.intern_pool.stringSlice(sema.intern_pool.indexToKey(container_ty).struct_type.name);
+    sema.writer.print("struct '{s}' has no member named '{s}'\n", .{ ct_name, name }) catch |e| return e;
+    return error.AnalysisFail;
+}
+
 /// Resolve a struct field by name to its index and type. Iterates the struct
 /// decl's fields via the stdlib `iterateFields`, matching name bytes; the field
 /// type is its type body evaluated in the struct's source ZIR (swapped in for a
@@ -3066,29 +3093,33 @@ fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
     return @intCast(zir.getStructDecl(st.decl_inst).field_names.len);
 }
 
-/// `struct_init_field_ptr`: `&object.field`, the pointer each field value is
-/// stored through during `.{ ... }` init. Resolves the field by name to its
-/// index and builds a `.field` pointer into the struct alloc. Mirrors
-/// zirStructInitFieldPtr -> fieldPtr -> structFieldPtrByIndex (the auto-layout
-/// `.field` representation).
-fn evalStructInitFieldPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+/// `field_ptr` (`&object.field`, and the intermediate in a chain like `l.a.x`)
+/// and `struct_init_field_ptr` (the pointer each field is stored through during
+/// `.{ ... }` init): both resolve the field by name and build the auto-layout
+/// `.field` projection into `object_ptr`. The compiler routes both through
+/// `fieldPtr`, differing only in an `initializing` flag that affects diagnostics,
+/// not the pointer. The field pointer inherits the parent pointer's constness.
+/// Mirrors zirFieldPtr / zirStructInitFieldPtr.
+fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const ip = sema.intern_pool;
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.Field, pl_node.payload_index).data;
     const name = sema.zir.nullTerminatedString(extra.field_name_start);
     const object_ptr = try sema.resolveRef(extra.lhs);
-    const struct_ty = sema.intern_pool.indexToKey(sema.intern_pool.indexToKey(object_ptr.index).ptr.ty).ptr_type.child;
-    const fld = (try sema.structFieldByName(struct_ty, name)) orelse {
-        try sema.writer.print("struct init: no field named '{s}'\n", .{name});
-        return error.AnalysisFail;
-    };
-    const field_ptr_ty = try sema.intern_pool.internPtrType(.{ .child = fld.ty, .flags = .{ .size = .one } });
-    const field_ptr = try sema.intern_pool.internPtr(.{
+    const parent_ty = ip.indexToKey(object_ptr.index).ptr.ty;
+    const struct_ty = ip.indexToKey(parent_ty).ptr_type.child;
+    const fld = (try sema.structFieldByName(struct_ty, name)) orelse
+        return sema.failBadStructFieldAccess(struct_ty, name);
+    const field_ptr_ty = try ip.internPtrType(.{
+        .child = fld.ty,
+        .flags = .{ .size = .one, .is_const = ip.indexToKey(parent_ty).ptr_type.flags.is_const },
+    });
+    return .{ .index = try ip.internPtr(.{
         .ty = field_ptr_ty,
         .base_addr = .{ .field = .{ .base = object_ptr.index, .index = fld.index } },
         .byte_offset = 0,
-    });
-    return .{ .index = field_ptr };
+    }) };
 }
 
 /// Look up a member declaration by name in a struct type's namespace (`P.id`)
@@ -3134,16 +3165,13 @@ fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // tuple guard). We look decls up from the struct's ZIR rather than a
     // persistent Namespace (no Zcu), the same way field access derives fields.
     if (ip.indexToKey(object.index) == .struct_type) {
-        return (try sema.structDeclByName(object.index, name)) orelse {
-            try sema.writer.print("field access: struct has no declaration '{s}'\n", .{name});
-            return error.AnalysisFail;
-        };
+        if (try sema.structDeclByName(object.index, name)) |v| return v;
+        return sema.failBadMemberAccess(object.index, name);
     }
 
-    const fld = (try sema.structFieldByName(object.typeOf(ip).toIndex(), name)) orelse {
-        try sema.writer.print("field access: no field named '{s}'\n", .{name});
-        return error.AnalysisFail;
-    };
+    const struct_ty = object.typeOf(ip).toIndex();
+    const fld = (try sema.structFieldByName(struct_ty, name)) orelse
+        return sema.failBadStructFieldAccess(struct_ty, name);
     const agg = ip.indexToKey(object.index).aggregate;
     return .{ .index = InternPool.aggregateElementAt(agg, fld.index) };
 }
@@ -3261,10 +3289,8 @@ fn evalStructInitFieldType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return error.AnalysisFail;
     }
     const name = sema.zir.nullTerminatedString(ft.name_start);
-    const field = (try sema.structFieldByName(container_ty, name)) orelse {
-        try sema.writer.print("struct init: no field named '{s}'\n", .{name});
-        return error.AnalysisFail;
-    };
+    const field = (try sema.structFieldByName(container_ty, name)) orelse
+        return sema.failBadStructFieldAccess(container_ty, name);
     return .{ .index = field.ty };
 }
 
@@ -3303,10 +3329,8 @@ fn evalStructInit(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Erro
         extra_index = item.end;
         const ft = sema.zir.extraData(Zir.Inst.FieldType, datas[@intFromEnum(item.data.field_type)].pl_node.payload_index).data;
         const name = sema.zir.nullTerminatedString(ft.name_start);
-        const field = (try sema.structFieldByName(struct_ty, name)) orelse {
-            try sema.writer.print("struct init: no field named '{s}'\n", .{name});
-            return error.AnalysisFail;
-        };
+        const field = (try sema.structFieldByName(struct_ty, name)) orelse
+            return sema.failBadStructFieldAccess(struct_ty, name);
         const raw = try sema.resolveRef(item.data.init);
         elems[field.index] = (try sema.coerceValueToType(raw, field.ty, "struct field")).index;
     }
@@ -4591,10 +4615,8 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
             const args_slice: []const Zir.Inst.Index = @ptrCast(sema.zir.extra[extra.end..]);
             // `P.decl(x)`: the object is the struct type -> static call, no receiver.
             if (sema.intern_pool.indexToKey(object.index) == .struct_type) {
-                const callee = (try sema.structDeclByName(object.index, name)) orelse {
-                    try sema.writer.print("field_call: struct has no declaration '{s}'\n", .{name});
-                    return error.AnalysisFail;
-                };
+                const callee = (try sema.structDeclByName(object.index, name)) orelse
+                    return sema.failBadMemberAccess(object.index, name);
                 break :blk .{ callee, null, extra.data.flags.args_len, args_slice, object.index };
             }
             // `p.method(x)`: the object is a struct value -> bind it as the receiver.
@@ -4604,7 +4626,11 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
                 return error.AnalysisFail;
             }
             const callee = (try sema.structDeclByName(struct_ty, name)) orelse {
-                try sema.writer.print("field_call: struct has no method '{s}'\n", .{name});
+                // UFCS `p.method()` miss: the compiler reports it against both a
+                // field and a member function (`callMethod`), distinct from a
+                // pure namespace member access.
+                const st_name = sema.intern_pool.stringSlice(sema.intern_pool.indexToKey(struct_ty).struct_type.name);
+                try sema.writer.print("no field or member function named '{s}' in '{s}'\n", .{ name, st_name });
                 return error.AnalysisFail;
             };
             break :blk .{ callee, object, extra.data.flags.args_len, args_slice, struct_ty };

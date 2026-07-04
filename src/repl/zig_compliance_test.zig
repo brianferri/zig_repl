@@ -1151,6 +1151,28 @@ test "compliance: explicit-type struct init (T{ ... })" {
     try expectBothReject(a, &.{"blk: { const Q = struct { a: u8 }; const q = Q{ .a = 300 }; break :blk q.a; }"});
 }
 
+test "compliance: field pointers (&x.field and chained access)" {
+    // `field_ptr` builds a pointer to a struct field: taking its address, reading
+    // and writing through it, and the intermediate step of a chained access.
+    const a = testing.allocator;
+    // Address of a field, read back through the pointer.
+    try expectMatchesZig(a, &.{"blk: { const P = struct { x: u8, y: u8 }; var p: P = .{ .x = 7, .y = 8 }; const px = &p.x; break :blk px.*; }"});
+    // Write through the field pointer, observe it on the parent.
+    try expectMatchesZig(a, &.{"blk: { const P = struct { x: u8, y: u8 }; var p: P = .{ .x = 7, .y = 8 }; const px = &p.x; px.* = 20; break :blk p.x; }"});
+    // Chained field access `l.a.x` -- a field_ptr to `l.a`, then read `.x`. The
+    // inner struct is a top-level decl so its type is not a captured local.
+    const P = "const P = struct { x: u8, y: u8 };";
+    const Line = "const Line = struct { a: P, b: P };";
+    const l = "const l = Line{ .a = P{ .x = 1, .y = 2 }, .b = P{ .x = 3, .y = 4 } };";
+    try expectMatchesZig(a, &.{ P, Line, l, "l.a.x + l.b.y" });
+    // A method on a nested struct value: field_ptr to `l.a`, then the method call.
+    const PM = "const P = struct { x: u8, y: u8, fn sum(self: @This()) u8 { return self.x + self.y; } };";
+    try expectMatchesZig(a, &.{ PM, Line, l, "l.a.sum() + l.b.sum()" });
+    // A field pointer inherits the parent's constness: writing through a field of
+    // a `const` is rejected on both sides.
+    try expectBothReject(a, &.{"blk: { const P = struct { x: u8 }; const p: P = .{ .x = 9 }; const px = &p.x; px.* = 1; break :blk p.x; }"});
+}
+
 test "compliance: for loops (range and array)" {
     const a = testing.allocator;
     try expectMatchesZig(a, &.{"blk: { var s: u32 = 0; for (0..4) |i| { s += @intCast(i); } break :blk s; }"});
