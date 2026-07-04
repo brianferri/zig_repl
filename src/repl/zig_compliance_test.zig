@@ -1173,6 +1173,21 @@ test "compliance: field pointers (&x.field and chained access)" {
     try expectBothReject(a, &.{"blk: { const P = struct { x: u8 }; const p: P = .{ .x = 9 }; const px = &p.x; px.* = 1; break :blk p.x; }"});
 }
 
+test "compliance: enum declarations, tag access, and @intFromEnum" {
+    // An auto-numbered enum: each tag's integer is its declaration order, read
+    // back through @intFromEnum. The tag type is the smallest unsigned int.
+    const a = testing.allocator;
+    const E = "const E = enum { a, b, c };";
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " break :blk @intFromEnum(E.a); }"});
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " break :blk @intFromEnum(E.c); }"});
+    // A tag bound to a name, then converted.
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const x = E.b; break :blk @intFromEnum(x); }"});
+    // A four-tag enum still fits u2; @intFromEnum yields the ordinal.
+    try expectMatchesZig(a, &.{"blk: { const Dir = enum { north, east, south, west }; break :blk @intFromEnum(Dir.west); }"});
+    // Referencing a tag the enum does not declare is a compile error on both sides.
+    try expectBothReject(a, &.{"blk: { const Q = enum { a, b }; break :blk @intFromEnum(Q.z); }"});
+}
+
 test "compliance: nested struct types capture an enclosing local (closure_get)" {
     // A struct whose field type names a local from the enclosing scope captures
     // that local (closure_capture); the field body reads it via closure_get.

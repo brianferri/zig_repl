@@ -44,6 +44,10 @@ pub fn render(
         .error_union => |eu| renderErrorUnion(eu, pool, writer),
         .func => |f| writer.print("fn@{d}\n", .{@intFromEnum(f.zir_body_inst)}),
         .aggregate => |agg| renderAggregate(agg, pool, writer),
+        // The tag name lives in the enum's ZIR, which the renderer cannot reach
+        // (same limit as struct field names). Render the underlying integer tag --
+        // what `@intFromEnum` yields -- until a ZIR-aware rendering path exists.
+        .enum_tag => |et| render(.{ .index = et.int }, pool, writer),
         // A bare type Key viewed as a value identifies the type itself
         // (Sema's value-of-type-type convention; see Value.typeOf). The
         // value Keys above are exhaustive, so the assert turns a future

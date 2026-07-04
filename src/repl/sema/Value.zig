@@ -53,6 +53,7 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
         .func => |f| .{ .index = f.ty },
         .opt => |o| .{ .index = o.ty },
         .aggregate => |agg| .{ .index = agg.ty },
+        .enum_tag => |et| .{ .index = et.ty },
         // Every remaining Key is a type used as a value, whose own type is
         // `type`. The value Keys above are exhaustive, so anything reaching
         // here is a type -- the assert turns a future unclassified value Key

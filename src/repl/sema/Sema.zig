@@ -476,6 +476,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .align_of => sema.evalAlignOf(inst),
         .size_of => sema.evalSizeOf(inst),
         .int_from_ptr => sema.evalIntFromPtr(inst),
+        .int_from_enum => sema.evalIntFromEnum(inst),
         .alloc, .alloc_mut, .alloc_comptime_mut => sema.evalAlloc(inst),
         .alloc_inferred, .alloc_inferred_comptime => sema.evalAllocInferred(true),
         .alloc_inferred_mut, .alloc_inferred_comptime_mut => sema.evalAllocInferred(false),
@@ -517,6 +518,9 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .call => sema.evalCall(inst, .direct),
         .field_call => sema.evalCall(inst, .field),
         .block_comptime => sema.evalBlockComptime(inst),
+        // Error-return-trace bookkeeping: no runtime trace exists at comptime, so
+        // save/restore are no-ops (the compiler also lowers them away comptime).
+        .save_err_ret_index,
         .restore_err_ret_index_unconditional,
         .restore_err_ret_index_fn_entry,
         => null,
@@ -3058,6 +3062,36 @@ fn evalStructDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     }) };
 }
 
+/// `enum_decl` (extended): a named enum type (`enum { a, b }`). Interns a nominal
+/// `enum_type` shell keyed on the declaration site, like `evalStructDecl`; field
+/// names, the integer tag type, and per-field values are resolved on demand from
+/// the decl's ZIR (`enumFieldByName`). Mirrors src/Sema.zig:zirEnumDecl ->
+/// getDeclaredEnumType (identity only, lazy field resolution).
+fn evalEnumDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const enum_decl = sema.zir.getEnumDecl(inst);
+    const name = switch (enum_decl.name_strategy) {
+        .parent => sema.type_name_ctx,
+        .anon, .func, .dbg_var => blk: {
+            const ctx = sema.intern_pool.stringSlice(sema.type_name_ctx);
+            const text = try std.fmt.allocPrint(sema.gpa, "{s}__enum_{d}", .{ ctx, @intFromEnum(inst) });
+            defer sema.gpa.free(text);
+            break :blk try sema.intern_pool.getOrPutString(sema.gpa, text);
+        },
+    };
+
+    const captures = try sema.resolveCaptures(enum_decl.captures);
+    defer sema.gpa.free(captures);
+
+    return .{ .index = try sema.intern_pool.internEnumType(.{
+        .source_zir_id = sema.current_zir_id,
+        .decl_inst = inst,
+        .name = name,
+        .captures = captures,
+    }) };
+}
+
 /// Resolve a struct decl's ZIR captures to their comptime values in the current
 /// scope. Mirrors `Sema.getCaptures`, reduced to the kinds a comptime evaluator
 /// produces: a captured local is an `.instruction` (its value) or an
@@ -3123,13 +3157,18 @@ fn failBadStructFieldAccess(sema: *Sema, struct_ty: InternPool.Index, name: []co
     return error.AnalysisFail;
 }
 
-/// The compiler's `failWithBadMemberAccess` diagnostic: a namespace (declaration)
-/// lookup that misses names the container and the member. Used for `T.member` and
-/// the static `T.decl()` call. The REPL has only struct containers, so the kind is
-/// always "struct". Mirrors src/Sema.zig.
+/// The compiler's `failWithBadMemberAccess` diagnostic: a namespace/tag lookup
+/// that misses names the container kind, the container, and the member. Used for
+/// `T.member`, the static `T.decl()` call, and a missing enum tag (`E.z`).
+/// Mirrors src/Sema.zig (kw_name + type name).
 fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: []const u8) Error {
-    const ct_name = sema.intern_pool.stringSlice(sema.intern_pool.indexToKey(container_ty).struct_type.name);
-    sema.writer.print("struct '{s}' has no member named '{s}'\n", .{ ct_name, name }) catch |e| return e;
+    const key = sema.intern_pool.indexToKey(container_ty);
+    const kw: []const u8, const ct_name: InternPool.NullTerminatedString = switch (key) {
+        .struct_type => |st| .{ "struct", st.name },
+        .enum_type => |et| .{ "enum", et.name },
+        else => unreachable, // only container types reach a member-access miss
+    };
+    sema.writer.print("{s} '{s}' has no member named '{s}'\n", .{ kw, sema.intern_pool.stringSlice(ct_name), name }) catch |e| return e;
     return error.AnalysisFail;
 }
 
@@ -3161,6 +3200,51 @@ fn structFieldByName(
         }
     }
     return null;
+}
+
+/// The integer tag type of an auto-numbered enum with `field_count` fields: the
+/// smallest unsigned int that can hold `field_count - 1`, the compiler's default
+/// enum tag type. Explicit `enum(T) {...}` tag types are not yet read.
+fn enumIntTagType(sema: *Sema, field_count: u32) Error!InternPool.Index {
+    const bits: u16 = if (field_count <= 1) 0 else @intCast(64 - @clz(@as(u64, field_count - 1)));
+    return try sema.intern_pool.internIntType(.unsigned, bits);
+}
+
+/// Resolve enum field `name` to its `enum_tag` value: the field's declaration
+/// order as an integer of the enum's tag type. Iterates the enum decl's
+/// `field_names` in its source ZIR, like `structFieldByName`. Returns null if no
+/// field matches. Explicit field values and explicit tag types are not yet read.
+fn enumTagByName(sema: *Sema, enum_ty: InternPool.Index, name: []const u8) Error!?Value {
+    const ip = sema.intern_pool;
+    const et = ip.indexToKey(enum_ty).enum_type;
+    const frame = try sema.enterSourceZir(et.source_zir_id, "enum field");
+    defer frame.restore(sema);
+    const decl = sema.zir.getEnumDecl(et.decl_inst);
+    if (decl.field_value_body_lens != null or decl.tag_type_body != null) {
+        try sema.writer.writeAll("enum: explicit values and tag types are not yet supported\n");
+        return error.AnalysisFail;
+    }
+    const tag_ty = try sema.enumIntTagType(@intCast(decl.field_names.len));
+    for (decl.field_names, 0..) |fname, idx| {
+        if (!std.mem.eql(u8, sema.zir.nullTerminatedString(fname), name)) continue;
+        const int = try ip.internInt(.{ .ty = tag_ty, .storage = .{ .u64 = idx } });
+        return .{ .index = try ip.internEnumTag(.{ .ty = enum_ty, .int = int }) };
+    }
+    return null;
+}
+
+/// `int_from_enum operand`: the integer tag of an enum value. Mirrors
+/// zirIntFromEnum's comptime arm -- returns the `enum_tag`'s stored int (already
+/// typed as the enum's integer tag type).
+fn evalIntFromEnum(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const operand = try sema.resolveRef(un_node.operand);
+    const key = sema.intern_pool.indexToKey(operand.index);
+    if (key != .enum_tag) {
+        try sema.writer.writeAll("@intFromEnum: operand is not an enum value\n");
+        return error.AnalysisFail;
+    }
+    return .{ .index = key.enum_tag.int };
 }
 
 /// A struct type's declared field count (read straight from its source ZIR's
@@ -3251,6 +3335,13 @@ fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // persistent Namespace (no Zcu), the same way field access derives fields.
     if (ip.indexToKey(object.index) == .struct_type) {
         if (try sema.structDeclByName(object.index, name)) |v| return v;
+        return sema.failBadMemberAccess(object.index, name);
+    }
+
+    // An enum *type* object (`E.b`): the name is one of its tags (the compiler's
+    // fieldVal `.type` -> `.@"enum"` arm -> the tag value).
+    if (ip.indexToKey(object.index) == .enum_type) {
+        if (try sema.enumTagByName(object.index, name)) |v| return v;
         return sema.failBadMemberAccess(object.index, name);
     }
 
@@ -5030,6 +5121,7 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .in_comptime => return Value.bool_false,
 
         .tuple_decl => return sema.evalTupleDecl(extended),
+        .enum_decl => return sema.evalEnumDecl(inst),
         .struct_decl => return sema.evalStructDecl(inst),
         .typeof_peer => return sema.evalTypeofPeer(extended, inst),
         .this => return sema.evalThis(),

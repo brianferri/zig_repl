@@ -599,6 +599,12 @@ pub const Key = union(enum) {
     /// `resolveStructFieldTypes`: field names/types are resolved on
     /// demand from the decl's ZIR, not stored here.
     struct_type: StructType,
+    /// A named enum type (`enum { a, b }`). Nominal, like `struct_type`:
+    /// identity is `(source_zir_id, decl_inst, captures)`. Field names, the
+    /// integer tag type, and per-field values are resolved on demand from the
+    /// decl's ZIR (`enumFieldByName`), not stored here. Mirrors the compiler's
+    /// `LoadedEnumType` shell before its fields are resolved.
+    enum_type: EnumType,
     /// An aggregate value (array, vector, struct -- the type
     /// determines which). Storage is either an N-element slice or a
     /// single-element repetition. Mirrors compiler `Key.Aggregate`
@@ -609,6 +615,9 @@ pub const Key = union(enum) {
     /// 0 bytes (`src/sema/InternPool.zig` ~`getOrPutString`), so we
     /// can't safely store an arbitrary `[]u8` array as a string yet.
     aggregate: Aggregate,
+    /// An enum tag value: an enum type plus the integer tag it holds (an `int`
+    /// value of the enum's integer tag type). Mirrors compiler `Key.EnumTag`.
+    enum_tag: EnumTag,
 
     pub const Int = struct {
         ty: Index,
@@ -761,6 +770,24 @@ pub const Key = union(enum) {
         /// (`Box(u8)` vs `Box(u16)`) capture different values and are distinct
         /// types, matching the compiler's `ContainerType.declared`.
         captures: []const Index = &.{},
+    };
+
+    /// A named enum type. Nominal like `StructType`: identity is the declaration
+    /// site plus captures; field names / tag type / values are resolved on demand
+    /// from the decl's ZIR, not stored. Mirrors `getDeclaredEnumType`'s shell.
+    pub const EnumType = struct {
+        source_zir_id: u32,
+        decl_inst: std.zig.Zir.Inst.Index,
+        name: NullTerminatedString,
+        captures: []const Index = &.{},
+    };
+
+    /// An enum tag value: the enum type and the integer tag it holds. `int` is an
+    /// `int` value whose type is the enum's integer tag type. Mirrors the
+    /// compiler's `Key.EnumTag` (`ty`, `int`).
+    pub const EnumTag = struct {
+        ty: Index,
+        int: Index,
     };
 
     /// An error value. `ty` is always an `error_set_type` Index --
@@ -1002,6 +1029,16 @@ pub const Key = union(enum) {
                 // and are distinct types, as `ContainerType.declared` hashes them.
                 for (st.captures) |c| std.hash.autoHash(&hasher, c);
             },
+            // Same nominal-plus-captures identity as `struct_type`.
+            .enum_type => |et| {
+                std.hash.autoHash(&hasher, et.source_zir_id);
+                std.hash.autoHash(&hasher, et.decl_inst);
+                for (et.captures) |c| std.hash.autoHash(&hasher, c);
+            },
+            .enum_tag => |et| {
+                std.hash.autoHash(&hasher, et.ty);
+                std.hash.autoHash(&hasher, et.int);
+            },
             .err => |e| {
                 std.hash.autoHash(&hasher, e.ty);
                 std.hash.autoHash(&hasher, e.name);
@@ -1138,6 +1175,15 @@ pub const Key = union(enum) {
                 break :blk x.source_zir_id == y.source_zir_id and x.decl_inst == y.decl_inst and
                     std.mem.eql(Index, x.captures, y.captures);
             },
+            .enum_type => |x| blk: {
+                const y = b.enum_type;
+                break :blk x.source_zir_id == y.source_zir_id and x.decl_inst == y.decl_inst and
+                    std.mem.eql(Index, x.captures, y.captures);
+            },
+            .enum_tag => |x| blk: {
+                const y = b.enum_tag;
+                break :blk x.ty == y.ty and x.int == y.int;
+            },
             .err => |x| blk: {
                 const y = b.err;
                 break :blk x.ty == y.ty and x.name == y.name;
@@ -1233,6 +1279,7 @@ pub const Key = union(enum) {
             .opt_type,
             .tuple_type,
             .struct_type,
+            .enum_type,
             => true,
             .simple_value,
             .int,
@@ -1244,6 +1291,7 @@ pub const Key = union(enum) {
             .opt,
             .func,
             .aggregate,
+            .enum_tag,
             => false,
         };
     }
@@ -1332,6 +1380,14 @@ const Item = struct {
         // separate tags (`Item.Tag.type_struct*`); we emit only the
         // declared flavor today.
         type_struct,
+        // Named enum type. data = extra index of EnumTypeRepr (3 u32 slots:
+        // source_zir_id, decl_inst, name) then trailing captures, laid out
+        // exactly like `type_struct`. Nominal identity; field names / tag type /
+        // values are resolved from the decl's ZIR on demand.
+        type_enum,
+        // Enum tag value. data = extra index of EnumTagRepr (2 u32 slots: ty,
+        // int). Mirrors the compiler's `Item.Tag.enum_tag`.
+        enum_tag,
         // Error value. data = extra index of ErrRepr (2 u32 slots:
         // ty, name). Mirrors the compiler's `Item.Tag.error_set_error`.
         error_set_error,
@@ -1547,6 +1603,21 @@ const StructTypeRepr = extern struct {
     source_zir_id: u32,
     decl_inst: u32,
     name: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.type_enum`. Same shape as `StructTypeRepr`
+/// (nominal identity + name), with captures trailing exactly as for structs.
+const EnumTypeRepr = extern struct {
+    source_zir_id: u32,
+    decl_inst: u32,
+    name: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.enum_tag`. Two u32 slots: the enum type and
+/// the integer tag value.
+const EnumTagRepr = extern struct {
+    ty: u32,
+    int: u32,
 };
 
 /// Extra-arena payload for `Item.Tag.ptr_comptime_alloc`. Four u32 slots: ty,
@@ -2187,6 +2258,8 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .error_set_type => |es| try emitErrorSetType(pool, es),
         .tuple_type => |tt| try emitTupleType(pool, tt),
         .struct_type => |st| try emitStructType(pool, st),
+        .enum_type => |et| try emitEnumType(pool, et),
+        .enum_tag => |et| try emitEnumTag(pool, et),
         .err => |e| try emitErr(pool, e),
         .error_union_type => |eu| try emitErrorUnionType(pool, eu),
         .error_union => |eu| try emitErrorUnion(pool, eu),
@@ -2272,6 +2345,8 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .type_error_set => errorSetTypeFromExtra(pool, item.data),
         .type_tuple => tupleTypeFromExtra(pool, item.data),
         .type_struct => structTypeFromExtra(pool, item.data),
+        .type_enum => enumTypeFromExtra(pool, item.data),
+        .enum_tag => enumTagFromExtra(pool, item.data),
         .error_set_error => errFromExtra(pool, item.data),
         .type_error_union => errorUnionTypeFromExtra(pool, item.data),
         .error_union_error => errorUnionErrFromExtra(pool, item.data),
@@ -2326,6 +2401,24 @@ fn structTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
         // Reinterpret the u32 slice as `[]const Index`, sharing the extra arena.
         .captures = @ptrCast(raw_captures),
     } };
+}
+
+fn enumTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const r = pool.extraData(EnumTypeRepr, extra_index);
+    const captures_at = extra_index + @sizeOf(EnumTypeRepr) / 4;
+    const captures_len = pool.extra.items[captures_at];
+    const raw_captures = pool.extra.items[captures_at + 1 ..][0..captures_len];
+    return .{ .enum_type = .{
+        .source_zir_id = r.source_zir_id,
+        .decl_inst = @enumFromInt(r.decl_inst),
+        .name = @enumFromInt(r.name),
+        .captures = @ptrCast(raw_captures),
+    } };
+}
+
+fn enumTagFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const r = pool.extraData(EnumTagRepr, extra_index);
+    return .{ .enum_tag = .{ .ty = @enumFromInt(r.ty), .int = @enumFromInt(r.int) } };
 }
 
 fn errorSetTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
@@ -2866,6 +2959,28 @@ fn emitStructType(pool: *InternPool, st: Key.StructType) Allocator.Error!void {
     pool.items.appendAssumeCapacity(.{ .tag = .type_struct, .data = extra_index });
 }
 
+/// Emit a `type_enum` Item. Same layout as `type_struct` (fixed repr + trailing
+/// captures).
+fn emitEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!void {
+    const extra_index = try pool.addExtra(EnumTypeRepr{
+        .source_zir_id = et.source_zir_id,
+        .decl_inst = @intFromEnum(et.decl_inst),
+        .name = @intFromEnum(et.name),
+    });
+    try pool.extra.append(pool.gpa, @intCast(et.captures.len));
+    try pool.extra.appendSlice(pool.gpa, @ptrCast(et.captures));
+    pool.items.appendAssumeCapacity(.{ .tag = .type_enum, .data = extra_index });
+}
+
+/// Emit an `enum_tag` Item. Two u32 slots: `ty`, `int`.
+fn emitEnumTag(pool: *InternPool, et: Key.EnumTag) Allocator.Error!void {
+    const extra_index = try pool.addExtra(EnumTagRepr{
+        .ty = @intFromEnum(et.ty),
+        .int = @intFromEnum(et.int),
+    });
+    pool.items.appendAssumeCapacity(.{ .tag = .enum_tag, .data = extra_index });
+}
+
 /// Emit an `err` Item. Two u32 slots: `ty`, `name`.
 fn emitErr(pool: *InternPool, e: Key.Error) Allocator.Error!void {
     assert(e.ty != .none);
@@ -3065,6 +3180,14 @@ pub fn internTupleType(pool: *InternPool, types: []const Index) Allocator.Error!
 
 pub fn internStructType(pool: *InternPool, st: Key.StructType) Allocator.Error!Index {
     return pool.get(.{ .struct_type = st });
+}
+
+pub fn internEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!Index {
+    return pool.get(.{ .enum_type = et });
+}
+
+pub fn internEnumTag(pool: *InternPool, et: Key.EnumTag) Allocator.Error!Index {
+    return pool.get(.{ .enum_tag = et });
 }
 
 /// Intern an error-set type from `names`. Sorts the names by their
