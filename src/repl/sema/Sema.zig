@@ -129,6 +129,11 @@ block: *Block = undefined,
 /// REPL has one enclosing declaration at a time, so `bindValueDecl`
 /// sets it around the value-body eval.
 type_name_ctx: InternPool.NullTerminatedString = .empty,
+/// The type `@This()` resolves to -- the struct whose member is being
+/// evaluated. `.none` outside a container member. Mirrors the compiler's
+/// `block.namespace.owner_type`; set around a struct member's evaluation
+/// (`structDeclByName`) since the flat REPL has one enclosing type at a time.
+this_type: InternPool.Index = .none,
 
 pub const default_branch_quota: u32 = 1000;
 
@@ -3088,6 +3093,11 @@ fn structDeclByName(sema: *Sema, struct_ty: InternPool.Index, name: []const u8) 
         if (unwrapped.name == .empty) continue;
         if (!std.mem.eql(u8, sema.zir.nullTerminatedString(unwrapped.name), name)) continue;
         const value_body = unwrapped.value_body orelse return null;
+        // Evaluate the member with this struct as `@This()` (e.g. a method's
+        // `self: @This()` parameter type resolves to it).
+        const saved_this = sema.this_type;
+        sema.this_type = struct_ty;
+        defer sema.this_type = saved_this;
         return try sema.resolveInlineBody(value_body, decl_inst);
     }
     return null;
@@ -4402,8 +4412,8 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///      callers of the same func get a clean slate.
 ///
 /// `.field_call` (`obj.f(x)`) resolves `f` in the object: a struct-type object
-/// (`P.decl(x)`) looks the declaration up in its namespace; a struct-value
-/// method call (which needs self-binding) is not yet supported.
+/// (`P.decl(x)`) calls the namespace declaration; a struct-value object
+/// (`p.method(x)`) binds the value as the method's first argument.
 fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, field }) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
@@ -4413,16 +4423,18 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     // `@setEvalBranchQuota` once that builtin lands.
     try sema.emitBackwardBranch();
 
-    // Resolve the callee and locate the argument bodies. A direct call reads
-    // the callee ref; a field call (`obj.f(...)`) resolves the name in the
-    // object. Only the struct-type namespace form (`P.decl(...)`) is handled;
-    // a method call on a struct value needs self-binding (not yet done).
-    const callee_value: Value, const args_len: u32, const args_body: []const Zir.Inst.Index = switch (kind) {
+    // Resolve the callee, an optional bound receiver, and the argument bodies.
+    // A direct call reads the callee ref. A field call (`obj.f(...)`) resolves
+    // `f` in the object: a struct-type object (`P.decl(x)`) calls the
+    // declaration with no receiver; a struct-value object (`p.method(x)`) binds
+    // the value as the method's first argument.
+    const callee_value: Value, const self_val: ?Value, const explicit_len: u32, const args_body: []const Zir.Inst.Index = switch (kind) {
         .direct => blk: {
             const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
             const extra = sema.zir.extraData(Zir.Inst.Call, pl_node.payload_index);
             break :blk .{
                 try sema.resolveRef(extra.data.callee),
+                null,
                 extra.data.flags.args_len,
                 @ptrCast(sema.zir.extra[extra.end..]),
             };
@@ -4432,15 +4444,26 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
             const extra = sema.zir.extraData(Zir.Inst.FieldCall, pl_node.payload_index);
             const name = sema.zir.nullTerminatedString(extra.data.field_name_start);
             const object = try sema.loadValue(try sema.resolveRef(extra.data.obj_ptr));
-            if (sema.intern_pool.indexToKey(object.index) != .struct_type) {
-                try sema.writer.writeAll("field_call: method call on a value not yet supported\n");
+            const args_slice: []const Zir.Inst.Index = @ptrCast(sema.zir.extra[extra.end..]);
+            // `P.decl(x)`: the object is the struct type -> static call, no receiver.
+            if (sema.intern_pool.indexToKey(object.index) == .struct_type) {
+                const callee = (try sema.structDeclByName(object.index, name)) orelse {
+                    try sema.writer.print("field_call: struct has no declaration '{s}'\n", .{name});
+                    return error.AnalysisFail;
+                };
+                break :blk .{ callee, null, extra.data.flags.args_len, args_slice };
+            }
+            // `p.method(x)`: the object is a struct value -> bind it as the receiver.
+            const struct_ty = object.typeOf(sema.intern_pool).toIndex();
+            if (sema.intern_pool.indexToKey(struct_ty) != .struct_type) {
+                try sema.writer.writeAll("field_call: receiver is not a struct\n");
                 return error.AnalysisFail;
             }
-            const callee = (try sema.structDeclByName(object.index, name)) orelse {
-                try sema.writer.print("field_call: struct has no declaration '{s}'\n", .{name});
+            const callee = (try sema.structDeclByName(struct_ty, name)) orelse {
+                try sema.writer.print("field_call: struct has no method '{s}'\n", .{name});
                 return error.AnalysisFail;
             };
-            break :blk .{ callee, extra.data.flags.args_len, @ptrCast(sema.zir.extra[extra.end..]) };
+            break :blk .{ callee, object, extra.data.flags.args_len, args_slice };
         },
     };
 
@@ -4452,6 +4475,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     const func = callee_key.func;
     const func_ty = sema.intern_pool.indexToKey(func.ty).func_type;
 
+    const args_len = explicit_len + @as(u32, @intFromBool(self_val != null));
     if (func_ty.param_types.len != args_len) {
         try sema.writer.print(
             "call: expected {d} args, got {d}\n",
@@ -4459,7 +4483,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
         );
         return error.AnalysisFail;
     }
-    const raw_args = try sema.evalCallArgs(inst, args_len, args_body);
+    const raw_args = try sema.evalCallArgs(inst, self_val, explicit_len, args_body);
     defer sema.gpa.free(raw_args);
 
     // Swap sema.zir to the func's source-ZIR snapshot when the
@@ -4546,22 +4570,27 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     }
 }
 
-/// Resolve each call argument to a raw (uncoerced) Value in the caller's
-/// scope. Returns a freshly allocated slice (caller frees). Coercion to the
-/// parameter type happens in `evalCall` once the callee's ZIR is in scope,
-/// because a generic parameter's type is only known there, per instantiation.
+/// Resolve each call argument to a raw (uncoerced) Value in the caller's scope.
+/// Returns a freshly allocated slice (caller frees). A bound `self_val` (a
+/// method call's receiver) is prepended as the first argument; the remaining
+/// `explicit_len` come from `args_body`. Coercion to the parameter type happens
+/// in `evalCall` once the callee's ZIR is in scope, because a generic
+/// parameter's type is only known there, per instantiation.
 fn evalCallArgs(
     sema: *Sema,
     inst: Zir.Inst.Index,
-    args_len: u32,
+    self_val: ?Value,
+    explicit_len: u32,
     args_body: []const Zir.Inst.Index,
 ) Error![]Value {
-    const arg_values = try sema.gpa.alloc(Value, args_len);
+    const base: u32 = @intFromBool(self_val != null);
+    const arg_values = try sema.gpa.alloc(Value, base + explicit_len);
     errdefer sema.gpa.free(arg_values);
-    for (0..args_len) |i| {
-        const start = if (i == 0) args_len else @intFromEnum(args_body[i - 1]);
+    if (self_val) |s| arg_values[0] = s;
+    for (0..explicit_len) |i| {
+        const start = if (i == 0) explicit_len else @intFromEnum(args_body[i - 1]);
         const end = @intFromEnum(args_body[i]);
-        arg_values[i] = try sema.resolveInlineBody(args_body[start..end], inst);
+        arg_values[base + i] = try sema.resolveInlineBody(args_body[start..end], inst);
     }
     return arg_values;
 }
@@ -4620,6 +4649,17 @@ fn evalTypeof(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// operands. AstGen puts the operand expressions in a body (evaluated for its
 /// instruction results) followed by their refs. Mirrors `src/Sema.zig`
 /// zirTypeofPeer: run the body, then fold peer resolution across the operands.
+/// `@This()` (extended `this`): the enclosing container type. Mirrors zirThis,
+/// which returns the block namespace's owner type; here it is the struct set by
+/// `structDeclByName` around a member's evaluation.
+fn evalThis(sema: *Sema) Error!?Value {
+    if (sema.this_type == .none) {
+        try sema.writer.writeAll("@This(): no enclosing container\n");
+        return error.AnalysisFail;
+    }
+    return Value{ .index = sema.this_type };
+}
+
 fn evalTypeofPeer(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.TypeOfPeer, extended.operand);
@@ -4714,6 +4754,7 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .tuple_decl => return sema.evalTupleDecl(extended),
         .struct_decl => return sema.evalStructDecl(inst),
         .typeof_peer => return sema.evalTypeofPeer(extended, inst),
+        .this => return sema.evalThis(),
 
         // The result type for a compound assignment (`s += x`, `s -= x`): the
         // lhs's own type, against which the rhs is coerced before the arith +

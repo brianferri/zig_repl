@@ -1081,6 +1081,25 @@ test "compliance: calling a struct's namespace declaration (P.decl(args))" {
     try expectMatchesZig(a, &.{"blk: { const P = struct { fn sq(x: u16) u16 { return x * x; } }; break :blk P.sq(9); }"});
 }
 
+test "compliance: a struct value method binds the receiver (p.method())" {
+    const a = testing.allocator;
+    const G = "const P = struct { x: u8, fn get(self: @This()) u8 { return self.x; } };";
+    try expectMatchesZig(a, &.{"blk: { " ++ G ++ " const p: P = .{ .x = 9 }; break :blk p.get(); }"});
+    // A method with an explicit argument beyond the bound receiver.
+    const A = "const P = struct { x: u8, fn addk(self: @This(), k: u8) u8 { return self.x + k; } };";
+    try expectMatchesZig(a, &.{"blk: { " ++ A ++ " const p: P = .{ .x = 10 }; break :blk p.addk(5); }"});
+}
+
+test "compliance: methods compose -- call each other and take struct args" {
+    const a = testing.allocator;
+    // A method calling another method on the receiver, chained three deep.
+    const V = "const V = struct { n: u8, fn base(self: @This()) u8 { return self.n; } fn p1(self: @This()) u8 { return self.base() + 1; } fn p2(self: @This()) u8 { return self.p1() + 1; } };";
+    try expectMatchesZig(a, &.{"blk: { " ++ V ++ " const v: V = .{ .n = 40 }; break :blk v.p2(); }"});
+    // A method taking another value of the same struct: a 2D dot product.
+    const Vec = "const Vec = struct { x: u8, y: u8, fn dot(self: @This(), o: @This()) u8 { return self.x * o.x + self.y * o.y; } };";
+    try expectMatchesZig(a, &.{"blk: { " ++ Vec ++ " const p: Vec = .{ .x = 2, .y = 3 }; const q: Vec = .{ .x = 4, .y = 5 }; break :blk p.dot(q); }"});
+}
+
 test "compliance: declaration and field access do not cross" {
     // A declaration is reachable through the type, a field through a value --
     // never the other way (mirrors the compiler's fieldVal split).
