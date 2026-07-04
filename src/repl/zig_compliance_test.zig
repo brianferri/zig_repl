@@ -1073,6 +1073,14 @@ test "compliance: a struct type exposes its member declarations (P.decl)" {
     try expectMatchesZig(a, &.{"blk: { " ++ K ++ " break :blk P.K + 1; }"}); // carries its type
 }
 
+test "compliance: calling a struct's namespace declaration (P.decl(args))" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"blk: { const P = struct { fn id(v: u8) u8 { return v; } }; break :blk P.id(7); }"});
+    try expectMatchesZig(a, &.{"blk: { const P = struct { fn add(a: u8, b: u8) u8 { return a + b; } }; break :blk P.add(40, 2); }"});
+    // A comptime-int argument coerces to the declared parameter type.
+    try expectMatchesZig(a, &.{"blk: { const P = struct { fn sq(x: u16) u16 { return x * x; } }; break :blk P.sq(9); }"});
+}
+
 test "compliance: declaration and field access do not cross" {
     // A declaration is reachable through the type, a field through a value --
     // never the other way (mirrors the compiler's fieldVal split).

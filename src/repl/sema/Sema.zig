@@ -4401,8 +4401,9 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///   8. Remove the param-binding entries from results so other
 ///      callers of the same func get a clean slate.
 ///
-/// `.field_call` (`a.foo(x)`) needs type-method resolution which
-/// requires struct support; surfaces a structured diagnostic.
+/// `.field_call` (`obj.f(x)`) resolves `f` in the object: a struct-type object
+/// (`P.decl(x)`) looks the declaration up in its namespace; a struct-value
+/// method call (which needs self-binding) is not yet supported.
 fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, field }) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
@@ -4412,16 +4413,37 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     // `@setEvalBranchQuota` once that builtin lands.
     try sema.emitBackwardBranch();
 
-    if (kind == .field) {
-        try sema.writer.writeAll("field_call: method-call resolution requires struct support\n");
-        return error.AnalysisFail;
-    }
+    // Resolve the callee and locate the argument bodies. A direct call reads
+    // the callee ref; a field call (`obj.f(...)`) resolves the name in the
+    // object. Only the struct-type namespace form (`P.decl(...)`) is handled;
+    // a method call on a struct value needs self-binding (not yet done).
+    const callee_value: Value, const args_len: u32, const args_body: []const Zir.Inst.Index = switch (kind) {
+        .direct => blk: {
+            const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+            const extra = sema.zir.extraData(Zir.Inst.Call, pl_node.payload_index);
+            break :blk .{
+                try sema.resolveRef(extra.data.callee),
+                extra.data.flags.args_len,
+                @ptrCast(sema.zir.extra[extra.end..]),
+            };
+        },
+        .field => blk: {
+            const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+            const extra = sema.zir.extraData(Zir.Inst.FieldCall, pl_node.payload_index);
+            const name = sema.zir.nullTerminatedString(extra.data.field_name_start);
+            const object = try sema.loadValue(try sema.resolveRef(extra.data.obj_ptr));
+            if (sema.intern_pool.indexToKey(object.index) != .struct_type) {
+                try sema.writer.writeAll("field_call: method call on a value not yet supported\n");
+                return error.AnalysisFail;
+            }
+            const callee = (try sema.structDeclByName(object.index, name)) orelse {
+                try sema.writer.print("field_call: struct has no declaration '{s}'\n", .{name});
+                return error.AnalysisFail;
+            };
+            break :blk .{ callee, extra.data.flags.args_len, @ptrCast(sema.zir.extra[extra.end..]) };
+        },
+    };
 
-    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const extra = sema.zir.extraData(Zir.Inst.Call, pl_node.payload_index);
-    const args_len: u32 = extra.data.flags.args_len;
-
-    const callee_value = try sema.resolveRef(extra.data.callee);
     const callee_key = sema.intern_pool.indexToKey(callee_value.index);
     if (callee_key != .func) {
         try sema.writer.writeAll("call: callee is not a function value\n");
@@ -4437,11 +4459,6 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
         );
         return error.AnalysisFail;
     }
-
-    // Walk arg bodies via the stride table. args_body[0..args_len]
-    // holds end-offsets; arg N's body is args_body[start..end] where
-    // start is `args_len` for N=0 or `args_body[N-1]` otherwise.
-    const args_body: []const Zir.Inst.Index = @ptrCast(sema.zir.extra[extra.end..]);
     const raw_args = try sema.evalCallArgs(inst, args_len, args_body);
     defer sema.gpa.free(raw_args);
 
