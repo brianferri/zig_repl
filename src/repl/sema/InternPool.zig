@@ -1550,6 +1550,17 @@ const PtrNavRepr = extern struct {
     byte_offset_hi: u32,
 };
 
+/// Extra-arena payload for `Item.Tag.ptr_field`. Six u32 slots: ty, the base
+/// pointer, the 64-bit field index (lo/hi), and byte_offset (lo/hi).
+const PtrFieldRepr = extern struct {
+    ty: u32,
+    base: u32,
+    index_lo: u32,
+    index_hi: u32,
+    byte_offset_lo: u32,
+    byte_offset_hi: u32,
+};
+
 /// Extra-arena payload for `Item.Tag.error_set_error`. Two u32 slots: the
 /// error-set type Index and the interned error-name handle. Mirrors
 /// the compiler's `Tag.Err` shape.
@@ -2211,27 +2222,27 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         } },
         .float_f64 => .{ .float = .{
             .ty = .f64_type,
-            .storage = .{ .f64 = floatFromExtra(pool, Float64, item.data).get() },
+            .storage = .{ .f64 = extraData(pool, Float64, item.data).get() },
         } },
         .float_f80 => .{ .float = .{
             .ty = .f80_type,
-            .storage = .{ .f80 = floatFromExtra(pool, Float80, item.data).get() },
+            .storage = .{ .f80 = extraData(pool, Float80, item.data).get() },
         } },
         .float_f128 => .{ .float = .{
             .ty = .f128_type,
-            .storage = .{ .f128 = floatFromExtra(pool, Float128, item.data).get() },
+            .storage = .{ .f128 = extraData(pool, Float128, item.data).get() },
         } },
         .float_c_longdouble_f80 => .{ .float = .{
             .ty = .c_longdouble_type,
-            .storage = .{ .f80 = floatFromExtra(pool, Float80, item.data).get() },
+            .storage = .{ .f80 = extraData(pool, Float80, item.data).get() },
         } },
         .float_c_longdouble_f128 => .{ .float = .{
             .ty = .c_longdouble_type,
-            .storage = .{ .f128 = floatFromExtra(pool, Float128, item.data).get() },
+            .storage = .{ .f128 = extraData(pool, Float128, item.data).get() },
         } },
         .float_comptime_float => .{ .float = .{
             .ty = .comptime_float_type,
-            .storage = .{ .f128 = floatFromExtra(pool, Float128, item.data).get() },
+            .storage = .{ .f128 = extraData(pool, Float128, item.data).get() },
         } },
         .undef => .{ .undef = @enumFromInt(item.data) },
         .type_pointer => ptrTypeFromExtra(pool, item.data),
@@ -2427,48 +2438,56 @@ fn errorUnionPayloadFromExtra(pool: *const InternPool, extra_index: u32) Key {
 }
 
 fn ptrComptimeAllocFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const fields = comptime @divExact(@sizeOf(PtrComptimeAllocRepr), @sizeOf(u32));
-    assert(extra_index + fields <= pool.extra.items.len);
-    const slice = pool.extra.items[extra_index..][0..fields];
-    const byte_offset = (@as(u64, slice[3]) << 32) | @as(u64, slice[2]);
+    const r = pool.extraData(PtrComptimeAllocRepr, extra_index);
     return .{ .ptr = .{
-        .ty = @enumFromInt(slice[0]),
-        .base_addr = .{ .comptime_alloc = @enumFromInt(slice[1]) },
-        .byte_offset = byte_offset,
+        .ty = @enumFromInt(r.ty),
+        .base_addr = .{ .comptime_alloc = @enumFromInt(r.alloc_index) },
+        .byte_offset = (@as(u64, r.byte_offset_hi) << 32) | r.byte_offset_lo,
     } };
 }
 
 fn ptrNavFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const fields = comptime @divExact(@sizeOf(PtrNavRepr), @sizeOf(u32));
-    assert(extra_index + fields <= pool.extra.items.len);
-    const slice = pool.extra.items[extra_index..][0..fields];
-    const byte_offset = (@as(u64, slice[3]) << 32) | @as(u64, slice[2]);
+    const r = pool.extraData(PtrNavRepr, extra_index);
     return .{ .ptr = .{
-        .ty = @enumFromInt(slice[0]),
-        .base_addr = .{ .nav = @enumFromInt(slice[1]) },
-        .byte_offset = byte_offset,
+        .ty = @enumFromInt(r.ty),
+        .base_addr = .{ .nav = @enumFromInt(r.nav_index) },
+        .byte_offset = (@as(u64, r.byte_offset_hi) << 32) | r.byte_offset_lo,
     } };
 }
 
 fn ptrFieldFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    assert(extra_index + 6 <= pool.extra.items.len);
-    const slice = pool.extra.items[extra_index..][0..6];
-    const index = (@as(u64, slice[3]) << 32) | @as(u64, slice[2]);
-    const byte_offset = (@as(u64, slice[5]) << 32) | @as(u64, slice[4]);
+    const r = pool.extraData(PtrFieldRepr, extra_index);
     return .{ .ptr = .{
-        .ty = @enumFromInt(slice[0]),
-        .base_addr = .{ .field = .{ .base = @enumFromInt(slice[1]), .index = index } },
-        .byte_offset = byte_offset,
+        .ty = @enumFromInt(r.ty),
+        .base_addr = .{ .field = .{
+            .base = @enumFromInt(r.base),
+            .index = (@as(u64, r.index_hi) << 32) | r.index_lo,
+        } },
+        .byte_offset = (@as(u64, r.byte_offset_hi) << 32) | r.byte_offset_lo,
     } };
 }
 
-/// Reconstruct a packed `Float64` / `Float80` / `Float128` from `extra`.
-/// The struct is stored as `@sizeOf(T) / 4` consecutive u32 slots.
-fn floatFromExtra(pool: *const InternPool, comptime T: type, extra_index: u32) T {
+/// Read an all-u32 extra-arena payload `T` back from `extra_index`. The `*Repr`
+/// structs (and the packed `Float64`/`Float80`/`Float128`) pre-flatten every
+/// field to u32 -- Index/enum via `@intFromEnum`, u64 split into lo/hi -- so the
+/// struct is its own wire form: `@sizeOf(T) / 4` consecutive slots bitcast to
+/// `T`. Pairs with `addExtra`.
+fn extraData(pool: *const InternPool, comptime T: type, extra_index: u32) T {
     const pieces_len = comptime @divExact(@sizeOf(T), @sizeOf(u32));
     assert(extra_index + pieces_len <= pool.extra.items.len);
     const pieces: [pieces_len]u32 = pool.extra.items[extra_index..][0..pieces_len].*;
     return @bitCast(pieces);
+}
+
+/// Append an all-u32 extra-arena payload `repr` and return its start index --
+/// the write side of `extraData`. Since a `*Repr` is its own wire form, the
+/// struct bitcasts directly to its `[N]u32` slots, so layout lives in the
+/// struct definition alone (no hand-synced slot counts between emit and read).
+fn addExtra(pool: *InternPool, repr: anytype) Allocator.Error!u32 {
+    const pieces: [@divExact(@sizeOf(@TypeOf(repr)), @sizeOf(u32))]u32 = @bitCast(repr);
+    const index: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.appendSlice(pool.gpa, &pieces);
+    return index;
 }
 
 inline fn intKey(ty: Index, storage: Key.Int.Storage) Key {
@@ -2776,34 +2795,31 @@ fn emitPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!void {
     assert(p.ty != .none);
     switch (p.base_addr) {
         .comptime_alloc => |idx| {
-            const extra_index: u32 = @intCast(pool.extra.items.len);
-            try pool.extra.appendSlice(pool.gpa, &.{
-                @intFromEnum(p.ty),
-                @intFromEnum(idx),
-                @as(u32, @truncate(p.byte_offset)),
-                @as(u32, @truncate(p.byte_offset >> 32)),
+            const extra_index = try pool.addExtra(PtrComptimeAllocRepr{
+                .ty = @intFromEnum(p.ty),
+                .alloc_index = @intFromEnum(idx),
+                .byte_offset_lo = @truncate(p.byte_offset),
+                .byte_offset_hi = @truncate(p.byte_offset >> 32),
             });
             pool.items.appendAssumeCapacity(.{ .tag = .ptr_comptime_alloc, .data = extra_index });
         },
         .nav => |nav| {
-            const extra_index: u32 = @intCast(pool.extra.items.len);
-            try pool.extra.appendSlice(pool.gpa, &.{
-                @intFromEnum(p.ty),
-                @intFromEnum(nav),
-                @as(u32, @truncate(p.byte_offset)),
-                @as(u32, @truncate(p.byte_offset >> 32)),
+            const extra_index = try pool.addExtra(PtrNavRepr{
+                .ty = @intFromEnum(p.ty),
+                .nav_index = @intFromEnum(nav),
+                .byte_offset_lo = @truncate(p.byte_offset),
+                .byte_offset_hi = @truncate(p.byte_offset >> 32),
             });
             pool.items.appendAssumeCapacity(.{ .tag = .ptr_nav, .data = extra_index });
         },
         .field => |f| {
-            const extra_index: u32 = @intCast(pool.extra.items.len);
-            try pool.extra.appendSlice(pool.gpa, &.{
-                @intFromEnum(p.ty),
-                @intFromEnum(f.base),
-                @as(u32, @truncate(f.index)),
-                @as(u32, @truncate(f.index >> 32)),
-                @as(u32, @truncate(p.byte_offset)),
-                @as(u32, @truncate(p.byte_offset >> 32)),
+            const extra_index = try pool.addExtra(PtrFieldRepr{
+                .ty = @intFromEnum(p.ty),
+                .base = @intFromEnum(f.base),
+                .index_lo = @truncate(f.index),
+                .index_hi = @truncate(f.index >> 32),
+                .byte_offset_lo = @truncate(p.byte_offset),
+                .byte_offset_hi = @truncate(p.byte_offset >> 32),
             });
             pool.items.appendAssumeCapacity(.{ .tag = .ptr_field, .data = extra_index });
         },
