@@ -3062,22 +3062,67 @@ fn evalStructInitFieldPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = field_ptr };
 }
 
-/// `field_ptr_load`: read `object.field`. Resolves the field index by name and
-/// returns the corresponding element of the struct alloc's aggregate value.
-/// Mirrors zirFieldPtrLoad -> fieldPtrLoad.
+/// Look up a member declaration by name in a struct type's namespace (`P.id`)
+/// and return its evaluated value. Iterates the struct decl's declarations in
+/// its source ZIR (swapped in for a cross-line struct, as `structFieldByName`
+/// does), matching by name. Returns null if no declaration matches. Unnamed
+/// members (`comptime` blocks, tests) are skipped.
+fn structDeclByName(sema: *Sema, struct_ty: InternPool.Index, name: []const u8) Error!?Value {
+    const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
+    const saved_zir = sema.zir;
+    const saved_id = sema.current_zir_id;
+    if (st.source_zir_id != sema.current_zir_id) {
+        if (st.source_zir_id >= sema.line_zir.len) {
+            try sema.writer.writeAll("struct decl: defining ZIR is no longer available\n");
+            return error.AnalysisFail;
+        }
+        sema.zir = sema.line_zir[st.source_zir_id];
+        sema.current_zir_id = st.source_zir_id;
+    }
+    defer {
+        sema.zir = saved_zir;
+        sema.current_zir_id = saved_id;
+    }
+    for (sema.zir.typeDecls(st.decl_inst)) |decl_inst| {
+        const unwrapped = sema.zir.getDeclaration(decl_inst);
+        if (unwrapped.name == .empty) continue;
+        if (!std.mem.eql(u8, sema.zir.nullTerminatedString(unwrapped.name), name)) continue;
+        const value_body = unwrapped.value_body orelse return null;
+        return try sema.resolveInlineBody(value_body, decl_inst);
+    }
+    return null;
+}
+
+/// `field_ptr_load`: read `object.field` -- a struct field when `object` is a
+/// struct value, or a member declaration when it is a struct type (the split
+/// below). Mirrors zirFieldPtrLoad -> fieldPtrLoad.
 fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const ip = sema.intern_pool;
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.Field, pl_node.payload_index).data;
     const name = sema.zir.nullTerminatedString(extra.field_name_start);
-    const object_ptr = try sema.resolveRef(extra.lhs);
-    const struct_ty = sema.intern_pool.indexToKey(sema.intern_pool.indexToKey(object_ptr.index).ptr.ty).ptr_type.child;
-    const fld = (try sema.structFieldByName(struct_ty, name)) orelse {
+    const object = try sema.loadValue(try sema.resolveRef(extra.lhs));
+
+    // Split on the object as the compiler's `fieldVal` (src/Sema.zig) splits on
+    // its type tag: a struct *type* object (`.type` -> `.@"struct"`) resolves the
+    // name as a declaration in the struct's namespace; a struct *value* object
+    // (`.@"struct"`) resolves it as a field. A tuple is `tuple_type`, not
+    // `struct_type`, so it correctly stays on the field path (the compiler's
+    // tuple guard). We look decls up from the struct's ZIR rather than a
+    // persistent Namespace (no Zcu), the same way field access derives fields.
+    if (ip.indexToKey(object.index) == .struct_type) {
+        return (try sema.structDeclByName(object.index, name)) orelse {
+            try sema.writer.print("field access: struct has no declaration '{s}'\n", .{name});
+            return error.AnalysisFail;
+        };
+    }
+
+    const fld = (try sema.structFieldByName(object.typeOf(ip).toIndex(), name)) orelse {
         try sema.writer.print("field access: no field named '{s}'\n", .{name});
         return error.AnalysisFail;
     };
-    const struct_val = try sema.loadValue(object_ptr);
-    const agg = sema.intern_pool.indexToKey(struct_val.index).aggregate;
+    const agg = ip.indexToKey(object.index).aggregate;
     return .{ .index = InternPool.aggregateElementAt(agg, fld.index) };
 }
 

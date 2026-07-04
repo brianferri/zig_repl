@@ -1064,6 +1064,24 @@ test "compliance: struct init and field access" {
     try expectMatchesZig(a, &.{"blk: { const R = struct { a: u8 }; const r: R = .{ .a = 250 }; break :blk r.a + 5; }"});
 }
 
+test "compliance: a struct type exposes its member declarations (P.decl)" {
+    const a = testing.allocator;
+    const F = "const P = struct { fn id(v: u8) u8 { return v; } };";
+    try expectMatchesZig(a, &.{"blk: { " ++ F ++ " break :blk @TypeOf(P.id); }"}); // fn decl
+    const K = "const P = struct { const K: u8 = 5; };";
+    try expectMatchesZig(a, &.{"blk: { " ++ K ++ " break :blk P.K; }"}); // value decl
+    try expectMatchesZig(a, &.{"blk: { " ++ K ++ " break :blk P.K + 1; }"}); // carries its type
+}
+
+test "compliance: declaration and field access do not cross" {
+    // A declaration is reachable through the type, a field through a value --
+    // never the other way (mirrors the compiler's fieldVal split).
+    const a = testing.allocator;
+    try expectBothReject(a, &.{"blk: { const P = struct { fn id(v: u8) u8 { return v; } }; break :blk P.nope; }"}); // no such decl
+    try expectBothReject(a, &.{"blk: { const P = struct { x: u8 }; break :blk P.x; }"}); // field via type
+    try expectBothReject(a, &.{"blk: { const P = struct { x: u8, fn id(v: u8) u8 { return v; } }; const p: P = .{ .x = 1 }; break :blk p.id; }"}); // decl via value
+}
+
 test "compliance: struct field defaults and missing-field validation" {
     const a = testing.allocator;
     const P = "const P = struct { a: u8, b: u16 = 99 };";
