@@ -477,6 +477,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .size_of => sema.evalSizeOf(inst),
         .int_from_ptr => sema.evalIntFromPtr(inst),
         .int_from_enum => sema.evalIntFromEnum(inst),
+        .enum_from_int => sema.evalEnumFromInt(inst),
+        .decl_literal, .decl_literal_no_coerce => sema.evalDeclLiteral(inst),
         .alloc, .alloc_mut, .alloc_comptime_mut => sema.evalAlloc(inst),
         .alloc_inferred, .alloc_inferred_comptime => sema.evalAllocInferred(true),
         .alloc_inferred_mut, .alloc_inferred_comptime_mut => sema.evalAllocInferred(false),
@@ -3231,6 +3233,75 @@ fn enumTagByName(sema: *Sema, enum_ty: InternPool.Index, name: []const u8) Error
         return .{ .index = try ip.internEnumTag(.{ .ty = enum_ty, .int = int }) };
     }
     return null;
+}
+
+/// An enum type's declared field (tag) count, read from its source ZIR.
+fn enumFieldCount(sema: *Sema, enum_ty: InternPool.Index) Error!u32 {
+    const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
+    const frame = try sema.enterSourceZir(et.source_zir_id, "enum field count");
+    defer frame.restore(sema);
+    return @intCast(sema.zir.getEnumDecl(et.decl_inst).field_names.len);
+}
+
+/// `enum_from_int lhs, rhs`: `@enumFromInt(n)` -- build the enum tag whose
+/// integer value is `n`. `lhs` is the destination enum type (from the result
+/// type), `rhs` the integer. For an auto-numbered enum the valid tags are
+/// `0..field_count`, so an out-of-range value is rejected as the compiler's
+/// `enumHasInt` check does. Mirrors zirEnumFromInt's exhaustive comptime arm.
+fn evalEnumFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const dest_ty = (try sema.resolveRef(bin.lhs)).index;
+    if (ip.indexToKey(dest_ty) != .enum_type) {
+        try sema.writer.writeAll("@enumFromInt: destination is not an enum\n");
+        return error.AnalysisFail;
+    }
+    const operand = try sema.resolveRef(bin.rhs);
+    const int_key = ip.indexToKey(operand.index);
+    if (int_key != .int) {
+        try sema.writer.writeAll("@enumFromInt: operand is not an integer\n");
+        return error.AnalysisFail;
+    }
+    const field_count = try sema.enumFieldCount(dest_ty);
+    const value: u64 = switch (int_key.int.storage) {
+        .u64 => |v| v,
+        .i64 => |v| if (v >= 0) @intCast(v) else field_count, // negative -> out of range
+        .big_int => |b| b.toInt(u64) catch field_count, // too large -> out of range
+    };
+    if (value >= field_count) {
+        const name = ip.stringSlice(ip.indexToKey(dest_ty).enum_type.name);
+        try sema.writer.print("enum '{s}' has no tag with value '{d}'\n", .{ name, value });
+        return error.AnalysisFail;
+    }
+    const int = try ip.internInt(.{ .ty = try sema.enumIntTagType(field_count), .storage = .{ .u64 = value } });
+    return .{ .index = try ip.internEnumTag(.{ .ty = dest_ty, .int = int }) };
+}
+
+/// `decl_literal` / `decl_literal_no_coerce`: `.name` resolved against the known
+/// result type's namespace (`const e: E = .b`). For an enum the name is a tag;
+/// for a struct it is a declaration. Mirrors zirDeclLiteral -> analyzeDeclLiteral
+/// -> fieldVal. A bare literal with no result type (the poison case, needing a
+/// standalone `enum_literal` value) is not yet modelled.
+fn evalDeclLiteral(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.Field, pl_node.payload_index).data;
+    const name = sema.zir.nullTerminatedString(extra.field_name_start);
+    const res_ty = (try sema.resolveRef(extra.lhs)).index;
+    switch (sema.intern_pool.indexToKey(res_ty)) {
+        .enum_type => {
+            if (try sema.enumTagByName(res_ty, name)) |v| return v;
+            return sema.failBadMemberAccess(res_ty, name);
+        },
+        .struct_type => {
+            if (try sema.structDeclByName(res_ty, name)) |v| return v;
+            return sema.failBadMemberAccess(res_ty, name);
+        },
+        else => {
+            try sema.writer.writeAll("decl literal: result type is not a container with members\n");
+            return error.AnalysisFail;
+        },
+    }
 }
 
 /// `int_from_enum operand`: the integer tag of an enum value. Mirrors

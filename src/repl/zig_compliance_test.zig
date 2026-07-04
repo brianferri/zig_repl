@@ -1188,6 +1188,20 @@ test "compliance: enum declarations, tag access, and @intFromEnum" {
     try expectBothReject(a, &.{"blk: { const Q = enum { a, b }; break :blk @intFromEnum(Q.z); }"});
 }
 
+test "compliance: @enumFromInt and result-typed enum literals" {
+    const a = testing.allocator;
+    const E = "const E = enum { a, b, c };";
+    // @enumFromInt builds the tag with that integer; round-trips through @intFromEnum.
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const e: E = @enumFromInt(1); break :blk @intFromEnum(e); }"});
+    // A result-typed enum literal `.c` resolves to the tag (decl_literal).
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const e: E = .c; break :blk @intFromEnum(e); }"});
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const e: E = .a; break :blk @intFromEnum(e); }"});
+    // An integer with no corresponding tag is a compile error on both sides.
+    try expectBothReject(a, &.{"blk: { " ++ E ++ " const e: E = @enumFromInt(9); break :blk @intFromEnum(e); }"});
+    // A literal naming a tag the enum lacks is rejected on both sides.
+    try expectBothReject(a, &.{"blk: { " ++ E ++ " const e: E = .z; break :blk @intFromEnum(e); }"});
+}
+
 test "compliance: nested struct types capture an enclosing local (closure_get)" {
     // A struct whose field type names a local from the enclosing scope captures
     // that local (closure_capture); the field body reads it via closure_get.
