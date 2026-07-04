@@ -1173,6 +1173,32 @@ test "compliance: field pointers (&x.field and chained access)" {
     try expectBothReject(a, &.{"blk: { const P = struct { x: u8 }; const p: P = .{ .x = 9 }; const px = &p.x; px.* = 1; break :blk p.x; }"});
 }
 
+test "compliance: nested struct types capture an enclosing local (closure_get)" {
+    // A struct whose field type names a local from the enclosing scope captures
+    // that local (closure_capture); the field body reads it via closure_get.
+    const a = testing.allocator;
+    // Field type is a captured struct local, then a nested field read.
+    try expectMatchesZig(a, &.{"blk: { const P = struct { x: u8 }; const W = struct { p: P }; const w = W{ .p = P{ .x = 42 } }; break :blk w.p.x; }"});
+    // A captured type alias as a field type.
+    try expectMatchesZig(a, &.{"blk: { const T = u16; const Box = struct { v: T }; const b = Box{ .v = 500 }; break :blk b.v; }"});
+    // Two levels of captured struct types, read through the chain.
+    try expectMatchesZig(a, &.{"blk: { const P = struct { x: u8 }; const N = struct { inner: P }; const M = struct { mid: N }; const m = M{ .mid = N{ .inner = P{ .x = 7 } } }; break :blk m.mid.inner.x; }"});
+    // A captured struct with a method, invoked on a nested value.
+    try expectMatchesZig(a, &.{"blk: { const P = struct { x: u8, y: u8, fn sum(self: @This()) u8 { return self.x + self.y; } }; const Line = struct { a: P, b: P }; const l = Line{ .a = P{ .x = 1, .y = 2 }, .b = P{ .x = 3, .y = 4 } }; break :blk l.a.sum() + l.b.sum(); }"});
+}
+
+test "compliance: a struct type declared inside a function body" {
+    // A struct created in a called function's body records that function's line
+    // as its source, so its fields resolve when the type is used later. A generic
+    // struct factory instantiated with different types yields distinct types.
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{ "fn mk() type { return struct { v: u8 }; }", "const m: mk() = .{ .v = 5 };", "m.v" });
+    const Box = "fn Box(comptime T: type) type { return struct { v: T }; }";
+    try expectMatchesZig(a, &.{ Box, "const b: Box(u16) = .{ .v = 500 };", "b.v" });
+    // Two instantiations coexist: each keeps its own captured element type.
+    try expectMatchesZig(a, &.{ Box, "const p: Box(u8) = .{ .v = 1 };", "const q: Box(u16) = .{ .v = 500 };", "q.v" });
+}
+
 test "compliance: type-inferred locals (var y = expr)" {
     // `var`/`const` with no written type infer it from the initializer via
     // alloc_inferred + store_to_inferred_ptr + resolve_inferred_alloc.

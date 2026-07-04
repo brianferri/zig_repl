@@ -3045,11 +3045,41 @@ fn evalStructDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         },
     };
 
+    // Resolve captured outer values now, while the defining scope is live; a
+    // `closure_get` in a field/decl body reads them later (`evalClosureGet`).
+    const captures = try sema.resolveCaptures(struct_decl.captures);
+    defer sema.gpa.free(captures);
+
     return .{ .index = try sema.intern_pool.internStructType(.{
         .source_zir_id = sema.current_zir_id,
         .decl_inst = inst,
         .name = name,
+        .captures = captures,
     }) };
+}
+
+/// Resolve a struct decl's ZIR captures to their comptime values in the current
+/// scope. Mirrors `Sema.getCaptures`, reduced to the kinds a comptime evaluator
+/// produces: a captured local is an `.instruction` (its value) or an
+/// `.instruction_load` (load through its alloc); `.nested` indexes the enclosing
+/// container's already-resolved captures (`this_type`). Returns a fresh slice the
+/// caller frees; `internStructType` copies it into the pool.
+fn resolveCaptures(sema: *Sema, zir_captures: []const Zir.Inst.Capture) Error![]const InternPool.Index {
+    if (zir_captures.len == 0) return &.{};
+    const caps = try sema.gpa.alloc(InternPool.Index, zir_captures.len);
+    errdefer sema.gpa.free(caps);
+    for (zir_captures, caps) |zc, *c| {
+        c.* = switch (zc.unwrap()) {
+            .instruction => |i| (try sema.resolveRef(i.toRef())).index,
+            .instruction_load => |i| (try sema.loadValue(try sema.resolveRef(i.toRef()))).index,
+            .nested => |idx| sema.intern_pool.indexToKey(sema.this_type).struct_type.captures[idx],
+            .decl_val, .decl_ref => {
+                try sema.writer.writeAll("closure capture: decl captures are not supported\n");
+                return error.AnalysisFail;
+            },
+        };
+    }
+    return caps;
 }
 
 /// A saved `(zir, current_zir_id)` pair, put back by `restore`. The compiler
@@ -3118,6 +3148,11 @@ fn structFieldByName(
     const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
     const frame = try sema.enterSourceZir(st.source_zir_id, "struct field");
     defer frame.restore(sema);
+    // The field type body belongs to this struct's namespace: expose it as
+    // `this_type` so a `closure_get` (a captured outer type) resolves.
+    const saved_this = sema.this_type;
+    sema.this_type = struct_ty;
+    defer sema.this_type = saved_this;
     var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
     while (it.next()) |field| {
         if (std.mem.eql(u8, sema.zir.nullTerminatedString(field.name), name)) {
@@ -3415,6 +3450,11 @@ fn finishStructInit(sema: *Sema, struct_ty: InternPool.Index, elems: []InternPoo
     const st = ip.indexToKey(struct_ty).struct_type;
     const frame = try sema.enterSourceZir(st.source_zir_id, "struct init");
     defer frame.restore(sema);
+    // Field type/default bodies belong to this struct's namespace; expose it as
+    // `this_type` so a `closure_get` in one resolves its captured value.
+    const saved_this = sema.this_type;
+    sema.this_type = struct_ty;
+    defer sema.this_type = saved_this;
     var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
     while (it.next()) |field| {
         if (elems[field.idx] != .none) continue;
@@ -4714,20 +4754,15 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     sema.this_type = enclosing_ty;
     defer sema.this_type = saved_this;
 
-    // Swap sema.zir to the func's source-ZIR snapshot when the
-    // call crosses a REPL line boundary. The common same-line
-    // case (current_zir_id == func.source_zir_id) skips the swap.
-    // Restored via defer so subsequent instructions in the
-    // caller's body see the caller's zir again.
-    const caller_zir = sema.zir;
-    if (func.source_zir_id != sema.current_zir_id) {
-        if (func.source_zir_id >= sema.line_zir.len) {
-            try sema.writer.writeAll("call: function's source ZIR is no longer available\n");
-            return error.AnalysisFail;
-        }
-        sema.zir = sema.line_zir[func.source_zir_id];
-    }
-    defer sema.zir = caller_zir;
+    // View the func's source-ZIR snapshot for the body eval, crossing a REPL line
+    // boundary when the call does (a no-op for a same-line call). Moving
+    // current_zir_id too is not incidental: a struct/func declared in the body
+    // records `(source_zir_id, decl_inst)` -- the REPL's analog of the compiler's
+    // `TrackedInst{ file, inst }` from `block.trackZir` -- so it must capture the
+    // callee's line (the block's file scope during the call), not the caller's,
+    // or its decl is later read from the wrong ZIR. Restored on return.
+    const frame = try sema.enterSourceZir(func.source_zir_id, "call");
+    defer frame.restore(sema);
 
     // Extract the body + param insts via getFnInfo on the
     // possibly-swapped sema.zir.
@@ -4888,6 +4923,21 @@ fn evalThis(sema: *Sema) Error!?Value {
     return Value{ .index = sema.this_type };
 }
 
+/// `closure_get` (extended): the value of capture `small` of the container being
+/// evaluated -- `this_type`, the compiler's `block.namespace.owner_type`. The
+/// capture's comptime value was resolved when the type was declared
+/// (`resolveCaptures`) and stored on the type. Mirrors zirClosureGet's comptime
+/// arm; the runtime/nav arms do not arise in a comptime evaluator.
+fn evalClosureGet(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
+    if (sema.this_type == .none) {
+        try sema.writer.writeAll("closure_get: no enclosing container\n");
+        return error.AnalysisFail;
+    }
+    const captures = sema.intern_pool.indexToKey(sema.this_type).struct_type.captures;
+    assert(extended.small < captures.len);
+    return Value{ .index = captures[extended.small] };
+}
+
 fn evalTypeofPeer(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.TypeOfPeer, extended.operand);
@@ -4983,6 +5033,7 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .struct_decl => return sema.evalStructDecl(inst),
         .typeof_peer => return sema.evalTypeofPeer(extended, inst),
         .this => return sema.evalThis(),
+        .closure_get => return sema.evalClosureGet(extended),
 
         // The result type for a compound assignment (`s += x`, `s -= x`): the
         // lhs's own type, against which the rhs is coerced before the arith +

@@ -588,12 +588,11 @@ pub const Key = union(enum) {
     /// omitted here -- deferred, see `Sema.evalArrayInitAnon`.
     tuple_type: TupleType,
     /// A named struct type (`struct { x: i32 }`). Nominal: identity is
-    /// `(source_zir_id, decl_inst)`, like `func_decl` -- two distinct
-    /// declarations are distinct types even with identical fields. The
-    /// compiler's `ContainerType.declared` hashes `zir_index` + captures
-    /// (`src/InternPool.zig`); we omit captures, which distinguish only
-    /// generic instantiations we don't model -- the same omission
-    /// `func_decl` makes. `name` is the fully-qualified name baked at
+    /// `(source_zir_id, decl_inst, captures)` -- two distinct declarations are
+    /// distinct types even with identical fields, and two instantiations of one
+    /// generic decl differ by their captured values, mirroring the compiler's
+    /// `ContainerType.declared` (`zir_index` + captures). `name` is the
+    /// fully-qualified name baked at
     /// creation (`setTypeName`'s model), excluded from identity (the
     /// compiler keeps it in `LoadedStructType`, not the hash). A shell
     /// mirroring `getDeclaredStructType` (identity only) before lazy
@@ -754,6 +753,14 @@ pub const Key = union(enum) {
         source_zir_id: u32,
         decl_inst: std.zig.Zir.Inst.Index,
         name: NullTerminatedString,
+        /// Comptime values captured from the enclosing scope at declaration time
+        /// (`const Line = struct { a: P }` captures `P`). A `closure_get` in a
+        /// field/decl body reads these by index. Stored on the type because the
+        /// defining scope is gone by the time a body is lazily resolved. Part of
+        /// identity (hash/eql): two instantiations of one generic struct decl
+        /// (`Box(u8)` vs `Box(u16)`) capture different values and are distinct
+        /// types, matching the compiler's `ContainerType.declared`.
+        captures: []const Index = &.{},
     };
 
     /// An error value. `ty` is always an `error_set_type` Index --
@@ -985,11 +992,15 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, @as(u32, @intCast(tt.types.len)));
                 for (tt.types) |ty| std.hash.autoHash(&hasher, ty);
             },
-            // Nominal: identity is the declaration site. `name` is
-            // derived from it, so it is excluded here (and in `eql`).
+            // Nominal: identity is the declaration site plus its captures. `name`
+            // is derived from the site, so it is excluded here (and in `eql`).
             .struct_type => |st| {
                 std.hash.autoHash(&hasher, st.source_zir_id);
                 std.hash.autoHash(&hasher, st.decl_inst);
+                // Captures are part of identity: two instantiations of one generic
+                // struct decl (`Box(u8)` vs `Box(u16)`) capture different values
+                // and are distinct types, as `ContainerType.declared` hashes them.
+                for (st.captures) |c| std.hash.autoHash(&hasher, c);
             },
             .err => |e| {
                 std.hash.autoHash(&hasher, e.ty);
@@ -1124,7 +1135,8 @@ pub const Key = union(enum) {
             .tuple_type => |x| std.mem.eql(Index, x.types, b.tuple_type.types),
             .struct_type => |x| blk: {
                 const y = b.struct_type;
-                break :blk x.source_zir_id == y.source_zir_id and x.decl_inst == y.decl_inst;
+                break :blk x.source_zir_id == y.source_zir_id and x.decl_inst == y.decl_inst and
+                    std.mem.eql(Index, x.captures, y.captures);
             },
             .err => |x| blk: {
                 const y = b.err;
@@ -2304,10 +2316,15 @@ fn tupleTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
 
 fn structTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
     const r = pool.extraData(StructTypeRepr, extra_index);
+    const captures_at = extra_index + @sizeOf(StructTypeRepr) / 4;
+    const captures_len = pool.extra.items[captures_at];
+    const raw_captures = pool.extra.items[captures_at + 1 ..][0..captures_len];
     return .{ .struct_type = .{
         .source_zir_id = r.source_zir_id,
         .decl_inst = @enumFromInt(r.decl_inst),
         .name = @enumFromInt(r.name),
+        // Reinterpret the u32 slice as `[]const Index`, sharing the extra arena.
+        .captures = @ptrCast(raw_captures),
     } };
 }
 
@@ -2842,6 +2859,10 @@ fn emitStructType(pool: *InternPool, st: Key.StructType) Allocator.Error!void {
         .decl_inst = @intFromEnum(st.decl_inst),
         .name = @intFromEnum(st.name),
     });
+    // Trailing the fixed repr: a `captures_len` count then the captured Indices
+    // (an all-u32 `[]Index`, same reinterpret trick as tuple/error-set types).
+    try pool.extra.append(pool.gpa, @intCast(st.captures.len));
+    try pool.extra.appendSlice(pool.gpa, @ptrCast(st.captures));
     pool.items.appendAssumeCapacity(.{ .tag = .type_struct, .data = extra_index });
 }
 
