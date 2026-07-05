@@ -2019,23 +2019,37 @@ fn evalComparison(
     const lhs_key = ip.indexToKey(lhs_value.index);
     const rhs_key = ip.indexToKey(rhs_value.index);
 
-    // Enum tags compare by identity: interning is canonical, so equal tags share
-    // an Index. Only `==`/`!=` are defined for enums (ordering is a type error,
-    // which AstGen rejects before here). Mirrors cmpScalar's enum path.
-    if (lhs_key == .enum_tag and rhs_key == .enum_tag) {
-        if (lhs_key.enum_tag.ty != rhs_key.enum_tag.ty) {
-            try sema.writer.print("{s}: enum operands have different types\n", .{op_name});
-            return error.AnalysisFail;
-        }
-        const equal = lhs_value.index == rhs_value.index;
-        return switch (op) {
-            .eq => .{ .index = if (equal) .bool_true else .bool_false },
-            .neq => .{ .index = if (equal) .bool_false else .bool_true },
-            else => {
-                try sema.writer.print("{s}: operator not allowed for enum operands\n", .{op_name});
+    // Types, bools, and enum tags compare by interned identity: interning is
+    // canonical, so equal values share an Index. Only `==`/`!=` are defined
+    // (ordering is a type error). Mirrors zirCmpEq's `.type` branch and cmpScalar's
+    // bool/enum paths. A type operand's own `.index` IS the type, so `==` is the
+    // compiler's `Type.eql` on interned types.
+    {
+        const lhs_ty = Value.typeOf(lhs_value, ip).index;
+        const rhs_ty = Value.typeOf(rhs_value, ip).index;
+        const kind: ?[]const u8 = if (lhs_ty == .type_type and rhs_ty == .type_type)
+            "type"
+        else if (lhs_ty == .bool_type and rhs_ty == .bool_type)
+            "bool"
+        else if (lhs_key == .enum_tag and rhs_key == .enum_tag)
+            "enum"
+        else
+            null;
+        if (kind) |kind_name| {
+            if (lhs_key == .enum_tag and lhs_key.enum_tag.ty != rhs_key.enum_tag.ty) {
+                try sema.writer.print("{s}: enum operands have different types\n", .{op_name});
                 return error.AnalysisFail;
-            },
-        };
+            }
+            const equal = lhs_value.index == rhs_value.index;
+            return switch (op) {
+                .eq => .{ .index = if (equal) .bool_true else .bool_false },
+                .neq => .{ .index = if (equal) .bool_false else .bool_true },
+                else => {
+                    try sema.writer.print("{s}: operator not allowed for {s} operands\n", .{ op_name, kind_name });
+                    return error.AnalysisFail;
+                },
+            };
+        }
     }
 
     // Comparison doesn't need to re-fit, so it only cares that peer

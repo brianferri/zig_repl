@@ -611,6 +611,21 @@ test "compliance: @TypeOf on @as-typed signed int" {
     try expectMatchesZig(testing.allocator, &.{"@TypeOf(@as(i32, -5))"});
 }
 
+test "compliance: type and bool equality compare by identity" {
+    const a = testing.allocator;
+    // Types compare by interned identity (the compiler's Type.eql); only ==/!=.
+    try expectMatchesZig(a, &.{"u8 == u8"});
+    try expectMatchesZig(a, &.{"u8 == u16"});
+    try expectMatchesZig(a, &.{"u8 != u16"});
+    try expectMatchesZig(a, &.{"blk: { const x: u8 = 1; const y: u8 = 2; break :blk @TypeOf(x) == @TypeOf(y); }"});
+    try expectMatchesZig(a, &.{"blk: { const x: u8 = 1; const y: u16 = 2; break :blk @TypeOf(x) == @TypeOf(y); }"});
+    // Bools compare the same way.
+    try expectMatchesZig(a, &.{"true == false"});
+    try expectMatchesZig(a, &.{"blk: { const b = true; break :blk b != false; }"});
+    // Ordering on types is a compile error on both sides.
+    try expectBothReject(a, &.{"blk: { break :blk u8 < u16; }"});
+}
+
 test "compliance: @TypeOf on a normal fn declaration" {
     try expectMatchesZig(testing.allocator, &.{
         "fn foo() void {}",
