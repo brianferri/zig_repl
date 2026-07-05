@@ -3609,15 +3609,44 @@ fn evalTagName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const operand = try sema.resolveRef(un_node.operand);
-    const key = ip.indexToKey(operand.index);
-    if (key != .enum_tag) {
-        try sema.writer.writeAll("@tagName: operand is not an enum value\n");
-        return error.AnalysisFail;
-    }
-    const value = sema.intAsI128(key.enum_tag.int).?; // the tag's integer, always in range
-    const m = (try sema.enumLookup(key.enum_tag.ty, .{ .value = value })) orelse
+    // Mirrors zirTagName's operand switch: an enum tag names itself; a union names
+    // its active field via its tag, but only if the union is tagged.
+    const tag: InternPool.Key.EnumTag = switch (ip.indexToKey(operand.index)) {
+        .enum_tag => |et| et,
+        .un => |uv| blk: {
+            if (!try sema.unionIsTagged(uv.ty)) {
+                try sema.writer.writeAll("union '");
+                try Type.print(.fromIndex(uv.ty), ip, sema.writer);
+                try sema.writer.writeAll("' is untagged\n");
+                return error.AnalysisFail;
+            }
+            break :blk ip.indexToKey(uv.tag).enum_tag;
+        },
+        else => {
+            try sema.writer.writeAll("expected enum or union; found '");
+            try Type.print(operand.typeOf(ip), ip, sema.writer);
+            try sema.writer.writeAll("'\n");
+            return error.AnalysisFail;
+        },
+    };
+    const value = sema.intAsI128(tag.int).?; // the tag's integer, always in range
+    const m = (try sema.enumLookup(tag.ty, .{ .value = value })) orelse
         unreachable; // a valid enum_tag always names one of its type's fields
     return try sema.internStringLiteral(ip.stringSlice(m.name));
+}
+
+/// Whether a union is tagged (`union(enum)` / `union(T)` / `union(enum(T))`), so
+/// its active field is a first-class enum tag reachable by `@tagName`/`switch`.
+/// Read from the union decl's ZIR `kind`, mirroring `unionTagType != null`
+/// (`tag_usage == .tagged`). Auto/extern/packed unions are untagged.
+fn unionIsTagged(sema: *Sema, union_ty: InternPool.Index) Error!bool {
+    const ut = sema.intern_pool.indexToKey(union_ty).union_type;
+    const frame = try sema.enterSourceZir(ut.source_zir_id, "union kind");
+    defer frame.restore(sema);
+    return switch (sema.zir.getUnionDecl(ut.decl_inst).kind) {
+        .tagged_explicit, .tagged_enum, .tagged_enum_explicit => true,
+        .auto, .@"extern", .@"packed", .packed_explicit => false,
+    };
 }
 
 /// A struct type's declared field count (read straight from its source ZIR's

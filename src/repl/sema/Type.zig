@@ -175,10 +175,12 @@ pub fn print(ty: Type, pool: *const InternPool, writer: *std.Io.Writer) PrintErr
             try print(fromIndex(child), pool, writer);
         },
         .tuple_type => |tt| try printTuple(tt, pool, writer),
-        // `name` is the fully-qualified name baked at creation, printed verbatim.
+        // Nominal types print their fully-qualified `name`, baked at creation.
         .struct_type => |st| try writer.writeAll(pool.stringSlice(st.name)),
-        // Unhandled *type* Keys (enum/union/opaque, ...) aren't rendered yet.
-        // A value Key reaching a type printer is a bug, so assert it's a type.
+        .enum_type => |et| try writer.writeAll(pool.stringSlice(et.name)),
+        .union_type => |ut| try writer.writeAll(pool.stringSlice(ut.name)),
+        // Unhandled *type* Keys (opaque, ...) aren't rendered yet. A value Key
+        // reaching a type printer is a bug, so assert it's a type.
         else => |other| {
             assert(other.isType());
             try writer.writeAll("<type>");

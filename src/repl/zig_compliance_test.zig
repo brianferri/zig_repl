@@ -1266,6 +1266,21 @@ test "compliance: @tagName of an enum value" {
     try expectBothReject(a, &.{"blk: { break :blk @tagName(5); }"});
 }
 
+test "compliance: @tagName of a tagged union names the active field" {
+    const a = testing.allocator;
+    const E = "const E = union(enum) { a: u32, b: bool };";
+    // @tagName on a tagged union yields the active field's name.
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const e = E{ .b = true }; break :blk @tagName(e)[0]; }"}); // 'b'
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const e = E{ .a = 9 }; const c: u8 = @tagName(e)[0]; break :blk c; }"}); // 'a'
+    // @tagName of an untagged union is a compile error on both sides.
+    try expectBothReject(a, &.{"blk: { const U = union { a: u32, b: bool }; const u = U{ .a = 5 }; break :blk @tagName(u)[0]; }"});
+    try expectReplDiagnostic(
+        a,
+        &.{ "const U = union { a: u32 };", "const u = U{ .a = 5 };", "@tagName(u)" },
+        "is untagged",
+    );
+}
+
 test "compliance: enum equality and switch" {
     const a = testing.allocator;
     const E = "const E = enum { a, b, c };";
