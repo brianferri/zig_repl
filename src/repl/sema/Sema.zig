@@ -3804,7 +3804,7 @@ fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index, comptime initializing: bool) 
     const object_ptr = try sema.resolveRef(extra.lhs);
     const parent_ty = ip.indexToKey(object_ptr.index).ptr.ty;
     const container_ty = ip.indexToKey(parent_ty).ptr_type.child;
-    const fld = switch (ip.indexToKey(container_ty)) {
+    const fld: FieldInfo = switch (ip.indexToKey(container_ty)) {
         .union_type => blk: {
             const f = (try sema.unionFieldByName(container_ty, name)) orelse
                 return sema.failBadUnionFieldAccess(container_ty, name);
@@ -3814,8 +3814,12 @@ fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index, comptime initializing: bool) 
             if (!initializing) _ = try sema.loadUnionField((try sema.loadValue(object_ptr)).index, f.index);
             break :blk f;
         },
-        else => (try sema.structFieldByName(container_ty, name)) orelse
+        .struct_type => (try sema.structFieldByName(container_ty, name)) orelse
             return sema.failBadStructFieldAccess(container_ty, name),
+        else => {
+            try sema.writer.writeAll("field access: operand is not a struct or union\n");
+            return error.AnalysisFail;
+        },
     };
     const field_ptr_ty = try ip.internPtrType(.{
         .child = fld.ty,
