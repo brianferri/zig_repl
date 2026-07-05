@@ -5044,9 +5044,25 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             else => null,
         };
 
+    // A tagged union switches on its active tag; the operand's payload is what a
+    // prong capture (`.a => |v|`) binds. Mirrors `switchCond` coercing a union to
+    // its tag enum, with an untagged union rejected. The tag is already an
+    // `enum_tag`, so the enum-literal matching below is unchanged.
+    var cond = operand;
+    var union_operand: ?InternPool.Key.Union = null;
+    if (sema.intern_pool.indexToKey(operand.index) == .un) {
+        const uv = sema.intern_pool.indexToKey(operand.index).un;
+        if (!try sema.unionIsTagged(uv.ty)) {
+            try sema.writer.writeAll("switch on union with no attached enum\n");
+            return error.AnalysisFail;
+        }
+        cond = .{ .index = uv.tag };
+        union_operand = uv;
+    }
+
     const op: SwitchOperand = .{
-        .value = operand,
-        .ty = Value.typeOf(operand, sema.intern_pool).index,
+        .value = cond,
+        .ty = Value.typeOf(cond, sema.intern_pool).index,
         .err_name = operand_err_name,
     };
 
@@ -5056,12 +5072,28 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         const prong_body = sema.zir.bodySlice(extra_index, case.prong_info.body_len);
         extra_index += case.prong_info.body_len;
 
-        if (case.prong_info.capture != .none) return sema.failSwitch("prong capture");
-
         var matched = try sema.matchSwitchItems(inst, case.item_infos, op, &extra_index, false);
         matched = try sema.matchSwitchRanges(inst, case.range_infos, op, &extra_index, matched);
 
-        if (matched) return try sema.resolveInlineBody(prong_body, inst);
+        if (matched) {
+            // `|_, tag|` binds the tag as a second capture; not modeled (the tag
+            // enum is auto-generated). Reject cleanly rather than leave its
+            // placeholder unbound.
+            if (case.prong_info.has_tag_capture) return sema.failSwitch("tag capture");
+            if (case.prong_info.capture != .none) {
+                // A multi-item capture (`.a, .b => |v|`) is valid only if the
+                // fields' types peer-resolve; we model the identical-type case and
+                // reject differing types rather than the compiler's peer type.
+                if (union_operand) |uv| {
+                    if (case.item_infos.len > 1 and
+                        (try sema.uniformUnionCaptureType(uv.ty, case.item_infos)) == null)
+                        return sema.failSwitch("capture group across differing field types");
+                }
+                const payload: ?Value = if (union_operand) |uv| .{ .index = uv.val } else null;
+                try sema.bindSwitchCapture(inst, sw, case.prong_info.capture, payload);
+            }
+            return try sema.resolveInlineBody(prong_body, inst);
+        }
     }
 
     if (sw.else_case) |else_case| {
@@ -5071,6 +5103,55 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     try sema.writer.writeAll("switch: no matching case and no else\n");
     return error.AnalysisFail;
+}
+
+/// Bind a matched prong's capture (`|v|`) to the instruction the prong body reads
+/// it through. AstGen uses the `switch_block` instruction itself as the first
+/// (payload) capture ref, falling back to a separate placeholder only for a
+/// second (tag) capture; so the capture inst is `payload_capture_placeholder`
+/// when present, else the switch inst. Only a tagged union's payload capture is
+/// modeled: `by_val` binds the active payload, `by_ref` a `*const` to it.
+fn bindSwitchCapture(
+    sema: *Sema,
+    inst: Zir.Inst.Index,
+    sw: Zir.UnwrappedSwitchBlock,
+    capture: Zir.Inst.SwitchBlock.ProngInfo.Capture,
+    union_payload: ?Value,
+) Error!void {
+    const payload = union_payload orelse return sema.failSwitch("prong capture");
+    const capture_inst = sw.payload_capture_placeholder.unwrap() orelse inst;
+    const cap: Value = switch (capture) {
+        .none => unreachable,
+        .by_val => payload,
+        .by_ref => try sema.materializeConstPtr(payload),
+    };
+    try sema.results.put(sema.gpa, capture_inst, cap);
+}
+
+/// The shared field type of a multi-item union capture prong (`.a, .b => |v|`),
+/// or null if the fields' types differ (or an item is not a field literal). The
+/// compiler peer-resolves them; we model only the identical-type case, so a
+/// differing group is rejected by the caller ("capture group with incompatible
+/// types" territory) rather than mis-typed.
+fn uniformUnionCaptureType(
+    sema: *Sema,
+    union_ty: InternPool.Index,
+    item_infos: []const Zir.Inst.SwitchBlock.ItemInfo,
+) Error!?InternPool.Index {
+    const ip = sema.intern_pool;
+    var common: ?InternPool.Index = null;
+    for (item_infos) |item_info| {
+        const name_idx = switch (item_info.unwrap()) {
+            .enum_literal => |n| n,
+            else => return null,
+        };
+        const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(name_idx));
+        const fld = (try sema.unionFieldByName(union_ty, name)) orelse return null;
+        if (common) |c| {
+            if (c != fld.ty) return null;
+        } else common = fld.ty;
+    }
+    return common;
 }
 
 /// The switch operand viewed three ways the case-matchers need: its value

@@ -1299,6 +1299,25 @@ test "compliance: enum equality and switch" {
     try expectBothReject(a, &.{"blk: { " ++ E ++ " const e = E.c; break :blk switch (e) { .a => 1, .z => 2, else => 3 }; }"});
 }
 
+test "compliance: switch on a tagged union captures the active payload" {
+    const a = testing.allocator;
+    const E = "const E = union(enum) { a: u32, b: u8 };";
+    // The switch dispatches on the active tag; a prong capture binds the payload.
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const e = E{ .a = 5 }; break :blk switch (e) { .a => |v| v, .b => 0 }; }"});
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const e = E{ .b = 7 }; break :blk switch (e) { .a => |v| v, .b => |v| v + 1 }; }"}); // 8
+    // A by-ref capture reads through the payload pointer.
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const e = E{ .a = 42 }; break :blk switch (e) { .a => |*v| v.*, .b => 0 }; }"});
+    // A non-capturing prong and an else prong both work.
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const e = E{ .b = 7 }; break :blk switch (e) { .a => |v| v, .b => 100 }; }"});
+    try expectMatchesZig(a, &.{"blk: { const V = union(enum) { a: u32, b: u8, c: u8 }; const v = V{ .c = 3 }; break :blk switch (v) { .a => |x| x, else => 99 }; }"});
+    // A multi-item capture prong binds one value across fields of the same type.
+    try expectMatchesZig(a, &.{"blk: { const V = union(enum) { a: u8, b: u8, c: u8 }; const v = V{ .b = 7 }; break :blk switch (v) { .a, .b => |x| x, .c => 0 }; }"});
+    // Switch on an untagged union is a compile error on both sides; so is a
+    // multi-item capture across incompatible field types.
+    try expectBothReject(a, &.{"blk: { const U = union { a: u32, b: u8 }; const u = U{ .a = 5 }; break :blk switch (u) { .a => |v| v, .b => 0 }; }"});
+    try expectBothReject(a, &.{"blk: { const V = union(enum) { a: u32, b: bool }; const v = V{ .a = 5 }; break :blk switch (v) { .a, .b => |x| x }; }"});
+}
+
 test "compliance: string literals -- length and byte indexing" {
     // A string literal is a `*const [N:0]u8`. `.len` is the array length; indexing
     // reads a byte. (`@tagName` and slices, which return `[]const u8`, come later.)
