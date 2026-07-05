@@ -1164,6 +1164,19 @@ test "compliance: a body resolves a bare sibling declaration in its container" {
     try expectMatchesZig(a, &.{"blk: { " ++ P ++ " break :blk P.b(); }"});
 }
 
+test "compliance: a nested container resolves an enclosing container's decl" {
+    // An unqualified identifier in a nested container walks outward to the
+    // enclosing container (the compiler's namespace parent chain), not just the
+    // innermost container + session.
+    const a = testing.allocator;
+    // Field default referencing the parent container's decl.
+    try expectMatchesZig(a, &.{"blk: { const S = struct { const x: u8 = 9; const A = struct { const y: u8 = x; }; }; break :blk S.A.y; }"});
+    // Method in a nested container referencing a grandparent decl.
+    try expectMatchesZig(a, &.{"blk: { const Outer = struct { const shared: u8 = 42; const Inner = struct { fn get() u8 { return shared; } }; }; break :blk Outer.Inner.get(); }"});
+    // A struct returned from a method referencing the method's container decl.
+    try expectMatchesZig(a, &.{"blk: { const S = struct { const k: u8 = 5; fn mk() type { return struct { const v: u8 = k; }; } }; break :blk S.mk().v; }"});
+}
+
 test "compliance: declaration and field access do not cross" {
     // A declaration is reachable through the type, a field through a value --
     // never the other way (mirrors the compiler's fieldVal split).

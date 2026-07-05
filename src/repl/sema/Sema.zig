@@ -129,10 +129,12 @@ block: *Block = undefined,
 /// REPL has one enclosing declaration at a time, so `bindValueDecl`
 /// sets it around the value-body eval.
 type_name_ctx: InternPool.NullTerminatedString = .empty,
-/// The type `@This()` resolves to -- the struct whose member is being
-/// evaluated. `.none` outside a container member. Mirrors the compiler's
-/// `block.namespace.owner_type`; set around a struct member's evaluation
-/// (`structDeclByName`) since the flat REPL has one enclosing type at a time.
+/// The type `@This()` resolves to -- the innermost container whose member is
+/// being evaluated. `.none` outside a container member. Mirrors the compiler's
+/// `block.namespace.owner_type`: one slot, set around a member's evaluation
+/// (`structDeclByName`). Enclosing containers are reached through each container
+/// type's `parent` field (the compiler's `Namespace.parent`), which `evalDeclVal`
+/// walks -- so this being a single slot is faithful, not a nesting limit.
 this_type: InternPool.Index = .none,
 
 pub const default_branch_quota: u32 = 1000;
@@ -3183,12 +3185,17 @@ fn evalStructDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const captures = try sema.resolveCaptures(struct_decl.captures);
     defer sema.gpa.free(captures);
 
-    return .{ .index = try sema.intern_pool.internStructType(.{
-        .source_zir_id = sema.current_zir_id,
-        .decl_inst = inst,
-        .name = name,
-        .captures = captures,
-    }) };
+    return .{
+        .index = try sema.intern_pool.internStructType(.{
+            .source_zir_id = sema.current_zir_id,
+            .decl_inst = inst,
+            .name = name,
+            .captures = captures,
+            // The container being evaluated is the enclosing one; record it so an
+            // unqualified decl reference resolves outward (the compiler's namespace parent).
+            .parent = sema.this_type,
+        }),
+    };
 }
 
 /// `enum_decl` (extended): a named enum type (`enum { a, b }`). Interns a nominal
@@ -3218,6 +3225,7 @@ fn evalEnumDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .decl_inst = inst,
         .name = name,
         .captures = captures,
+        .parent = sema.this_type,
     }) };
 }
 
@@ -3247,6 +3255,7 @@ fn evalUnionDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .decl_inst = inst,
         .name = name,
         .captures = captures,
+        .parent = sema.this_type,
     }) };
 }
 
@@ -3864,6 +3873,17 @@ fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index, comptime initializing: bool) 
         .base_addr = .{ .field = .{ .base = object_ptr.index, .index = fld.index } },
         .byte_offset = 0,
     }) };
+}
+
+/// The container a type is declared in (`.none` at the top level), the REPL's
+/// stand-in for `Namespace.parent`. Read from the container type's `parent` field.
+fn containerParent(sema: *Sema, container_ty: InternPool.Index) InternPool.Index {
+    return switch (sema.intern_pool.indexToKey(container_ty)) {
+        .struct_type => |st| st.parent,
+        .enum_type => |et| et.parent,
+        .union_type => |ut| ut.parent,
+        else => .none,
+    };
 }
 
 /// Look up a member declaration by name in a container type's namespace (`P.id`)
@@ -4746,7 +4766,12 @@ fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // (the enclosing container, set around member evaluation) first, session next.
     if (sema.this_type != .none) {
         const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir));
-        if (try sema.structDeclByName(sema.this_type, name)) |val| return val;
+        // Walk the enclosing-container chain (`this_type` -> its `parent` -> ...),
+        // as `lookupIdentifier` walks `namespace.parent`, before the session scope.
+        var container = sema.this_type;
+        while (container != .none) : (container = sema.containerParent(container)) {
+            if (try sema.structDeclByName(container, name)) |val| return val;
+        }
     }
     if (try sema.lookupDecl(inst, "decl_val")) |found| {
         return .{ .index = found.resolved.value };
@@ -4769,7 +4794,10 @@ fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // comptime analog of the compiler's `analyzeNavRef` decl pointer.
     if (sema.this_type != .none) {
         const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir));
-        if (try sema.structDeclByName(sema.this_type, name)) |val| return try sema.materializeConstPtr(val);
+        var container = sema.this_type;
+        while (container != .none) : (container = sema.containerParent(container)) {
+            if (try sema.structDeclByName(container, name)) |val| return try sema.materializeConstPtr(val);
+        }
     }
     const found = (try sema.lookupDecl(inst, "decl_ref")) orelse {
         const name = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir);

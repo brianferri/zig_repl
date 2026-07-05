@@ -801,6 +801,12 @@ pub const Key = union(enum) {
         /// (`Box(u8)` vs `Box(u16)`) capture different values and are distinct
         /// types, matching the compiler's `ContainerType.declared`.
         captures: []const Index = &.{},
+        /// The enclosing container this type is declared in, or `.none` at the
+        /// session/file top level. The REPL's stand-in for `Namespace.parent`:
+        /// `evalDeclVal` walks it outward so a nested container resolves an
+        /// unqualified enclosing decl. Not part of identity (a decl site has one
+        /// parent, fixed by its zir position).
+        parent: Index = .none,
     };
 
     /// A named enum type. Nominal like `StructType`: identity is the declaration
@@ -818,6 +824,8 @@ pub const Key = union(enum) {
         /// `captures`/`source_zir_id`/`decl_inst` are inert (the compiler stores
         /// `.empty` captures and a `.none` zir_index). `.none` for a declared enum.
         generated_union: Index = .none,
+        /// Enclosing container, or `.none`. See `StructType.parent`.
+        parent: Index = .none,
     };
 
     /// A named union type. Nominal like `EnumType`; field names/types resolved on
@@ -827,6 +835,8 @@ pub const Key = union(enum) {
         decl_inst: std.zig.Zir.Inst.Index,
         name: NullTerminatedString,
         captures: []const Index = &.{},
+        /// Enclosing container, or `.none`. See `StructType.parent`.
+        parent: Index = .none,
     };
 
     /// A union value: the union type, the active field's tag (its integer index),
@@ -1712,6 +1722,7 @@ const StructTypeRepr = extern struct {
     source_zir_id: u32,
     decl_inst: u32,
     name: u32,
+    parent: u32,
 };
 
 /// Extra-arena payload for `Item.Tag.type_enum`. Like `StructTypeRepr` (nominal
@@ -1722,6 +1733,7 @@ const EnumTypeRepr = extern struct {
     decl_inst: u32,
     name: u32,
     generated_union: u32,
+    parent: u32,
 };
 
 /// Extra-arena payload for `Item.Tag.enum_tag`. Two u32 slots: the enum type and
@@ -1737,6 +1749,7 @@ const UnionTypeRepr = extern struct {
     source_zir_id: u32,
     decl_inst: u32,
     name: u32,
+    parent: u32,
 };
 
 /// Extra-arena payload for `Item.Tag.union_value`. Three u32 slots: union type,
@@ -2543,6 +2556,7 @@ fn structTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
             .name = @enumFromInt(r.name),
             // Reinterpret the u32 slice as `[]const Index`, sharing the extra arena.
             .captures = @ptrCast(raw_captures),
+            .parent = @enumFromInt(r.parent),
         },
     };
 }
@@ -2558,6 +2572,7 @@ fn enumTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .name = @enumFromInt(r.name),
         .captures = @ptrCast(raw_captures),
         .generated_union = @enumFromInt(r.generated_union),
+        .parent = @enumFromInt(r.parent),
     } };
 }
 
@@ -2581,6 +2596,7 @@ fn unionTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .decl_inst = @enumFromInt(r.decl_inst),
         .name = @enumFromInt(r.name),
         .captures = @ptrCast(raw_captures),
+        .parent = @enumFromInt(r.parent),
     } };
 }
 
@@ -3130,6 +3146,7 @@ fn emitStructType(pool: *InternPool, st: Key.StructType) Allocator.Error!void {
         .source_zir_id = st.source_zir_id,
         .decl_inst = @intFromEnum(st.decl_inst),
         .name = @intFromEnum(st.name),
+        .parent = @intFromEnum(st.parent),
     });
     // Trailing the fixed repr: a `captures_len` count then the captured Indices
     // (an all-u32 `[]Index`, same reinterpret trick as tuple/error-set types).
@@ -3146,6 +3163,7 @@ fn emitEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!void {
         .decl_inst = @intFromEnum(et.decl_inst),
         .name = @intFromEnum(et.name),
         .generated_union = @intFromEnum(et.generated_union),
+        .parent = @intFromEnum(et.parent),
     });
     try pool.extra.append(pool.gpa, @intCast(et.captures.len));
     try pool.extra.appendSlice(pool.gpa, @ptrCast(et.captures));
@@ -3167,6 +3185,7 @@ fn emitUnionType(pool: *InternPool, ut: Key.UnionType) Allocator.Error!void {
         .source_zir_id = ut.source_zir_id,
         .decl_inst = @intFromEnum(ut.decl_inst),
         .name = @intFromEnum(ut.name),
+        .parent = @intFromEnum(ut.parent),
     });
     try pool.extra.append(pool.gpa, @intCast(ut.captures.len));
     try pool.extra.appendSlice(pool.gpa, @ptrCast(ut.captures));
