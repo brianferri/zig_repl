@@ -1310,6 +1310,16 @@ test "compliance: slices -- coercion from a string literal, .len, indexing" {
     try expectBothReject(a, &.{"blk: { const s: []const u8 = \"hi\"; break :blk s[5]; }"});
 }
 
+test "compliance: array element store" {
+    const a = testing.allocator;
+    // Store into an array element, directly and through an element pointer.
+    try expectMatchesZig(a, &.{"blk: { var arr = [_]u8{ 1, 2, 3 }; arr[1] = 9; break :blk arr[1]; }"});
+    try expectMatchesZig(a, &.{"blk: { var arr = [_]u8{ 1, 2, 3 }; arr[0] = 10; arr[2] = 30; break :blk arr[0] + arr[2]; }"});
+    try expectMatchesZig(a, &.{"blk: { var arr = [_]u8{ 5, 6 }; const p = &arr[1]; p.* = 99; break :blk arr[1]; }"});
+    // Writing an element of a `const` array is rejected on both sides.
+    try expectBothReject(a, &.{"blk: { const arr = [_]u8{ 1, 2 }; arr[0] = 5; break :blk arr[0]; }"});
+}
+
 test "compliance: slices nested in structs and arrays of slices" {
     const a = testing.allocator;
     // A `[]const u8` field of a struct: access, `.len`, and byte indexing.

@@ -2566,20 +2566,14 @@ fn evalStoreNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             try sema.writer.writeAll("unable to evaluate comptime expression: store through a pointer to a declaration\n");
             return error.AnalysisFail;
         },
-        // Store into one field of a struct alloc: coerce to the field type
-        // (the field pointer's child) and rebuild the alloc's aggregate.
-        .field => |f| {
+        // Store into one slot of an aggregate alloc (a struct field or an array
+        // element): coerce to the pointer's child type and rebuild the aggregate.
+        .field, .arr_elem => |f| {
             const base = ip.indexToKey(f.base).ptr;
-            const struct_ty = ip.indexToKey(base.ty).ptr_type.child;
+            const agg_ty = ip.indexToKey(base.ty).ptr_type.child;
             const coerced = try sema.coerceValueToType(rhs_value, ptr_ty_key.ptr_type.child, "store");
             const base_alloc = try sema.lookupComptimeAlloc(base);
-            base_alloc.val = try sema.setStructField(base_alloc.val, struct_ty, @intCast(f.index), coerced);
-        },
-        // Element mutation through an array-element pointer needs array
-        // read-modify-write (`setStructField` is struct-keyed); not yet built.
-        .arr_elem => {
-            try sema.writer.writeAll("store through an array-element pointer is not yet supported\n");
-            return error.AnalysisFail;
+            base_alloc.val = try sema.setAggregateElement(base_alloc.val, agg_ty, @intCast(f.index), coerced);
         },
     }
     return .{ .index = .void_value };
@@ -3607,20 +3601,26 @@ fn failNoMember(sema: *Sema, ty: InternPool.Index, name: InternPool.NullTerminat
     return error.AnalysisFail;
 }
 
-/// Write `elem` into field `index` of a struct alloc's value, returning the new
-/// aggregate. An `undef` alloc materialises an all-`undef` aggregate of the
-/// right arity first; an existing aggregate is copied with one element
-/// replaced. Whole-aggregate read-modify-write -- the compiler mutates in place
-/// via `MutableValue`, which this comptime-only evaluator does not model.
-fn setStructField(
+/// Write `elem` into slot `index` of an aggregate alloc's value (a struct field
+/// or an array element), returning the new aggregate. An `undef` alloc
+/// materialises an all-`undef` aggregate of the right arity first; an existing
+/// aggregate is copied with one element replaced. Whole-aggregate read-modify-
+/// write -- the compiler mutates in place via `MutableValue`, which this
+/// comptime-only evaluator does not model.
+fn setAggregateElement(
     sema: *Sema,
     old: Value,
-    struct_ty: InternPool.Index,
+    agg_ty: InternPool.Index,
     index: u32,
     elem: Value,
 ) Error!Value {
     const ip = sema.intern_pool;
-    const count = try sema.structFieldCount(struct_ty);
+    // A struct doesn't store its field count in the type (resolved from ZIR); an
+    // array/vector/tuple does (`aggregateElementCount`).
+    const count = if (ip.indexToKey(agg_ty) == .struct_type)
+        try sema.structFieldCount(agg_ty)
+    else
+        @as(u32, @intCast(ip.aggregateElementCount(agg_ty)));
     const elems = try sema.gpa.alloc(InternPool.Index, count);
     defer sema.gpa.free(elems);
     const old_key = ip.indexToKey(old.index);
@@ -3630,7 +3630,7 @@ fn setStructField(
         @memset(elems, .undef);
     }
     elems[index] = elem.index;
-    return .{ .index = try ip.internAggregate(.{ .ty = struct_ty, .storage = .{ .elems = elems } }) };
+    return .{ .index = try ip.internAggregate(.{ .ty = agg_ty, .storage = .{ .elems = elems } }) };
 }
 
 /// `opt_eu_base_ptr_init`: strips the optional/error-union payload base before a
@@ -3684,7 +3684,7 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         const raw = try sema.resolveInlineBody(default_body, st.decl_inst);
         const value = try sema.coerceValueToType(raw, field_ty, "struct field default");
         const alloc = try sema.lookupComptimeAlloc(ip.indexToKey(object_ptr.index).ptr);
-        alloc.val = try sema.setStructField(alloc.val, struct_ty, field.idx, value);
+        alloc.val = try sema.setAggregateElement(alloc.val, struct_ty, field.idx, value);
     }
     return null;
 }
