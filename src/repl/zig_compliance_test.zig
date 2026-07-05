@@ -1118,6 +1118,10 @@ test "compliance: a struct type exposes its member declarations (P.decl)" {
     const K = "const P = struct { const K: u8 = 5; };";
     try expectMatchesZig(a, &.{"blk: { " ++ K ++ " break :blk P.K; }"}); // value decl
     try expectMatchesZig(a, &.{"blk: { " ++ K ++ " break :blk P.K + 1; }"}); // carries its type
+    // A chain through nested type declarations (S.A.y needs S.A as an addressable
+    // type -- a namespace decl access on a type via field_ptr).
+    try expectMatchesZig(a, &.{"blk: { const S = struct { const A = struct { const y: u8 = 5; }; }; break :blk S.A.y; }"});
+    try expectMatchesZig(a, &.{"blk: { const S = struct { const A = struct { const B = struct { const z: u8 = 7; }; }; }; break :blk S.A.B.z; }"});
 }
 
 test "compliance: calling a struct's namespace declaration (P.decl(args))" {

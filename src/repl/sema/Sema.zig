@@ -3804,6 +3804,18 @@ fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index, comptime initializing: bool) 
     const object_ptr = try sema.resolveRef(extra.lhs);
     const parent_ty = ip.indexToKey(object_ptr.index).ptr.ty;
     const container_ty = ip.indexToKey(parent_ty).ptr_type.child;
+
+    // Namespace decl access on a type (`&S.decl`, e.g. the intermediate `S.A` in
+    // `S.A.y`): the operand points at a type value. Resolve the decl in that type's
+    // namespace and return a pointer to it. Mirrors fieldPtr's `.type` arm, whose
+    // `namespaceLookupRef` yields a `decl_ref`.
+    if (container_ty == .type_type) {
+        const container = try sema.loadValue(object_ptr);
+        if (try sema.structDeclByName(container.index, name)) |decl_val|
+            return try sema.materializeConstPtr(decl_val);
+        return sema.failBadMemberAccess(container.index, name);
+    }
+
     const fld: FieldInfo = switch (ip.indexToKey(container_ty)) {
         .union_type => blk: {
             const f = (try sema.unionFieldByName(container_ty, name)) orelse
