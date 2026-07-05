@@ -1253,6 +1253,19 @@ test "compliance: explicit enum tag types and values" {
     try expectBothReject(a, &.{"blk: { const E = enum(u8) { a = 300 }; break :blk @intFromEnum(E.a); }"});
 }
 
+test "compliance: @tagName of an enum value" {
+    // @tagName yields the tag's name as a `*const [N:0]u8`; check its length and
+    // bytes (rendering the string itself needs slices, a later stage).
+    const a = testing.allocator;
+    const E = "const E = enum { north, east, south };";
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " break :blk @tagName(E.east).len; }"}); // 4
+    try expectMatchesZig(a, &.{"blk: { " ++ E ++ " const c: u8 = @tagName(E.south)[0]; break :blk c; }"}); // 's'
+    // The name tracks the tag, not its integer, for an explicit-value enum.
+    try expectMatchesZig(a, &.{"blk: { const V = enum(u8) { lo = 5, hi = 10 }; const c: u8 = @tagName(V.hi)[0]; break :blk c; }"}); // 'h'
+    // @tagName of a non-enum is a compile error on both sides.
+    try expectBothReject(a, &.{"blk: { break :blk @tagName(5); }"});
+}
+
 test "compliance: enum equality and switch" {
     const a = testing.allocator;
     const E = "const E = enum { a, b, c };";

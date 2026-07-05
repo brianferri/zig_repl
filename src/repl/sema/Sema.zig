@@ -478,6 +478,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .size_of => sema.evalSizeOf(inst),
         .int_from_ptr => sema.evalIntFromPtr(inst),
         .int_from_enum => sema.evalIntFromEnum(inst),
+        .tag_name => sema.evalTagName(inst),
         .enum_from_int => sema.evalEnumFromInt(inst),
         .decl_literal, .decl_literal_no_coerce => sema.evalDeclLiteral(inst),
         .alloc, .alloc_mut, .alloc_comptime_mut => sema.evalAlloc(inst),
@@ -569,14 +570,19 @@ fn evalInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = idx };
 }
 
-/// `str "..."`: a string literal, `*const [N:0]u8`. Interns a `[N:0]u8` array
-/// value (each byte a `u8`, plus the trailing 0 sentinel) and returns a const
-/// pointer to it. Mirrors zirStr -> addStrLit -> uavRef. The compiler uses the
-/// aggregate `bytes` storage; this evaluator has only `elems` storage, so the
-/// bytes are interned one `u8` per slot until a `bytes` flavor lands.
+/// `str "..."`: a string literal, `*const [N:0]u8`. Mirrors zirStr -> addStrLit.
 fn evalStr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    const ip = sema.intern_pool;
     const bytes = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str.get(sema.zir);
+    return try sema.internStringLiteral(bytes);
+}
+
+/// Build a string-literal value: a `[N:0]u8` array (each byte a `u8`, plus the
+/// trailing 0 sentinel) behind a const pointer, `*const [N:0]u8`. Mirrors
+/// `addStrLit` -> `uavRef`. The compiler uses the aggregate `bytes` storage; this
+/// evaluator has only `elems` storage, so the bytes are interned one `u8` per slot
+/// until a `bytes` flavor lands. Shared by `str` and `@tagName`.
+fn internStringLiteral(sema: *Sema, bytes: []const u8) Error!Value {
+    const ip = sema.intern_pool;
     const u8_zero = try ip.internInt(.{ .ty = .u8_type, .storage = .{ .u64 = 0 } });
     const array_ty = try ip.internArrayType(.{ .len = bytes.len, .child = .u8_type, .sentinel = u8_zero });
 
@@ -3262,14 +3268,18 @@ fn enumIntTagType(sema: *Sema, field_count: u32) Error!InternPool.Index {
 /// (`@enumFromInt`). Both walk the same field iteration, so one helper serves both.
 const EnumMatch = union(enum) { name: InternPool.NullTerminatedString, value: i128 };
 
-/// Resolve an enum tag by name or by integer value, returning its `enum_tag`.
-/// Walks the decl's fields in order, assigning each its value: an explicit
-/// `= expr` body, else one past the previous (0 for the first). The tag type is
-/// an explicit `enum(T)` body, else the auto smallest-unsigned. Returns null if
-/// nothing matches. Mirrors the compiler's enum field resolution plus
+/// The result of an enum lookup: the `enum_tag` value and its interned field name
+/// (the name lets `@tagName` build the tag's string without a second scan).
+const EnumMatchResult = struct { tag: Value, name: InternPool.NullTerminatedString };
+
+/// Resolve an enum tag by name or by integer value, returning its `enum_tag` and
+/// interned name. Walks the decl's fields in order, assigning each its value: an
+/// explicit `= expr` body, else one past the previous (0 for the first). The tag
+/// type is an explicit `enum(T)` body, else the auto smallest-unsigned. Returns
+/// null if nothing matches. Mirrors the compiler's enum field resolution plus
 /// `nameIndex` / `tagValueIndex`. `this_type` is set so a value body may use
 /// `@This()`.
-fn enumLookup(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?Value {
+fn enumLookup(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?EnumMatchResult {
     const ip = sema.intern_pool;
     const et = ip.indexToKey(enum_ty).enum_type;
     const frame = try sema.enterSourceZir(et.source_zir_id, "enum field");
@@ -3295,8 +3305,9 @@ fn enumLookup(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?V
             };
         } else next_auto;
         next_auto = cur + 1;
+        const field_name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
         const matched = switch (match) {
-            .name => |n| (try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name))) == n,
+            .name => |n| field_name == n,
             .value => |v| cur == v,
         };
         if (!matched) continue;
@@ -3308,14 +3319,14 @@ fn enumLookup(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?V
         };
         const raw = try ip.internInt(.{ .ty = .comptime_int_type, .storage = .{ .i64 = i64v } });
         const int = (try sema.coerceValueToType(.{ .index = raw }, tag_ty, "enum tag")).index;
-        return .{ .index = try ip.internEnumTag(.{ .ty = enum_ty, .int = int }) };
+        return .{ .tag = .{ .index = try ip.internEnumTag(.{ .ty = enum_ty, .int = int }) }, .name = field_name };
     }
     return null;
 }
 
 /// A name-keyed enum tag lookup (`E.b`, `.b`). Thin wrapper over `enumLookup`.
 fn enumTagByName(sema: *Sema, enum_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
-    return sema.enumLookup(enum_ty, .{ .name = name });
+    return if (try sema.enumLookup(enum_ty, .{ .name = name })) |m| m.tag else null;
 }
 
 /// The integer value of an `int` Key as `i128`, or null if it is not an integer
@@ -3348,7 +3359,7 @@ fn evalEnumFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         try sema.writer.writeAll("@enumFromInt: operand is not an integer\n");
         return error.AnalysisFail;
     };
-    if (try sema.enumLookup(dest_ty, .{ .value = value })) |tag| return tag;
+    if (try sema.enumLookup(dest_ty, .{ .value = value })) |m| return m.tag;
     const name = ip.stringSlice(ip.indexToKey(dest_ty).enum_type.name);
     try sema.writer.print("enum '{s}' has no tag with value '{d}'\n", .{ name, value });
     return error.AnalysisFail;
@@ -3392,6 +3403,25 @@ fn evalIntFromEnum(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return error.AnalysisFail;
     }
     return .{ .index = key.enum_tag.int };
+}
+
+/// `tag_name operand`: `@tagName(e)` -- the name of an enum value's tag as a
+/// `*const [N:0]u8` string literal. Finds the tag by its integer value, then
+/// builds the string from the field name. Mirrors zirTagName's comptime arm,
+/// which returns `addNullTerminatedStrLit(field_name)`.
+fn evalTagName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const operand = try sema.resolveRef(un_node.operand);
+    const key = ip.indexToKey(operand.index);
+    if (key != .enum_tag) {
+        try sema.writer.writeAll("@tagName: operand is not an enum value\n");
+        return error.AnalysisFail;
+    }
+    const value = sema.intAsI128(key.enum_tag.int).?; // the tag's integer, always in range
+    const m = (try sema.enumLookup(key.enum_tag.ty, .{ .value = value })) orelse
+        unreachable; // a valid enum_tag always names one of its type's fields
+    return try sema.internStringLiteral(ip.stringSlice(m.name));
 }
 
 /// A struct type's declared field count (read straight from its source ZIR's
