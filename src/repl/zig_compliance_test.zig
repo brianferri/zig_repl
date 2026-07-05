@@ -1318,6 +1318,47 @@ test "compliance: switch on a tagged union captures the active payload" {
     try expectBothReject(a, &.{"blk: { const V = union(enum) { a: u32, b: bool }; const v = V{ .a = 5 }; break :blk switch (v) { .a, .b => |x| x }; }"});
 }
 
+test "compliance: unions with explicit tag types" {
+    const a = testing.allocator;
+    // `union(enum(T))`: the tag enum has an explicit backing int; access/switch
+    // behave as for `union(enum)`.
+    const T = "const T = union(enum(u8)) { a: u32, b: u8 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ T ++ " const t = T{ .b = 7 }; break :blk switch (t) { .a => |v| v, .b => |v| v + 1 }; }"}); // 8
+    // `union(E)`: the tag is the existing enum `E`, whose values may be explicit;
+    // the active-field check and @tagName resolve through `E`.
+    const U = "const E = enum(u8) { a = 5, b = 10 }; const U = union(E) { a: u32, b: u8 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ U ++ " const u = U{ .b = 9 }; break :blk u.b; }"});
+    try expectMatchesZig(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 3 }; break :blk switch (u) { .a => |v| v, .b => 0 }; }"});
+    try expectMatchesZig(a, &.{"blk: { " ++ U ++ " const u = U{ .b = 9 }; const c: u8 = @tagName(u)[0]; break :blk c; }"}); // 'b'
+    try expectBothReject(a, &.{"blk: { " ++ U ++ " const u = U{ .b = 9 }; break :blk u.a; }"});
+    // A non-enum tag type, and a union field absent from the tag enum, are both
+    // compile errors on both sides. So is a field-order mismatch or a tag enum
+    // with fields the union lacks.
+    try expectBothReject(a, &.{"blk: { const U = union(u8) { a: u32, b: u8 }; const u = U{ .a = 5 }; break :blk u.a; }"});
+    try expectBothReject(a, &.{"blk: { const E = enum { a, b }; const U = union(E) { a: u32, x: u8 }; const u = U{ .x = 1 }; break :blk u.x; }"});
+    try expectBothReject(a, &.{"blk: { const E = enum { a, b }; const U = union(E) { b: bool, a: u32 }; const u = U{ .a = 5 }; break :blk u.a; }"});
+    try expectBothReject(a, &.{"blk: { const E = enum { a, b, c }; const U = union(E) { a: u32, b: u8 }; const u = U{ .a = 5 }; break :blk u.a; }"});
+}
+
+test "compliance: union sad paths pin the REPL's diagnostics" {
+    const a = testing.allocator;
+    const U = "const U = union(enum) { a: u32, b: u8 };";
+    // Initializing or accessing a field the union lacks names the union (this used
+    // to crash: the diagnostic assumed a struct type).
+    try expectReplDiagnostic(a, &.{"blk: { " ++ U ++ " const u = U{ .z = 1 }; break :blk u.a; }"}, "no field named 'z' in union");
+    try expectReplDiagnostic(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 1 }; break :blk u.z; }"}, "no field named 'z' in union");
+    // A union init names exactly one field.
+    try expectReplDiagnostic(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 1, .b = 2 }; break :blk u.a; }"}, "union initialization expects exactly one field");
+    // The init value must coerce to the field type.
+    try expectReplDiagnostic(a, &.{"blk: { " ++ U ++ " const u = U{ .a = true }; break :blk u.a; }"}, "cannot coerce value to destination type");
+    // @tagName rejects a non-enum/union operand.
+    try expectReplDiagnostic(a, &.{"blk: { const S = struct { x: u8 }; const s = S{ .x = 1 }; break :blk @tagName(s); }"}, "expected enum or union");
+    // An explicit non-enum tag type, and union(E) order/count mismatches, are
+    // rejected with the compiler's wording.
+    try expectReplDiagnostic(a, &.{"blk: { const V = union(u8) { a: u32, b: u8 }; const v = V{ .a = 1 }; break :blk v.a; }"}, "expected enum tag type, found 'u8'");
+    try expectReplDiagnostic(a, &.{"blk: { const E = enum { a, b }; const V = union(E) { b: bool, a: u32 }; const v = V{ .a = 1 }; break :blk v.a; }"}, "union field order does not match tag enum field order");
+}
+
 test "compliance: string literals -- length and byte indexing" {
     // A string literal is a `*const [N:0]u8`. `.len` is the array length; indexing
     // reads a byte. (`@tagName` and slices, which return `[]const u8`, come later.)
