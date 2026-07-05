@@ -2636,8 +2636,8 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
 fn loadUnionField(sema: *Sema, union_val: InternPool.Index, index: u32) Error!Value {
     const ip = sema.intern_pool;
     const uv = ip.indexToKey(union_val).un;
-    const et = ip.indexToKey(uv.tag).enum_tag;
-    const active_index = (try sema.enumLookup(et.ty, .{ .value = sema.intAsI128(et.int).? })).?.index;
+    const tag_ty = ip.indexToKey(uv.tag).enum_tag.ty;
+    const active_index = (try sema.enumTagFieldIndex(tag_ty, .{ .index = uv.tag })).?;
     if (active_index == index) return .{ .index = uv.val };
     const accessed = (try sema.unionFieldNameAt(uv.ty, index)) orelse unreachable;
     const active_name = (try sema.unionFieldNameAt(uv.ty, active_index)) orelse unreachable;
@@ -3471,7 +3471,7 @@ fn enumIntTagType(sema: *Sema, field_count: u32) Error!InternPool.Index {
 
 /// How to select an enum tag: by field name (`E.b`) or by integer value
 /// (`@enumFromInt`). Both walk the same field iteration, so one helper serves both.
-const EnumMatch = union(enum) { name: InternPool.NullTerminatedString, value: i128 };
+const EnumMatch = union(enum) { name: InternPool.NullTerminatedString, value: i128, index: u32 };
 
 /// The result of an enum lookup: the `enum_tag` value, its interned field name
 /// (so `@tagName` needs no second scan), and its field position. The position is
@@ -3483,15 +3483,18 @@ const EnumMatchResult = struct { tag: Value, name: InternPool.NullTerminatedStri
 /// interned name. Walks the decl's fields in order, assigning each its value: an
 /// explicit `= expr` body, else one past the previous (0 for the first). The tag
 /// type is an explicit `enum(T)` body, else the auto smallest-unsigned. Returns
-/// null if nothing matches. Mirrors the compiler's enum field resolution plus
-/// `nameIndex` / `tagValueIndex`. `this_type` is set so a value body may use
-/// `@This()`.
-fn enumLookup(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?EnumMatchResult {
+/// null if nothing matches. `this_type` is set so a value body may use `@This()`.
+///
+/// This is the shared walk backing the compiler-shaped accessors below
+/// (`enumFieldIndex` / `enumTagFieldIndex` / `enumFieldName` / `enumValueFieldIndex`),
+/// analogous to the compiler indexing into a `LoadedEnumType`'s resolved arrays --
+/// this evaluator has no such cached type, so it re-walks the ZIR.
+fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?EnumMatchResult {
     const ip = sema.intern_pool;
     const et = ip.indexToKey(enum_ty).enum_type;
     // A union's generated tag enum has no enum ZIR: its fields are the union's,
     // auto-numbered from 0 with no explicit values or tag type.
-    if (et.generated_union != .none) return try sema.generatedTagLookup(enum_ty, match);
+    if (et.generated_union != .none) return try sema.generatedTagScan(enum_ty, match);
 
     const frame = try sema.enterSourceZir(et.source_zir_id, "enum field");
     defer frame.restore(sema);
@@ -3523,11 +3526,11 @@ fn enumLookup(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?E
     return null;
 }
 
-/// `enumLookup` for a union's generated tag enum: the fields are the union's,
+/// `enumFieldScan` for a union's generated tag enum: the fields are the union's,
 /// auto-numbered from 0. The int tag type is `union(enum(T))`'s explicit `T`, else
 /// the auto smallest-unsigned. Mirrors the compiler treating the generated tag as
 /// an ordinary auto enum whose int mode is explicit only for `tagged_enum_explicit`.
-fn generatedTagLookup(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?EnumMatchResult {
+fn generatedTagScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?EnumMatchResult {
     const ip = sema.intern_pool;
     const union_ty = ip.indexToKey(enum_ty).enum_type.generated_union;
     const ut = ip.indexToKey(union_ty).union_type;
@@ -3569,6 +3572,7 @@ fn matchEnumField(
     const matched = switch (match) {
         .name => |n| field_name == n,
         .value => |v| value == v,
+        .index => |i| field_index == i,
     };
     if (!matched) return null;
     const i64v = std.math.cast(i64, value) orelse {
@@ -3584,9 +3588,37 @@ fn matchEnumField(
     };
 }
 
-/// A name-keyed enum tag lookup (`E.b`, `.b`). Thin wrapper over `enumLookup`.
+/// The field index of `name`, or null if the enum has no such field. Mirrors the
+/// compiler's `Type.enumFieldIndex` / `LoadedEnumType.nameIndex`.
+fn enumFieldIndex(sema: *Sema, enum_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?u32 {
+    return if (try sema.enumFieldScan(enum_ty, .{ .name = name })) |m| m.index else null;
+}
+
+/// The field index whose tag value is `tag` (an `enum_tag` or bare `int` value),
+/// or null if none. Mirrors `Type.enumTagFieldIndex` / `LoadedEnumType.tagValueIndex`.
+fn enumTagFieldIndex(sema: *Sema, enum_ty: InternPool.Index, tag: Value) Error!?u32 {
+    const int = switch (sema.intern_pool.indexToKey(tag.index)) {
+        .enum_tag => |et| et.int,
+        .int => tag.index,
+        else => unreachable,
+    };
+    return if (try sema.enumFieldScan(enum_ty, .{ .value = sema.intAsI128(int).? })) |m| m.index else null;
+}
+
+/// The name of field `index`. Mirrors `Type.enumFieldName`.
+fn enumFieldName(sema: *Sema, enum_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
+    return if (try sema.enumFieldScan(enum_ty, .{ .index = index })) |m| m.name else null;
+}
+
+/// The `enum_tag` value of field `index`. Mirrors `pt.enumValueFieldIndex`.
+fn enumValueFieldIndex(sema: *Sema, enum_ty: InternPool.Index, index: u32) Error!?Value {
+    return if (try sema.enumFieldScan(enum_ty, .{ .index = index })) |m| m.tag else null;
+}
+
+/// The `enum_tag` value of the field named `name` (`E.b`, `.b`), or null. Combines
+/// `enumFieldIndex` + `enumValueFieldIndex`; kept as one call for the common lookup.
 fn enumTagByName(sema: *Sema, enum_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
-    return if (try sema.enumLookup(enum_ty, .{ .name = name })) |m| m.tag else null;
+    return if (try sema.enumFieldScan(enum_ty, .{ .name = name })) |m| m.tag else null;
 }
 
 /// The integer value of an `int` Key as `i128`, or null if it is not an integer
@@ -3619,7 +3651,10 @@ fn evalEnumFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         try sema.writer.writeAll("@enumFromInt: operand is not an integer\n");
         return error.AnalysisFail;
     };
-    if (try sema.enumLookup(dest_ty, .{ .value = value })) |m| return m.tag;
+    // Mirror `intToEnum`: the value must name a field (`tagValueIndex`), then take
+    // that field's canonical tag (`enumValueFieldIndex`).
+    if (try sema.enumTagFieldIndex(dest_ty, operand)) |field_index|
+        return (try sema.enumValueFieldIndex(dest_ty, field_index)).?;
     const name = ip.stringSlice(ip.indexToKey(dest_ty).enum_type.name);
     try sema.writer.print("enum '{s}' has no tag with value '{d}'\n", .{ name, value });
     return error.AnalysisFail;
@@ -3693,10 +3728,10 @@ fn evalTagName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             return error.AnalysisFail;
         },
     };
-    const value = sema.intAsI128(tag.int).?; // the tag's integer, always in range
-    const m = (try sema.enumLookup(tag.ty, .{ .value = value })) orelse
-        unreachable; // a valid enum_tag always names one of its type's fields
-    return try sema.internStringLiteral(ip.stringSlice(m.name));
+    // A valid enum_tag always names one of its type's fields: value -> index -> name.
+    const field_index = (try sema.enumTagFieldIndex(tag.ty, .{ .index = tag.int })).?;
+    const name = (try sema.enumFieldName(tag.ty, field_index)).?;
+    return try sema.internStringLiteral(ip.stringSlice(name));
 }
 
 /// Whether a union is tagged (`union(enum)` / `union(T)` / `union(enum(T))`), so
@@ -4083,12 +4118,12 @@ fn evalUnionInit(sema: *Sema, union_ty: InternPool.Index, inst: Zir.Inst.Index, 
     const val = (try sema.coerceValueToType(raw, field.ty, "union field")).index;
 
     const tag_enum = try sema.unionTagEnumType(union_ty);
-    const tag = (try sema.enumLookup(tag_enum, .{ .name = name })) orelse
+    const tag_index = (try sema.enumFieldIndex(tag_enum, name)) orelse
         return sema.failBadMemberAccess(tag_enum, name);
     // A `union(E)` requires its fields to match `E`'s in order and count; the
     // active-field check reads the tag's position, so a mismatch would misreport
     // it. Mirrors the compiler's union/tag field-order validation.
-    if (tag.index != field.index) {
+    if (tag_index != field.index) {
         try sema.writer.writeAll("union field order does not match tag enum field order\n");
         return error.AnalysisFail;
     }
@@ -4096,7 +4131,8 @@ fn evalUnionInit(sema: *Sema, union_ty: InternPool.Index, inst: Zir.Inst.Index, 
         try sema.writer.writeAll("enum field missing from union\n");
         return error.AnalysisFail;
     }
-    const value: Value = .{ .index = try ip.internUnion(.{ .ty = union_ty, .tag = tag.tag.index, .val = val }) };
+    const tag = (try sema.enumValueFieldIndex(tag_enum, tag_index)).?;
+    const value: Value = .{ .index = try ip.internUnion(.{ .ty = union_ty, .tag = tag.index, .val = val }) };
     return if (is_ref) try sema.materializeConstPtr(value) else value;
 }
 
@@ -5312,9 +5348,9 @@ fn validateSwitchItemValue(
     const ip = sema.intern_pool;
     switch (type_tag) {
         .@"enum" => {
-            const et = ip.indexToKey(val.index).enum_tag;
-            const m = (try sema.enumLookup(et.ty, .{ .value = sema.intAsI128(et.int).? })).?;
-            return markSwitchEnumField(seen_enum_fields, m.index);
+            const tag_ty = ip.indexToKey(val.index).enum_tag.ty;
+            const field_index = (try sema.enumTagFieldIndex(tag_ty, val)).?;
+            return markSwitchEnumField(seen_enum_fields, field_index);
         },
         .error_set => return (try seen_errors.getOrPut(sema.gpa, ip.indexToKey(val.index).err.name)).found_existing,
         .int, .comptime_int => {
@@ -5404,9 +5440,9 @@ fn validateSwitchBlock(sema: *Sema, inst: Zir.Inst.Index, item_ty: InternPool.In
                 .enum_literal => |n| blk: {
                     const name = try ip.getOrPutString(gpa, sema.zir.nullTerminatedString(n));
                     if (ip.indexToKey(item_ty) != .enum_type) return sema.failBadMemberAccess(item_ty, name);
-                    const m = (try sema.enumLookup(item_ty, .{ .name = name })) orelse
+                    const field_index = (try sema.enumFieldIndex(item_ty, name)) orelse
                         return sema.failBadMemberAccess(item_ty, name);
-                    break :blk markSwitchEnumField(seen_enum_fields, m.index);
+                    break :blk markSwitchEnumField(seen_enum_fields, field_index);
                 },
                 .error_value => |n| blk: {
                     const name = try ip.getOrPutString(gpa, sema.zir.nullTerminatedString(n));
