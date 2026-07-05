@@ -48,6 +48,7 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
         .float => |fv| .{ .index = fv.ty },
         .undef => |ty| .{ .index = ty },
         .ptr => |p| .{ .index = p.ty },
+        .slice => |s| .{ .index = s.ty },
         .err => |e| .{ .index = e.ty },
         .error_union => |eu| .{ .index = eu.ty },
         .func => |f| .{ .index = f.ty },

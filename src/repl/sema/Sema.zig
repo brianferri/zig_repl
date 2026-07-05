@@ -550,6 +550,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .validate_array_init_result_ty => sema.evalValidateArrayInitResultTy(inst),
         .ref => sema.evalRef(inst),
         .elem_ptr_load => sema.evalElemPtrLoad(inst),
+        .elem_ptr_node => sema.evalElemPtrNode(inst),
         .elem_val => sema.evalElemVal(inst),
         inline else => |unhandled| return sema.reportUnsupportedTag(unhandled),
     };
@@ -2332,10 +2333,10 @@ fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         // address so the alignment invariant holds; it is not cached, since no
         // comptime-valid use observes the address value itself.
         .nav => sema.nextSyntheticAddress(align_bytes, size),
-        // A field pointer's address needs the field's byte offset within the
-        // aggregate, which auto-layout structs don't expose here.
-        .field => {
-            try sema.writer.writeAll("@intFromPtr: address of a struct field not supported\n");
+        // A field/element pointer's address needs the byte offset within the
+        // aggregate, which auto-layout aggregates don't expose here.
+        .field, .arr_elem => {
+            try sema.writer.writeAll("@intFromPtr: address of an aggregate element is not supported\n");
             return error.AnalysisFail;
         },
     };
@@ -2389,8 +2390,8 @@ fn evalMakePtrConst(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         // reads `ptr.base_addr.comptime_alloc` directly (src/Sema.zig
         // zirMakePtrConst), never a nav, so a decl pointer cannot reach here.
         .nav => unreachable,
-        // A field pointer freezes the aggregate it projects from.
-        .field => |f| sema.comptime_allocs.items[@intFromEnum(ip.indexToKey(f.base).ptr.base_addr.comptime_alloc)].is_const = true,
+        // A field/element pointer freezes the aggregate it projects from.
+        .field, .arr_elem => |f| sema.comptime_allocs.items[@intFromEnum(ip.indexToKey(f.base).ptr.base_addr.comptime_alloc)].is_const = true,
     }
     const old = ip.indexToKey(p.ty).ptr_type;
     if (old.flags.is_const) return ptr;
@@ -2574,6 +2575,12 @@ fn evalStoreNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const base_alloc = try sema.lookupComptimeAlloc(base);
             base_alloc.val = try sema.setStructField(base_alloc.val, struct_ty, @intCast(f.index), coerced);
         },
+        // Element mutation through an array-element pointer needs array
+        // read-modify-write (`setStructField` is struct-keyed); not yet built.
+        .arr_elem => {
+            try sema.writer.writeAll("store through an array-element pointer is not yet supported\n");
+            return error.AnalysisFail;
+        },
     }
     return .{ .index = .void_value };
 }
@@ -2605,10 +2612,11 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
     }
     switch (ptr_key.ptr.base_addr) {
         .nav => |nav| return .{ .index = ip.getNav(nav).resolved.?.value },
-        // A field pointer (`&l.a`, or the intermediate in `l.a.x`): load the
-        // aggregate behind the base pointer, then project the field. The base may
-        // itself be a nav, alloc, or another field pointer, so recurse.
-        .field => |f| {
+        // A field/element pointer (`&l.a`, `&arr[i]`, or the intermediate in
+        // `l.a.x` / `arr[i].f`): load the aggregate behind the base pointer, then
+        // project the index. The base may itself be a nav, alloc, or another such
+        // pointer, so recurse.
+        .field, .arr_elem => |f| {
             const parent = try sema.loadValue(.{ .index = f.base });
             return .{ .index = InternPool.aggregateElementAt(ip.indexToKey(parent.index).aggregate, @intCast(f.index)) };
         },
@@ -2677,8 +2685,39 @@ fn coerceValueToType(
         return try sema.coerceToOptional(value, dest_ty, op_name);
     }
 
+    // Coercion into a slice type: a pointer to an array (`*const [N:0]u8`, e.g. a
+    // string literal) becomes a slice with `len = N`. Mirrors coerceExtra's
+    // array-pointer -> slice arm.
+    if (ip.indexToKey(dest_ty) == .ptr_type and ip.indexToKey(dest_ty).ptr_type.flags.size == .slice) {
+        if (try sema.coerceToSlice(value, dest_ty)) |coerced| return coerced;
+    }
+
     try sema.writer.print("{s}: cannot coerce value to destination type\n", .{op_name});
     return error.AnalysisFail;
+}
+
+/// Coerce a single-pointer-to-array value (`*const [N]T`) into `dest_ty` (a slice
+/// `[]T`): a slice whose `ptr` is the array pointer re-typed to the slice's
+/// many-pointer field type (`[*]T`) and whose `len` is the array length. Returns
+/// null if `value` is not a pointer to an array (caller reports). Mirrors
+/// coerceArrayPtrToSlice's comptime arm (getCoerced to `slicePtrFieldType`).
+fn coerceToSlice(sema: *Sema, value: Value, dest_ty: InternPool.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    if (ip.indexToKey(value.index) != .ptr) return null;
+    const array_ptr = ip.indexToKey(value.index).ptr;
+    const child = ip.indexToKey(array_ptr.ty).ptr_type.child;
+    if (ip.indexToKey(child) != .array_type) return null;
+    const array = ip.indexToKey(child).array_type;
+
+    // The slice's ptr field type is a many-ptr (`[*]T`) carrying the slice's
+    // constness; re-tag the array pointer to it (same base address).
+    const many_ptr_ty = try ip.internPtrType(.{
+        .child = array.child,
+        .flags = .{ .size = .many, .is_const = ip.indexToKey(dest_ty).ptr_type.flags.is_const },
+    });
+    const many_ptr = try ip.internPtr(.{ .ty = many_ptr_ty, .base_addr = array_ptr.base_addr, .byte_offset = array_ptr.byte_offset });
+    const len_val = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = array.len } });
+    return .{ .index = try ip.get(.{ .slice = .{ .ty = dest_ty, .ptr = many_ptr, .len = len_val } }) };
 }
 
 /// Coerce `value` to a fixed-width int `dest_ty`, or `null` if `dest_ty` isn't
@@ -3545,6 +3584,15 @@ fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
                 return sema.failBadStructFieldAccess(inner_ty, name);
             return .{ .index = InternPool.aggregateElementAt(ip.indexToKey(inner.index).aggregate, fld.index) };
         },
+        // `.pointer` arm (a slice): `.len` / `.ptr` read from the slice value.
+        .ptr_type => |ptr_ty| {
+            if (ptr_ty.flags.size == .slice) {
+                const s = ip.indexToKey(inner.index).slice;
+                if (name.eqlSlice("len", ip)) return .{ .index = s.len };
+                if (name.eqlSlice("ptr", ip)) return .{ .index = s.ptr };
+            }
+            return sema.failNoMember(inner_ty, name);
+        },
         else => return sema.failNoMember(inner_ty, name),
     }
 }
@@ -3802,6 +3850,35 @@ fn evalElemPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return try sema.aggregateElement(array_value, bin.rhs);
 }
 
+/// `elem_ptr_node lhs, rhs`: a pointer to element `rhs` of the array behind `lhs`
+/// (`&arr[i]`, and the pointer AstGen forms for `arr[i].f`). Builds an `.arr_elem`
+/// projection, as the compiler's `elemPtr` does. Mirrors zirElemPtrNode -> elemPtr.
+fn evalElemPtrNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const bin = sema.binData(inst);
+    const array_ptr = try sema.resolveRef(bin.lhs);
+    const index = try sema.resolveArrayLen(bin.rhs, "elem ptr");
+    const parent_ty = ip.indexToKey(array_ptr.index).ptr.ty;
+    const array_key = ip.indexToKey(ip.indexToKey(parent_ty).ptr_type.child);
+    if (array_key != .array_type) {
+        try sema.writer.writeAll("elem ptr: operand is not an array pointer\n");
+        return error.AnalysisFail;
+    }
+    if (index >= array_key.array_type.len) {
+        try sema.writer.print("index {d} outside array of length {d}\n", .{ index, array_key.array_type.len });
+        return error.AnalysisFail;
+    }
+    const elem_ptr_ty = try ip.internPtrType(.{
+        .child = array_key.array_type.child,
+        .flags = .{ .size = .one, .is_const = ip.indexToKey(parent_ty).ptr_type.flags.is_const },
+    });
+    return .{ .index = try ip.internPtr(.{
+        .ty = elem_ptr_ty,
+        .base_addr = .{ .arr_elem = .{ .base = array_ptr.index, .index = index } },
+        .byte_offset = 0,
+    }) };
+}
+
 /// `elem_val`: `indexable[index]` by value (the `for (a) |x|` capture and
 /// direct indexing of an aggregate value). Same element read as
 /// `elem_ptr_load`, but the operand is the aggregate value rather than a
@@ -3823,11 +3900,19 @@ fn evalElemVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// Shared by `elem_ptr_load` and `elem_val`.
 fn aggregateElement(sema: *Sema, array_value: Value, index_ref: Zir.Inst.Ref) Error!Value {
     const ip = sema.intern_pool;
+    // A slice indexes through its `ptr` into the array; its own `len` bounds it
+    // (the array behind `ptr` may be longer). Unwrap to the array pointer first.
+    var agg = array_value;
+    var slice_len: ?u64 = null;
+    if (ip.indexToKey(agg.index) == .slice) {
+        const s = ip.indexToKey(agg.index).slice;
+        slice_len = try sema.resolveUsizeInt(.{ .index = s.len }, "slice len");
+        agg = .{ .index = s.ptr };
+    }
     // Deref a pointer operand to the aggregate it addresses. A string literal is a
     // `*const [N:0]u8`, and taking its address (`ref` before an index) nests one
     // more pointer, so follow the chain -- the compiler's elem access auto-derefs
     // a single-pointer-to-array the same way.
-    var agg = array_value;
     while (ip.indexToKey(agg.index) == .ptr) agg = try sema.loadValue(agg);
     const agg_key = ip.indexToKey(agg.index);
     if (agg_key != .aggregate) {
@@ -3835,7 +3920,7 @@ fn aggregateElement(sema: *Sema, array_value: Value, index_ref: Zir.Inst.Ref) Er
         return error.AnalysisFail;
     }
     const index = try sema.resolveArrayLen(index_ref, "elem access");
-    const count = ip.aggregateElementCount(agg_key.aggregate.ty);
+    const count = slice_len orelse ip.aggregateElementCount(agg_key.aggregate.ty);
     if (index >= count) {
         try sema.writer.print("index {d} outside array of length {d}\n", .{ index, count });
         return error.AnalysisFail;

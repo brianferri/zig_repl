@@ -1298,6 +1298,34 @@ test "compliance: string literals -- length and byte indexing" {
     try expectBothReject(a, &.{"blk: { break :blk \"hi\"[5]; }"});
 }
 
+test "compliance: slices -- coercion from a string literal, .len, indexing" {
+    // A `*const [N:0]u8` (string literal, `@tagName`) coerces to `[]const u8`.
+    // `.len` and byte indexing read through the slice.
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"blk: { const s: []const u8 = \"hello\"; break :blk s.len; }"});
+    try expectMatchesZig(a, &.{"blk: { const s: []const u8 = \"hello\"; break :blk s[1]; }"}); // 'e'
+    // @tagName's result coerces to a []const u8 slice.
+    try expectMatchesZig(a, &.{"blk: { const E = enum { north, east }; const s: []const u8 = @tagName(E.east); break :blk s[0]; }"});
+    // Indexing past the slice length is a compile error on both sides.
+    try expectBothReject(a, &.{"blk: { const s: []const u8 = \"hi\"; break :blk s[5]; }"});
+}
+
+test "compliance: slices nested in structs and arrays of slices" {
+    const a = testing.allocator;
+    // A `[]const u8` field of a struct: access, `.len`, and byte indexing.
+    const S = "const S = struct { name: []const u8 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ S ++ " const s = S{ .name = \"hello\" }; break :blk s.name.len; }"});
+    try expectMatchesZig(a, &.{"blk: { " ++ S ++ " const s = S{ .name = \"abc\" }; break :blk s.name[1]; }"}); // 'b'
+    // An array of slices (`[N][]const u8`): element `.len`, and chained indexing --
+    // `arr[i].len` / `arr[i][j]` go through elem_ptr_node to the element slice.
+    const Arr = "const arr = [_][]const u8{ \"a\", \"bb\", \"ccc\" };";
+    try expectMatchesZig(a, &.{"blk: { " ++ Arr ++ " break :blk arr[2].len; }"}); // 3
+    try expectMatchesZig(a, &.{"blk: { " ++ Arr ++ " break :blk arr[0][0]; }"}); // 'a'
+    // A struct holding an array of slices, reached through both.
+    const W = "const W = struct { rows: [2][]const u8 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ W ++ " const w = W{ .rows = .{ \"xy\", \"z\" } }; break :blk w.rows[0][1]; }"}); // 'y'
+}
+
 test "compliance: a member body takes the address of a sibling declaration" {
     // `&k` inside a method body resolves `k` in the enclosing container, like a
     // bare `k` does -- decl_ref and decl_val share the same lookup.

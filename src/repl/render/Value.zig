@@ -40,6 +40,13 @@ pub fn render(
         else
             render(.{ .index = o.val }, pool, writer),
         .ptr => |p| writer.print("ptr@{d}+{d}\n", .{ @intFromEnum(p.ty), p.byte_offset }),
+        // The elements live behind the slice's `ptr` in a Sema comptime alloc the
+        // renderer cannot reach (like struct fields), so render just the length.
+        .slice => |s| blk: {
+            var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+            const len = pool.indexToKey(s.len).int.storage.toBigInt(&space);
+            break :blk writer.print("slice[{f}]\n", .{len});
+        },
         .err => |e| writer.print("error.{s}\n", .{pool.stringSlice(e.name)}),
         .error_union => |eu| renderErrorUnion(eu, pool, writer),
         .func => |f| writer.print("fn@{d}\n", .{@intFromEnum(f.zir_body_inst)}),

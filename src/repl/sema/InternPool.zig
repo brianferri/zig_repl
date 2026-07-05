@@ -530,6 +530,9 @@ pub const Key = union(enum) {
     /// allocations; `.nav` / `.uav` / `.int` etc. land alongside their
     /// dependent stages.
     ptr: Ptr,
+    /// A slice value: `{ty, ptr, len}`. Mirrors the compiler's `Key.Slice`
+    /// (`ptr_slice`): `ptr` addresses the elements, `len` is a `usize` value.
+    slice: Slice,
     /// An error set type (`error{Foo, Bar}`). The compiler keeps
     /// names sorted for deterministic dedup; we do the same. Names
     /// are interned via `getOrPutString` so two error-set types
@@ -726,17 +729,29 @@ pub const Key = union(enum) {
             /// codegen. Mirrors the compiler's `BaseAddr.nav`.
             nav: Nav.Index,
             /// A pointer to a field of an auto-layout aggregate: `base` is the
-            /// parent pointer (a `.comptime_alloc`), `index` the field index.
-            /// Mirrors the compiler's `BaseAddr.field`, whose payload is the
-            /// shared `BaseIndex` (also used by `.arr_elem`, which we don't
-            /// model yet).
+            /// parent pointer, `index` the field index. Mirrors the compiler's
+            /// `BaseAddr.field`.
             field: BaseIndex,
+            /// A pointer to an element of an array: `base` is the array pointer,
+            /// `index` the element index. Mirrors the compiler's `BaseAddr.arr_elem`.
+            /// Shares `BaseIndex` with `.field`; in this no-layout evaluator both
+            /// resolve by index projection (the compiler splits them for byte
+            /// stride vs field offset).
+            arr_elem: BaseIndex,
 
             pub const BaseIndex = struct {
                 base: Index,
                 index: u64,
             };
         };
+    };
+
+    /// A slice value. Mirrors the compiler's `Key.Slice`: `ty` is the slice type,
+    /// `ptr` the pointer to the elements, `len` a `usize` value.
+    pub const Slice = struct {
+        ty: Index,
+        ptr: Index,
+        len: Index,
     };
 
     /// Opaque handle into `Sema.comptime_allocs`. Mirrors the compiler's
@@ -1012,7 +1027,7 @@ pub const Key = union(enum) {
                 switch (p.base_addr) {
                     .comptime_alloc => |slot| std.hash.autoHash(&hasher, slot),
                     .nav => |nav| std.hash.autoHash(&hasher, nav),
-                    .field => |f| {
+                    .field, .arr_elem => |f| {
                         std.hash.autoHash(&hasher, f.base);
                         std.hash.autoHash(&hasher, f.index);
                     },
@@ -1045,6 +1060,11 @@ pub const Key = union(enum) {
             .enum_tag => |et| {
                 std.hash.autoHash(&hasher, et.ty);
                 std.hash.autoHash(&hasher, et.int);
+            },
+            .slice => |s| {
+                std.hash.autoHash(&hasher, s.ty);
+                std.hash.autoHash(&hasher, s.ptr);
+                std.hash.autoHash(&hasher, s.len);
             },
             .err => |e| {
                 std.hash.autoHash(&hasher, e.ty);
@@ -1173,6 +1193,7 @@ pub const Key = union(enum) {
                     .comptime_alloc => |slot| slot == y.base_addr.comptime_alloc,
                     .nav => |nav| nav == y.base_addr.nav,
                     .field => |f| f.base == y.base_addr.field.base and f.index == y.base_addr.field.index,
+                    .arr_elem => |f| f.base == y.base_addr.arr_elem.base and f.index == y.base_addr.arr_elem.index,
                 };
             },
             .error_set_type => |x| std.mem.eql(NullTerminatedString, x.names, b.error_set_type.names),
@@ -1190,6 +1211,10 @@ pub const Key = union(enum) {
             .enum_tag => |x| blk: {
                 const y = b.enum_tag;
                 break :blk x.ty == y.ty and x.int == y.int;
+            },
+            .slice => |x| blk: {
+                const y = b.slice;
+                break :blk x.ty == y.ty and x.ptr == y.ptr and x.len == y.len;
             },
             .err => |x| blk: {
                 const y = b.err;
@@ -1292,6 +1317,7 @@ pub const Key = union(enum) {
             .int,
             .float,
             .ptr,
+            .slice,
             .undef,
             .err,
             .error_union,
@@ -1368,6 +1394,12 @@ const Item = struct {
         // slots: ty, base ptr Index, index_lo, index_hi, byte_offset_lo,
         // byte_offset_hi. Mirrors the compiler's `Item.Tag.ptr_field`.
         ptr_field,
+        // Pointer value with `BaseAddr.arr_elem`. Same PtrFieldRepr layout as
+        // `ptr_field`. Mirrors the compiler's `Item.Tag.ptr_arr_elem`.
+        ptr_arr_elem,
+        // Slice value. data = extra index of SliceRepr (3 u32 slots: ty, ptr,
+        // len). Mirrors the compiler's `Item.Tag.ptr_slice`.
+        ptr_slice,
         // Error set type. data = extra index of `[names_len, name0,
         // name1, ...]` -- one u32 length followed by `names_len`
         // interned-string handles. Mirrors the compiler's
@@ -1625,6 +1657,14 @@ const EnumTypeRepr = extern struct {
 const EnumTagRepr = extern struct {
     ty: u32,
     int: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.ptr_slice`. Three u32 slots: slice type,
+/// ptr value, len value.
+const SliceRepr = extern struct {
+    ty: u32,
+    ptr: u32,
+    len: u32,
 };
 
 /// Extra-arena payload for `Item.Tag.ptr_comptime_alloc`. Four u32 slots: ty,
@@ -2262,6 +2302,7 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .float => |f| try emitFloat(pool, f),
         .ptr_type => |pt| try emitPtrType(pool, pt),
         .ptr => |p| try emitPtr(pool, p),
+        .slice => |s| try emitSlice(pool, s),
         .error_set_type => |es| try emitErrorSetType(pool, es),
         .tuple_type => |tt| try emitTupleType(pool, tt),
         .struct_type => |st| try emitStructType(pool, st),
@@ -2349,6 +2390,8 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .ptr_comptime_alloc => ptrComptimeAllocFromExtra(pool, item.data),
         .ptr_nav => ptrNavFromExtra(pool, item.data),
         .ptr_field => ptrFieldFromExtra(pool, item.data),
+        .ptr_arr_elem => ptrArrElemFromExtra(pool, item.data),
+        .ptr_slice => sliceFromExtra(pool, item.data),
         .type_error_set => errorSetTypeFromExtra(pool, item.data),
         .type_tuple => tupleTypeFromExtra(pool, item.data),
         .type_struct => structTypeFromExtra(pool, item.data),
@@ -2426,6 +2469,11 @@ fn enumTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
 fn enumTagFromExtra(pool: *const InternPool, extra_index: u32) Key {
     const r = pool.extraData(EnumTagRepr, extra_index);
     return .{ .enum_tag = .{ .ty = @enumFromInt(r.ty), .int = @enumFromInt(r.int) } };
+}
+
+fn sliceFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const r = pool.extraData(SliceRepr, extra_index);
+    return .{ .slice = .{ .ty = @enumFromInt(r.ty), .ptr = @enumFromInt(r.ptr), .len = @enumFromInt(r.len) } };
 }
 
 fn errorSetTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
@@ -2558,13 +2606,23 @@ fn ptrNavFromExtra(pool: *const InternPool, extra_index: u32) Key {
 }
 
 fn ptrFieldFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    return ptrBaseIndexFromExtra(pool, extra_index, false);
+}
+
+fn ptrArrElemFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    return ptrBaseIndexFromExtra(pool, extra_index, true);
+}
+
+/// Decode a `PtrFieldRepr` into a `.field` or `.arr_elem` ptr (identical layout).
+fn ptrBaseIndexFromExtra(pool: *const InternPool, extra_index: u32, is_arr_elem: bool) Key {
     const r = pool.extraData(PtrFieldRepr, extra_index);
+    const bi: Key.Ptr.BaseAddr.BaseIndex = .{
+        .base = @enumFromInt(r.base),
+        .index = (@as(u64, r.index_hi) << 32) | r.index_lo,
+    };
     return .{ .ptr = .{
         .ty = @enumFromInt(r.ty),
-        .base_addr = .{ .field = .{
-            .base = @enumFromInt(r.base),
-            .index = (@as(u64, r.index_hi) << 32) | r.index_lo,
-        } },
+        .base_addr = if (is_arr_elem) .{ .arr_elem = bi } else .{ .field = bi },
         .byte_offset = (@as(u64, r.byte_offset_hi) << 32) | r.byte_offset_lo,
     } };
 }
@@ -2913,7 +2971,7 @@ fn emitPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!void {
             });
             pool.items.appendAssumeCapacity(.{ .tag = .ptr_nav, .data = extra_index });
         },
-        .field => |f| {
+        .field, .arr_elem => |f| {
             const extra_index = try pool.addExtra(PtrFieldRepr{
                 .ty = @intFromEnum(p.ty),
                 .base = @intFromEnum(f.base),
@@ -2922,7 +2980,8 @@ fn emitPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!void {
                 .byte_offset_lo = @truncate(p.byte_offset),
                 .byte_offset_hi = @truncate(p.byte_offset >> 32),
             });
-            pool.items.appendAssumeCapacity(.{ .tag = .ptr_field, .data = extra_index });
+            const tag: Item.Tag = if (p.base_addr == .field) .ptr_field else .ptr_arr_elem;
+            pool.items.appendAssumeCapacity(.{ .tag = tag, .data = extra_index });
         },
     }
 }
@@ -2986,6 +3045,16 @@ fn emitEnumTag(pool: *InternPool, et: Key.EnumTag) Allocator.Error!void {
         .int = @intFromEnum(et.int),
     });
     pool.items.appendAssumeCapacity(.{ .tag = .enum_tag, .data = extra_index });
+}
+
+/// Emit a `ptr_slice` Item. Three u32 slots: `ty`, `ptr`, `len`.
+fn emitSlice(pool: *InternPool, s: Key.Slice) Allocator.Error!void {
+    const extra_index = try pool.addExtra(SliceRepr{
+        .ty = @intFromEnum(s.ty),
+        .ptr = @intFromEnum(s.ptr),
+        .len = @intFromEnum(s.len),
+    });
+    pool.items.appendAssumeCapacity(.{ .tag = .ptr_slice, .data = extra_index });
 }
 
 /// Emit an `err` Item. Two u32 slots: `ty`, `name`.
