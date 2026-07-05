@@ -488,7 +488,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .resolve_inferred_alloc => sema.evalResolveInferredAlloc(inst),
         .make_ptr_const => sema.evalMakePtrConst(inst),
         .store_node => sema.evalStoreNode(inst),
-        .struct_init_field_ptr, .field_ptr => sema.evalFieldPtr(inst),
+        .struct_init_field_ptr => sema.evalFieldPtr(inst, true),
+        .field_ptr => sema.evalFieldPtr(inst, false),
         .field_ptr_load => sema.evalFieldPtrLoad(inst),
         .opt_eu_base_ptr_init => sema.evalOptEuBasePtrInit(inst),
         .validate_ptr_struct_init => sema.evalValidatePtrStructInit(inst),
@@ -1176,7 +1177,6 @@ fn computeFloatBin(
         else => unreachable,
     };
 }
-
 
 /// Translate an arith.DivError into either a successful Index or a written
 /// runtime-style diagnostic + AnalysisFail.
@@ -2612,6 +2612,11 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
         // pointer, so recurse.
         .field, .arr_elem => |f| {
             const parent = try sema.loadValue(.{ .index = f.base });
+            // A union value stores only the active field's payload, not a
+            // positional slot per field; reading a field pointer checks the
+            // active tag, mirroring `unionFieldPtr`'s comptime load.
+            if (ip.indexToKey(parent.index) == .un)
+                return try sema.loadUnionField(parent.index, @intCast(f.index));
             return .{ .index = InternPool.aggregateElementAt(ip.indexToKey(parent.index).aggregate, @intCast(f.index)) };
         },
         else => {
@@ -2619,6 +2624,24 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
             return alloc.val;
         },
     }
+}
+
+/// Read field `index` of a union value, checking it is the active field. The
+/// active field is the union's `enum_tag`; its integer is the field index (the
+/// tag enum is auto-numbered, so value == index). An inactive read is the
+/// compiler's "access of union field ... while field ... is active" error. Shared
+/// by the field-pointer load and the direct field access.
+fn loadUnionField(sema: *Sema, union_val: InternPool.Index, index: u32) Error!Value {
+    const ip = sema.intern_pool;
+    const uv = ip.indexToKey(union_val).un;
+    const active: u32 = @intCast(sema.intAsI128(ip.indexToKey(uv.tag).enum_tag.int).?);
+    if (active == index) return .{ .index = uv.val };
+    const accessed = (try sema.unionFieldNameAt(uv.ty, index)) orelse unreachable;
+    const active_name = (try sema.unionFieldNameAt(uv.ty, active)) orelse unreachable;
+    try sema.writer.print("access of union field '{s}' while field '{s}' is active\n", .{
+        ip.stringSlice(accessed), ip.stringSlice(active_name),
+    });
+    return error.AnalysisFail;
 }
 
 /// Locate the `ComptimeAlloc` entry referenced by a `Key.Ptr`. Returns
@@ -3172,6 +3195,35 @@ fn evalEnumDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     }) };
 }
 
+/// `union_decl` (extended): a named union type (`union(enum) { a: u8, b: u16 }`).
+/// Interns a nominal `union_type` shell, like `evalEnumDecl`; field names and
+/// types resolve on demand from the decl's ZIR. Mirrors zirUnionDecl ->
+/// getDeclaredUnionType.
+fn evalUnionDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const union_decl = sema.zir.getUnionDecl(inst);
+    const name = switch (union_decl.name_strategy) {
+        .parent => sema.type_name_ctx,
+        .anon, .func, .dbg_var => blk: {
+            const ctx = sema.intern_pool.stringSlice(sema.type_name_ctx);
+            const text = try std.fmt.allocPrint(sema.gpa, "{s}__union_{d}", .{ ctx, @intFromEnum(inst) });
+            defer sema.gpa.free(text);
+            break :blk try sema.intern_pool.getOrPutString(sema.gpa, text);
+        },
+    };
+
+    const captures = try sema.resolveCaptures(union_decl.captures);
+    defer sema.gpa.free(captures);
+
+    return .{ .index = try sema.intern_pool.internUnionType(.{
+        .source_zir_id = sema.current_zir_id,
+        .decl_inst = inst,
+        .name = name,
+        .captures = captures,
+    }) };
+}
+
 /// Resolve a struct decl's ZIR captures to their comptime values in the current
 /// scope. Mirrors `Sema.getCaptures`, reduced to the kinds a comptime evaluator
 /// produces: a captured local is an `.instruction` (its value) or an
@@ -3254,6 +3306,10 @@ fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: Intern
     return error.AnalysisFail;
 }
 
+/// A resolved container field: its declaration index and type. Shared by the
+/// struct and union lookups so their results are one type at call sites.
+const FieldInfo = struct { index: u32, ty: InternPool.Index };
+
 /// Resolve a struct field by name to its index and type. Iterates the struct
 /// decl's fields via the stdlib `iterateFields`, matching name bytes; the field
 /// type is its type body evaluated in the struct's source ZIR (swapped in for a
@@ -3265,7 +3321,7 @@ fn structFieldByName(
     sema: *Sema,
     struct_ty: InternPool.Index,
     name: InternPool.NullTerminatedString,
-) Error!?struct { index: u32, ty: InternPool.Index } {
+) Error!?FieldInfo {
     const ip = sema.intern_pool;
     const st = ip.indexToKey(struct_ty).struct_type;
     // Intern each ZIR field name as we scan and compare interned handles against
@@ -3287,6 +3343,77 @@ fn structFieldByName(
         }
     }
     return null;
+}
+
+/// Resolve a union field by name to its index and type. Mirrors `structFieldByName`
+/// over the union decl's fields (`getUnionDecl().iterateFields()`); a field with no
+/// type body is `void`. Returns null if no field matches.
+fn unionFieldByName(
+    sema: *Sema,
+    union_ty: InternPool.Index,
+    name: InternPool.NullTerminatedString,
+) Error!?FieldInfo {
+    const ip = sema.intern_pool;
+    const ut = ip.indexToKey(union_ty).union_type;
+    const frame = try sema.enterSourceZir(ut.source_zir_id, "union field");
+    defer frame.restore(sema);
+    const saved_this = sema.this_type;
+    sema.this_type = union_ty;
+    defer sema.this_type = saved_this;
+    var it = sema.zir.getUnionDecl(ut.decl_inst).iterateFields();
+    while (it.next()) |field| {
+        if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name))) == name) {
+            const ty = if (field.type_body) |body|
+                (try sema.resolveInlineBody(body, ut.decl_inst)).index
+            else
+                .void_type;
+            return .{ .index = field.idx, .ty = ty };
+        }
+    }
+    return null;
+}
+
+/// A union type's declared field count, read from its source ZIR.
+fn unionFieldCount(sema: *Sema, union_ty: InternPool.Index) Error!u32 {
+    const ut = sema.intern_pool.indexToKey(union_ty).union_type;
+    const frame = try sema.enterSourceZir(ut.source_zir_id, "union field count");
+    defer frame.restore(sema);
+    return @intCast(sema.zir.getUnionDecl(ut.decl_inst).field_names.len);
+}
+
+/// The interned name of a union's field at `index`, for the active-field
+/// diagnostic (the compiler's `enumFieldName(active_index)`). Returns null if the
+/// index is out of range.
+fn unionFieldNameAt(sema: *Sema, union_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
+    const ip = sema.intern_pool;
+    const ut = ip.indexToKey(union_ty).union_type;
+    const frame = try sema.enterSourceZir(ut.source_zir_id, "union field name");
+    defer frame.restore(sema);
+    var it = sema.zir.getUnionDecl(ut.decl_inst).iterateFields();
+    while (it.next()) |field| {
+        if (field.idx == index)
+            return try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
+    }
+    return null;
+}
+
+/// The union's auto-generated tag enum: an `enum_type` whose identity is the
+/// union index alone (`generated_union`) and whose fields are the union's,
+/// resolved through that back-reference. Mirrors the compiler's
+/// `generated_union_tag` container: `owner_union` set, `zir_index`/`captures`
+/// empty. Every auto-layout union has one, and its tag values drive the
+/// active-field check.
+fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPool.Index {
+    const ut = sema.intern_pool.indexToKey(union_ty).union_type;
+    return try sema.intern_pool.internEnumType(.{
+        // Inert for a generated tag enum: identity and field resolution go
+        // through `generated_union`, mirroring the compiler's `.none` zir_index /
+        // `.empty` captures. `name` still prints the tag type's name.
+        .source_zir_id = ut.source_zir_id,
+        .decl_inst = ut.decl_inst,
+        .name = ut.name,
+        .generated_union = union_ty,
+    });
 }
 
 /// The integer tag type of an auto-numbered enum with `field_count` fields: the
@@ -3315,6 +3442,10 @@ const EnumMatchResult = struct { tag: Value, name: InternPool.NullTerminatedStri
 fn enumLookup(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?EnumMatchResult {
     const ip = sema.intern_pool;
     const et = ip.indexToKey(enum_ty).enum_type;
+    // A union's generated tag enum has no enum ZIR: its fields are the union's,
+    // auto-numbered from 0 with no explicit values or tag type.
+    if (et.generated_union != .none) return try sema.generatedTagLookup(enum_ty, match);
+
     const frame = try sema.enterSourceZir(et.source_zir_id, "enum field");
     defer frame.restore(sema);
     const saved_this = sema.this_type;
@@ -3339,22 +3470,54 @@ fn enumLookup(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?E
         } else next_auto;
         next_auto = cur + 1;
         const field_name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
-        const matched = switch (match) {
-            .name => |n| field_name == n,
-            .value => |v| cur == v,
-        };
-        if (!matched) continue;
-        // Coerce the value to the tag type (its range check rejects a value the
-        // tag type can't hold, as the compiler's field-value coercion does).
-        const i64v = std.math.cast(i64, cur) orelse {
-            try sema.writer.writeAll("enum: tag value out of supported range\n");
-            return error.AnalysisFail;
-        };
-        const raw = try ip.internInt(.{ .ty = .comptime_int_type, .storage = .{ .i64 = i64v } });
-        const int = (try sema.coerceValueToType(.{ .index = raw }, tag_ty, "enum tag")).index;
-        return .{ .tag = .{ .index = try ip.internEnumTag(.{ .ty = enum_ty, .int = int }) }, .name = field_name };
+        if (try sema.matchEnumField(enum_ty, tag_ty, match, field_name, cur)) |m| return m;
     }
     return null;
+}
+
+/// `enumLookup` for a union's generated tag enum: the fields are the union's,
+/// auto-numbered from 0, tag type the auto smallest-unsigned. Mirrors the
+/// compiler treating `unionTagTypeHypothetical` as an ordinary auto enum.
+fn generatedTagLookup(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?EnumMatchResult {
+    const ip = sema.intern_pool;
+    const union_ty = ip.indexToKey(enum_ty).enum_type.generated_union;
+    const ut = ip.indexToKey(union_ty).union_type;
+    const frame = try sema.enterSourceZir(ut.source_zir_id, "union tag field");
+    defer frame.restore(sema);
+    const tag_ty = try sema.enumIntTagType(try sema.unionFieldCount(union_ty));
+    var it = sema.zir.getUnionDecl(ut.decl_inst).iterateFields();
+    while (it.next()) |field| {
+        const field_name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
+        if (try sema.matchEnumField(enum_ty, tag_ty, match, field_name, field.idx)) |m| return m;
+    }
+    return null;
+}
+
+/// If `(field_name, value)` matches `match`, build the `enum_tag` result. The
+/// value is coerced to `tag_ty`, whose range check rejects an out-of-range tag as
+/// the compiler's field-value coercion does. Shared by declared and generated
+/// enum field iteration.
+fn matchEnumField(
+    sema: *Sema,
+    enum_ty: InternPool.Index,
+    tag_ty: InternPool.Index,
+    match: EnumMatch,
+    field_name: InternPool.NullTerminatedString,
+    value: i128,
+) Error!?EnumMatchResult {
+    const ip = sema.intern_pool;
+    const matched = switch (match) {
+        .name => |n| field_name == n,
+        .value => |v| value == v,
+    };
+    if (!matched) return null;
+    const i64v = std.math.cast(i64, value) orelse {
+        try sema.writer.writeAll("enum: tag value out of supported range\n");
+        return error.AnalysisFail;
+    };
+    const raw = try ip.internInt(.{ .ty = .comptime_int_type, .storage = .{ .i64 = i64v } });
+    const int = (try sema.coerceValueToType(.{ .index = raw }, tag_ty, "enum tag")).index;
+    return .{ .tag = .{ .index = try ip.internEnumTag(.{ .ty = enum_ty, .int = int }) }, .name = field_name };
 }
 
 /// A name-keyed enum tag lookup (`E.b`, `.b`). Thin wrapper over `enumLookup`.
@@ -3476,10 +3639,12 @@ fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
 /// and `struct_init_field_ptr` (the pointer each field is stored through during
 /// `.{ ... }` init): both resolve the field by name and build the auto-layout
 /// `.field` projection into `object_ptr`. The compiler routes both through
-/// `fieldPtr`, differing only in an `initializing` flag that affects diagnostics,
-/// not the pointer. The field pointer inherits the parent pointer's constness.
-/// Mirrors zirFieldPtr / zirStructInitFieldPtr.
-fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+/// `fieldPtr`, differing in an `initializing` flag: a pointer to a union field is
+/// only valid for the active field unless it is being initialized, so a
+/// non-initializing pointer to an inactive field is rejected here (as
+/// `unionFieldPtr`'s comptime branch does). The field pointer inherits the parent
+/// pointer's constness. Mirrors zirFieldPtr / zirStructInitFieldPtr.
+fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index, comptime initializing: bool) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const ip = sema.intern_pool;
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
@@ -3487,9 +3652,20 @@ fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.field_name_start));
     const object_ptr = try sema.resolveRef(extra.lhs);
     const parent_ty = ip.indexToKey(object_ptr.index).ptr.ty;
-    const struct_ty = ip.indexToKey(parent_ty).ptr_type.child;
-    const fld = (try sema.structFieldByName(struct_ty, name)) orelse
-        return sema.failBadStructFieldAccess(struct_ty, name);
+    const container_ty = ip.indexToKey(parent_ty).ptr_type.child;
+    const fld = switch (ip.indexToKey(container_ty)) {
+        .union_type => blk: {
+            const f = (try sema.unionFieldByName(container_ty, name)) orelse
+                return sema.failBadStructFieldAccess(container_ty, name);
+            // Reading a pointer to an inactive union field is illegal; the
+            // compiler checks the active tag at the pointer op unless the field
+            // is being initialized. The union value is comptime-known here.
+            if (!initializing) _ = try sema.loadUnionField((try sema.loadValue(object_ptr)).index, f.index);
+            break :blk f;
+        },
+        else => (try sema.structFieldByName(container_ty, name)) orelse
+            return sema.failBadStructFieldAccess(container_ty, name),
+    };
     const field_ptr_ty = try ip.internPtrType(.{
         .child = fld.ty,
         .flags = .{ .size = .one, .is_const = ip.indexToKey(parent_ty).ptr_type.flags.is_const },
@@ -3501,27 +3677,35 @@ fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     }) };
 }
 
-/// Look up a member declaration by name in a struct type's namespace (`P.id`)
-/// and return its evaluated value. Iterates the struct decl's declarations in
-/// its source ZIR (swapped in for a cross-line struct, as `structFieldByName`
+/// Look up a member declaration by name in a container type's namespace (`P.id`)
+/// and return its evaluated value. Iterates the container decl's declarations in
+/// its source ZIR (swapped in for a cross-line type, as `structFieldByName`
 /// does), matching by name. Returns null if no declaration matches. Unnamed
-/// members (`comptime` blocks, tests) are skipped.
-fn structDeclByName(sema: *Sema, struct_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
-    const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
+/// members (`comptime` blocks, tests) are skipped. Works for any nominal
+/// container -- struct, union, or enum -- since all share a decl namespace (the
+/// compiler's namespace lookup is container-kind agnostic).
+fn structDeclByName(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
+    const Namespace = struct { source_zir_id: u32, decl_inst: Zir.Inst.Index };
+    const ns: Namespace = switch (sema.intern_pool.indexToKey(container_ty)) {
+        .struct_type => |st| .{ .source_zir_id = st.source_zir_id, .decl_inst = st.decl_inst },
+        .union_type => |ut| .{ .source_zir_id = ut.source_zir_id, .decl_inst = ut.decl_inst },
+        .enum_type => |et| .{ .source_zir_id = et.source_zir_id, .decl_inst = et.decl_inst },
+        else => return null,
+    };
     // Decls are not stored on the type; intern each decl name as we scan and
     // compare interned handles against the query, as the compiler's namespace
     // lookup does.
-    const frame = try sema.enterSourceZir(st.source_zir_id, "struct decl");
+    const frame = try sema.enterSourceZir(ns.source_zir_id, "container decl");
     defer frame.restore(sema);
-    for (sema.zir.typeDecls(st.decl_inst)) |decl_inst| {
+    for (sema.zir.typeDecls(ns.decl_inst)) |decl_inst| {
         const unwrapped = sema.zir.getDeclaration(decl_inst);
         if (unwrapped.name == .empty) continue;
         if ((try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(unwrapped.name))) != name) continue;
         const value_body = unwrapped.value_body orelse return null;
-        // Evaluate the member with this struct as `@This()` (e.g. a method's
+        // Evaluate the member with this container as `@This()` (e.g. a method's
         // `self: @This()` parameter type resolves to it).
         const saved_this = sema.this_type;
-        sema.this_type = struct_ty;
+        sema.this_type = container_ty;
         defer sema.this_type = saved_this;
         return try sema.resolveInlineBody(value_body, decl_inst);
     }
@@ -3577,6 +3761,13 @@ fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const fld = (try sema.structFieldByName(inner_ty, name)) orelse
                 return sema.failBadStructFieldAccess(inner_ty, name);
             return .{ .index = InternPool.aggregateElementAt(ip.indexToKey(inner.index).aggregate, fld.index) };
+        },
+        // `.@"union"` arm: the accessed field must be the active one, mirroring
+        // unionFieldVal's `active_index == field_index` check.
+        .union_type => {
+            const fld = (try sema.unionFieldByName(inner_ty, name)) orelse
+                return sema.failBadStructFieldAccess(inner_ty, name);
+            return try sema.loadUnionField(inner.index, fld.index);
         },
         // `.pointer` arm (a slice): `.len` / `.ptr` read from the slice value.
         .ptr_type => |ptr_ty| {
@@ -3691,33 +3882,39 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// `validate_struct_init_ty` / `validate_struct_init_result_ty`: check that the
 /// named type accepts `T{ ... }` init syntax; the following `struct_init` builds
-/// the value. Returns void. Mirrors zirValidateStructInitTy -- a struct passes.
-/// Unions also pass in the compiler, but `struct_init`'s union arm is not built
-/// here yet, so a union would fail there rather than in this check.
+/// the value. Returns void. Mirrors zirValidateStructInitTy -- a struct or union
+/// passes (the same ZIR drives `T{ .a = x }` for both).
 fn evalValidateStructInitTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const ty = (try sema.resolveRef(un_node.operand)).index;
-    if (sema.intern_pool.indexToKey(ty) != .struct_type) {
-        try sema.writer.writeAll("struct init: type does not support struct initialization syntax\n");
-        return error.AnalysisFail;
+    switch (sema.intern_pool.indexToKey(ty)) {
+        .struct_type, .union_type => return null,
+        else => {
+            try sema.writer.writeAll("struct init: type does not support struct initialization syntax\n");
+            return error.AnalysisFail;
+        },
     }
-    return null;
 }
 
 /// `struct_init_field_type`: the type of `container_type`'s field `name`, used
-/// to coerce that field's init expression. Mirrors zirStructInitFieldType.
+/// to coerce that field's init expression. Mirrors zirStructInitFieldType, which
+/// resolves the field against a struct or a union.
 fn evalStructInitFieldType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const datas = sema.zir.instructions.items(.data);
     const ft = sema.zir.extraData(Zir.Inst.FieldType, datas[@intFromEnum(inst)].pl_node.payload_index).data;
     const container_ty = (try sema.resolveRef(ft.container_type)).index;
-    if (sema.intern_pool.indexToKey(container_ty) != .struct_type) {
-        try sema.writer.writeAll("struct init: initializer type is not a struct\n");
-        return error.AnalysisFail;
-    }
     const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(ft.name_start));
-    const field = (try sema.structFieldByName(container_ty, name)) orelse
-        return sema.failBadStructFieldAccess(container_ty, name);
-    return .{ .index = field.ty };
+    const field_ty = switch (sema.intern_pool.indexToKey(container_ty)) {
+        .struct_type => ((try sema.structFieldByName(container_ty, name)) orelse
+            return sema.failBadStructFieldAccess(container_ty, name)).ty,
+        .union_type => ((try sema.unionFieldByName(container_ty, name)) orelse
+            return sema.failBadStructFieldAccess(container_ty, name)).ty,
+        else => {
+            try sema.writer.writeAll("struct init: initializer type is not a struct or union\n");
+            return error.AnalysisFail;
+        },
+    };
+    return .{ .index = field_ty };
 }
 
 /// `struct_init`: `T{ .a = x, .b = y }` -- explicit-type struct initialization,
@@ -3725,9 +3922,10 @@ fn evalStructInitFieldType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// instruction (naming the container type and field) with an init expression;
 /// the struct type is read from the first item. Fields left unwritten take their
 /// declared default, or are a missing-field error. Mirrors zirStructInit's
-/// struct arm + finishStructInit (its union arm is not built here). `struct_init_ref`
-/// (`is_ref`) is `struct_init` + `ref`: a pointer to the fresh value. The
-/// `.{ ... }` result-location form goes through `validate_ptr_struct_init`.
+/// struct arm + finishStructInit; the union arm builds a union value from the
+/// single initialized field. `struct_init_ref` (`is_ref`) is `struct_init` +
+/// `ref`: a pointer to the fresh value. The `.{ ... }` result-location form goes
+/// through `validate_ptr_struct_init`.
 fn evalStructInit(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Error!?Value {
     const ip = sema.intern_pool;
     const datas = sema.zir.instructions.items(.data);
@@ -3736,9 +3934,13 @@ fn evalStructInit(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Erro
     const first = sema.zir.extraData(Zir.Inst.StructInit.Item, extra.end).data;
     const first_ft = sema.zir.extraData(Zir.Inst.FieldType, datas[@intFromEnum(first.field_type)].pl_node.payload_index).data;
     const struct_ty = (try sema.resolveRef(first_ft.container_type)).index;
-    if (ip.indexToKey(struct_ty) != .struct_type) {
-        try sema.writer.writeAll("struct init: initializer type is not a struct\n");
-        return error.AnalysisFail;
+    switch (ip.indexToKey(struct_ty)) {
+        .struct_type => {},
+        .union_type => return try sema.evalUnionInit(struct_ty, inst, is_ref),
+        else => {
+            try sema.writer.writeAll("struct init: initializer type is not a struct or union\n");
+            return error.AnalysisFail;
+        },
     }
 
     const count = try sema.structFieldCount(struct_ty);
@@ -3762,6 +3964,34 @@ fn evalStructInit(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Erro
     }
 
     return try sema.finishStructInit(struct_ty, elems, is_ref);
+}
+
+/// `struct_init`'s union arm: `U{ .a = x }` builds a union value. A union init
+/// names exactly one field; the tag is that field's `enum_tag` in the union's
+/// generated tag enum, the payload the coerced init. Mirrors zirStructInit's
+/// union branch: unionFieldIndex -> enumValueFieldIndex tag -> internUnion.
+fn evalUnionInit(sema: *Sema, union_ty: InternPool.Index, inst: Zir.Inst.Index, comptime is_ref: bool) Error!Value {
+    const ip = sema.intern_pool;
+    const datas = sema.zir.instructions.items(.data);
+    const extra = sema.zir.extraData(Zir.Inst.StructInit, datas[@intFromEnum(inst)].pl_node.payload_index);
+    if (extra.data.fields_len != 1) {
+        try sema.writer.writeAll("union initialization expects exactly one field\n");
+        return error.AnalysisFail;
+    }
+
+    const item = sema.zir.extraData(Zir.Inst.StructInit.Item, extra.end).data;
+    const ft = sema.zir.extraData(Zir.Inst.FieldType, datas[@intFromEnum(item.field_type)].pl_node.payload_index).data;
+    const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(ft.name_start));
+    const field = (try sema.unionFieldByName(union_ty, name)) orelse
+        return sema.failBadStructFieldAccess(union_ty, name);
+
+    const raw = try sema.resolveRef(item.init);
+    const val = (try sema.coerceValueToType(raw, field.ty, "union field")).index;
+
+    const tag_enum = try sema.unionTagEnumType(union_ty);
+    const tag = (try sema.enumLookup(tag_enum, .{ .value = field.index })).?.tag.index;
+    const value: Value = .{ .index = try ip.internUnion(.{ .ty = union_ty, .tag = tag, .val = val }) };
+    return if (is_ref) try sema.materializeConstPtr(value) else value;
 }
 
 /// `struct_init_empty`: `T{}` -- every field takes its default. Just the
@@ -5341,7 +5571,12 @@ fn evalClosureGet(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Valu
         try sema.writer.writeAll("closure_get: no enclosing container\n");
         return error.AnalysisFail;
     }
-    const captures = sema.intern_pool.indexToKey(sema.this_type).struct_type.captures;
+    const captures = switch (sema.intern_pool.indexToKey(sema.this_type)) {
+        .struct_type => |st| st.captures,
+        .union_type => |ut| ut.captures,
+        .enum_type => |et| et.captures,
+        else => unreachable,
+    };
     assert(extended.small < captures.len);
     return Value{ .index = captures[extended.small] };
 }
@@ -5439,6 +5674,7 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
         .tuple_decl => return sema.evalTupleDecl(extended),
         .enum_decl => return sema.evalEnumDecl(inst),
+        .union_decl => return sema.evalUnionDecl(inst),
         .struct_decl => return sema.evalStructDecl(inst),
         .typeof_peer => return sema.evalTypeofPeer(extended, inst),
         .this => return sema.evalThis(),

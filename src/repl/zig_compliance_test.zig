@@ -1320,6 +1320,29 @@ test "compliance: array element store" {
     try expectBothReject(a, &.{"blk: { const arr = [_]u8{ 1, 2 }; arr[0] = 5; break :blk arr[0]; }"});
 }
 
+test "compliance: union initialization and active-field access" {
+    const a = testing.allocator;
+    const U = "const U = union { a: u32, b: bool };";
+    // Initialize a union and read back its active field.
+    try expectMatchesZig(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 5 }; break :blk u.a; }"});
+    try expectMatchesZig(a, &.{"blk: { " ++ U ++ " const u = U{ .b = true }; break :blk u.b; }"});
+    // A union field can be another aggregate, reached through both.
+    const W = "const W = struct { x: u8, y: u8 }; const V = union { p: W, n: u8 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ W ++ " const v = V{ .p = W{ .x = 3, .y = 4 } }; break :blk v.p.x + v.p.y; }"});
+    // Reading an inactive field is a compile error on both sides; a two-field
+    // init is rejected on both. Taking a *pointer* to an inactive field is
+    // rejected at the pointer op, even without a load (matching unionFieldPtr).
+    try expectBothReject(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 5 }; break :blk u.b; }"});
+    try expectBothReject(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 5 }; const q = &u.b; _ = q; break :blk 0; }"});
+    try expectBothReject(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 5, .b = true }; break :blk u.a; }"});
+    // Pin the REPL's active-field wording to the compiler's.
+    try expectReplDiagnostic(
+        a,
+        &.{"blk: { " ++ U ++ " const u = U{ .a = 5 }; break :blk u.b; }"},
+        "access of union field 'b' while field 'a' is active",
+    );
+}
+
 test "compliance: slices nested in structs and arrays of slices" {
     const a = testing.allocator;
     // A `[]const u8` field of a struct: access, `.len`, and byte indexing.

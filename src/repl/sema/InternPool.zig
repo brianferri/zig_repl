@@ -615,6 +615,10 @@ pub const Key = union(enum) {
     /// decl's ZIR (`enumFieldByName`), not stored here. Mirrors the compiler's
     /// `LoadedEnumType` shell before its fields are resolved.
     enum_type: EnumType,
+    /// A named union type (`union(enum) { a: u8, b: u16 }`). Nominal like
+    /// `enum_type`: identity is `(source_zir_id, decl_inst, captures)`; field
+    /// names and types are resolved on demand from the decl's ZIR.
+    union_type: UnionType,
     /// An aggregate value (array, vector, struct -- the type
     /// determines which). Storage is either an N-element slice or a
     /// single-element repetition. Mirrors compiler `Key.Aggregate`
@@ -628,6 +632,11 @@ pub const Key = union(enum) {
     /// An enum tag value: an enum type plus the integer tag it holds (an `int`
     /// value of the enum's integer tag type). Mirrors compiler `Key.EnumTag`.
     enum_tag: EnumTag,
+    /// A union value: `{ty, tag, val}` -- the union type, the active field's tag,
+    /// and its payload. Mirrors compiler `Key.un` (`Key.Union`); `tag` is an
+    /// `enum_tag` of the union's generated tag enum. Stored under
+    /// `Item.Tag.union_value`, as in the compiler.
+    un: Union,
 
     pub const Int = struct {
         ty: Index,
@@ -802,6 +811,30 @@ pub const Key = union(enum) {
         decl_inst: std.zig.Zir.Inst.Index,
         name: NullTerminatedString,
         captures: []const Index = &.{},
+        /// When set, this enum is the auto-generated tag type of that union: its
+        /// fields are the union's, auto-numbered from 0, resolved through this
+        /// back-reference. Mirrors the compiler's `generated_union_tag` container
+        /// (`LoadedEnumType.owner_union`): identity is the union index alone, and
+        /// `captures`/`source_zir_id`/`decl_inst` are inert (the compiler stores
+        /// `.empty` captures and a `.none` zir_index). `.none` for a declared enum.
+        generated_union: Index = .none,
+    };
+
+    /// A named union type. Nominal like `EnumType`; field names/types resolved on
+    /// demand from the decl's ZIR. Mirrors `getDeclaredUnionType`'s shell.
+    pub const UnionType = struct {
+        source_zir_id: u32,
+        decl_inst: std.zig.Zir.Inst.Index,
+        name: NullTerminatedString,
+        captures: []const Index = &.{},
+    };
+
+    /// A union value: the union type, the active field's tag (its integer index),
+    /// and the payload. Mirrors compiler `Key.Union {ty, tag, val}`.
+    pub const Union = struct {
+        ty: Index,
+        tag: Index,
+        val: Index,
     };
 
     /// An enum tag value: the enum type and the integer tag it holds. `int` is an
@@ -1051,8 +1084,12 @@ pub const Key = union(enum) {
                 // and are distinct types, as `ContainerType.declared` hashes them.
                 for (st.captures) |c| std.hash.autoHash(&hasher, c);
             },
-            // Same nominal-plus-captures identity as `struct_type`.
-            .enum_type => |et| {
+            // A union's generated tag enum is identified by that union index
+            // alone (the compiler's `generated_union_tag` hash arm); a declared
+            // enum by its nominal-plus-captures identity, like `struct_type`.
+            .enum_type => |et| if (et.generated_union != .none) {
+                std.hash.autoHash(&hasher, et.generated_union);
+            } else {
                 std.hash.autoHash(&hasher, et.source_zir_id);
                 std.hash.autoHash(&hasher, et.decl_inst);
                 for (et.captures) |c| std.hash.autoHash(&hasher, c);
@@ -1060,6 +1097,17 @@ pub const Key = union(enum) {
             .enum_tag => |et| {
                 std.hash.autoHash(&hasher, et.ty);
                 std.hash.autoHash(&hasher, et.int);
+            },
+            // Same nominal-plus-captures identity as `enum_type`.
+            .union_type => |ut| {
+                std.hash.autoHash(&hasher, ut.source_zir_id);
+                std.hash.autoHash(&hasher, ut.decl_inst);
+                for (ut.captures) |c| std.hash.autoHash(&hasher, c);
+            },
+            .un => |uv| {
+                std.hash.autoHash(&hasher, uv.ty);
+                std.hash.autoHash(&hasher, uv.tag);
+                std.hash.autoHash(&hasher, uv.val);
             },
             .slice => |s| {
                 std.hash.autoHash(&hasher, s.ty);
@@ -1205,12 +1253,26 @@ pub const Key = union(enum) {
             },
             .enum_type => |x| blk: {
                 const y = b.enum_type;
+                // A generated tag enum compares by owner union alone; this also
+                // keeps it distinct from any declared enum (whose generated_union
+                // is `.none`). Mirrors the compiler's `generated_union_tag` arm.
+                if (x.generated_union != .none or y.generated_union != .none)
+                    break :blk x.generated_union == y.generated_union;
                 break :blk x.source_zir_id == y.source_zir_id and x.decl_inst == y.decl_inst and
                     std.mem.eql(Index, x.captures, y.captures);
             },
             .enum_tag => |x| blk: {
                 const y = b.enum_tag;
                 break :blk x.ty == y.ty and x.int == y.int;
+            },
+            .union_type => |x| blk: {
+                const y = b.union_type;
+                break :blk x.source_zir_id == y.source_zir_id and x.decl_inst == y.decl_inst and
+                    std.mem.eql(Index, x.captures, y.captures);
+            },
+            .un => |x| blk: {
+                const y = b.un;
+                break :blk x.ty == y.ty and x.tag == y.tag and x.val == y.val;
             },
             .slice => |x| blk: {
                 const y = b.slice;
@@ -1312,6 +1374,7 @@ pub const Key = union(enum) {
             .tuple_type,
             .struct_type,
             .enum_type,
+            .union_type,
             => true,
             .simple_value,
             .int,
@@ -1325,6 +1388,7 @@ pub const Key = union(enum) {
             .func,
             .aggregate,
             .enum_tag,
+            .un,
             => false,
         };
     }
@@ -1419,14 +1483,20 @@ const Item = struct {
         // separate tags (`Item.Tag.type_struct*`); we emit only the
         // declared flavor today.
         type_struct,
-        // Named enum type. data = extra index of EnumTypeRepr (3 u32 slots:
-        // source_zir_id, decl_inst, name) then trailing captures, laid out
-        // exactly like `type_struct`. Nominal identity; field names / tag type /
+        // Named enum type. data = extra index of EnumTypeRepr (4 u32 slots:
+        // source_zir_id, decl_inst, name, generated_union) then trailing captures,
+        // laid out like `type_struct`. Nominal identity; field names / tag type /
         // values are resolved from the decl's ZIR on demand.
         type_enum,
         // Enum tag value. data = extra index of EnumTagRepr (2 u32 slots: ty,
         // int). Mirrors the compiler's `Item.Tag.enum_tag`.
         enum_tag,
+        // Named union type. data = extra index of UnionTypeRepr (3 u32 slots) then
+        // trailing captures, laid out exactly like `type_enum`.
+        type_union,
+        // Union value. data = extra index of UnionValueRepr (3 u32 slots: ty, tag,
+        // val). Mirrors the compiler's `Item.Tag.union_value`.
+        union_value,
         // Error value. data = extra index of ErrRepr (2 u32 slots:
         // ty, name). Mirrors the compiler's `Item.Tag.error_set_error`.
         error_set_error,
@@ -1644,12 +1714,14 @@ const StructTypeRepr = extern struct {
     name: u32,
 };
 
-/// Extra-arena payload for `Item.Tag.type_enum`. Same shape as `StructTypeRepr`
-/// (nominal identity + name), with captures trailing exactly as for structs.
+/// Extra-arena payload for `Item.Tag.type_enum`. Like `StructTypeRepr` (nominal
+/// identity + name, captures trailing) plus `generated_union`: the union whose
+/// tag type this enum is, or `.none` for a source-declared enum.
 const EnumTypeRepr = extern struct {
     source_zir_id: u32,
     decl_inst: u32,
     name: u32,
+    generated_union: u32,
 };
 
 /// Extra-arena payload for `Item.Tag.enum_tag`. Two u32 slots: the enum type and
@@ -1657,6 +1729,22 @@ const EnumTypeRepr = extern struct {
 const EnumTagRepr = extern struct {
     ty: u32,
     int: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.type_union`. Same shape/trailing as
+/// `EnumTypeRepr` (nominal identity + name, captures trailing).
+const UnionTypeRepr = extern struct {
+    source_zir_id: u32,
+    decl_inst: u32,
+    name: u32,
+};
+
+/// Extra-arena payload for `Item.Tag.union_value`. Three u32 slots: union type,
+/// tag, payload.
+const UnionValueRepr = extern struct {
+    ty: u32,
+    tag: u32,
+    val: u32,
 };
 
 /// Extra-arena payload for `Item.Tag.ptr_slice`. Three u32 slots: slice type,
@@ -2308,6 +2396,8 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .struct_type => |st| try emitStructType(pool, st),
         .enum_type => |et| try emitEnumType(pool, et),
         .enum_tag => |et| try emitEnumTag(pool, et),
+        .union_type => |ut| try emitUnionType(pool, ut),
+        .un => |uv| try emitUnionValue(pool, uv),
         .err => |e| try emitErr(pool, e),
         .error_union_type => |eu| try emitErrorUnionType(pool, eu),
         .error_union => |eu| try emitErrorUnion(pool, eu),
@@ -2397,6 +2487,8 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .type_struct => structTypeFromExtra(pool, item.data),
         .type_enum => enumTypeFromExtra(pool, item.data),
         .enum_tag => enumTagFromExtra(pool, item.data),
+        .type_union => unionTypeFromExtra(pool, item.data),
+        .union_value => unionValueFromExtra(pool, item.data),
         .error_set_error => errFromExtra(pool, item.data),
         .type_error_union => errorUnionTypeFromExtra(pool, item.data),
         .error_union_error => errorUnionErrFromExtra(pool, item.data),
@@ -2444,13 +2536,15 @@ fn structTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
     const captures_at = extra_index + @sizeOf(StructTypeRepr) / 4;
     const captures_len = pool.extra.items[captures_at];
     const raw_captures = pool.extra.items[captures_at + 1 ..][0..captures_len];
-    return .{ .struct_type = .{
-        .source_zir_id = r.source_zir_id,
-        .decl_inst = @enumFromInt(r.decl_inst),
-        .name = @enumFromInt(r.name),
-        // Reinterpret the u32 slice as `[]const Index`, sharing the extra arena.
-        .captures = @ptrCast(raw_captures),
-    } };
+    return .{
+        .struct_type = .{
+            .source_zir_id = r.source_zir_id,
+            .decl_inst = @enumFromInt(r.decl_inst),
+            .name = @enumFromInt(r.name),
+            // Reinterpret the u32 slice as `[]const Index`, sharing the extra arena.
+            .captures = @ptrCast(raw_captures),
+        },
+    };
 }
 
 fn enumTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
@@ -2463,6 +2557,7 @@ fn enumTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .decl_inst = @enumFromInt(r.decl_inst),
         .name = @enumFromInt(r.name),
         .captures = @ptrCast(raw_captures),
+        .generated_union = @enumFromInt(r.generated_union),
     } };
 }
 
@@ -2474,6 +2569,24 @@ fn enumTagFromExtra(pool: *const InternPool, extra_index: u32) Key {
 fn sliceFromExtra(pool: *const InternPool, extra_index: u32) Key {
     const r = pool.extraData(SliceRepr, extra_index);
     return .{ .slice = .{ .ty = @enumFromInt(r.ty), .ptr = @enumFromInt(r.ptr), .len = @enumFromInt(r.len) } };
+}
+
+fn unionTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const r = pool.extraData(UnionTypeRepr, extra_index);
+    const captures_at = extra_index + @sizeOf(UnionTypeRepr) / 4;
+    const captures_len = pool.extra.items[captures_at];
+    const raw_captures = pool.extra.items[captures_at + 1 ..][0..captures_len];
+    return .{ .union_type = .{
+        .source_zir_id = r.source_zir_id,
+        .decl_inst = @enumFromInt(r.decl_inst),
+        .name = @enumFromInt(r.name),
+        .captures = @ptrCast(raw_captures),
+    } };
+}
+
+fn unionValueFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const r = pool.extraData(UnionValueRepr, extra_index);
+    return .{ .un = .{ .ty = @enumFromInt(r.ty), .tag = @enumFromInt(r.tag), .val = @enumFromInt(r.val) } };
 }
 
 fn errorSetTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
@@ -3032,6 +3145,7 @@ fn emitEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!void {
         .source_zir_id = et.source_zir_id,
         .decl_inst = @intFromEnum(et.decl_inst),
         .name = @intFromEnum(et.name),
+        .generated_union = @intFromEnum(et.generated_union),
     });
     try pool.extra.append(pool.gpa, @intCast(et.captures.len));
     try pool.extra.appendSlice(pool.gpa, @ptrCast(et.captures));
@@ -3045,6 +3159,28 @@ fn emitEnumTag(pool: *InternPool, et: Key.EnumTag) Allocator.Error!void {
         .int = @intFromEnum(et.int),
     });
     pool.items.appendAssumeCapacity(.{ .tag = .enum_tag, .data = extra_index });
+}
+
+/// Emit a `type_union` Item. Same layout as `type_enum` (fixed repr + captures).
+fn emitUnionType(pool: *InternPool, ut: Key.UnionType) Allocator.Error!void {
+    const extra_index = try pool.addExtra(UnionTypeRepr{
+        .source_zir_id = ut.source_zir_id,
+        .decl_inst = @intFromEnum(ut.decl_inst),
+        .name = @intFromEnum(ut.name),
+    });
+    try pool.extra.append(pool.gpa, @intCast(ut.captures.len));
+    try pool.extra.appendSlice(pool.gpa, @ptrCast(ut.captures));
+    pool.items.appendAssumeCapacity(.{ .tag = .type_union, .data = extra_index });
+}
+
+/// Emit a `union_value` Item. Three u32 slots: `ty`, `tag`, `val`.
+fn emitUnionValue(pool: *InternPool, uv: Key.Union) Allocator.Error!void {
+    const extra_index = try pool.addExtra(UnionValueRepr{
+        .ty = @intFromEnum(uv.ty),
+        .tag = @intFromEnum(uv.tag),
+        .val = @intFromEnum(uv.val),
+    });
+    pool.items.appendAssumeCapacity(.{ .tag = .union_value, .data = extra_index });
 }
 
 /// Emit a `ptr_slice` Item. Three u32 slots: `ty`, `ptr`, `len`.
@@ -3264,6 +3400,14 @@ pub fn internEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!Index
 
 pub fn internEnumTag(pool: *InternPool, et: Key.EnumTag) Allocator.Error!Index {
     return pool.get(.{ .enum_tag = et });
+}
+
+pub fn internUnionType(pool: *InternPool, ut: Key.UnionType) Allocator.Error!Index {
+    return pool.get(.{ .union_type = ut });
+}
+
+pub fn internUnion(pool: *InternPool, uv: Key.Union) Allocator.Error!Index {
+    return pool.get(.{ .un = uv });
 }
 
 /// Intern an error-set type from `names`. Sorts the names by their

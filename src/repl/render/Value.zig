@@ -55,6 +55,9 @@ pub fn render(
         // (same limit as struct field names). Render the underlying integer tag --
         // what `@intFromEnum` yields -- until a ZIR-aware rendering path exists.
         .enum_tag => |et| render(.{ .index = et.int }, pool, writer),
+        // The active field's name lives in the union's ZIR (unreachable here, same
+        // limit as struct fields/enum tags); render the active payload value.
+        .un => |uv| render(.{ .index = uv.val }, pool, writer),
         // A bare type Key viewed as a value identifies the type itself
         // (Sema's value-of-type-type convention; see Value.typeOf). The
         // value Keys above are exhaustive, so the assert turns a future
