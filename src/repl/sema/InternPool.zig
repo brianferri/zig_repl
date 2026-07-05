@@ -150,6 +150,13 @@ pub const NullTerminatedString = enum(u32) {
     pub fn toOptional(string: NullTerminatedString) OptionalNullTerminatedString {
         return @enumFromInt(@intFromEnum(string));
     }
+
+    /// Whether this interned string equals `slice`. Mirrors the compiler's
+    /// `NullTerminatedString.eqlSlice`: compares an interned name against a
+    /// literal (e.g. a field's `len`) without interning the literal.
+    pub fn eqlSlice(string: NullTerminatedString, slice: []const u8, ip: *const InternPool) bool {
+        return std.mem.eql(u8, ip.stringSlice(string), slice);
+    }
 };
 
 /// Optional version of `NullTerminatedString`. Sentinel `none` is

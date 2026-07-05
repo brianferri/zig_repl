@@ -3192,9 +3192,10 @@ fn enterSourceZir(sema: *Sema, source_zir_id: u32, ctx: []const u8) Error!ZirFra
 /// misses names both the field and the struct. Shared by every field-access site
 /// (`field_ptr`, field loads, struct init) so the wording is one message keyed on
 /// the struct -- not a per-syntax context string. Mirrors src/Sema.zig.
-fn failBadStructFieldAccess(sema: *Sema, struct_ty: InternPool.Index, name: []const u8) Error {
-    const st_name = sema.intern_pool.stringSlice(sema.intern_pool.indexToKey(struct_ty).struct_type.name);
-    sema.writer.print("no field named '{s}' in struct '{s}'\n", .{ name, st_name }) catch |e| return e;
+fn failBadStructFieldAccess(sema: *Sema, struct_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error {
+    const ip = sema.intern_pool;
+    const st_name = ip.stringSlice(ip.indexToKey(struct_ty).struct_type.name);
+    sema.writer.print("no field named '{s}' in struct '{s}'\n", .{ ip.stringSlice(name), st_name }) catch |e| return e;
     return error.AnalysisFail;
 }
 
@@ -3202,14 +3203,15 @@ fn failBadStructFieldAccess(sema: *Sema, struct_ty: InternPool.Index, name: []co
 /// that misses names the container kind, the container, and the member. Used for
 /// `T.member`, the static `T.decl()` call, and a missing enum tag (`E.z`).
 /// Mirrors src/Sema.zig (kw_name + type name).
-fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: []const u8) Error {
-    const key = sema.intern_pool.indexToKey(container_ty);
+fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error {
+    const ip = sema.intern_pool;
+    const key = ip.indexToKey(container_ty);
     const kw: []const u8, const ct_name: InternPool.NullTerminatedString = switch (key) {
         .struct_type => |st| .{ "struct", st.name },
         .enum_type => |et| .{ "enum", et.name },
         else => unreachable, // only container types reach a member-access miss
     };
-    sema.writer.print("{s} '{s}' has no member named '{s}'\n", .{ kw, sema.intern_pool.stringSlice(ct_name), name }) catch |e| return e;
+    sema.writer.print("{s} '{s}' has no member named '{s}'\n", .{ kw, ip.stringSlice(ct_name), ip.stringSlice(name) }) catch |e| return e;
     return error.AnalysisFail;
 }
 
@@ -3223,9 +3225,14 @@ fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: []cons
 fn structFieldByName(
     sema: *Sema,
     struct_ty: InternPool.Index,
-    name: []const u8,
+    name: InternPool.NullTerminatedString,
 ) Error!?struct { index: u32, ty: InternPool.Index } {
-    const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
+    const ip = sema.intern_pool;
+    const st = ip.indexToKey(struct_ty).struct_type;
+    // Intern each ZIR field name as we scan and compare interned handles against
+    // the (already interned) query -- the compiler resolves struct fields lazily
+    // too (`resolveStructFieldTypes` interns each ZIR name), and `getOrPutString`
+    // dedups so repeated resolution is stable.
     const frame = try sema.enterSourceZir(st.source_zir_id, "struct field");
     defer frame.restore(sema);
     // The field type body belongs to this struct's namespace: expose it as
@@ -3235,7 +3242,7 @@ fn structFieldByName(
     defer sema.this_type = saved_this;
     var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
     while (it.next()) |field| {
-        if (std.mem.eql(u8, sema.zir.nullTerminatedString(field.name), name)) {
+        if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name))) == name) {
             const ty = (try sema.resolveInlineBody(field.type_body, st.decl_inst)).index;
             return .{ .index = field.idx, .ty = ty };
         }
@@ -3253,7 +3260,7 @@ fn enumIntTagType(sema: *Sema, field_count: u32) Error!InternPool.Index {
 
 /// How to select an enum tag: by field name (`E.b`) or by integer value
 /// (`@enumFromInt`). Both walk the same field iteration, so one helper serves both.
-const EnumMatch = union(enum) { name: []const u8, value: i128 };
+const EnumMatch = union(enum) { name: InternPool.NullTerminatedString, value: i128 };
 
 /// Resolve an enum tag by name or by integer value, returning its `enum_tag`.
 /// Walks the decl's fields in order, assigning each its value: an explicit
@@ -3289,7 +3296,7 @@ fn enumLookup(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?V
         } else next_auto;
         next_auto = cur + 1;
         const matched = switch (match) {
-            .name => |n| std.mem.eql(u8, sema.zir.nullTerminatedString(field.name), n),
+            .name => |n| (try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name))) == n,
             .value => |v| cur == v,
         };
         if (!matched) continue;
@@ -3307,7 +3314,7 @@ fn enumLookup(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?V
 }
 
 /// A name-keyed enum tag lookup (`E.b`, `.b`). Thin wrapper over `enumLookup`.
-fn enumTagByName(sema: *Sema, enum_ty: InternPool.Index, name: []const u8) Error!?Value {
+fn enumTagByName(sema: *Sema, enum_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
     return sema.enumLookup(enum_ty, .{ .name = name });
 }
 
@@ -3355,7 +3362,7 @@ fn evalEnumFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 fn evalDeclLiteral(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.Field, pl_node.payload_index).data;
-    const name = sema.zir.nullTerminatedString(extra.field_name_start);
+    const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.field_name_start));
     const res_ty = (try sema.resolveRef(extra.lhs)).index;
     switch (sema.intern_pool.indexToKey(res_ty)) {
         .enum_type => {
@@ -3414,7 +3421,7 @@ fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.Field, pl_node.payload_index).data;
-    const name = sema.zir.nullTerminatedString(extra.field_name_start);
+    const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.field_name_start));
     const object_ptr = try sema.resolveRef(extra.lhs);
     const parent_ty = ip.indexToKey(object_ptr.index).ptr.ty;
     const struct_ty = ip.indexToKey(parent_ty).ptr_type.child;
@@ -3436,14 +3443,17 @@ fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// its source ZIR (swapped in for a cross-line struct, as `structFieldByName`
 /// does), matching by name. Returns null if no declaration matches. Unnamed
 /// members (`comptime` blocks, tests) are skipped.
-fn structDeclByName(sema: *Sema, struct_ty: InternPool.Index, name: []const u8) Error!?Value {
+fn structDeclByName(sema: *Sema, struct_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
     const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
+    // Decls are not stored on the type; intern each decl name as we scan and
+    // compare interned handles against the query, as the compiler's namespace
+    // lookup does.
     const frame = try sema.enterSourceZir(st.source_zir_id, "struct decl");
     defer frame.restore(sema);
     for (sema.zir.typeDecls(st.decl_inst)) |decl_inst| {
         const unwrapped = sema.zir.getDeclaration(decl_inst);
         if (unwrapped.name == .empty) continue;
-        if (!std.mem.eql(u8, sema.zir.nullTerminatedString(unwrapped.name), name)) continue;
+        if ((try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(unwrapped.name))) != name) continue;
         const value_body = unwrapped.value_body orelse return null;
         // Evaluate the member with this struct as `@This()` (e.g. a method's
         // `self: @This()` parameter type resolves to it).
@@ -3463,7 +3473,9 @@ fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.Field, pl_node.payload_index).data;
-    const name = sema.zir.nullTerminatedString(extra.field_name_start);
+    // Intern the field name once (as `zirFieldVal` does), then reuse the handle for
+    // every arm below -- the `len` check, the namespace lookups, and diagnostics.
+    const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.field_name_start));
     const object = try sema.loadValue(try sema.resolveRef(extra.lhs));
 
     // Mirror fieldVal, which switches on the object's type tag. A *type* used as a
@@ -3493,7 +3505,7 @@ fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     switch (ip.indexToKey(inner_ty)) {
         // `.array` arm: only `len` (the array length as a `usize`).
         .array_type => |at| {
-            if (std.mem.eql(u8, name, "len"))
+            if (name.eqlSlice("len", ip))
                 return .{ .index = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = at.len } }) };
             return sema.failNoMember(inner_ty, name);
         },
@@ -3510,8 +3522,8 @@ fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// The compiler's `"no member named '{f}' in '{f}'"` diagnostic for a field
 /// access on a type that has no such member (an array without `len`/`ptr`, or a
 /// non-aggregate). Mirrors fieldVal's array/else arms.
-fn failNoMember(sema: *Sema, ty: InternPool.Index, name: []const u8) Error {
-    sema.writer.print("no member named '{s}' in '", .{name}) catch |e| return e;
+fn failNoMember(sema: *Sema, ty: InternPool.Index, name: InternPool.NullTerminatedString) Error {
+    sema.writer.print("no member named '{s}' in '", .{sema.intern_pool.stringSlice(name)}) catch |e| return e;
     Type.print(.fromIndex(ty), sema.intern_pool, sema.writer) catch |e| return e;
     sema.writer.writeAll("'\n") catch |e| return e;
     return error.AnalysisFail;
@@ -3570,13 +3582,13 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const object_ptr = try sema.resolveRef(first.lhs);
     const struct_ty = ip.indexToKey(ip.indexToKey(object_ptr.index).ptr.ty).ptr_type.child;
 
-    // Names explicitly initialized -- byte slices into the current ZIR, valid
-    // across the source-ZIR swap below (a different ZIR's string table).
-    const stored = try sema.gpa.alloc([]const u8, body.len);
+    // The interned names explicitly initialized, to test each declared field
+    // against by handle. Interned from the current ZIR before the swap below.
+    const stored = try sema.gpa.alloc(InternPool.NullTerminatedString, body.len);
     defer sema.gpa.free(stored);
-    for (body, stored) |field_ptr, *name| {
+    for (body, stored) |field_ptr, *n| {
         const fp = sema.zir.extraData(Zir.Inst.Field, datas[@intFromEnum(field_ptr)].pl_node.payload_index).data;
-        name.* = sema.zir.nullTerminatedString(fp.field_name_start);
+        n.* = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(fp.field_name_start));
     }
 
     const st = ip.indexToKey(struct_ty).struct_type;
@@ -3584,10 +3596,10 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     defer frame.restore(sema);
     var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
     while (it.next()) |field| {
-        const name = sema.zir.nullTerminatedString(field.name);
-        if (sliceContainsName(stored, name)) continue;
+        const fname = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
+        if (std.mem.indexOfScalar(InternPool.NullTerminatedString, stored, fname) != null) continue;
         const default_body = field.default_body orelse {
-            try sema.writer.print("missing struct field: {s}\n", .{name});
+            try sema.writer.print("missing struct field: {s}\n", .{sema.zir.nullTerminatedString(field.name)});
             return error.AnalysisFail;
         };
         const field_ty = (try sema.resolveInlineBody(field.type_body, st.decl_inst)).index;
@@ -3597,11 +3609,6 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         alloc.val = try sema.setStructField(alloc.val, struct_ty, field.idx, value);
     }
     return null;
-}
-
-fn sliceContainsName(names: []const []const u8, name: []const u8) bool {
-    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
-    return false;
 }
 
 /// `validate_struct_init_ty` / `validate_struct_init_result_ty`: check that the
@@ -3629,7 +3636,7 @@ fn evalStructInitFieldType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         try sema.writer.writeAll("struct init: initializer type is not a struct\n");
         return error.AnalysisFail;
     }
-    const name = sema.zir.nullTerminatedString(ft.name_start);
+    const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(ft.name_start));
     const field = (try sema.structFieldByName(container_ty, name)) orelse
         return sema.failBadStructFieldAccess(container_ty, name);
     return .{ .index = field.ty };
@@ -3669,7 +3676,7 @@ fn evalStructInit(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Erro
         const item = sema.zir.extraData(Zir.Inst.StructInit.Item, extra_index);
         extra_index = item.end;
         const ft = sema.zir.extraData(Zir.Inst.FieldType, datas[@intFromEnum(item.data.field_type)].pl_node.payload_index).data;
-        const name = sema.zir.nullTerminatedString(ft.name_start);
+        const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(ft.name_start));
         const field = (try sema.structFieldByName(struct_ty, name)) orelse
             return sema.failBadStructFieldAccess(struct_ty, name);
         const raw = try sema.resolveRef(item.data.init);
@@ -4095,7 +4102,7 @@ fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // inner decl shadows a same-named outer one. Mirror that order: `this_type`
     // (the enclosing container, set around member evaluation) first, session next.
     if (sema.this_type != .none) {
-        const name = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir);
+        const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir));
         if (try sema.structDeclByName(sema.this_type, name)) |val| return val;
     }
     if (try sema.lookupDecl(inst, "decl_val")) |found| {
@@ -4118,7 +4125,7 @@ fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // pointer to it materialises a const slot holding its comptime value -- the
     // comptime analog of the compiler's `analyzeNavRef` decl pointer.
     if (sema.this_type != .none) {
-        const name = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir);
+        const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir));
         if (try sema.structDeclByName(sema.this_type, name)) |val| return try sema.materializeConstPtr(val);
     }
     const found = (try sema.lookupDecl(inst, "decl_ref")) orelse {
@@ -4726,12 +4733,11 @@ fn matchSwitchItems(
             },
             .under => hit = true,
             .error_value => |item_err_name| {
-                // Item names live in zir.string_bytes; the operand's
-                // error name lives in the intern pool. Compare bytes.
+                // The operand's error name is an interned handle; intern the ZIR
+                // item name and compare handles (interned-name equality).
                 if (op.err_name) |opn| {
-                    const op_bytes = sema.intern_pool.stringSlice(opn);
-                    const item_bytes = sema.zir.nullTerminatedString(item_err_name);
-                    if (std.mem.eql(u8, op_bytes, item_bytes)) hit = true;
+                    const item = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(item_err_name));
+                    if (item == opn) hit = true;
                 }
             },
             // A `.tag` prong on an enum switch. The compiler resolves each item via
@@ -4746,7 +4752,7 @@ fn matchSwitchItems(
                 if (sema.intern_pool.indexToKey(op.ty) != .enum_type) {
                     return sema.failSwitch("enum-literal case on a non-enum operand");
                 }
-                const name = sema.zir.nullTerminatedString(name_idx);
+                const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(name_idx));
                 const tag = (try sema.enumTagByName(op.ty, name)) orelse
                     return sema.failBadMemberAccess(op.ty, name);
                 if (tag.index == op.value.index) hit = true;
@@ -4987,7 +4993,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
         .field => blk: {
             const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
             const extra = sema.zir.extraData(Zir.Inst.FieldCall, pl_node.payload_index);
-            const name = sema.zir.nullTerminatedString(extra.data.field_name_start);
+            const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.data.field_name_start));
             const object = try sema.loadValue(try sema.resolveRef(extra.data.obj_ptr));
             const args_slice: []const Zir.Inst.Index = @ptrCast(sema.zir.extra[extra.end..]);
             // `P.decl(x)`: the object is the struct type -> static call, no receiver.
@@ -5007,7 +5013,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
                 // field and a member function (`callMethod`), distinct from a
                 // pure namespace member access.
                 const st_name = sema.intern_pool.stringSlice(sema.intern_pool.indexToKey(struct_ty).struct_type.name);
-                try sema.writer.print("no field or member function named '{s}' in '{s}'\n", .{ name, st_name });
+                try sema.writer.print("no field or member function named '{s}' in '{s}'\n", .{ sema.intern_pool.stringSlice(name), st_name });
                 return error.AnalysisFail;
             };
             break :blk .{ callee, object, extra.data.flags.args_len, args_slice, struct_ty };
