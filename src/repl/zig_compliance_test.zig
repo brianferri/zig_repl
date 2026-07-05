@@ -1410,6 +1410,28 @@ test "compliance: array element store" {
     try expectBothReject(a, &.{"blk: { const arr = [_]u8{ 1, 2 }; arr[0] = 5; break :blk arr[0]; }"});
 }
 
+test "compliance: array slicing (a[start..end])" {
+    const a = testing.allocator;
+    // A sub-slice reads through its own start offset and length.
+    try expectMatchesZig(a, &.{"blk: { const arr = [_]u8{ 10, 20, 30, 40 }; const s = arr[1..3]; break :blk s.len; }"}); // 2
+    try expectMatchesZig(a, &.{"blk: { const arr = [_]u8{ 10, 20, 30, 40 }; const s = arr[1..3]; break :blk s[0]; }"}); // 20
+    try expectMatchesZig(a, &.{"blk: { const arr = [_]u8{ 10, 20, 30, 40 }; const s = arr[1..3]; break :blk s[1]; }"}); // 30
+    try expectMatchesZig(a, &.{"blk: { const arr = [_]u8{ 10, 20, 30, 40 }; const s = arr[0..4]; break :blk s[3]; }"}); // 40
+    // Indexing past the slice length, and an end past the array, are rejected.
+    try expectBothReject(a, &.{"blk: { const arr = [_]u8{ 10, 20, 30, 40 }; const s = arr[1..3]; break :blk s[2]; }"});
+    try expectBothReject(a, &.{"blk: { const arr = [_]u8{ 1, 2 }; const s = arr[0..9]; break :blk s.len; }"});
+}
+
+test "compliance: typed array initialization ([N]T = .{ ... })" {
+    const a = testing.allocator;
+    // The result-location form (array_init_elem_ptr / validate_ptr_array_init).
+    try expectMatchesZig(a, &.{"blk: { const arr: [3]u8 = .{ 7, 8, 9 }; break :blk arr[2]; }"});
+    try expectMatchesZig(a, &.{"blk: { const arr: [3]u8 = .{ 7, 8, 9 }; break :blk arr[0] + arr[1] + arr[2]; }"});
+    // Element-count mismatches are compile errors on both sides.
+    try expectBothReject(a, &.{"blk: { const arr: [3]u8 = .{ 1, 2 }; break :blk arr[0]; }"});
+    try expectBothReject(a, &.{"blk: { const arr: [2]u8 = .{ 1, 2, 3 }; break :blk arr[0]; }"});
+}
+
 test "compliance: union initialization and active-field access" {
     const a = testing.allocator;
     const U = "const U = union { a: u32, b: bool };";

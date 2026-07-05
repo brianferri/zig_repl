@@ -553,6 +553,9 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .elem_ptr_load => sema.evalElemPtrLoad(inst),
         .elem_ptr_node => sema.evalElemPtrNode(inst),
         .elem_val => sema.evalElemVal(inst),
+        .slice_end => sema.evalSliceEnd(inst),
+        .array_init_elem_ptr => sema.evalArrayInitElemPtr(inst),
+        .validate_ptr_array_init => sema.evalValidatePtrArrayInit(inst),
         inline else => |unhandled| return sema.reportUnsupportedTag(unhandled),
     };
 }
@@ -4246,10 +4249,28 @@ fn evalElemPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// (`&arr[i]`, and the pointer AstGen forms for `arr[i].f`). Builds an `.arr_elem`
 /// projection, as the compiler's `elemPtr` does. Mirrors zirElemPtrNode -> elemPtr.
 fn evalElemPtrNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
-    const ip = sema.intern_pool;
     const bin = sema.binData(inst);
     const array_ptr = try sema.resolveRef(bin.lhs);
     const index = try sema.resolveArrayLen(bin.rhs, "elem ptr");
+    return try sema.elemPtr(array_ptr, index);
+}
+
+/// `array_init_elem_ptr`: the pointer to element `index` (an immediate) of the
+/// array being initialized by a `.{ ... }` result-location init; each is a
+/// `store_node` target. Mirrors zirArrayInitElemPtr -> elemPtrArray.
+fn evalArrayInitElemPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const datas = sema.zir.instructions.items(.data);
+    const extra = sema.zir.extraData(Zir.Inst.ElemPtrImm, datas[@intFromEnum(inst)].pl_node.payload_index).data;
+    const array_ptr = try sema.resolveRef(extra.ptr);
+    return try sema.elemPtr(array_ptr, extra.index);
+}
+
+/// Build a single-element pointer to element `index` of the array behind
+/// `array_ptr` (an `.arr_elem` projection into the no-layout aggregate). Shared by
+/// `elem_ptr_node` (`&a[i]`) and `array_init_elem_ptr` (a `.{...}` store target).
+/// Mirrors the compiler's `elemPtrArray`.
+fn elemPtr(sema: *Sema, array_ptr: Value, index: u64) Error!Value {
+    const ip = sema.intern_pool;
     const parent_ty = ip.indexToKey(array_ptr.index).ptr.ty;
     const array_key = ip.indexToKey(ip.indexToKey(parent_ty).ptr_type.child);
     if (array_key != .array_type) {
@@ -4266,9 +4287,77 @@ fn evalElemPtrNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     });
     return .{ .index = try ip.internPtr(.{
         .ty = elem_ptr_ty,
-        .base_addr = .{ .arr_elem = .{ .base = array_ptr.index, .index = index } },
+        .base_addr = .{ .arr_elem = .{ .base = array_ptr.index, .index = @intCast(index) } },
         .byte_offset = 0,
     }) };
+}
+
+/// `validate_ptr_array_init`: after a `.{ ... }` array init's element stores,
+/// check the number of initialized elements equals the array length. The body is
+/// the list of `array_init_elem_ptr` instructions. Mirrors zirValidatePtrArrayInit's
+/// array arm (sentinel handling deferred).
+fn evalValidatePtrArrayInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const datas = sema.zir.instructions.items(.data);
+    const extra = sema.zir.extraData(Zir.Inst.Block, datas[@intFromEnum(inst)].pl_node.payload_index);
+    const body = sema.zir.bodySlice(extra.end, extra.data.body_len);
+    if (body.len == 0) return null;
+    const first = sema.zir.extraData(Zir.Inst.ElemPtrImm, datas[@intFromEnum(body[0])].pl_node.payload_index).data;
+    const array_ptr = try sema.resolveRef(first.ptr);
+    const array_ty = ip.indexToKey(ip.indexToKey(array_ptr.index).ptr.ty).ptr_type.child;
+    const array_len = ip.indexToKey(array_ty).array_type.len;
+    if (body.len != array_len) {
+        try sema.writer.print("expected {d} array elements; found {d}\n", .{ array_len, body.len });
+        return error.AnalysisFail;
+    }
+    return null;
+}
+
+/// `slice_end`: `a[start..end]` -- a slice of a pointer-to-array. The result
+/// slice's `ptr` is a many-pointer to `a[start]` (an `.arr_elem` base carrying the
+/// start offset, the compiler's byte-offset-to-`a[start]` in this no-layout model)
+/// and its `len` is `end - start`. Mirrors zirSliceEnd -> analyzeSlice for the
+/// comptime array-pointer case.
+fn evalSliceEnd(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const datas = sema.zir.instructions.items(.data);
+    const extra = sema.zir.extraData(Zir.Inst.SliceEnd, datas[@intFromEnum(inst)].pl_node.payload_index).data;
+    const array_ptr = try sema.resolveRef(extra.lhs);
+    const start = try sema.resolveArrayLen(extra.start, "slice start");
+    const end = try sema.resolveArrayLen(extra.end, "slice end");
+
+    const parent_ty = ip.indexToKey(array_ptr.index).ptr.ty;
+    const child_ty = ip.indexToKey(parent_ty).ptr_type.child;
+    if (ip.indexToKey(child_ty) != .array_type) {
+        try sema.writer.writeAll("slice: operand is not an array pointer\n");
+        return error.AnalysisFail;
+    }
+    const array = ip.indexToKey(child_ty).array_type;
+    if (start > end) {
+        try sema.writer.print("start index {d} is larger than end index {d}\n", .{ start, end });
+        return error.AnalysisFail;
+    }
+    if (end > array.len) {
+        try sema.writer.print("end index {d} out of bounds for array of length {d}\n", .{ end, array.len });
+        return error.AnalysisFail;
+    }
+
+    const is_const = ip.indexToKey(parent_ty).ptr_type.flags.is_const;
+    const many_ptr_ty = try ip.internPtrType(.{
+        .child = array.child,
+        .flags = .{ .size = .many, .is_const = is_const },
+    });
+    const many_ptr = try ip.internPtr(.{
+        .ty = many_ptr_ty,
+        .base_addr = .{ .arr_elem = .{ .base = array_ptr.index, .index = @intCast(start) } },
+        .byte_offset = 0,
+    });
+    const slice_ty = try ip.internPtrType(.{
+        .child = array.child,
+        .flags = .{ .size = .slice, .is_const = is_const },
+    });
+    const len_val = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = end - start } });
+    return .{ .index = try ip.get(.{ .slice = .{ .ty = slice_ty, .ptr = many_ptr, .len = len_val } }) };
 }
 
 /// `elem_val`: `indexable[index]` by value (the `for (a) |x|` capture and
@@ -4293,13 +4382,22 @@ fn evalElemVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 fn aggregateElement(sema: *Sema, array_value: Value, index_ref: Zir.Inst.Ref) Error!Value {
     const ip = sema.intern_pool;
     // A slice indexes through its `ptr` into the array; its own `len` bounds it
-    // (the array behind `ptr` may be longer). Unwrap to the array pointer first.
+    // (the array behind `ptr` may be longer). Unwrap to the array pointer first. A
+    // sub-slice (`a[start..end]`) carries its start in the many-pointer's
+    // `.arr_elem` base, so index reads land at `array[start + i]`.
     var agg = array_value;
     var slice_len: ?u64 = null;
+    var start_offset: u64 = 0;
     if (ip.indexToKey(agg.index) == .slice) {
         const s = ip.indexToKey(agg.index).slice;
         slice_len = try sema.resolveUsizeInt(.{ .index = s.len }, "slice len");
-        agg = .{ .index = s.ptr };
+        const ptr = ip.indexToKey(s.ptr).ptr;
+        if (ptr.base_addr == .arr_elem) {
+            start_offset = ptr.base_addr.arr_elem.index;
+            agg = .{ .index = ptr.base_addr.arr_elem.base };
+        } else {
+            agg = .{ .index = s.ptr };
+        }
     }
     // Deref a pointer operand to the aggregate it addresses. A string literal is a
     // `*const [N:0]u8`, and taking its address (`ref` before an index) nests one
@@ -4317,7 +4415,7 @@ fn aggregateElement(sema: *Sema, array_value: Value, index_ref: Zir.Inst.Ref) Er
         try sema.writer.print("index {d} outside array of length {d}\n", .{ index, count });
         return error.AnalysisFail;
     }
-    return .{ .index = InternPool.aggregateElementAt(agg_key.aggregate, index) };
+    return .{ .index = InternPool.aggregateElementAt(agg_key.aggregate, start_offset + index) };
 }
 
 /// Resolve a ZIR ref to a `u64` array length or element index:
