@@ -430,6 +430,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     return switch (tag) {
         .int => sema.evalInt(inst),
         .int_big => sema.evalIntBig(inst),
+        .str => sema.evalStr(inst),
         .float => sema.evalFloat(inst),
         .float128 => sema.evalFloat128(inst),
         .add,
@@ -566,6 +567,26 @@ fn evalInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const idx = try sema.intern_pool.internComptimeInt(mutable.toConst());
     return .{ .index = idx };
+}
+
+/// `str "..."`: a string literal, `*const [N:0]u8`. Interns a `[N:0]u8` array
+/// value (each byte a `u8`, plus the trailing 0 sentinel) and returns a const
+/// pointer to it. Mirrors zirStr -> addStrLit -> uavRef. The compiler uses the
+/// aggregate `bytes` storage; this evaluator has only `elems` storage, so the
+/// bytes are interned one `u8` per slot until a `bytes` flavor lands.
+fn evalStr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const bytes = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str.get(sema.zir);
+    const u8_zero = try ip.internInt(.{ .ty = .u8_type, .storage = .{ .u64 = 0 } });
+    const array_ty = try ip.internArrayType(.{ .len = bytes.len, .child = .u8_type, .sentinel = u8_zero });
+
+    const elems = try sema.gpa.alloc(InternPool.Index, bytes.len + 1);
+    defer sema.gpa.free(elems);
+    for (bytes, 0..) |b, i| elems[i] = try ip.internInt(.{ .ty = .u8_type, .storage = .{ .u64 = b } });
+    elems[bytes.len] = u8_zero; // the sentinel slot
+
+    const array_val = try ip.internAggregate(.{ .ty = array_ty, .storage = .{ .elems = elems } });
+    return try sema.materializeConstPtr(.{ .index = array_val });
 }
 
 /// Arbitrary-precision integer literal. AstGen stores raw limb bytes
@@ -3445,30 +3466,55 @@ fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const name = sema.zir.nullTerminatedString(extra.field_name_start);
     const object = try sema.loadValue(try sema.resolveRef(extra.lhs));
 
-    // Split on the object as the compiler's `fieldVal` (src/Sema.zig) splits on
-    // its type tag: a struct *type* object (`.type` -> `.@"struct"`) resolves the
-    // name as a declaration in the struct's namespace; a struct *value* object
-    // (`.@"struct"`) resolves it as a field. A tuple is `tuple_type`, not
-    // `struct_type`, so it correctly stays on the field path (the compiler's
-    // tuple guard). We look decls up from the struct's ZIR rather than a
-    // persistent Namespace (no Zcu), the same way field access derives fields.
-    if (ip.indexToKey(object.index) == .struct_type) {
-        if (try sema.structDeclByName(object.index, name)) |v| return v;
-        return sema.failBadMemberAccess(object.index, name);
+    // Mirror fieldVal, which switches on the object's type tag. A *type* used as a
+    // value (`S.decl`, `E.tag`) is the `.type` arm: resolve the name in the type's
+    // namespace. We look decls/tags up from the type's ZIR rather than a persistent
+    // Namespace (no Zcu).
+    switch (ip.indexToKey(object.index)) {
+        .struct_type => {
+            if (try sema.structDeclByName(object.index, name)) |v| return v;
+            return sema.failBadMemberAccess(object.index, name);
+        },
+        .enum_type => {
+            if (try sema.enumTagByName(object.index, name)) |v| return v;
+            return sema.failBadMemberAccess(object.index, name);
+        },
+        else => {},
     }
 
-    // An enum *type* object (`E.b`): the name is one of its tags (the compiler's
-    // fieldVal `.type` -> `.@"enum"` arm -> the tag value).
-    if (ip.indexToKey(object.index) == .enum_type) {
-        if (try sema.enumTagByName(object.index, name)) |v| return v;
-        return sema.failBadMemberAccess(object.index, name);
+    // Otherwise `object` is a data value; dispatch on its (inner) type, auto-
+    // dereferencing a single pointer to the aggregate it addresses -- as fieldVal
+    // does for a single-pointer-to-array/struct. A string literal is a
+    // `*const [N:0]u8`, and `ref`-before-field nests one more pointer, so follow
+    // the chain.
+    var inner = object;
+    while (ip.indexToKey(inner.index) == .ptr) inner = try sema.loadValue(inner);
+    const inner_ty = inner.typeOf(ip).toIndex();
+    switch (ip.indexToKey(inner_ty)) {
+        // `.array` arm: only `len` (the array length as a `usize`).
+        .array_type => |at| {
+            if (std.mem.eql(u8, name, "len"))
+                return .{ .index = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = at.len } }) };
+            return sema.failNoMember(inner_ty, name);
+        },
+        // `.@"struct"` arm: the named field of a struct value.
+        .struct_type => {
+            const fld = (try sema.structFieldByName(inner_ty, name)) orelse
+                return sema.failBadStructFieldAccess(inner_ty, name);
+            return .{ .index = InternPool.aggregateElementAt(ip.indexToKey(inner.index).aggregate, fld.index) };
+        },
+        else => return sema.failNoMember(inner_ty, name),
     }
+}
 
-    const struct_ty = object.typeOf(ip).toIndex();
-    const fld = (try sema.structFieldByName(struct_ty, name)) orelse
-        return sema.failBadStructFieldAccess(struct_ty, name);
-    const agg = ip.indexToKey(object.index).aggregate;
-    return .{ .index = InternPool.aggregateElementAt(agg, fld.index) };
+/// The compiler's `"no member named '{f}' in '{f}'"` diagnostic for a field
+/// access on a type that has no such member (an array without `len`/`ptr`, or a
+/// non-aggregate). Mirrors fieldVal's array/else arms.
+fn failNoMember(sema: *Sema, ty: InternPool.Index, name: []const u8) Error {
+    sema.writer.print("no member named '{s}' in '", .{name}) catch |e| return e;
+    Type.print(.fromIndex(ty), sema.intern_pool, sema.writer) catch |e| return e;
+    sema.writer.writeAll("'\n") catch |e| return e;
+    return error.AnalysisFail;
 }
 
 /// Write `elem` into field `index` of a struct alloc's value, returning the new
@@ -3740,7 +3786,13 @@ fn evalElemVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// Shared by `elem_ptr_load` and `elem_val`.
 fn aggregateElement(sema: *Sema, array_value: Value, index_ref: Zir.Inst.Ref) Error!Value {
     const ip = sema.intern_pool;
-    const agg_key = ip.indexToKey(array_value.index);
+    // Deref a pointer operand to the aggregate it addresses. A string literal is a
+    // `*const [N:0]u8`, and taking its address (`ref` before an index) nests one
+    // more pointer, so follow the chain -- the compiler's elem access auto-derefs
+    // a single-pointer-to-array the same way.
+    var agg = array_value;
+    while (ip.indexToKey(agg.index) == .ptr) agg = try sema.loadValue(agg);
+    const agg_key = ip.indexToKey(agg.index);
     if (agg_key != .aggregate) {
         try sema.writer.writeAll("elem access: operand is not an indexable aggregate\n");
         return error.AnalysisFail;

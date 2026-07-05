@@ -1271,6 +1271,20 @@ test "compliance: enum equality and switch" {
     try expectBothReject(a, &.{"blk: { " ++ E ++ " const e = E.c; break :blk switch (e) { .a => 1, .z => 2, else => 3 }; }"});
 }
 
+test "compliance: string literals -- length and byte indexing" {
+    // A string literal is a `*const [N:0]u8`. `.len` is the array length; indexing
+    // reads a byte. (`@tagName` and slices, which return `[]const u8`, come later.)
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"blk: { const s = \"hello\"; break :blk s.len; }"});
+    try expectMatchesZig(a, &.{"blk: { break :blk \"hi\".len; }"});
+    try expectMatchesZig(a, &.{"blk: { break :blk \"hi\"[0]; }"}); // 'h' = 104
+    try expectMatchesZig(a, &.{"blk: { const s = \"abc\"; break :blk s[2]; }"}); // 'c' = 99
+    // `.len` on a plain u8 array works the same (previously misrouted to a field lookup).
+    try expectMatchesZig(a, &.{"blk: { const arr = [_]u8{ 10, 20, 30 }; break :blk arr.len; }"});
+    // An out-of-range index is a compile error on both sides.
+    try expectBothReject(a, &.{"blk: { break :blk \"hi\"[5]; }"});
+}
+
 test "compliance: a member body takes the address of a sibling declaration" {
     // `&k` inside a method body resolves `k` in the enclosing container, like a
     // bare `k` does -- decl_ref and decl_val share the same lookup.
