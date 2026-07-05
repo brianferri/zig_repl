@@ -1595,6 +1595,15 @@ test "compliance: switch operand and exhaustiveness are validated" {
     // compiler's zigTypeTag routes them.
     try expectReplDiagnostic(a, &.{"blk: { break :blk switch (@as(usize, 0)) { 0 => 1 }; }"}, "switch must handle all possibilities");
     try expectReplDiagnostic(a, &.{"blk: { break :blk switch (@as(comptime_int, 0)) { 0 => 1 }; }"}, "else prong required when switching on type 'comptime_int'");
+    // Non-else full coverage via multiple ranges is accepted (RangeSet spanning).
+    try expectMatchesZig(a, &.{"blk: { break :blk switch (@as(u8, 5)) { 0...4 => 1, 5...255 => 2 }; }"});
+    // Duplicate items, a range on a non-int, and a `_` prong are all rejected.
+    try expectReplDiagnostic(a, &.{"blk: { const E = enum { a, b }; break :blk switch (E.a) { .a => 1, .a => 2, .b => 3 }; }"}, "duplicate switch value");
+    try expectReplDiagnostic(a, &.{"blk: { break :blk switch (@as(u8, 0)) { 0 => 1, 0 => 2, else => 3 }; }"}, "duplicate switch value");
+    try expectReplDiagnostic(a, &.{"blk: { break :blk switch (true) { true...false => 1 }; }"}, "ranges not allowed when switching on type 'bool'");
+    try expectReplDiagnostic(a, &.{"blk: { const E = enum { a, b }; break :blk switch (E.a) { .a => 1, .b => 2, _ => 3 }; }"}, "'_' prong only allowed when switching on non-exhaustive enums");
+    try expectBothReject(a, &.{"blk: { const E = enum { a, b }; break :blk switch (E.a) { .a => 1, .a => 2, .b => 3 }; }"});
+    try expectBothReject(a, &.{"blk: { const E = enum { a, b }; break :blk switch (E.a) { .a => 1, .b => 2, _ => 3 }; }"});
     // Error-set switches are exhaustive over the set's names.
     try expectMatchesZig(a, &.{ "const E = error{ A, B };", "const x: E!u8 = error.A;", "x catch |e| switch (e) { error.A => 1, error.B => 2 }" });
     try expectBothReject(a, &.{ "const E = error{ A, B };", "const x: E!u8 = error.A;", "x catch |e| switch (e) { error.A => 1 }" });

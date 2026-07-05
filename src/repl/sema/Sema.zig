@@ -5143,7 +5143,7 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .err_name = operand_err_name,
     };
 
-    try sema.validateSwitch(inst, op.ty, sw);
+    try sema.validateSwitchBlock(inst, op.ty, sw);
 
     var extra_index: usize = sw.end;
     var it = sw.iterateCases();
@@ -5230,240 +5230,258 @@ fn requireSwitchElse(sema: *Sema, item_ty: InternPool.Index, has_else: bool) Err
     try sema.writer.writeAll("'\n");
     return error.AnalysisFail;
 }
+/// Miniature of the compiler's `RangeSet`: `i128` integer intervals with overlap
+/// (duplicate) and full-range spanning tests; `[lo, hi]` inclusive.
+const SwitchRangeSet = struct {
+    ranges: std.ArrayListUnmanaged([2]i128) = .empty,
 
-/// Validate a switch before matching, mirroring `validateSwitchBlock`: the operand
-/// must be a switchable type ("switch on type '{f}'" otherwise), and every case's
-/// items are resolved so coverage can be checked. `item_ty` is the operand's type
-/// (a union's tag enum for a union switch). Absent an `else`, the handled items
-/// must be exhaustive for the type, and with an `else` a fully-covered switch is a
-/// redundant-else error -- both as `validateSwitchBlock` does. Enum tags are marked
-/// by field position, as the compiler's `seen_enum_fields[tagValueIndex(...)]`.
-///
-/// REPL deltas (consistent with existing deviations): the missing-item diagnostic
-/// is one line without the compiler's per-field notes, and int/error coverage uses
-/// this evaluator's `i128`/name collectors rather than the compiler's `RangeSet` /
-/// inferred-error-set resolution.
-fn validateSwitch(sema: *Sema, inst: Zir.Inst.Index, item_ty: InternPool.Index, sw: Zir.UnwrappedSwitchBlock) Error!void {
-    const ip = sema.intern_pool;
-    const has_else = sw.else_case != null;
-
-    // Dispatch on the compiler's `zigTypeTag` (this evaluator has none), matching
-    // the arms of `validateSwitchBlock`'s exhaustiveness switch. `.other` is the
-    // item-type determination's `else => "switch on type"`.
-    switch (switchTypeTag(ip, item_ty)) {
-        .other => {
-            try sema.writer.writeAll("switch on type '");
-            try Type.print(.fromIndex(item_ty), ip, sema.writer);
-            try sema.writer.writeAll("'\n");
-            return error.AnalysisFail;
-        },
-        // Unbounded domains -- `.comptime_int, .enum_literal, .@"fn", .type` -- can
-        // only be exhausted by an `else` (`validateSwitchBlock` 11553).
-        .comptime_int, .enum_literal, .@"fn", .type => return sema.requireSwitchElse(item_ty, has_else),
-        // An `anyerror` set is likewise else-only, though its tag is `error_set`
-        // (`validateSwitchBlock` 11453).
-        .error_set => if (isAnyerrorSet(ip, item_ty)) return sema.requireSwitchElse(item_ty, has_else),
-        // enum / fixed-width int / bool / void, and concrete error sets: coverage
-        // is checked below.
-        .@"enum", .int, .bool, .void => {},
+    fn deinit(set: *SwitchRangeSet, gpa: std.mem.Allocator) void {
+        set.ranges.deinit(gpa);
     }
 
-    // Collect coverage over every case item, resolving computed (`body_len`) items
-    // and ranges through the same cursor the matcher walks (prong body, then item
-    // bodies, then range bodies).
-    var cov = try SwitchCoverage.init(sema, item_ty);
-    defer cov.deinit(sema);
-    var extra_index: usize = sw.end;
-    var it = sw.iterateCases();
-    while (it.next()) |case| {
-        extra_index += case.prong_info.body_len;
-        for (case.item_infos) |item_info| switch (item_info.unwrap()) {
-            .under => cov.saw_under = true,
-            .enum_literal => |n| try cov.markEnumName(sema, item_ty, try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(n))),
-            .error_value => |n| try cov.markErrorName(sema, try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(n))),
-            .body_len => |len| {
-                const body = sema.zir.bodySlice(extra_index, len);
-                extra_index += len;
-                // Coerce to the operand type as the matcher does; a type-mismatched
-                // item fails here exactly as the compiler's per-item coercion does.
-                const raw = try sema.resolveInlineBody(body, inst);
-                try cov.markValue(sema, item_ty, try sema.coerceValueToType(raw, item_ty, "switch case"));
-            },
-        };
-        for (case.range_infos) |range_pair| {
-            const lo_len = range_pair[0].bodyLen() orelse 0;
-            const lo = try sema.coerceValueToType(try sema.resolveInlineBody(sema.zir.bodySlice(extra_index, lo_len), inst), item_ty, "switch range");
-            extra_index += lo_len;
-            const hi_len = range_pair[1].bodyLen() orelse 0;
-            const hi = try sema.coerceValueToType(try sema.resolveInlineBody(sema.zir.bodySlice(extra_index, hi_len), inst), item_ty, "switch range");
-            extra_index += hi_len;
-            try cov.markRange(sema, sema.intAsI128(lo.index).?, sema.intAsI128(hi.index).?);
+    /// Add `[lo, hi]`; returns true if it overlaps an existing range (a duplicate
+    /// switch value), mirroring `RangeSet.addAssumeCapacity`.
+    fn add(set: *SwitchRangeSet, gpa: std.mem.Allocator, lo: i128, hi: i128) Error!bool {
+        for (set.ranges.items) |r| {
+            if (hi >= r[0] and lo <= r[1]) return true;
         }
-    }
-    try cov.check(sema, item_ty, has_else);
-}
-
-/// Coverage accumulator for `validateSwitch`, one variant per switchable finite
-/// type. `check` reports "switch must handle all possibilities" when a
-/// no-`else` switch leaves a value unhandled, and "unreachable else prong; all
-/// cases already handled" when an `else` is redundant -- mirroring
-/// `validateSwitchBlock`'s per-type exhaustiveness arms.
-const SwitchCoverage = struct {
-    data: Data,
-    /// The `_` prong; only meaningful for a (non-exhaustive) enum.
-    saw_under: bool = false,
-
-    const Data = union(enum) {
-        /// One flag per enum field position.
-        @"enum": []bool,
-        /// Handled error names, checked against the set's declared names.
-        err: std.ArrayListUnmanaged(InternPool.NullTerminatedString),
-        /// Handled integer intervals `[lo, hi]`, merged to test full-range spanning.
-        int: std.ArrayListUnmanaged([2]i128),
-        /// `true`/`false` handled.
-        boolean: [2]bool,
-        /// `void` handled.
-        void_seen: bool,
-    };
-
-    fn init(sema: *Sema, item_ty: InternPool.Index) Error!SwitchCoverage {
-        const ip = sema.intern_pool;
-        const data: Data = switch (ip.indexToKey(item_ty)) {
-            .enum_type => .{ .@"enum" = blk: {
-                const flags = try sema.gpa.alloc(bool, try sema.enumFieldCount(item_ty));
-                @memset(flags, false);
-                break :blk flags;
-            } },
-            .error_set_type, .error_union_type => .{ .err = .empty },
-            .int_type => .{ .int = .empty },
-            .simple_type => |s| switch (s) {
-                .bool => .{ .boolean = .{ false, false } },
-                .void => .{ .void_seen = false },
-                // usize/isize/c_* reach here via the `.int` tag.
-                else => .{ .int = .empty },
-            },
-            else => unreachable,
-        };
-        return .{ .data = data };
+        try set.ranges.append(gpa, .{ lo, hi });
+        return false;
     }
 
-    fn deinit(cov: *SwitchCoverage, sema: *Sema) void {
-        switch (cov.data) {
-            .@"enum" => |flags| sema.gpa.free(flags),
-            .err => |*list| list.deinit(sema.gpa),
-            .int => |*list| list.deinit(sema.gpa),
-            else => {},
-        }
-    }
-
-    fn markEnumName(cov: *SwitchCoverage, sema: *Sema, enum_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!void {
-        const m = (try sema.enumLookup(enum_ty, .{ .name = name })) orelse return;
-        if (m.index < cov.data.@"enum".len) cov.data.@"enum"[m.index] = true;
-    }
-
-    fn markErrorName(cov: *SwitchCoverage, sema: *Sema, name: InternPool.NullTerminatedString) Error!void {
-        try cov.data.err.append(sema.gpa, name);
-    }
-
-    fn markRange(cov: *SwitchCoverage, sema: *Sema, lo: i128, hi: i128) Error!void {
-        try cov.data.int.append(sema.gpa, .{ lo, hi });
-    }
-
-    /// Classify a resolved item value and record it against the right collector.
-    fn markValue(cov: *SwitchCoverage, sema: *Sema, item_ty: InternPool.Index, val: Value) Error!void {
-        const ip = sema.intern_pool;
-        switch (cov.data) {
-            .@"enum" => |flags| {
-                const et = ip.indexToKey(val.index).enum_tag;
-                const m = (try sema.enumLookup(item_ty, .{ .value = sema.intAsI128(et.int).? })).?;
-                if (m.index < flags.len) flags[m.index] = true;
-            },
-            .err => |*list| try list.append(sema.gpa, ip.indexToKey(val.index).err.name),
-            .int => |*list| {
-                const v = sema.intAsI128(val.index).?;
-                try list.append(sema.gpa, .{ v, v });
-            },
-            .boolean => |*b| switch (ip.indexToKey(val.index).simple_value) {
-                .true => b[1] = true,
-                .false => b[0] = true,
-                else => {},
-            },
-            .void_seen => cov.data.void_seen = true,
-        }
-    }
-
-    fn check(cov: *SwitchCoverage, sema: *Sema, item_ty: InternPool.Index, has_else: bool) Error!void {
-        const all_handled = switch (cov.data) {
-            .@"enum" => |flags| for (flags) |f| {
-                if (!f) break false;
-            } else true,
-            .boolean => |b| b[0] and b[1],
-            .void_seen => |v| v,
-            .err => cov.errorsSpan(sema, item_ty),
-            .int => cov.intervalsSpan(sema, item_ty),
-        };
-        // A `_` prong covers a non-exhaustive enum's unnamed values, so it stands
-        // in for full coverage here.
-        const covered = all_handled or (cov.data == .@"enum" and cov.saw_under);
-        if (has_else) {
-            if (covered) {
-                try sema.writer.writeAll("unreachable else prong; all cases already handled\n");
-                return error.AnalysisFail;
-            }
-        } else if (!covered) {
-            try sema.writer.writeAll("switch must handle all possibilities\n");
-            return error.AnalysisFail;
-        }
-    }
-
-    fn errorsSpan(cov: *SwitchCoverage, sema: *Sema, item_ty: InternPool.Index) bool {
-        const ip = sema.intern_pool;
-        const set_ty = switch (ip.indexToKey(item_ty)) {
-            .error_set_type => item_ty,
-            .error_union_type => |eu| eu.error_set_type,
-            else => return false,
-        };
-        for (ip.indexToKey(set_ty).error_set_type.names) |set_name| {
-            const handled = for (cov.data.err.items) |seen| {
-                if (seen == set_name) break true;
-            } else false;
-            if (!handled) return false;
-        }
-        return true;
-    }
-
-    /// Whether the collected intervals cover the whole `[min, max]` of the int
-    /// type. Merges adjacent/overlapping intervals (the compiler's `RangeSet.spans`
-    /// in miniature); a type too wide to bound in `i128` is treated as unspanned.
-    fn intervalsSpan(cov: *SwitchCoverage, sema: *Sema, item_ty: InternPool.Index) bool {
-        const key = sema.intern_pool.indexToKey(item_ty);
-        // usize/isize/c_* have a target-dependent width this evaluator does not
-        // bound here; treat them as unspanned so a no-else switch needs full
-        // coverage it cannot express -> "switch must handle all possibilities".
-        if (key != .int_type) return false;
-        const it = key.int_type;
-        if (it.bits == 0) return true; // u0/i0 has one value; any/no case covers it
-        const width_ok = if (it.signedness == .unsigned) it.bits <= 127 else it.bits <= 128;
-        if (!width_ok) return false;
-        const min: i128 = if (it.signedness == .unsigned) 0 else -(@as(i128, 1) << @intCast(it.bits - 1));
-        const max: i128 = if (it.signedness == .unsigned)
-            (@as(i128, 1) << @intCast(it.bits)) - 1
-        else
-            (@as(i128, 1) << @intCast(it.bits - 1)) - 1;
-        const items = cov.data.int.items;
+    /// Whether the ranges exactly cover `[min, max]` with no gaps. Ranges never
+    /// overlap (`add` rejects that), so sort and check strict adjacency, mirroring
+    /// `RangeSet.spans`.
+    fn spans(set: *SwitchRangeSet, min: i128, max: i128) bool {
+        const items = set.ranges.items;
+        if (items.len == 0) return false;
         std.mem.sort([2]i128, items, {}, struct {
             fn lt(_: void, a: [2]i128, b: [2]i128) bool {
                 return a[0] < b[0];
             }
         }.lt);
-        var reach: i128 = min - 1;
-        for (items) |iv| {
-            if (iv[0] > reach + 1) return false; // gap before this interval
-            if (iv[1] > reach) reach = iv[1];
+        if (items[0][0] != min or items[items.len - 1][1] != max) return false;
+        for (items[1..], items[0 .. items.len - 1]) |cur, prev| {
+            if (prev[1] + 1 != cur[0]) return false;
         }
-        return reach >= max;
+        return true;
     }
 };
+
+/// The `[min, max]` of a fixed-width int type as `i128`, or null when the operand
+/// is a target-width/`c_*` int (unbounded here) so a no-`else` switch can never
+/// span it -- matching the compiler routing those through the `.int` arm.
+fn intTypeBounds(ip: *const InternPool, item_ty: InternPool.Index) ?[2]i128 {
+    const key = ip.indexToKey(item_ty);
+    if (key != .int_type) return null;
+    const it = key.int_type;
+    if (it.bits == 0) return .{ 0, 0 };
+    const wide = if (it.signedness == .unsigned) it.bits > 127 else it.bits > 128;
+    if (wide) return null;
+    return if (it.signedness == .unsigned)
+        .{ 0, (@as(i128, 1) << @intCast(it.bits)) - 1 }
+    else
+        .{ -(@as(i128, 1) << @intCast(it.bits - 1)), (@as(i128, 1) << @intCast(it.bits - 1)) - 1 };
+}
+
+/// Mark enum field `index` as seen; returns true if it was already seen (a
+/// duplicate). Mirrors writing `seen_enum_fields[field_index]`.
+fn markSwitchEnumField(seen: []bool, index: u32) bool {
+    if (index >= seen.len) return false;
+    if (seen[index]) return true;
+    seen[index] = true;
+    return false;
+}
+
+/// Record a resolved (computed) case item value against the collector for its
+/// type, returning true on a duplicate. Mirrors `validateSwitchItemOrRange`'s
+/// per-type arms; `type_tag` selects the collector as the compiler's `zigTypeTag`
+/// switch does.
+fn validateSwitchItemValue(
+    sema: *Sema,
+    type_tag: SwitchTypeTag,
+    val: Value,
+    seen_enum_fields: []bool,
+    seen_errors: *std.AutoHashMapUnmanaged(InternPool.NullTerminatedString, void),
+    seen_sparse: *std.AutoHashMapUnmanaged(InternPool.Index, void),
+    range_set: *SwitchRangeSet,
+    true_seen: *bool,
+    false_seen: *bool,
+    void_seen: *bool,
+) Error!bool {
+    const ip = sema.intern_pool;
+    switch (type_tag) {
+        .@"enum" => {
+            const et = ip.indexToKey(val.index).enum_tag;
+            const m = (try sema.enumLookup(et.ty, .{ .value = sema.intAsI128(et.int).? })).?;
+            return markSwitchEnumField(seen_enum_fields, m.index);
+        },
+        .error_set => return (try seen_errors.getOrPut(sema.gpa, ip.indexToKey(val.index).err.name)).found_existing,
+        .int, .comptime_int => {
+            const v = sema.intAsI128(val.index).?;
+            return try range_set.add(sema.gpa, v, v);
+        },
+        .bool => {
+            switch (ip.indexToKey(val.index).simple_value) {
+                .true => {
+                    if (true_seen.*) return true;
+                    true_seen.* = true;
+                },
+                .false => {
+                    if (false_seen.*) return true;
+                    false_seen.* = true;
+                },
+                else => {},
+            }
+            return false;
+        },
+        .void => {
+            if (void_seen.*) return true;
+            void_seen.* = true;
+            return false;
+        },
+        .enum_literal, .@"fn", .type => return (try seen_sparse.getOrPut(sema.gpa, val.index)).found_existing,
+        .other => unreachable,
+    }
+}
+
+/// Mirror of the compiler's `validateSwitchBlock`: reject a non-switchable operand
+/// ("switch on type '{f}'"), collect every case's items/ranges into the same
+/// per-type sets the compiler keeps (`seen_enum_fields`, `seen_errors`,
+/// `seen_sparse_values`, a `range_set`, and true/false/void seen), rejecting a
+/// duplicate item ("duplicate switch value"), a stray range on a non-int, and a
+/// `_` prong, then check exhaustiveness per `item_ty`'s tag: all values handled or
+/// an `else` ("switch must handle all possibilities"), an unbounded domain needs
+/// an else ("else prong required when switching on type '{f}'"), and a
+/// fully-covered switch's else is redundant ("unreachable else prong; all cases
+/// already handled").
+///
+/// REPL deltas: no source locations, so duplicate/coverage errors are single-line
+/// without the compiler's "previous value here" / per-field notes; and `_` is
+/// always rejected since the evaluator does not model non-exhaustive enums.
+fn validateSwitchBlock(sema: *Sema, inst: Zir.Inst.Index, item_ty: InternPool.Index, sw: Zir.UnwrappedSwitchBlock) Error!void {
+    const ip = sema.intern_pool;
+    const gpa = sema.gpa;
+    const has_else = sw.else_case != null;
+
+    const type_tag = switchTypeTag(ip, item_ty);
+    if (type_tag == .other) {
+        try sema.writer.writeAll("switch on type '");
+        try Type.print(.fromIndex(item_ty), ip, sema.writer);
+        try sema.writer.writeAll("'\n");
+        return error.AnalysisFail;
+    }
+
+    var seen_enum_fields: []bool = &.{};
+    if (type_tag == .@"enum") {
+        seen_enum_fields = try gpa.alloc(bool, try sema.enumFieldCount(item_ty));
+        @memset(seen_enum_fields, false);
+    }
+    defer gpa.free(seen_enum_fields);
+    var seen_errors: std.AutoHashMapUnmanaged(InternPool.NullTerminatedString, void) = .empty;
+    defer seen_errors.deinit(gpa);
+    var seen_sparse: std.AutoHashMapUnmanaged(InternPool.Index, void) = .empty;
+    defer seen_sparse.deinit(gpa);
+    var range_set: SwitchRangeSet = .{};
+    defer range_set.deinit(gpa);
+    var true_seen = false;
+    var false_seen = false;
+    var void_seen = false;
+    var saw_range = false;
+
+    // Collect and duplicate-check every item/range, walking the same cursor the
+    // matcher does (prong body, then item bodies, then range bodies).
+    var extra_index: usize = sw.end;
+    var it = sw.iterateCases();
+    while (it.next()) |case| {
+        extra_index += case.prong_info.body_len;
+        for (case.item_infos) |item_info| {
+            const dup = switch (item_info.unwrap()) {
+                .under => {
+                    try sema.writer.writeAll("'_' prong only allowed when switching on non-exhaustive enums\n");
+                    return error.AnalysisFail;
+                },
+                .enum_literal => |n| blk: {
+                    const name = try ip.getOrPutString(gpa, sema.zir.nullTerminatedString(n));
+                    if (ip.indexToKey(item_ty) != .enum_type) return sema.failBadMemberAccess(item_ty, name);
+                    const m = (try sema.enumLookup(item_ty, .{ .name = name })) orelse
+                        return sema.failBadMemberAccess(item_ty, name);
+                    break :blk markSwitchEnumField(seen_enum_fields, m.index);
+                },
+                .error_value => |n| blk: {
+                    const name = try ip.getOrPutString(gpa, sema.zir.nullTerminatedString(n));
+                    break :blk (try seen_errors.getOrPut(gpa, name)).found_existing;
+                },
+                .body_len => |len| blk: {
+                    const raw = try sema.resolveInlineBody(sema.zir.bodySlice(extra_index, len), inst);
+                    extra_index += len;
+                    const val = try sema.coerceValueToType(raw, item_ty, "switch case");
+                    break :blk try validateSwitchItemValue(sema, type_tag, val, seen_enum_fields, &seen_errors, &seen_sparse, &range_set, &true_seen, &false_seen, &void_seen);
+                },
+            };
+            if (dup) {
+                try sema.writer.writeAll("duplicate switch value\n");
+                return error.AnalysisFail;
+            }
+        }
+        for (case.range_infos) |range_pair| {
+            saw_range = true;
+            const lo_len = range_pair[0].bodyLen() orelse 0;
+            const hi_len = range_pair[1].bodyLen() orelse 0;
+            // A range only spans for integers, whose endpoints are always computed
+            // (`body_len`); on any other type the ranges-not-allowed check below
+            // rejects it, so skip resolving the endpoints (they may be bodyless).
+            if (type_tag == .int or type_tag == .comptime_int) {
+                const lo = try sema.coerceValueToType(try sema.resolveInlineBody(sema.zir.bodySlice(extra_index, lo_len), inst), item_ty, "switch range");
+                const hi = try sema.coerceValueToType(try sema.resolveInlineBody(sema.zir.bodySlice(extra_index + lo_len, hi_len), inst), item_ty, "switch range");
+                if (try range_set.add(gpa, sema.intAsI128(lo.index).?, sema.intAsI128(hi.index).?)) {
+                    try sema.writer.writeAll("duplicate switch value\n");
+                    return error.AnalysisFail;
+                }
+            }
+            extra_index += lo_len + hi_len;
+        }
+    }
+
+    // Ranges are only meaningful for integers (validateSwitchBlock 11366).
+    if (saw_range and type_tag != .int and type_tag != .comptime_int) {
+        try sema.writer.writeAll("ranges not allowed when switching on type '");
+        try Type.print(.fromIndex(item_ty), ip, sema.writer);
+        try sema.writer.writeAll("'\n");
+        return error.AnalysisFail;
+    }
+
+    // Exhaustiveness per type tag (validateSwitchBlock 11390).
+    const all_handled = switch (type_tag) {
+        .@"enum" => for (seen_enum_fields) |f| {
+            if (!f) break false;
+        } else true,
+        .bool => true_seen and false_seen,
+        .void => void_seen,
+        .int => if (intTypeBounds(ip, item_ty)) |b| range_set.spans(b[0], b[1]) else false,
+        .error_set => blk: {
+            if (isAnyerrorSet(ip, item_ty)) return sema.requireSwitchElse(item_ty, has_else);
+            const set_ty = switch (ip.indexToKey(item_ty)) {
+                .error_union_type => |eu| eu.error_set_type,
+                else => item_ty,
+            };
+            break :blk for (ip.indexToKey(set_ty).error_set_type.names) |set_name| {
+                if (!seen_errors.contains(set_name)) break false;
+            } else true;
+        },
+        .comptime_int, .enum_literal, .@"fn", .type => return sema.requireSwitchElse(item_ty, has_else),
+        .other => unreachable,
+    };
+    if (has_else) {
+        if (all_handled) {
+            try sema.writer.writeAll("unreachable else prong; all cases already handled\n");
+            return error.AnalysisFail;
+        }
+    } else if (!all_handled) {
+        try sema.writer.writeAll("switch must handle all possibilities\n");
+        return error.AnalysisFail;
+    }
+}
 
 /// Bind a matched prong's capture (`|v|`) to the instruction the prong body reads
 /// it through. AstGen uses the `switch_block` instruction itself as the first
