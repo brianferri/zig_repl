@@ -1560,11 +1560,39 @@ test "sad paths: optionals and error unions are rejected" {
 
 test "sad paths: switch item type mismatch is rejected" {
     const a = testing.allocator;
-    // A case item whose type cannot coerce to the operand type is rejected on
-    // both sides. (Whole-switch exhaustiveness is a documented REPL gap -- the
-    // evaluator returns on the first match rather than validating every prong.)
+    // A case item whose type cannot coerce to the operand type is rejected.
     try expectBothReject(a, &.{"blk: { break :blk switch (@as(u8, 5)) { true => 1, else => 0 }; }"});
     try expectBothReject(a, &.{"blk: { const E = enum { a, b }; break :blk switch (E.a) { 0 => 1, else => 0 }; }"});
+}
+
+test "compliance: switch operand and exhaustiveness are validated" {
+    const a = testing.allocator;
+    // Switching on an un-switchable type is rejected ("switch on type '{f}'").
+    try expectReplDiagnostic(a, &.{"blk: { break :blk switch (@as(f32, 1)) { else => 0 }; }"}, "switch on type 'f32'");
+    try expectBothReject(a, &.{"blk: { const x: ?u8 = 1; break :blk switch (x) { else => 0 }; }"});
+    // An enum switch with no else must handle every tag.
+    try expectReplDiagnostic(a, &.{"blk: { const E = enum { a, b }; break :blk switch (E.a) { .a => 1 }; }"}, "switch must handle all possibilities");
+    try expectBothReject(a, &.{"blk: { const E = enum { a, b, c }; break :blk switch (E.a) { .a => 1, .b => 2 }; }"});
+    // A tagged union (switched via its tag enum) is validated the same way.
+    try expectBothReject(a, &.{"blk: { const U = union(enum) { a: u32, b: u8 }; const u = U{ .a = 1 }; break :blk switch (u) { .a => |v| v }; }"});
+    // Exhaustive-or-else switches remain accepted.
+    try expectMatchesZig(a, &.{"blk: { const E = enum { a, b }; break :blk switch (E.b) { .a => 1, .b => 2 }; }"});
+    try expectMatchesZig(a, &.{"blk: { const E = enum { a, b, c }; break :blk switch (E.c) { .a => 1, else => 9 }; }"});
+    // A no-else switch is exhaustive when its cases span the whole domain: a small
+    // int fully covered by values or a range, or a bool covering true and false.
+    try expectMatchesZig(a, &.{"blk: { break :blk switch (@as(u1, 0)) { 0 => 10, 1 => 20 }; }"});
+    try expectMatchesZig(a, &.{"blk: { break :blk switch (@as(u2, 3)) { 0...3 => 10 }; }"});
+    try expectMatchesZig(a, &.{"blk: { break :blk switch (true) { true => 1, false => 0 }; }"});
+    // A non-spanning int or a missing bool value without else is rejected.
+    try expectBothReject(a, &.{"blk: { break :blk switch (@as(u8, 0)) { 0 => 10, 1 => 20 }; }"});
+    try expectBothReject(a, &.{"blk: { break :blk switch (true) { true => 1 }; }"});
+    // A computed (non-literal) case item is resolved, so a gap is still caught.
+    try expectBothReject(a, &.{"blk: { const E = enum { a, b }; const k = E.b; break :blk switch (E.a) { k => 1 }; }"});
+    // A redundant else on a fully-covered switch is rejected on both sides.
+    try expectReplDiagnostic(a, &.{"blk: { const E = enum { a, b }; break :blk switch (E.a) { .a => 1, .b => 2, else => 9 }; }"}, "unreachable else prong; all cases already handled");
+    // Error-set switches are exhaustive over the set's names.
+    try expectMatchesZig(a, &.{ "const E = error{ A, B };", "const x: E!u8 = error.A;", "x catch |e| switch (e) { error.A => 1, error.B => 2 }" });
+    try expectBothReject(a, &.{ "const E = error{ A, B };", "const x: E!u8 = error.A;", "x catch |e| switch (e) { error.A => 1 }" });
 }
 
 test "sad paths: enums are rejected" {
