@@ -1522,3 +1522,90 @@ test "compliance: a type-returning generic function and composition" {
     try expectMatchesZig(a, &.{ id, make, "@TypeOf(make(Id(u16)))" });
     try expectMatchesZig(a, &.{ id, make, "make(Id(u16))" });
 }
+
+test "sad paths: numeric coercion and casts are rejected" {
+    const a = testing.allocator;
+    // Out-of-range and wrong-sign comptime coercions fail on both sides.
+    try expectBothReject(a, &.{"blk: { break :blk @as(u8, 300); }"});
+    try expectBothReject(a, &.{"blk: { break :blk @as(u8, -1); }"});
+    try expectBothReject(a, &.{"blk: { break :blk @as(i8, 200); }"});
+    try expectBothReject(a, &.{"blk: { break :blk @as(u8, @intCast(@as(u16, 300))); }"});
+    // Casts require an operand of the right category.
+    try expectBothReject(a, &.{"blk: { break :blk @floatFromInt(true); }"});
+    try expectBothReject(a, &.{"blk: { break :blk @intFromFloat(@as(u8, 1)); }"});
+    // Division by zero is illegal behavior at comptime.
+    try expectBothReject(a, &.{"blk: { break :blk @as(u8, 7) / @as(u8, 0); }"});
+}
+
+test "sad paths: operator type mismatches are rejected" {
+    const a = testing.allocator;
+    try expectBothReject(a, &.{"blk: { break :blk true + 1; }"});
+    try expectBothReject(a, &.{"blk: { break :blk void + void; }"});
+    try expectBothReject(a, &.{"blk: { const x: bool = 1; break :blk x; }"});
+}
+
+test "sad paths: const mutation and bad deref are rejected" {
+    const a = testing.allocator;
+    try expectBothReject(a, &.{"blk: { const x: u8 = 1; x = 2; break :blk x; }"});
+    try expectBothReject(a, &.{"blk: { var x: u8 = 1; break :blk x.*; }"});
+}
+
+test "sad paths: optionals and error unions are rejected" {
+    const a = testing.allocator;
+    // Unwrapping a comptime-known null is illegal behavior.
+    try expectBothReject(a, &.{"blk: { const x: ?u8 = null; break :blk x.?; }"});
+    // An error union does not coerce to its payload without catch/try.
+    try expectBothReject(a, &.{"blk: { const E = error{A}; const eu: E!u8 = 1; const y: u8 = eu; break :blk y; }"});
+}
+
+test "sad paths: switch item type mismatch is rejected" {
+    const a = testing.allocator;
+    // A case item whose type cannot coerce to the operand type is rejected on
+    // both sides. (Whole-switch exhaustiveness is a documented REPL gap -- the
+    // evaluator returns on the first match rather than validating every prong.)
+    try expectBothReject(a, &.{"blk: { break :blk switch (@as(u8, 5)) { true => 1, else => 0 }; }"});
+    try expectBothReject(a, &.{"blk: { const E = enum { a, b }; break :blk switch (E.a) { 0 => 1, else => 0 }; }"});
+}
+
+test "sad paths: enums are rejected" {
+    const a = testing.allocator;
+    try expectBothReject(a, &.{"blk: { const E = enum { a, b }; break :blk E.z; }"});
+    try expectBothReject(a, &.{"blk: { break :blk @intFromEnum(@as(u8, 1)); }"});
+    try expectBothReject(a, &.{"blk: { const E = enum(u8) { a = 0, b = 1 }; break :blk @intFromEnum(@as(E, @enumFromInt(200))); }"});
+}
+
+test "sad paths: structs are rejected" {
+    const a = testing.allocator;
+    try expectBothReject(a, &.{"blk: { const S = struct { x: u8 }; const s = S{}; break :blk s.x; }"});
+    try expectBothReject(a, &.{"blk: { const S = struct { x: u8 }; const s = S{ .x = 1 }; break :blk s.y; }"});
+    try expectBothReject(a, &.{"blk: { const S = struct { x: u8 }; break :blk S.nope; }"});
+}
+
+test "sad paths: arrays and tuples are rejected" {
+    const a = testing.allocator;
+    try expectBothReject(a, &.{"blk: { const arr = [_]u8{ 1, 2 }; break :blk arr[5]; }"});
+    try expectBothReject(a, &.{"blk: { const t = .{ 1, 2 }; break :blk t[5]; }"});
+    try expectBothReject(a, &.{"blk: { const t: struct { u8, u8 } = .{ 1, 2, 3 }; break :blk t[0]; }"});
+}
+
+test "sad paths: generics and @TypeOf are rejected" {
+    const a = testing.allocator;
+    // A generic body whose result cannot coerce to the resolved return type.
+    try expectBothReject(a, &.{"blk: { const S = struct { fn f(comptime T: type) T { return true; } }; break :blk S.f(u8); }"});
+    // Wrong argument count to a function.
+    try expectBothReject(a, &.{"blk: { const S = struct { fn f(x: u8) u8 { return x; } }; break :blk S.f(); }"});
+}
+
+test "sad paths: slices, loops, and indexing are rejected" {
+    const a = testing.allocator;
+    try expectBothReject(a, &.{"blk: { const arr = [_]u8{ 1, 2, 3 }; const s = arr[1..9]; break :blk s.len; }"});
+    try expectBothReject(a, &.{"blk: { var s: u8 = 0; for (@as(u8, 5)) |x| s += x; break :blk s; }"});
+    try expectBothReject(a, &.{"blk: { const x: u8 = 5; break :blk x[0]; }"});
+}
+
+test "sad paths: bad builtins and calls are rejected" {
+    const a = testing.allocator;
+    try expectBothReject(a, &.{"blk: { break :blk @as(u8, 1) << 100; }"});
+    try expectBothReject(a, &.{"blk: { const x: u8 = 5; break :blk x(); }"});
+    try expectReplDiagnostic(a, &.{"blk: { break :blk @sizeOf(); }"}, "expected 1 argument, found 0");
+}
