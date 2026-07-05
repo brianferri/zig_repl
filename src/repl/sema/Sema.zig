@@ -5184,6 +5184,53 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return error.AnalysisFail;
 }
 
+/// The subset of `zigTypeTag` that `validateSwitchBlock`'s exhaustiveness switch
+/// distinguishes, computed from an InternPool key -- this evaluator has no
+/// `zigTypeTag`. `usize`/`isize`/`c_*` are fixed-width ints, so they map to `.int`
+/// like the compiler (not a separate "needs else" group). `.other` stands for the
+/// compiler's `else => "switch on type"`.
+const SwitchTypeTag = enum { @"enum", error_set, int, comptime_int, bool, void, @"fn", enum_literal, type, other };
+fn switchTypeTag(ip: *const InternPool, ty: InternPool.Index) SwitchTypeTag {
+    return switch (ip.indexToKey(ty)) {
+        .enum_type => .@"enum",
+        .error_set_type, .error_union_type => .error_set,
+        .int_type => .int,
+        .func_type => .@"fn",
+        .simple_type => |s| switch (s) {
+            .anyerror => .error_set,
+            .comptime_int => .comptime_int,
+            .bool => .bool,
+            .void => .void,
+            .type => .type,
+            .enum_literal => .enum_literal,
+            .usize, .isize, .c_char, .c_short, .c_ushort, .c_int, .c_uint => .int,
+            .c_long, .c_ulong, .c_longlong, .c_ulonglong => .int,
+            else => .other,
+        },
+        else => .other,
+    };
+}
+
+/// Whether an error-set item type is `anyerror` (directly or as an error union's
+/// set), which -- being unbounded -- can only be exhausted by an `else`.
+fn isAnyerrorSet(ip: *const InternPool, item_ty: InternPool.Index) bool {
+    const set_ty = switch (ip.indexToKey(item_ty)) {
+        .error_union_type => |eu| eu.error_set_type,
+        else => item_ty,
+    };
+    return set_ty == .anyerror_type;
+}
+
+/// The compiler's "else prong required when switching on type '{f}'" for a type
+/// whose domain cannot be enumerated; a no-op when an `else` is present.
+fn requireSwitchElse(sema: *Sema, item_ty: InternPool.Index, has_else: bool) Error!void {
+    if (has_else) return;
+    try sema.writer.writeAll("else prong required when switching on type '");
+    try Type.print(.fromIndex(item_ty), sema.intern_pool, sema.writer);
+    try sema.writer.writeAll("'\n");
+    return error.AnalysisFail;
+}
+
 /// Validate a switch before matching, mirroring `validateSwitchBlock`: the operand
 /// must be a switchable type ("switch on type '{f}'" otherwise), and every case's
 /// items are resolved so coverage can be checked. `item_ty` is the operand's type
@@ -5200,41 +5247,25 @@ fn validateSwitch(sema: *Sema, inst: Zir.Inst.Index, item_ty: InternPool.Index, 
     const ip = sema.intern_pool;
     const has_else = sw.else_case != null;
 
-    // Whitelist the switchable types, mirroring `validateSwitchBlock`'s `item_ty`
-    // switch. `.needs_else` types (unbounded/target-width domains: comptime_int,
-    // type, fn, enum_literal, anyerror, usize/isize/c_*) can only be exhausted by
-    // an `else`; `.finite` types (enum, fixed-width int, error set, bool, void)
-    // have their coverage checked below; anything else is "switch on type".
-    const Class = enum { finite, needs_else, bad };
-    const class: Class = switch (ip.indexToKey(item_ty)) {
-        .int_type, .enum_type, .error_set_type, .error_union_type => .finite,
-        .func_type => .needs_else,
-        .simple_type => |s| switch (s) {
-            .bool, .void => .finite,
-            .type, .comptime_int, .enum_literal, .anyerror => .needs_else,
-            .usize, .isize, .c_char, .c_short, .c_ushort, .c_int, .c_uint => .needs_else,
-            .c_long, .c_ulong, .c_longlong, .c_ulonglong => .needs_else,
-            else => .bad,
-        },
-        else => .bad,
-    };
-    switch (class) {
-        .bad => {
+    // Dispatch on the compiler's `zigTypeTag` (this evaluator has none), matching
+    // the arms of `validateSwitchBlock`'s exhaustiveness switch. `.other` is the
+    // item-type determination's `else => "switch on type"`.
+    switch (switchTypeTag(ip, item_ty)) {
+        .other => {
             try sema.writer.writeAll("switch on type '");
             try Type.print(.fromIndex(item_ty), ip, sema.writer);
             try sema.writer.writeAll("'\n");
             return error.AnalysisFail;
         },
-        .needs_else => {
-            if (!has_else) {
-                try sema.writer.writeAll("else prong required when switching on type '");
-                try Type.print(.fromIndex(item_ty), ip, sema.writer);
-                try sema.writer.writeAll("'\n");
-                return error.AnalysisFail;
-            }
-            return;
-        },
-        .finite => {},
+        // Unbounded domains -- `.comptime_int, .enum_literal, .@"fn", .type` -- can
+        // only be exhausted by an `else` (`validateSwitchBlock` 11553).
+        .comptime_int, .enum_literal, .@"fn", .type => return sema.requireSwitchElse(item_ty, has_else),
+        // An `anyerror` set is likewise else-only, though its tag is `error_set`
+        // (`validateSwitchBlock` 11453).
+        .error_set => if (isAnyerrorSet(ip, item_ty)) return sema.requireSwitchElse(item_ty, has_else),
+        // enum / fixed-width int / bool / void, and concrete error sets: coverage
+        // is checked below.
+        .@"enum", .int, .bool, .void => {},
     }
 
     // Collect coverage over every case item, resolving computed (`body_len`) items
@@ -5307,7 +5338,9 @@ const SwitchCoverage = struct {
             .int_type => .{ .int = .empty },
             .simple_type => |s| switch (s) {
                 .bool => .{ .boolean = .{ false, false } },
-                else => .{ .void_seen = false },
+                .void => .{ .void_seen = false },
+                // usize/isize/c_* reach here via the `.int` tag.
+                else => .{ .int = .empty },
             },
             else => unreachable,
         };
@@ -5403,7 +5436,12 @@ const SwitchCoverage = struct {
     /// type. Merges adjacent/overlapping intervals (the compiler's `RangeSet.spans`
     /// in miniature); a type too wide to bound in `i128` is treated as unspanned.
     fn intervalsSpan(cov: *SwitchCoverage, sema: *Sema, item_ty: InternPool.Index) bool {
-        const it = sema.intern_pool.indexToKey(item_ty).int_type;
+        const key = sema.intern_pool.indexToKey(item_ty);
+        // usize/isize/c_* have a target-dependent width this evaluator does not
+        // bound here; treat them as unspanned so a no-else switch needs full
+        // coverage it cannot express -> "switch must handle all possibilities".
+        if (key != .int_type) return false;
+        const it = key.int_type;
         if (it.bits == 0) return true; // u0/i0 has one value; any/no case covers it
         const width_ok = if (it.signedness == .unsigned) it.bits <= 127 else it.bits <= 128;
         if (!width_ok) return false;

@@ -1590,6 +1590,11 @@ test "compliance: switch operand and exhaustiveness are validated" {
     try expectBothReject(a, &.{"blk: { const E = enum { a, b }; const k = E.b; break :blk switch (E.a) { k => 1 }; }"});
     // A redundant else on a fully-covered switch is rejected on both sides.
     try expectReplDiagnostic(a, &.{"blk: { const E = enum { a, b }; break :blk switch (E.a) { .a => 1, .b => 2, else => 9 }; }"}, "unreachable else prong; all cases already handled");
+    // Wide/target-width ints are the `.int` category (span-or-else, "must handle
+    // all possibilities"), while comptime_int is else-required -- matching how the
+    // compiler's zigTypeTag routes them.
+    try expectReplDiagnostic(a, &.{"blk: { break :blk switch (@as(usize, 0)) { 0 => 1 }; }"}, "switch must handle all possibilities");
+    try expectReplDiagnostic(a, &.{"blk: { break :blk switch (@as(comptime_int, 0)) { 0 => 1 }; }"}, "else prong required when switching on type 'comptime_int'");
     // Error-set switches are exhaustive over the set's names.
     try expectMatchesZig(a, &.{ "const E = error{ A, B };", "const x: E!u8 = error.A;", "x catch |e| switch (e) { error.A => 1, error.B => 2 }" });
     try expectBothReject(a, &.{ "const E = error{ A, B };", "const x: E!u8 = error.A;", "x catch |e| switch (e) { error.A => 1 }" });
