@@ -3828,8 +3828,12 @@ fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index, comptime initializing: bool) 
         },
         .struct_type => (try sema.structFieldByName(container_ty, name)) orelse
             return sema.failBadStructFieldAccess(container_ty, name),
+        // A by-pointer field access on a non-aggregate, non-type operand. Mirrors
+        // fieldPtr's fallthrough "type '{f}' does not support field access".
         else => {
-            try sema.writer.writeAll("field access: operand is not a struct or union\n");
+            try sema.writer.writeAll("type '");
+            try Type.print(.fromIndex(container_ty), ip, sema.writer);
+            try sema.writer.writeAll("' does not support field access\n");
             return error.AnalysisFail;
         },
     };
