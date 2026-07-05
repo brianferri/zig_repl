@@ -1424,6 +1424,9 @@ test "compliance: array slicing (a[start..end])" {
     // Indexing past the slice length, and an end past the array, are rejected.
     try expectBothReject(a, &.{"blk: { const arr = [_]u8{ 10, 20, 30, 40 }; const s = arr[1..3]; break :blk s[2]; }"});
     try expectBothReject(a, &.{"blk: { const arr = [_]u8{ 1, 2 }; const s = arr[0..9]; break :blk s.len; }"});
+    // `len`/`ptr` taken by pointer (fieldPtr's array / slice arms).
+    try expectMatchesZig(a, &.{"blk: { const arr = [_]u8{ 1, 2, 3 }; const p = &arr.len; break :blk p.*; }"}); // 3
+    try expectMatchesZig(a, &.{"blk: { const arr = [_]u8{ 10, 20, 30 }; const s = arr[0..2]; const p = &s.len; break :blk p.*; }"}); // 2
 }
 
 test "compliance: typed array initialization ([N]T = .{ ... })" {

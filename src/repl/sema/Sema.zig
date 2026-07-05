@@ -3816,6 +3816,24 @@ fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index, comptime initializing: bool) 
         return sema.failBadMemberAccess(container.index, name);
     }
 
+    // `.array` / `.pointer` (slice) fieldPtr arms: `arr.len`, `slice.len`/`.ptr`
+    // taken by pointer. These fields are computed values, not `.field` projections,
+    // so return a `*const` to the value (the compiler's `uavRef` / field ptr).
+    switch (ip.indexToKey(container_ty)) {
+        .array_type => |at| {
+            if (name.eqlSlice("len", ip))
+                return try sema.materializeConstPtr(.{ .index = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = at.len } }) });
+            return sema.failNoMember(container_ty, name);
+        },
+        .ptr_type => |ptr_ty| if (ptr_ty.flags.size == .slice) {
+            const s = ip.indexToKey((try sema.loadValue(object_ptr)).index).slice;
+            if (name.eqlSlice("len", ip)) return try sema.materializeConstPtr(.{ .index = s.len });
+            if (name.eqlSlice("ptr", ip)) return try sema.materializeConstPtr(.{ .index = s.ptr });
+            return sema.failNoMember(container_ty, name);
+        },
+        else => {},
+    }
+
     const fld: FieldInfo = switch (ip.indexToKey(container_ty)) {
         .union_type => blk: {
             const f = (try sema.unionFieldByName(container_ty, name)) orelse
