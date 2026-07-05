@@ -2687,29 +2687,35 @@ fn coerceValueToType(
         return .{ .index = idx };
     }
 
-    if (try sema.coerceToFixedWidthInt(value, dest_ty, op_name)) |coerced| return coerced;
-    if (try sema.coerceToFloat(value, dest_ty, op_name)) |coerced| return coerced;
-
-    // Coercion into an error-union type: an error value becomes the
-    // `.err` arm; any other value coerces to the payload type and
-    // becomes the `.payload` arm. Same shape as the compiler's
-    // `coerceExtra` error-union branch.
-    if (ip.indexToKey(dest_ty) == .error_union_type) {
-        return try sema.coerceToErrorUnion(value, dest_ty, op_name);
-    }
-
-    // Coercion into an optional type: `null` becomes the null optional;
-    // any other value coerces to the child type and wraps as the
-    // payload. Same shape as the compiler's `coerceExtra` optional arm.
-    if (ip.indexToKey(dest_ty) == .opt_type) {
-        return try sema.coerceToOptional(value, dest_ty, op_name);
-    }
-
-    // Coercion into a slice type: a pointer to an array (`*const [N:0]u8`, e.g. a
-    // string literal) becomes a slice with `len = N`. Mirrors coerceExtra's
-    // array-pointer -> slice arm.
-    if (ip.indexToKey(dest_ty) == .ptr_type and ip.indexToKey(dest_ty).ptr_type.flags.size == .slice) {
-        if (try sema.coerceToSlice(value, dest_ty)) |coerced| return coerced;
+    // Dispatch on the destination type, mirroring `coerceExtra`'s
+    // `switch (dest_ty.zigTypeTag())`; each arm is that type's coercion (a helper,
+    // as the compiler calls one per arm). Falling through the switch is the
+    // compiler's "cannot coerce" tail.
+    switch (ip.indexToKey(dest_ty)) {
+        // `.int` arm: any fixed-width int type (`intN`, `usize`/`isize`, `c_*`).
+        .int_type => if (try sema.coerceToFixedWidthInt(value, dest_ty, op_name)) |c| return c,
+        .simple_type => |s| switch (s) {
+            .usize, .isize, .c_char, .c_short, .c_ushort, .c_int, .c_uint, .c_long, .c_ulong, .c_longlong, .c_ulonglong => {
+                if (try sema.coerceToFixedWidthInt(value, dest_ty, op_name)) |c| return c;
+            },
+            // `.float` arm: `fN`, `comptime_float`, `c_longdouble`.
+            .f16, .f32, .f64, .f80, .f128, .comptime_float, .c_longdouble => {
+                if (try sema.coerceToFloat(value, dest_ty, op_name)) |c| return c;
+            },
+            else => {},
+        },
+        // `.error_union` arm: an error value becomes the `.err` arm; any other
+        // value coerces to the payload type and becomes the `.payload` arm.
+        .error_union_type => return try sema.coerceToErrorUnion(value, dest_ty, op_name),
+        // `.optional` arm: `null` becomes the null optional; any other value
+        // coerces to the child type and wraps as the payload.
+        .opt_type => return try sema.coerceToOptional(value, dest_ty, op_name),
+        // `.pointer` arm (slice): a pointer to an array (`*const [N:0]u8`, e.g. a
+        // string literal) becomes a slice with `len = N`.
+        .ptr_type => |p| if (p.flags.size == .slice) {
+            if (try sema.coerceToSlice(value, dest_ty)) |c| return c;
+        },
+        else => {},
     }
 
     try sema.writer.print("{s}: cannot coerce value to destination type\n", .{op_name});
