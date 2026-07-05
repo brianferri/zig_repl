@@ -545,6 +545,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .vector_type => sema.evalVectorType(inst),
         .optional_type => sema.evalOptionalType(inst),
         .optional_payload_safe, .optional_payload_unsafe => sema.evalOptionalPayload(inst),
+        .is_non_null => sema.evalIsNonNull(inst),
         .array_type => sema.evalArrayType(inst),
         .array_init => sema.evalArrayInit(inst),
         .array_init_ref => sema.evalArrayInitRef(inst),
@@ -2962,6 +2963,31 @@ fn evalOptionalPayload(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return error.AnalysisFail;
     }
     return .{ .index = key.opt.val };
+}
+
+/// `is_non_null` (`if (opt) |v|`, `orelse`): the comptime null test that
+/// feeds the following `condbr`. Mirrors `zirIsNonNull` ->
+/// `analyzeIsNull(invert_logic = true)`: the operand is always a
+/// comptime-known value here, so the answer is `makeBool(!isNull)`, where
+/// `isNull` is `opt.val == .none` (Value.isNull's `.opt` arm).
+/// `checkNullableType` rejects a non-optional operand. The `_ptr` variant
+/// (`if (p.*) |v|`) is unmodeled -- it needs a deref of the pointer's slot.
+/// Compiler reference: src/Sema.zig:zirIsNonNull (~17416).
+fn evalIsNonNull(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const operand = try sema.resolveRef(un_node.operand);
+    const ip = sema.intern_pool;
+    const key = ip.indexToKey(operand.index);
+    if (key != .opt) {
+        try sema.writer.writeAll("expected optional type, found '");
+        try Type.print(operand.typeOf(ip), ip, sema.writer);
+        try sema.writer.writeAll("'\n");
+        return error.AnalysisFail;
+    }
+    const is_null = key.opt.val == .none;
+    return .{ .index = if (is_null) .bool_false else .bool_true };
 }
 
 /// `array_init`: build the aggregate value. `array_init_ref`: build

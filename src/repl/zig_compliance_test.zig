@@ -936,6 +936,18 @@ test "compliance: unwrapping a comptime-known null is rejected by both" {
     try expectBothReject(testing.allocator, &.{"@as(?i32, null).?"});
 }
 
+test "compliance: optional null test drives if-capture and orelse" {
+    // `if (opt) |v|` and `orelse` both lower to `is_non_null` -> `condbr`.
+    try expectMatchesZig(testing.allocator, &.{"blk: { const x: ?u32 = 7; break :blk if (x) |v| v else 0; }"});
+    try expectMatchesZig(testing.allocator, &.{"blk: { const x: ?u32 = null; break :blk if (x) |v| v else 42; }"});
+    try expectMatchesZig(testing.allocator, &.{"blk: { const x: ?u32 = null; break :blk x orelse 99; }"});
+    try expectMatchesZig(testing.allocator, &.{"blk: { const x: ?u32 = 7; break :blk x orelse 99; }"});
+}
+
+test "compliance: if-capture on a non-optional is rejected by both" {
+    try expectBothReject(testing.allocator, &.{"blk: { const n: u32 = 5; break :blk if (n) |v| v else 0; }"});
+}
+
 test "compliance: optional across awkward payload widths" {
     inline for (awkward_widths) |bits| {
         const decl = std.fmt.comptimePrint("@as(?u{d}, 1)", .{bits});
