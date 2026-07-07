@@ -717,25 +717,73 @@ fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?
     assert(op_name.len > 0);
 
     const ip = sema.intern_pool;
-    const lhs_value = try sema.resolveRef(bin.lhs);
-    const rhs_value = try sema.resolveRef(bin.rhs);
-    const lhs_key = ip.indexToKey(lhs_value.index);
-    const rhs_key = ip.indexToKey(rhs_value.index);
+    const lv = try sema.resolveRef(bin.lhs);
+    const rv = try sema.resolveRef(bin.rhs);
 
-    if (resolveNumericPairToInt(ip, lhs_key, rhs_key)) |triple| {
+    // Vector operands: apply the op lane-wise and build a result vector, mirroring
+    // the compiler's element-wise arithmetic on `@Vector(N, T)`.
+    if (ip.indexToKey(Value.typeOf(lv, ip).index) == .vector_type)
+        return try sema.evalVectorArith(tag, lv, rv, op_name);
+
+    return sema.scalarArith(tag, ip.indexToKey(lv.index), ip.indexToKey(rv.index), op_name);
+}
+
+/// The scalar (non-vector) arithmetic dispatch shared by `evalBinaryArith` and
+/// each lane of `evalVectorArith`: int-pair, then float-pair, else a typed error.
+fn scalarArith(sema: *Sema, tag: Zir.Inst.Tag, lhs_key: InternPool.Key, rhs_key: InternPool.Key, op_name: []const u8) Error!?Value {
+    if (resolveNumericPairToInt(sema.intern_pool, lhs_key, rhs_key)) |triple| {
         return sema.evalBinaryArithInt(tag, triple.lhs, triple.rhs, triple.ty);
     }
-
     if (coerceNumericPairToFloat(lhs_key, rhs_key)) |pair| {
         return sema.evalBinaryArithFloat(tag, pair[0], pair[1]);
     }
+    return sema.failNumericOperands(op_name, lhs_key, rhs_key);
+}
 
+/// The "not a workable numeric pair" error shared by scalar arithmetic
+/// (`scalarArith`) and comparison (`evalComparison`): two numeric operands with
+/// no common type are "incompatible"; a non-numeric operand is "non-numeric or
+/// mismatched".
+fn failNumericOperands(sema: *Sema, op_name: []const u8, lhs_key: InternPool.Key, rhs_key: InternPool.Key) Error {
     if ((lhs_key == .int or lhs_key == .float) and (rhs_key == .int or rhs_key == .float)) {
-        try sema.writer.print("{s}: incompatible numeric operands\n", .{op_name});
+        sema.writer.print("{s}: incompatible numeric operands\n", .{op_name}) catch |e| return e;
     } else {
-        try sema.writer.print("{s}: non-numeric or mismatched operands\n", .{op_name});
+        sema.writer.print("{s}: non-numeric or mismatched operands\n", .{op_name}) catch |e| return e;
     }
     return error.AnalysisFail;
+}
+
+/// Lane-wise arithmetic on two `@Vector(N, T)` operands: apply the scalar op to
+/// each `(lhs[i], rhs[i])` pair and intern a result vector. Both operands must be
+/// vectors of the same length -- the compiler requires an explicit `@splat` to
+/// combine a scalar, so a scalar operand is "mixed scalar and vector operands"
+/// and a differing length is a "vector length mismatch". The result lane type
+/// follows the scalar op's result (identity for same-type lanes).
+fn evalVectorArith(sema: *Sema, tag: Zir.Inst.Tag, lhs: Value, rhs: Value, op_name: []const u8) Error!?Value {
+    const ip = sema.intern_pool;
+    const lhs_vt = ip.indexToKey(Value.typeOf(lhs, ip).index).vector_type;
+    const rhs_ty_key = ip.indexToKey(Value.typeOf(rhs, ip).index);
+    if (rhs_ty_key != .vector_type) {
+        try sema.writer.print("{s}: mixed scalar and vector operands\n", .{op_name});
+        return error.AnalysisFail;
+    }
+    if (rhs_ty_key.vector_type.len != lhs_vt.len) {
+        try sema.writer.print("{s}: vector length mismatch\n", .{op_name});
+        return error.AnalysisFail;
+    }
+    const lhs_agg = ip.indexToKey(lhs.index).aggregate;
+    const rhs_agg = ip.indexToKey(rhs.index).aggregate;
+    const count: usize = @intCast(lhs_vt.len);
+    const elems = try sema.gpa.alloc(InternPool.Index, count);
+    defer sema.gpa.free(elems);
+    for (elems, 0..) |*e, i| {
+        const l = ip.indexToKey(InternPool.aggregateElementAt(lhs_agg, i));
+        const r = ip.indexToKey(InternPool.aggregateElementAt(rhs_agg, i));
+        e.* = (try sema.scalarArith(tag, l, r, op_name) orelse return null).index;
+    }
+    const child = Value.typeOf(.{ .index = elems[0] }, ip).index;
+    const vec_ty = try ip.internVectorType(.{ .len = @intCast(count), .child = child });
+    return .{ .index = try ip.internAggregate(.{ .ty = vec_ty, .storage = .{ .elems = elems } }) };
 }
 
 /// Peer-type resolution for two int operands. Returns the common int
@@ -2093,12 +2141,7 @@ fn evalComparison(
         return .{ .index = if (result) .bool_true else .bool_false };
     }
 
-    if ((lhs_key == .int or lhs_key == .float) and (rhs_key == .int or rhs_key == .float)) {
-        try sema.writer.print("{s}: incompatible numeric operands\n", .{op_name});
-    } else {
-        try sema.writer.print("{s}: non-numeric or mismatched operands\n", .{op_name});
-    }
-    return error.AnalysisFail;
+    return sema.failNumericOperands(op_name, lhs_key, rhs_key);
 }
 
 /// Compare two float storages of the same width. NaN comparisons follow

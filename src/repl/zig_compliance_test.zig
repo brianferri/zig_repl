@@ -1734,6 +1734,42 @@ test "compliance: @Vector element indexing" {
     try expectBothReject(a, &.{"blk: { const v: @Vector(3, u8) = .{ 5, 6, 7 }; break :blk v[5]; }"});
 }
 
+test "compliance: @Vector lane-wise arithmetic" {
+    const a = testing.allocator;
+    // A vector operand pair applies the op element-wise; the scalar kernel runs
+    // per lane, so every scalar semantic (peer type, wrap/sat, overflow check,
+    // division/remainder) carries through. Prefixes reused across the ops below.
+    const X = "const x: @Vector(4, i32) = .{ 8, 9, 20, 21 }; const y: @Vector(4, i32) = .{ 2, 3, 4, 5 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ X ++ " const z = x + y; break :blk z[0] + z[3]; }"}); // 36
+    try expectMatchesZig(a, &.{"blk: { " ++ X ++ " const z = x - y; break :blk z[2]; }"}); // 16
+    try expectMatchesZig(a, &.{"blk: { " ++ X ++ " const z = x * y; break :blk z[1]; }"}); // 27
+    try expectMatchesZig(a, &.{"blk: { " ++ X ++ " const z = @divFloor(x, y); break :blk z[2] + z[3]; }"}); // 9
+    try expectMatchesZig(a, &.{"blk: { " ++ X ++ " const z = @divTrunc(x, y); break :blk z[2]; }"}); // 5
+    try expectMatchesZig(a, &.{"blk: { " ++ X ++ " const z = @mod(x, y); break :blk z[1]; }"}); // 0
+    try expectMatchesZig(a, &.{"blk: { " ++ X ++ " const z = @rem(x, y); break :blk z[3]; }"}); // 1
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(2, i32) = .{ 20, 30 }; const y: @Vector(2, i32) = .{ 4, 5 }; const z = @divExact(x, y); break :blk z[0] + z[1]; }"}); // 11
+    // Wrapping and saturating arithmetic on narrow lanes.
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(2, u8) = .{ 200, 10 }; const y: @Vector(2, u8) = .{ 100, 5 }; const z = x +% y; break :blk z[0]; }"}); // 44
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(2, u8) = .{ 10, 10 }; const y: @Vector(2, u8) = .{ 200, 5 }; const z = x -% y; break :blk z[0]; }"}); // 66
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(2, u8) = .{ 100, 10 }; const y: @Vector(2, u8) = .{ 200, 5 }; const z = x +| y; break :blk z[0]; }"}); // 255
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(2, u8) = .{ 10, 10 }; const y: @Vector(2, u8) = .{ 200, 5 }; const z = x -| y; break :blk z[0]; }"}); // 0
+    // Float lanes, including division.
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(2, f32) = .{ 1.5, 2.5 }; const y: @Vector(2, f32) = .{ 0.5, 0.5 }; const z = x + y; break :blk z[0]; }"}); // 2
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(2, f64) = .{ 7.0, 9.0 }; const y: @Vector(2, f64) = .{ 2.0, 3.0 }; const z = x / y; break :blk z[1]; }"}); // 3
+    // Wider/narrower lane types keep their type through the op.
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(3, i64) = .{ 1000000, 2, 3 }; const y: @Vector(3, i64) = .{ 1, 2, 3 }; const z = x + y; break :blk z[0]; }"}); // 1000001
+    // A chained expression and coercing the result to an array both work.
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(3, i32) = .{ 1, 2, 3 }; const y: @Vector(3, i32) = .{ 4, 5, 6 }; const z = (x + y) * x; break :blk z[2]; }"}); // 27
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(4, i16) = .{ 1, 2, 3, 4 }; const y: @Vector(4, i16) = .{ 5, 6, 7, 8 }; const z = x + y; const arr: [4]i16 = z; break :blk arr[3]; }"}); // 12
+    // Sad paths: a per-lane overflow (checked add), a scalar operand (needs an
+    // explicit @splat), and a lane-count mismatch -- with the compiler's wording.
+    try expectBothReject(a, &.{"blk: { const x: @Vector(2, u8) = .{ 200, 1 }; const y: @Vector(2, u8) = .{ 100, 1 }; const z = x + y; break :blk z[0]; }"});
+    try expectBothReject(a, &.{"blk: { const x: @Vector(2, i32) = .{ 1, 2 }; const z = x * 2; break :blk z[0]; }"});
+    try expectBothReject(a, &.{"blk: { const x: @Vector(2, i32) = .{ 1, 2 }; const y: @Vector(3, i32) = .{ 1, 2, 3 }; const z = x + y; break :blk z[0]; }"});
+    try expectReplDiagnostic(a, &.{"blk: { const x: @Vector(2, i32) = .{ 1, 2 }; const z = x * 2; break :blk z[0]; }"}, "mixed scalar and vector operands");
+    try expectReplDiagnostic(a, &.{"blk: { const x: @Vector(2, i32) = .{ 1, 2 }; const y: @Vector(3, i32) = .{ 1, 2, 3 }; const z = x + y; break :blk z[0]; }"}, "vector length mismatch");
+}
+
 test "compliance: @Vector and arrays are distinct but interconvertible" {
     const a = testing.allocator;
     // Distinct types (different type identity), but same-length arrays and
