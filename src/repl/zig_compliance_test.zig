@@ -1734,6 +1734,27 @@ test "compliance: @Vector element indexing" {
     try expectBothReject(a, &.{"blk: { const v: @Vector(3, u8) = .{ 5, 6, 7 }; break :blk v[5]; }"});
 }
 
+test "compliance: @Vector and arrays are distinct but interconvertible" {
+    const a = testing.allocator;
+    // Distinct types (different type identity), but same-length arrays and
+    // vectors coerce to each other -- they share the aggregate representation.
+    try expectMatchesZig(a, &.{"@as(type, [4]i32) == @as(type, @Vector(4, i32))"}); // false
+    try expectMatchesZig(a, &.{"blk: { const arr = [4]i32{ 1, 2, 3, 4 }; const v: @Vector(4, i32) = arr; break :blk v[2]; }"}); // 3 (array -> vector)
+    try expectMatchesZig(a, &.{"blk: { const v: @Vector(4, i32) = .{ 10, 20, 30, 40 }; const arr: [4]i32 = v; break :blk arr[3]; }"}); // 40 (vector -> array)
+    // A length mismatch does not coerce.
+    try expectBothReject(a, &.{"blk: { const arr = [3]u8{ 1, 2, 3 }; const v: @Vector(4, u8) = arr; break :blk v[0]; }"});
+    // The core discriminator: a vector's element type must be int/float/bool/
+    // pointer; an array accepts any element type (here an array-of-arrays and an
+    // array-of-structs, which a vector rejects).
+    try expectBothReject(a, &.{"blk: { const T = @Vector(3, [2]u8); break :blk @sizeOf(T); }"});
+    try expectBothReject(a, &.{"blk: { const T = @Vector(2, struct { x: u8 }); break :blk @sizeOf(T); }"});
+    // An explicit-type array of aggregates uses validate_array_init_ty, which
+    // names the array kind on a count mismatch.
+    try expectMatchesZig(a, &.{"blk: { const S = struct { x: u8 }; const arr = [2]S{ .{ .x = 1 }, .{ .x = 2 } }; break :blk arr[1].x; }"}); // 2
+    try expectBothReject(a, &.{"blk: { const arr = [2]u8{ 1, 2, 3 }; break :blk arr[0]; }"});
+    try expectReplDiagnostic(a, &.{"blk: { const arr = [2]u8{ 1, 2, 3 }; break :blk arr[0]; }"}, "expected 2 array elements; found 3");
+}
+
 test "compliance: nested aggregate init and element store" {
     const a = testing.allocator;
     // Storing through a nested element pointer rebuilds each enclosing aggregate.

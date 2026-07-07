@@ -565,7 +565,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .array_init_anon => sema.evalArrayInitAnon(inst),
         .array_init_elem_type => sema.evalArrayInitElemType(inst),
         .elem_type => sema.evalElemType(inst),
-        .validate_array_init_result_ty => sema.evalValidateArrayInitResultTy(inst),
+        .validate_array_init_ty => sema.evalValidateArrayInitTy(inst, false),
+        .validate_array_init_result_ty => sema.evalValidateArrayInitTy(inst, true),
         .ref => sema.evalRef(inst),
         .elem_ptr_load => sema.evalElemPtrLoad(inst),
         // `elem_ptr` is the for-loop by-ref capture (`for (&arr) |*e|`), `_node`
@@ -2774,6 +2775,10 @@ fn coerceValueToType(
             .many => if (try sema.coerceToManyPtr(value, dest_ty)) |c| return c,
             else => {},
         },
+        // `.array` / `.vector` arms: an array coerces to a vector (and vice versa)
+        // of the same length -- they share the comptime aggregate representation
+        // (`coerceArrayLike`).
+        .array_type, .vector_type => if (try sema.coerceArrayLike(value, dest_ty, op_name)) |c| return c,
         else => {},
     }
 
@@ -2818,6 +2823,30 @@ fn coerceToManyPtr(sema: *Sema, value: Value, dest_ty: InternPool.Index) Error!?
     if (ip.indexToKey(child) != .array_type) return null;
     const retagged = try ip.internPtr(.{ .ty = dest_ty, .base_addr = array_ptr.base_addr, .byte_offset = array_ptr.byte_offset });
     return .{ .index = retagged };
+}
+
+/// Coerce an array or vector value to `dest_ty` (a vector or array) of the same
+/// length: arrays and vectors share the comptime aggregate representation, so
+/// re-tag the aggregate to `dest_ty`, coercing each element to the destination
+/// element type (identity for the same element type, widening otherwise). Returns
+/// null if `value` is not an aggregate or the lengths differ (caller reports).
+/// Mirrors coerceArrayLike's comptime in-memory / element-by-element arms.
+fn coerceArrayLike(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_name: []const u8) Error!?Value {
+    const ip = sema.intern_pool;
+    if (ip.indexToKey(value.index) != .aggregate) return null;
+    const src = indexableInfo(ip, Value.typeOf(value, ip).index) orelse return null;
+    const dst = indexableInfo(ip, dest_ty).?; // dest is array/vector by the caller's switch
+    if (src.len != dst.len) return null;
+
+    const count: usize = @intCast(dst.len);
+    const elems = try sema.gpa.alloc(InternPool.Index, count);
+    defer sema.gpa.free(elems);
+    const agg = ip.indexToKey(value.index).aggregate;
+    for (elems, 0..) |*e, i| {
+        const elem: Value = .{ .index = InternPool.aggregateElementAt(agg, i) };
+        e.* = (try sema.coerceValueToType(elem, dst.child, op_name)).index;
+    }
+    return .{ .index = try ip.internAggregate(.{ .ty = dest_ty, .storage = .{ .elems = elems } }) };
 }
 
 /// Coerce `value` to a fixed-width int `dest_ty`, or `null` if `dest_ty` isn't
@@ -3226,33 +3255,49 @@ fn evalElemType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = sema.intern_pool.indexToKey(ptr_ty).ptr_type.child };
 }
 
-/// `validate_array_init_result_ty`: confirm the known result type accepts
-/// array-init syntax and that the element count matches. The compiler
-/// returns void; the real type checking happens element-by-element in
-/// `array_init`. Compiler reference: src/Sema.zig:zirValidateArrayInitResultTy.
-fn evalValidateArrayInitResultTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+/// `validate_array_init_ty` (`[N]T{...}`) / `validate_array_init_result_ty`
+/// (`.{...}` with a known result type): confirm the type accepts array-init
+/// syntax and that the element count matches. Validation only -- the per-element
+/// type checking happens in `array_init`. The `_result_ty` form peels an
+/// optional/error-union wrapper first (`is_result_ty`). Compiler reference:
+/// src/Sema.zig:zirValidateArrayInitTy -> validateArrayInitTy.
+fn evalValidateArrayInitTy(sema: *Sema, inst: Zir.Inst.Index, comptime is_result_ty: bool) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const data = sema.zir.extraData(Zir.Inst.ArrayInit, pl_node.payload_index).data;
-    const result_ty = try sema.resolveDestType(data.ty, "array init");
-    const field_count: u64 = switch (sema.intern_pool.indexToKey(result_ty)) {
-        .array_type => |at| at.len,
-        .vector_type => |vt| vt.len,
-        .tuple_type => |tt| tt.types.len,
-        else => {
-            try sema.writer.print("array init: type does not support array-init syntax\n", .{});
+    const ty = try sema.resolveDestType(data.ty, "array init");
+    const arr_ty = if (is_result_ty) sema.optEuBaseType(ty) else ty;
+    try sema.validateArrayInitTy(data.init_count, arr_ty);
+    return null;
+}
+
+/// The type-tag switch of `validateArrayInitTy`, mirrored arm-for-arm: an array
+/// or vector requires an exact element count; a tuple allows AT MOST its field
+/// count (trailing defaulted fields may be omitted); anything else does not
+/// support array-init syntax.
+fn validateArrayInitTy(sema: *Sema, init_count: u32, ty: InternPool.Index) Error!void {
+    const ip = sema.intern_pool;
+    switch (ip.indexToKey(ty)) {
+        .array_type => |at| if (init_count != at.len) {
+            try sema.writer.print("expected {d} array elements; found {d}\n", .{ at.len, init_count });
             return error.AnalysisFail;
         },
-    };
-    if (data.init_count != field_count) {
-        try sema.writer.print(
-            "array init: expected {d} elements, found {d}\n",
-            .{ field_count, data.init_count },
-        );
-        return error.AnalysisFail;
+        .vector_type => |vt| if (init_count != vt.len) {
+            try sema.writer.print("expected {d} vector elements; found {d}\n", .{ vt.len, init_count });
+            return error.AnalysisFail;
+        },
+        .tuple_type => |tt| if (init_count > tt.types.len) {
+            try sema.writer.print("expected at most {d} tuple fields; found {d}\n", .{ tt.types.len, init_count });
+            return error.AnalysisFail;
+        },
+        else => {
+            try sema.writer.writeAll("type '");
+            try Type.print(.fromIndex(ty), ip, sema.writer);
+            try sema.writer.writeAll("' does not support array initialization syntax\n");
+            return error.AnalysisFail;
+        },
     }
-    return null;
 }
 
 /// `validate_ref_ty` (`&expr` with a known result type): checks the
