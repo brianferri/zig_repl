@@ -1429,6 +1429,23 @@ test "compliance: slices -- coercion from a string literal, .len, indexing" {
     try expectBothReject(a, &.{"blk: { const s: []const u8 = \"hi\"; break :blk s[5]; }"});
 }
 
+test "compliance: address-of an array literal coerces to slice/many-ptr" {
+    // `&[_]T{...}` bound to a `[]T` / `[*]T` result type: validate_ref_ty
+    // accepts the pointer result, coerce_ptr_elem_ty sizes the array to the
+    // element type, and the array-ptr coerces to the slice/many pointer.
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"blk: { const s: []const u8 = &[_]u8{ 1, 2, 3 }; break :blk s[1]; }"}); // 2
+    try expectMatchesZig(a, &.{"blk: { const s: []const u8 = &[_]u8{ 1, 2, 3 }; break :blk s.len; }"}); // 3
+    try expectMatchesZig(a, &.{"blk: { const t: []const u32 = &[_]u32{ 10, 20, 30 }; break :blk t[2]; }"}); // 30
+    try expectMatchesZig(a, &.{"blk: { const m: [*]const u8 = &[_]u8{ 9, 8, 7 }; break :blk m[0]; }"}); // 9
+    // `&expr` bound to a non-pointer result type is rejected on both sides.
+    try expectBothReject(a, &.{"blk: { const y: u32 = 5; const x: u32 = &y; break :blk x; }"});
+    // Bound to a session const and indexed on a LATER line (the anonymous-decl
+    // pointer persists across lines).
+    try expectMatchesZig(a, &.{ "const s: []const u8 = &[_]u8{ 1, 2, 3 };", "s[2]" }); // 3
+    try expectMatchesZig(a, &.{ "const m: [*]const u8 = &[_]u8{ 9, 8 };", "m[1]" }); // 8
+}
+
 test "compliance: indexing a const pointer built on an earlier line" {
     // Regression: a const decl holding a pointer to an anonymous constant used
     // to keep a `.comptime_alloc` base, whose backing slot is discarded when the

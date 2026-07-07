@@ -507,6 +507,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .struct_init_ref => sema.evalStructInit(inst, true),
         .struct_init_empty => sema.evalStructInitEmpty(inst),
         .validate_deref => sema.evalValidateDeref(inst),
+        .validate_ref_ty => sema.evalValidateRefTy(inst),
+        .coerce_ptr_elem_ty => sema.evalCoercePtrElemTy(inst),
         .load => sema.evalLoad(inst),
         .decl_val => sema.evalDeclVal(inst),
         .decl_ref => sema.evalDeclRef(inst),
@@ -2750,10 +2752,13 @@ fn coerceValueToType(
         // `.optional` arm: `null` becomes the null optional; any other value
         // coerces to the child type and wraps as the payload.
         .opt_type => return try sema.coerceToOptional(value, dest_ty, op_name),
-        // `.pointer` arm (slice): a pointer to an array (`*const [N:0]u8`, e.g. a
-        // string literal) becomes a slice with `len = N`.
-        .ptr_type => |p| if (p.flags.size == .slice) {
-            if (try sema.coerceToSlice(value, dest_ty)) |c| return c;
+        // `.pointer` arm: a pointer to an array (`*const [N:0]u8`, e.g. a string
+        // literal, or `&[_]T{...}`) coerces to a slice (`len = N`) or to a bare
+        // many-pointer (`[*]T`, re-typed, no length).
+        .ptr_type => |p| switch (p.flags.size) {
+            .slice => if (try sema.coerceToSlice(value, dest_ty)) |c| return c,
+            .many => if (try sema.coerceToManyPtr(value, dest_ty)) |c| return c,
+            else => {},
         },
         else => {},
     }
@@ -2784,6 +2789,21 @@ fn coerceToSlice(sema: *Sema, value: Value, dest_ty: InternPool.Index) Error!?Va
     const many_ptr = try ip.internPtr(.{ .ty = many_ptr_ty, .base_addr = array_ptr.base_addr, .byte_offset = array_ptr.byte_offset });
     const len_val = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = array.len } });
     return .{ .index = try ip.get(.{ .slice = .{ .ty = dest_ty, .ptr = many_ptr, .len = len_val } }) };
+}
+
+/// Coerce a single-pointer-to-array value (`*const [N]T`) into `dest_ty` (a
+/// many-pointer `[*]T`): re-tag the array pointer to the many-pointer type,
+/// keeping the same base address (indexing then derefs it like a slice's ptr).
+/// Returns null if `value` is not a pointer to an array. Mirrors
+/// coerceArrayPtrToMany's comptime arm (getCoerced to the many-pointer type).
+fn coerceToManyPtr(sema: *Sema, value: Value, dest_ty: InternPool.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    if (ip.indexToKey(value.index) != .ptr) return null;
+    const array_ptr = ip.indexToKey(value.index).ptr;
+    const child = ip.indexToKey(array_ptr.ty).ptr_type.child;
+    if (ip.indexToKey(child) != .array_type) return null;
+    const retagged = try ip.internPtr(.{ .ty = dest_ty, .base_addr = array_ptr.base_addr, .byte_offset = array_ptr.byte_offset });
+    return .{ .index = retagged };
 }
 
 /// Coerce `value` to a fixed-width int `dest_ty`, or `null` if `dest_ty` isn't
@@ -3167,6 +3187,87 @@ fn evalValidateArrayInitResultTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value
         return error.AnalysisFail;
     }
     return null;
+}
+
+/// `validate_ref_ty` (`&expr` with a known result type): checks the
+/// result-location type is a pointer, so `&expr` -- which always yields a
+/// pointer -- can satisfy it. Validation only (no value). Mirrors
+/// `zirValidateRefTy`: peel any optional/error-union wrapper
+/// (`optEuBaseType`, so `?*T`/`E!*T` targets pass) then require a
+/// `ptr_type`. Compiler reference: src/Sema.zig:zirValidateRefTy (~4239).
+fn evalValidateRefTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+
+    const un_tok = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_tok;
+    const ty_operand = try sema.resolveDestType(un_tok.operand, "address-of");
+    if (sema.intern_pool.indexToKey(sema.optEuBaseType(ty_operand)) != .ptr_type) {
+        try sema.writer.writeAll("expected type '");
+        try Type.print(.fromIndex(ty_operand), sema.intern_pool, sema.writer);
+        try sema.writer.writeAll("', found pointer\n");
+        return error.AnalysisFail;
+    }
+    return null;
+}
+
+/// `coerce_ptr_elem_ty lhs, rhs`: coerce a value (`rhs`) to what the
+/// result pointer type (`lhs`) expects to point at -- for `&[_]T{...}` /
+/// `&.{...}` bound to a `[]T`/`[*]T` target, an array of the pointer's
+/// element type sized to the value's length. Mirrors `zirCoercePtrElemTy`:
+/// a slice/many target coerces to `[N]elem`; a single (`.one`) target
+/// coerces to `elem` (unless it's `*[1]T` from `&T`, left as-is); a C
+/// pointer is left uncoerced. Compiler reference:
+/// src/Sema.zig:zirCoercePtrElemTy (~4140).
+fn evalCoercePtrElemTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const bin = sema.binData(inst);
+    assert(bin.lhs != .none);
+    assert(bin.rhs != .none);
+
+    const ip = sema.intern_pool;
+    const uncoerced = try sema.resolveRef(bin.rhs);
+    const ptr_ty = ip.indexToKey(sema.optEuBaseType(try sema.resolveDestType(bin.lhs, "coerce_ptr_elem_ty"))).ptr_type;
+    const elem_ty = ptr_ty.child;
+    const val_ty = Value.typeOf(uncoerced, ip).index;
+    switch (ptr_ty.flags.size) {
+        .one => {
+            // `*[1]T` initialised from `&T`: the pointer already matches, so
+            // coercing the element would be wrong. Otherwise coerce to `T`.
+            if (ip.indexToKey(elem_ty) == .array_type and ip.indexToKey(elem_ty).array_type.child == val_ty) {
+                return uncoerced;
+            }
+            return try sema.coerceValueToType(uncoerced, elem_ty, "coerce_ptr_elem_ty");
+        },
+        .slice, .many => {
+            const len = switch (ip.indexToKey(val_ty)) {
+                .array_type => |at| at.len,
+                .vector_type => |vt| vt.len,
+                .tuple_type => |tt| tt.types.len,
+                else => {
+                    try sema.writer.writeAll("expected array of '");
+                    try Type.print(.fromIndex(elem_ty), ip, sema.writer);
+                    try sema.writer.writeAll("', found '");
+                    try Type.print(.fromIndex(val_ty), ip, sema.writer);
+                    try sema.writer.writeAll("'\n");
+                    return error.AnalysisFail;
+                },
+            };
+            const want_ty = try ip.internArrayType(.{ .len = len, .child = elem_ty, .sentinel = ptr_ty.sentinel });
+            return try sema.coerceValueToType(uncoerced, want_ty, "coerce_ptr_elem_ty");
+        },
+        .c => return uncoerced,
+    }
+}
+
+/// Peel any optional (`?T`) or error-union (`E!T`) wrapper off a type,
+/// returning the innermost base. Mirrors `Type.optEuBaseType`, which the
+/// result-location handlers use so `?*T` / `E![]T` targets are treated by
+/// their pointer/array base.
+fn optEuBaseType(sema: *Sema, ty: InternPool.Index) InternPool.Index {
+    var cur = ty;
+    while (true) switch (sema.intern_pool.indexToKey(cur)) {
+        .opt_type => |child| cur = child,
+        .error_union_type => |eu| cur = eu.payload_type,
+        else => return cur,
+    };
 }
 
 /// `tuple_decl` (extended): a positional struct type, e.g.
