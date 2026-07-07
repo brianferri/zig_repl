@@ -1815,6 +1815,24 @@ test "compliance: @splat broadcasts a scalar to a vector or array" {
     try expectReplDiagnostic(a, &.{"blk: { const x: i32 = @splat(5); break :blk x; }"}, "expected array or vector type, found 'i32'");
 }
 
+test "compliance: @Vector lane-wise bitwise, shift, and negation" {
+    const a = testing.allocator;
+    // Bitwise operators apply per lane.
+    const B = "const x: @Vector(2, u8) = .{ 12, 10 }; const y: @Vector(2, u8) = .{ 10, 6 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ B ++ " const z = x & y; break :blk z[0]; }"}); // 8
+    try expectMatchesZig(a, &.{"blk: { " ++ B ++ " const z = x | y; break :blk z[0]; }"}); // 14
+    try expectMatchesZig(a, &.{"blk: { " ++ B ++ " const z = x ^ y; break :blk z[1]; }"}); // 12
+    // Shifts apply per lane, each by its own amount.
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(2, u8) = .{ 1, 2 }; const y: @Vector(2, u3) = .{ 3, 2 }; const z = x << y; break :blk z[0] + z[1]; }"}); // 16
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(2, u8) = .{ 16, 32 }; const y: @Vector(2, u3) = .{ 2, 1 }; const z = x >> y; break :blk z[0] + z[1]; }"}); // 20
+    // Unary negation, int and float lanes, plus wrapping negation.
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(3, i32) = .{ 5, -6, 7 }; const z = -x; break :blk z[0] + z[1] + z[2]; }"}); // -6
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(2, f32) = .{ 1.5, -2.5 }; const z = -x; break :blk z[1]; }"}); // 2.5
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(2, i8) = .{ -128, 1 }; const z = -%x; break :blk z[0]; }"}); // -128
+    // Same operand rules: bitwise on a scalar+vector mix rejects.
+    try expectBothReject(a, &.{"blk: { const x: @Vector(2, u8) = .{ 1, 2 }; const z = x & 3; break :blk z[0]; }"});
+}
+
 test "compliance: @Vector and arrays are distinct but interconvertible" {
     const a = testing.allocator;
     // Distinct types (different type identity), but same-length arrays and

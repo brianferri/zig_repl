@@ -725,7 +725,7 @@ fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?
     // Vector operands: apply the op lane-wise and build a result vector, mirroring
     // the compiler's element-wise arithmetic on `@Vector(N, T)`.
     if (ip.indexToKey(Value.typeOf(lv, ip).index) == .vector_type)
-        return try sema.evalVectorArith(tag, lv, rv, op_name);
+        return try sema.evalVectorBinaryTag(tag, lv, rv, op_name, scalarArith);
 
     return sema.scalarArith(tag, ip.indexToKey(lv.index), ip.indexToKey(rv.index), op_name);
 }
@@ -755,13 +755,12 @@ fn failNumericOperands(sema: *Sema, op_name: []const u8, lhs_key: InternPool.Key
     return error.AnalysisFail;
 }
 
-/// Lane-wise arithmetic on two `@Vector(N, T)` operands: apply the scalar op to
-/// each `(lhs[i], rhs[i])` pair and intern a result vector. Both operands must be
-/// vectors of the same length -- the compiler requires an explicit `@splat` to
-/// combine a scalar, so a scalar operand is "mixed scalar and vector operands"
-/// and a differing length is a "vector length mismatch". The result lane type
-/// follows the scalar op's result (identity for same-type lanes).
-fn evalVectorArith(sema: *Sema, tag: Zir.Inst.Tag, lhs: Value, rhs: Value, op_name: []const u8) Error!?Value {
+/// Validate two operands for a binary lane-wise op: both must be vectors of the
+/// same length -- the compiler requires an explicit `@splat` to combine a scalar,
+/// so a scalar operand is "mixed scalar and vector operands" and a differing
+/// length is a "vector length mismatch". Returns the lane count + both aggregates.
+const VectorPair = struct { len: usize, lhs: InternPool.Key.Aggregate, rhs: InternPool.Key.Aggregate };
+fn vectorBinaryOperands(sema: *Sema, lhs: Value, rhs: Value, op_name: []const u8) Error!VectorPair {
     const ip = sema.intern_pool;
     const lhs_vt = ip.indexToKey(Value.typeOf(lhs, ip).index).vector_type;
     const rhs_ty_key = ip.indexToKey(Value.typeOf(rhs, ip).index);
@@ -773,18 +772,32 @@ fn evalVectorArith(sema: *Sema, tag: Zir.Inst.Tag, lhs: Value, rhs: Value, op_na
         try sema.writer.print("{s}: vector length mismatch\n", .{op_name});
         return error.AnalysisFail;
     }
-    const lhs_agg = ip.indexToKey(lhs.index).aggregate;
-    const rhs_agg = ip.indexToKey(rhs.index).aggregate;
-    const count: usize = @intCast(lhs_vt.len);
-    const elems = try sema.gpa.alloc(InternPool.Index, count);
+    return .{ .len = @intCast(lhs_vt.len), .lhs = ip.indexToKey(lhs.index).aggregate, .rhs = ip.indexToKey(rhs.index).aggregate };
+}
+
+/// Apply a tag-dispatched scalar kernel (`scalarArith` / `scalarBitwise` /
+/// `scalarShift`) to each `(lhs[i], rhs[i])` lane and intern the result vector.
+/// The result lane type follows the scalar op's result (identity for same-type
+/// lanes). Shared by every binary lane-wise op whose kernel keys on the ZIR tag.
+fn evalVectorBinaryTag(
+    sema: *Sema,
+    tag: Zir.Inst.Tag,
+    lhs: Value,
+    rhs: Value,
+    op_name: []const u8,
+    comptime lane: fn (*Sema, Zir.Inst.Tag, InternPool.Key, InternPool.Key, []const u8) Error!?Value,
+) Error!?Value {
+    const ip = sema.intern_pool;
+    const vp = try sema.vectorBinaryOperands(lhs, rhs, op_name);
+    const elems = try sema.gpa.alloc(InternPool.Index, vp.len);
     defer sema.gpa.free(elems);
     for (elems, 0..) |*e, i| {
-        const l = ip.indexToKey(InternPool.aggregateElementAt(lhs_agg, i));
-        const r = ip.indexToKey(InternPool.aggregateElementAt(rhs_agg, i));
-        e.* = (try sema.scalarArith(tag, l, r, op_name) orelse return null).index;
+        const l = ip.indexToKey(InternPool.aggregateElementAt(vp.lhs, i));
+        const r = ip.indexToKey(InternPool.aggregateElementAt(vp.rhs, i));
+        e.* = (try lane(sema, tag, l, r, op_name) orelse return null).index;
     }
     const child = Value.typeOf(.{ .index = elems[0] }, ip).index;
-    const vec_ty = try ip.internVectorType(.{ .len = @intCast(count), .child = child });
+    const vec_ty = try ip.internVectorType(.{ .len = @intCast(vp.len), .child = child });
     return .{ .index = try ip.internAggregate(.{ .ty = vec_ty, .storage = .{ .elems = elems } }) };
 }
 
@@ -1409,24 +1422,36 @@ fn evalTypeofLog2IntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     assert(un_node.operand != .none);
 
+    const ip = sema.intern_pool;
     const operand = try sema.resolveRef(un_node.operand);
-    const operand_type = Value.typeOf(operand, sema.intern_pool);
+    const operand_type = Value.typeOf(operand, ip).index;
 
-    if (operand_type.index == .comptime_int_type) {
-        // A type used as a value is its own Index (a value of type `type`).
-        return .{ .index = .comptime_int_type };
+    // A vector shift takes a `@Vector(N, log2)` amount -- the element's log2 type.
+    if (ip.indexToKey(operand_type) == .vector_type) {
+        const vt = ip.indexToKey(operand_type).vector_type;
+        const elem_log2 = (try sema.log2IntType(vt.child)) orelse
+            return sema.failLog2NonInt();
+        return .{ .index = try ip.internVectorType(.{ .len = vt.len, .child = elem_log2 }) };
     }
 
-    const operand_type_key = sema.intern_pool.indexToKey(operand_type.index);
-    if (operand_type_key == .int_type) {
-        const bits = operand_type_key.int_type.bits;
-        const log2_bits: u16 = if (bits == 0) 0 else std.math.log2_int_ceil(u16, bits);
-        const log2_type = try sema.intern_pool.internIntType(.unsigned, log2_bits);
-        return .{ .index = log2_type };
-    }
+    return .{ .index = (try sema.log2IntType(operand_type)) orelse return sema.failLog2NonInt() };
+}
 
-    try sema.writer.writeAll("typeof_log2_int_type: non-integer operand not yet supported\n");
+fn failLog2NonInt(sema: *Sema) Error {
+    sema.writer.writeAll("typeof_log2_int_type: non-integer operand not yet supported\n") catch |e| return e;
     return error.AnalysisFail;
+}
+
+/// The type valid as a shift amount for a value of int type `int_ty`:
+/// `comptime_int` for a `comptime_int`, else `unsigned(log2_ceil(bits))`. Null if
+/// `int_ty` is not an int. Mirrors the compiler's `log2IntType`.
+fn log2IntType(sema: *Sema, int_ty: InternPool.Index) Error!?InternPool.Index {
+    if (int_ty == .comptime_int_type) return .comptime_int_type;
+    const key = sema.intern_pool.indexToKey(int_ty);
+    if (key != .int_type) return null;
+    const bits = key.int_type.bits;
+    const log2_bits: u16 = if (bits == 0) 0 else std.math.log2_int_ceil(u16, bits);
+    return try sema.intern_pool.internIntType(.unsigned, log2_bits);
 }
 
 /// `as_node` / `as_shift_operand`: coerce `operand` to `dest_type`.
@@ -1912,9 +1937,18 @@ fn evalShift(
     const ip = sema.intern_pool;
     const lhs_value = try sema.resolveRef(bin.lhs);
     const rhs_value = try sema.resolveRef(bin.rhs);
-    const lhs_key = ip.indexToKey(lhs_value.index);
-    const rhs_key = ip.indexToKey(rhs_value.index);
 
+    // Vector operands shift lane-wise (each lane by its own shift amount).
+    if (ip.indexToKey(Value.typeOf(lhs_value, ip).index) == .vector_type)
+        return try sema.evalVectorBinaryTag(tag, lhs_value, rhs_value, op_name, scalarShift);
+
+    return sema.scalarShift(tag, ip.indexToKey(lhs_value.index), ip.indexToKey(rhs_value.index), op_name);
+}
+
+/// The scalar shift kernel (`shl / shr / shl_exact / shr_exact / shl_sat`),
+/// shared by `evalShift` and each lane of a vector shift.
+fn scalarShift(sema: *Sema, tag: Zir.Inst.Tag, lhs_key: InternPool.Key, rhs_key: InternPool.Key, op_name: []const u8) Error!?Value {
+    const ip = sema.intern_pool;
     if (lhs_key != .int or rhs_key != .int) {
         try sema.writer.print("{s}: non-int operand\n", .{op_name});
         return error.AnalysisFail;
@@ -2047,9 +2081,19 @@ fn evalBitwise(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Valu
     const ip = sema.intern_pool;
     const lhs_value = try sema.resolveRef(bin.lhs);
     const rhs_value = try sema.resolveRef(bin.rhs);
-    const lhs_key = ip.indexToKey(lhs_value.index);
-    const rhs_key = ip.indexToKey(rhs_value.index);
 
+    // Vector operands apply the bitwise op lane-wise.
+    if (ip.indexToKey(Value.typeOf(lhs_value, ip).index) == .vector_type)
+        return try sema.evalVectorBinaryTag(tag, lhs_value, rhs_value, op_name, scalarBitwise);
+
+    return sema.scalarBitwise(tag, ip.indexToKey(lhs_value.index), ip.indexToKey(rhs_value.index), op_name);
+}
+
+/// The scalar `bit_and / bit_or / xor` kernel, shared by `evalBitwise` and each
+/// lane of a vector bitwise op: peer-resolve to a common int type, apply the
+/// bignum kernel, then re-fit into the destination width.
+fn scalarBitwise(sema: *Sema, tag: Zir.Inst.Tag, lhs_key: InternPool.Key, rhs_key: InternPool.Key, op_name: []const u8) Error!?Value {
+    const ip = sema.intern_pool;
     const triple = resolveNumericPairToInt(ip, lhs_key, rhs_key) orelse {
         try sema.writer.print("{s}: non-int or incompatible operands\n", .{op_name});
         return error.AnalysisFail;
@@ -2156,27 +2200,16 @@ fn scalarCompare(sema: *Sema, op: std.math.CompareOperator, lhs_key: InternPool.
 /// compiler's element-wise `cmp` on vectors.
 fn evalVectorComparison(sema: *Sema, op: std.math.CompareOperator, lhs: Value, rhs: Value, op_name: []const u8) Error!?Value {
     const ip = sema.intern_pool;
-    const lhs_vt = ip.indexToKey(Value.typeOf(lhs, ip).index).vector_type;
-    const rhs_ty_key = ip.indexToKey(Value.typeOf(rhs, ip).index);
-    if (rhs_ty_key != .vector_type) {
-        try sema.writer.print("{s}: mixed scalar and vector operands\n", .{op_name});
-        return error.AnalysisFail;
-    }
-    if (rhs_ty_key.vector_type.len != lhs_vt.len) {
-        try sema.writer.print("{s}: vector length mismatch\n", .{op_name});
-        return error.AnalysisFail;
-    }
-    const lhs_agg = ip.indexToKey(lhs.index).aggregate;
-    const rhs_agg = ip.indexToKey(rhs.index).aggregate;
-    const count: usize = @intCast(lhs_vt.len);
-    const elems = try sema.gpa.alloc(InternPool.Index, count);
+    const vp = try sema.vectorBinaryOperands(lhs, rhs, op_name);
+    const elems = try sema.gpa.alloc(InternPool.Index, vp.len);
     defer sema.gpa.free(elems);
     for (elems, 0..) |*e, i| {
-        const l = ip.indexToKey(InternPool.aggregateElementAt(lhs_agg, i));
-        const r = ip.indexToKey(InternPool.aggregateElementAt(rhs_agg, i));
+        const l = ip.indexToKey(InternPool.aggregateElementAt(vp.lhs, i));
+        const r = ip.indexToKey(InternPool.aggregateElementAt(vp.rhs, i));
         e.* = (try sema.scalarCompare(op, l, r, op_name) orelse return null).index;
     }
-    const vec_ty = try ip.internVectorType(.{ .len = @intCast(count), .child = .bool_type });
+    // A comparison mask is always `@Vector(N, bool)`, whatever the operand type.
+    const vec_ty = try ip.internVectorType(.{ .len = @intCast(vp.len), .child = .bool_type });
     return .{ .index = try ip.internAggregate(.{ .ty = vec_ty, .storage = .{ .elems = elems } }) };
 }
 
@@ -2222,9 +2255,42 @@ fn evalNegate(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value
 
     const ip = sema.intern_pool;
     const operand_value = try sema.resolveRef(un_node.operand);
-    const operand_key = ip.indexToKey(operand_value.index);
     const op_name: []const u8 = @tagName(tag);
 
+    // A vector negates lane-wise.
+    if (ip.indexToKey(Value.typeOf(operand_value, ip).index) == .vector_type)
+        return try sema.evalVectorUnary(tag, operand_value, op_name, scalarNegate);
+
+    return sema.scalarNegate(tag, ip.indexToKey(operand_value.index), op_name);
+}
+
+/// Apply a unary lane kernel (`scalarNegate`) to each lane of a vector operand
+/// and intern the result vector. The lane loop for unary lane-wise ops, the
+/// unary analogue of `evalVectorBinaryTag`.
+fn evalVectorUnary(
+    sema: *Sema,
+    tag: Zir.Inst.Tag,
+    operand: Value,
+    op_name: []const u8,
+    comptime lane: fn (*Sema, Zir.Inst.Tag, InternPool.Key, []const u8) Error!?Value,
+) Error!?Value {
+    const ip = sema.intern_pool;
+    const vt = ip.indexToKey(Value.typeOf(operand, ip).index).vector_type;
+    const agg = ip.indexToKey(operand.index).aggregate;
+    const elems = try sema.gpa.alloc(InternPool.Index, vt.len);
+    defer sema.gpa.free(elems);
+    for (elems, 0..) |*e, i| {
+        e.* = (try lane(sema, tag, ip.indexToKey(InternPool.aggregateElementAt(agg, i)), op_name) orelse return null).index;
+    }
+    const child = Value.typeOf(.{ .index = elems[0] }, ip).index;
+    const vec_ty = try ip.internVectorType(.{ .len = vt.len, .child = child });
+    return .{ .index = try ip.internAggregate(.{ .ty = vec_ty, .storage = .{ .elems = elems } }) };
+}
+
+/// The scalar `negate` / `negate_wrap` kernel, shared by `evalNegate` and each
+/// lane of a vector negation.
+fn scalarNegate(sema: *Sema, tag: Zir.Inst.Tag, operand_key: InternPool.Key, op_name: []const u8) Error!?Value {
+    const ip = sema.intern_pool;
     if (operand_key == .float) {
         if (tag == .negate_wrap) {
             try sema.writer.writeAll("negate_wrap: not valid on float operand\n");
