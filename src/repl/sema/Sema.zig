@@ -66,6 +66,11 @@ comptime_allocs: std.ArrayListUnmanaged(ComptimeAlloc),
 /// above zero so no alloc lands on the null address; advanced per addressed
 /// alloc, rounded up to the alloc's alignment. Synthetic -- see `evalIntFromPtr`.
 comptime_address_cursor: u64 = 0x1000,
+/// Synthetic addresses handed out to `.nav` / `.uav` pointers, keyed by the
+/// interned pointer value. Interned pointers dedup, so equal pointers reuse one
+/// address -- `@intFromPtr(&x) == @intFromPtr(&x)` holds. (A `.comptime_alloc`
+/// caches its address inline on the slot instead; those slots are not interned.)
+synthetic_addresses: std.AutoHashMapUnmanaged(InternPool.Index, u64) = .empty,
 /// Current lookup scope. `null` for test paths that don't construct
 /// a session; REPL passes the session-root index so `evalDeclVal`
 /// can resolve cross-line names via the parent chain.
@@ -228,6 +233,7 @@ pub fn analyze(session: *Session, zir: Zir, writer: *std.Io.Writer) Error!?Value
     };
     defer sema.results.deinit(gpa);
     defer sema.comptime_allocs.deinit(gpa);
+    defer sema.synthetic_addresses.deinit(gpa);
 
     // Seed the naming context with the root namespace's own name, so a
     // type declared at session scope (e.g. an anonymous `struct {...}` in
@@ -2319,8 +2325,10 @@ fn nextSyntheticAddress(sema: *Sema, align_bytes: u64, size: u64) u64 {
 /// rounded up to the pointer's alignment (explicit `align(N)`, else the
 /// pointee's natural alignment). This makes alignment observable
 /// (`@intFromPtr(&x) % @alignOf(T) == 0`). The address is REPL-synthetic: it
-/// will not equal a real `zig run` address, so only the alignment invariant is
-/// meaningful -- the address value itself is not comparable to the compiler.
+/// will not equal a real `zig run` address, so the address value is not
+/// comparable to the compiler -- but it IS stable per pointer (cached on the
+/// alloc slot or in `synthetic_addresses`), so identity holds within a line
+/// (`@intFromPtr(&x) == @intFromPtr(&x)`, distinct decls compare unequal).
 fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
@@ -2347,12 +2355,19 @@ fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
                 break :addr aligned;
             };
         },
-        // A decl pointer has no Sema slot; zig folds `@intFromPtr(&x) % align`
-        // through the known alignment rather than a concrete address (a bare
-        // `@intFromPtr(&x)` is a comptime error there). Synthesize an aligned
-        // address so the alignment invariant holds; it is not cached, since no
-        // comptime-valid use observes the address value itself.
-        .nav => sema.nextSyntheticAddress(align_bytes, size),
+        // A decl (`.nav`) or anonymous-constant (`.uav`) pointer has no Sema
+        // slot to cache on, so key the synthetic address on the interned pointer
+        // itself. zig folds `@intFromPtr(&x) % align` through the known alignment
+        // (a bare `@intFromPtr(&x)` is a comptime error there); synthesizing an
+        // aligned address keeps that invariant, and caching per pointer keeps it
+        // stable within the line so `@intFromPtr(&x) == @intFromPtr(&x)` holds.
+        // These pointers carry byte_offset 0, so the pointer identity is the base
+        // identity.
+        .nav, .uav => sema.synthetic_addresses.get(ptr.index) orelse addr: {
+            const aligned = sema.nextSyntheticAddress(align_bytes, size);
+            try sema.synthetic_addresses.put(sema.gpa, ptr.index, aligned);
+            break :addr aligned;
+        },
         // A field/element pointer's address needs the byte offset within the
         // aggregate, which auto-layout aggregates don't expose here.
         .field, .arr_elem => {
@@ -2408,8 +2423,9 @@ fn evalMakePtrConst(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .comptime_alloc => |idx| sema.comptime_allocs.items[@intFromEnum(idx)].is_const = true,
         // make_ptr_const's operand is always an `alloc` result -- the compiler
         // reads `ptr.base_addr.comptime_alloc` directly (src/Sema.zig
-        // zirMakePtrConst), never a nav, so a decl pointer cannot reach here.
-        .nav => unreachable,
+        // zirMakePtrConst), never a nav or anonymous constant, so those cannot
+        // reach here.
+        .nav, .uav => unreachable,
         // A field/element pointer freezes the aggregate it projects from.
         .field, .arr_elem => |f| sema.comptime_allocs.items[@intFromEnum(ip.indexToKey(f.base).ptr.base_addr.comptime_alloc)].is_const = true,
     }
@@ -2581,8 +2597,10 @@ fn evalStoreNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         },
         // A `.nav` pointer addresses a declaration's storage, which is runtime;
         // the compiler defers the store to codegen and cannot perform it at
-        // comptime. This evaluator has no runtime stage, so it rejects.
-        .nav => {
+        // comptime. This evaluator has no runtime stage, so it rejects. A `.uav`
+        // (anonymous constant) is always const, so the is-const guard above
+        // rejects it first; it cannot reach here.
+        .nav, .uav => {
             try sema.writer.writeAll("unable to evaluate comptime expression: store through a pointer to a declaration\n");
             return error.AnalysisFail;
         },
@@ -2626,6 +2644,8 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
     }
     switch (ptr_key.ptr.base_addr) {
         .nav => |nav| return .{ .index = ip.getNav(nav).resolved.?.value },
+        // A `.uav` pointer carries its pointee inline (an anonymous constant).
+        .uav => |uav| return .{ .index = uav.val },
         // A field/element pointer (`&l.a`, `&arr[i]`, or the intermediate in
         // `l.a.x` / `arr[i].f`): load the aggregate behind the base pointer, then
         // project the index. The base may itself be a nav, alloc, or another such
@@ -4304,15 +4324,28 @@ fn evalRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return try sema.materializeConstPtr(value);
 }
 
-/// Store `value` in a fresh const comptime-alloc slot and return a
-/// `*const T` pointer to it. Shared by `ref` (pointer to an inline
-/// value) and `array_init_ref` (pointer to a fresh aggregate) -- both
-/// address a temporary, which the compiler also types `*const` at natural
-/// alignment. `decl_ref` does NOT use this: a pointer to a binding carries
-/// the decl's own constness and alignment.
+/// Give a constant value an address as a `*const T` -- `&"str"`, `&[_]T{...}`,
+/// `ref` (a pointer to an inline temporary), the namespace-access intermediate
+/// in `S.A.y`. The compiler types these `*const` at natural alignment too;
+/// `decl_ref` does NOT use this (a pointer to a binding carries the decl's own
+/// constness and alignment). The pointee is already interned, so bake it into a
+/// `.uav` (anonymous-decl) pointer rather than an ephemeral `comptime_allocs`
+/// slot: unlike a `.comptime_alloc` pointer, a uav survives past the line that
+/// created it, since `comptime_allocs` is reset each analysis. Mirrors the
+/// compiler storing an unnamed constant as an anon decl.
 fn materializeConstPtr(sema: *Sema, value: Value) Error!Value {
-    const child_ty = Value.typeOf(value, sema.intern_pool).index;
-    return try sema.pushComptimeAlloc(child_ty, value, true, .none);
+    const ip = sema.intern_pool;
+    const child_ty = Value.typeOf(value, ip).index;
+    const ptr_ty = try ip.internPtrType(.{
+        .child = child_ty,
+        .flags = .{ .size = .one, .is_const = true },
+    });
+    const ptr_idx = try ip.internPtr(.{
+        .ty = ptr_ty,
+        .base_addr = .{ .uav = .{ .val = value.index, .orig_ty = ptr_ty } },
+        .byte_offset = 0,
+    });
+    return .{ .index = ptr_idx };
 }
 
 /// `elem_ptr_load lhs, rhs`: load the aggregate behind pointer

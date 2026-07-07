@@ -1429,6 +1429,22 @@ test "compliance: slices -- coercion from a string literal, .len, indexing" {
     try expectBothReject(a, &.{"blk: { const s: []const u8 = \"hi\"; break :blk s[5]; }"});
 }
 
+test "compliance: indexing a const pointer built on an earlier line" {
+    // Regression: a const decl holding a pointer to an anonymous constant used
+    // to keep a `.comptime_alloc` base, whose backing slot is discarded when the
+    // next line is analysed -- indexing it on a LATER line panicked in
+    // `lookupComptimeAlloc` (slot index out of range). A `.uav` base carries the
+    // pointee inline, so it survives. These are the exact reproducers.
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{ "const s: []const u8 = \"abc\";", "s[0]" }); // 'a'
+    try expectMatchesZig(a, &.{ "const s: []const u8 = \"abc\";", "s.len" }); // 3
+    // A `&decl` pointer bound to a const and dereferenced on the next line.
+    try expectMatchesZig(a, &.{ "const a = [_]u8{ 4, 5, 6 };", "const p = &a;", "p[0]" }); // 4
+    // Sub-slicing an array on one line and indexing the result on the next: the
+    // sub-slice's `.arr_elem` base is the same anonymous-constant pointer.
+    try expectMatchesZig(a, &.{ "const arr = [_]u8{ 10, 20, 30, 40 };", "const s = arr[1..3];", "s[0]" }); // 20
+}
+
 test "compliance: array element store" {
     const a = testing.allocator;
     // Store into an array element, directly and through an element pointer.
@@ -1579,6 +1595,11 @@ test "compliance: @intFromPtr honors the pointer's alignment" {
     try expectMatchesZig(a, &.{ "var x: u32 align(8) = 5;", "@intFromPtr(&x) % 8" });
     try expectMatchesZig(a, &.{ "var w: u64 align(16) = 5;", "@intFromPtr(&w) % 16" });
     try expectMatchesZig(a, &.{ "var p: u32 = 5;", "@intFromPtr(&p) % @alignOf(u32)" });
+    // The synthetic address is stable per pointer: address-of the same binding
+    // compares equal (pointer identity), two distinct bindings compare unequal.
+    try expectMatchesZig(a, &.{ "const a = [_]u8{ 1, 2, 3 };", "@intFromPtr(&a) == @intFromPtr(&a)" });
+    try expectMatchesZig(a, &.{ "const a = [_]u8{ 1, 2 };", "const b = [_]u8{ 3, 4 };", "@intFromPtr(&a) == @intFromPtr(&b)" });
+    try expectMatchesZig(a, &.{ "var v: u32 = 5;", "@intFromPtr(&v) == @intFromPtr(&v)" });
 }
 
 test "compliance: a type-returning generic function and composition" {
