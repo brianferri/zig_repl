@@ -1716,6 +1716,22 @@ test "compliance: for loops (range and array)" {
     try expectMatchesZig(a, &.{"blk: { var s: u32 = 0; for (2..5) |i| { s += @intCast(i); } break :blk s; }"});
     try expectMatchesZig(a, &.{"blk: { const arr = [_]u8{ 10, 20, 30 }; var s: u32 = 0; for (arr) |x| { s += x; } break :blk s; }"});
     try expectMatchesZig(a, &.{"blk: { var s: u32 = 0; for (0..3) |i| { for (0..3) |j| { s += @intCast(i * j); } } break :blk s; }"});
+    // By-reference capture over a pointer-to-array (`for (&arr) |*e|`): the
+    // element pointer stores back into the array. With an index input too.
+    try expectMatchesZig(a, &.{"blk: { var arr = [_]u8{ 1, 2, 3 }; for (&arr) |*e| { e.* += 10; } break :blk arr[0] + arr[1] + arr[2]; }"}); // 36
+    try expectMatchesZig(a, &.{"blk: { var arr = [_]u8{ 5, 6, 7, 8 }; for (&arr) |*e| { e.* = e.* * 2; } break :blk arr[3]; }"}); // 16
+    try expectMatchesZig(a, &.{"blk: { var arr = [_]u32{ 0, 0, 0 }; for (&arr, 0..) |*e, i| { e.* = @intCast(i); } break :blk arr[2]; }"}); // 2
+}
+
+test "compliance: @Vector element indexing" {
+    const a = testing.allocator;
+    // A vector initialises and indexes like an array; the element type is the
+    // lane type.
+    try expectMatchesZig(a, &.{"blk: { const v: @Vector(4, i32) = .{ 10, 20, 30, 40 }; break :blk v[2]; }"}); // 30
+    try expectMatchesZig(a, &.{"blk: { const v: @Vector(4, i32) = .{ 10, 20, 30, 40 }; break :blk v[0] + v[3]; }"}); // 50
+    try expectMatchesZig(a, &.{"blk: { const v: @Vector(3, u8) = .{ 5, 6, 7 }; break :blk v[1]; }"}); // 6
+    // Indexing past the vector length is a compile error on both sides.
+    try expectBothReject(a, &.{"blk: { const v: @Vector(3, u8) = .{ 5, 6, 7 }; break :blk v[5]; }"});
 }
 
 test "compliance: nested aggregate init and element store" {

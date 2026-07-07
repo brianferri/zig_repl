@@ -564,10 +564,14 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .array_init_ref => sema.evalArrayInitRef(inst),
         .array_init_anon => sema.evalArrayInitAnon(inst),
         .array_init_elem_type => sema.evalArrayInitElemType(inst),
+        .elem_type => sema.evalElemType(inst),
         .validate_array_init_result_ty => sema.evalValidateArrayInitResultTy(inst),
         .ref => sema.evalRef(inst),
         .elem_ptr_load => sema.evalElemPtrLoad(inst),
-        .elem_ptr_node => sema.evalElemPtrNode(inst),
+        // `elem_ptr` is the for-loop by-ref capture (`for (&arr) |*e|`), `_node`
+        // is `&arr[i]`; both take a pointer operand and project one element, so
+        // they share a handler (the compiler differs only in a diagnostic).
+        .elem_ptr, .elem_ptr_node => sema.evalElemPtrNode(inst),
         .elem_val => sema.evalElemVal(inst),
         .slice_end => sema.evalSliceEnd(inst),
         .array_init_elem_ptr => sema.evalArrayInitElemPtr(inst),
@@ -3210,6 +3214,18 @@ fn evalArrayInitElemType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = elem_ty };
 }
 
+/// `elem_type`: the pointee type of a pointer type -- the result-location type
+/// for a value stored through an element pointer (`e.* = @intCast(i)` in a
+/// by-ref `for` capture). Mirrors zirElemType: peel any optional/error-union
+/// wrapper, then take the pointer's child. Compiler reference:
+/// src/Sema.zig:zirElemType (~7411).
+fn evalElemType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const ptr_ty = sema.optEuBaseType(try sema.resolveDestType(un_node.operand, "elem_type"));
+    return .{ .index = sema.intern_pool.indexToKey(ptr_ty).ptr_type.child };
+}
+
 /// `validate_array_init_result_ty`: confirm the known result type accepts
 /// array-init syntax and that the element count matches. The compiler
 /// returns void; the real type checking happens element-by-element in
@@ -4735,17 +4751,18 @@ fn evalArrayInitElemPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 fn elemPtr(sema: *Sema, array_ptr: Value, index: u64) Error!Value {
     const ip = sema.intern_pool;
     const parent_ty = ip.indexToKey(array_ptr.index).ptr.ty;
-    const array_key = ip.indexToKey(ip.indexToKey(parent_ty).ptr_type.child);
-    if (array_key != .array_type) {
+    // A vector indexes exactly like an array (`@Vector(N, T)` inits and indexes
+    // through the same `array_init_elem_ptr` / `elem_ptr` ZIR), so accept both.
+    const elems = indexableInfo(ip, ip.indexToKey(parent_ty).ptr_type.child) orelse {
         try sema.writer.writeAll("elem ptr: operand is not an array pointer\n");
         return error.AnalysisFail;
-    }
-    if (index >= array_key.array_type.len) {
-        try sema.writer.print("index {d} outside array of length {d}\n", .{ index, array_key.array_type.len });
+    };
+    if (index >= elems.len) {
+        try sema.writer.print("index {d} outside array of length {d}\n", .{ index, elems.len });
         return error.AnalysisFail;
     }
     const elem_ptr_ty = try ip.internPtrType(.{
-        .child = array_key.array_type.child,
+        .child = elems.child,
         .flags = .{ .size = .one, .is_const = ip.indexToKey(parent_ty).ptr_type.flags.is_const },
     });
     return .{ .index = try ip.internPtr(.{
@@ -4753,6 +4770,18 @@ fn elemPtr(sema: *Sema, array_ptr: Value, index: u64) Error!Value {
         .base_addr = .{ .arr_elem = .{ .base = array_ptr.index, .index = @intCast(index) } },
         .byte_offset = 0,
     }) };
+}
+
+/// The element count and element type of an indexable homogeneous type -- an
+/// array or a vector, which share `{len, child}` and index identically. Null for
+/// anything else. Lets the element-access paths treat `@Vector(N, T)` as `[N]T`.
+const IndexableInfo = struct { len: u64, child: InternPool.Index };
+fn indexableInfo(ip: *const InternPool, ty: InternPool.Index) ?IndexableInfo {
+    return switch (ip.indexToKey(ty)) {
+        .array_type => |at| .{ .len = at.len, .child = at.child },
+        .vector_type => |vt| .{ .len = vt.len, .child = vt.child },
+        else => null,
+    };
 }
 
 /// `validate_ptr_array_init`: after a `.{ ... }` array init's element stores,
@@ -4768,7 +4797,8 @@ fn evalValidatePtrArrayInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const first = sema.zir.extraData(Zir.Inst.ElemPtrImm, datas[@intFromEnum(body[0])].pl_node.payload_index).data;
     const array_ptr = try sema.resolveRef(first.ptr);
     const array_ty = ip.indexToKey(ip.indexToKey(array_ptr.index).ptr.ty).ptr_type.child;
-    const array_len = ip.indexToKey(array_ty).array_type.len;
+    // The init target is an array or a vector (both use `array_init_elem_ptr`).
+    const array_len = (indexableInfo(ip, array_ty) orelse return null).len;
     if (body.len != array_len) {
         try sema.writer.print("expected {d} array elements; found {d}\n", .{ array_len, body.len });
         return error.AnalysisFail;
@@ -5638,13 +5668,20 @@ fn evalForLen(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     for (pairs) |pair| {
         if (pair[0] == .none) continue;
         const arg_len: u64 = if (pair[1] == .none) blk: {
-            const obj = try sema.resolveRef(pair[0]);
-            const key = sema.intern_pool.indexToKey(obj.index);
+            // The indexable's element count: an array/vector/tuple aggregate, a
+            // slice's `len`, or a pointer to any of those (`for (&arr)`), which
+            // auto-derefs. Mirrors the compiler resolving each input's length.
+            var obj = try sema.resolveRef(pair[0]);
+            const ip = sema.intern_pool;
+            if (ip.indexToKey(obj.index) == .slice)
+                break :blk try sema.resolveUsizeInt(.{ .index = ip.indexToKey(obj.index).slice.len }, "for slice len");
+            while (ip.indexToKey(obj.index) == .ptr) obj = try sema.loadValue(obj);
+            const key = ip.indexToKey(obj.index);
             if (key != .aggregate) {
                 try sema.writer.writeAll("for: operand is not a range or indexable\n");
                 return error.AnalysisFail;
             }
-            break :blk sema.intern_pool.aggregateElementCount(key.aggregate.ty);
+            break :blk ip.aggregateElementCount(key.aggregate.ty);
         } else blk: {
             const start = try sema.resolveUsizeInt(try sema.resolveRef(pair[0]), "for range start");
             const end = try sema.resolveUsizeInt(try sema.resolveRef(pair[1]), "for range end");

@@ -3302,6 +3302,7 @@ pub fn aggregateElementCount(pool: *const InternPool, ty: Index) u64 {
     const key = pool.indexToKey(ty);
     return switch (key) {
         .array_type => |at| at.lenIncludingSentinel(),
+        .vector_type => |vt| vt.len,
         .tuple_type => |tt| tt.types.len,
         else => unreachable, // future aggregate types land here
     };
