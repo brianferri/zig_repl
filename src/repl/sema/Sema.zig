@@ -5149,10 +5149,38 @@ fn evalSliceEnd(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const datas = sema.zir.instructions.items(.data);
     const extra = sema.zir.extraData(Zir.Inst.SliceEnd, datas[@intFromEnum(inst)].pl_node.payload_index).data;
-    const array_ptr = try sema.resolveRef(extra.lhs);
+    const operand = try sema.resolveRef(extra.lhs);
     const start = try sema.resolveArrayLen(extra.start, "slice start");
     const end = try sema.resolveArrayLen(extra.end, "slice end");
+    if (start > end) {
+        try sema.writer.print("start index {d} is larger than end index {d}\n", .{ start, end });
+        return error.AnalysisFail;
+    }
 
+    // Dispatch on what the operand pointer addresses (mirrors analyzeSlice's
+    // `ptr_ptr_child_ty` switch): a `*[N]T` slices directly; a pointer to another
+    // pointer/slice (`&str`, `&some_slice`) is loaded first, then sliced.
+    const child_ty = ip.indexToKey(ip.indexToKey(operand.index).ptr.ty).ptr_type.child;
+    switch (ip.indexToKey(child_ty)) {
+        .array_type => return try sema.sliceArrayPtr(operand, start, end),
+        .ptr_type => |inner| switch (inner.flags.size) {
+            // `&ptr_to_array` (a string literal, `&[_]T{...}`): load to the
+            // pointer-to-array, then slice it.
+            .one => return try sema.sliceArrayPtr(try sema.loadValue(operand), start, end),
+            // `&slice`: load the slice, then re-slice it.
+            .slice => return try sema.sliceSliceValue(try sema.loadValue(operand), start, end),
+            else => {},
+        },
+        else => {},
+    }
+    try sema.writer.writeAll("slice: operand is not an array pointer\n");
+    return error.AnalysisFail;
+}
+
+/// Slice a pointer-to-array (`*[N]T`) to `[start..end]`: a slice whose many-ptr
+/// carries the start offset (`.arr_elem`) and whose `len` is `end - start`.
+fn sliceArrayPtr(sema: *Sema, array_ptr: Value, start: u64, end: u64) Error!?Value {
+    const ip = sema.intern_pool;
     const parent_ty = ip.indexToKey(array_ptr.index).ptr.ty;
     const child_ty = ip.indexToKey(parent_ty).ptr_type.child;
     if (ip.indexToKey(child_ty) != .array_type) {
@@ -5160,31 +5188,47 @@ fn evalSliceEnd(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return error.AnalysisFail;
     }
     const array = ip.indexToKey(child_ty).array_type;
-    if (start > end) {
-        try sema.writer.print("start index {d} is larger than end index {d}\n", .{ start, end });
-        return error.AnalysisFail;
-    }
     if (end > array.len) {
         try sema.writer.print("end index {d} out of bounds for array of length {d}\n", .{ end, array.len });
         return error.AnalysisFail;
     }
 
     const is_const = ip.indexToKey(parent_ty).ptr_type.flags.is_const;
-    const many_ptr_ty = try ip.internPtrType(.{
-        .child = array.child,
-        .flags = .{ .size = .many, .is_const = is_const },
-    });
     const many_ptr = try ip.internPtr(.{
-        .ty = many_ptr_ty,
+        .ty = try ip.internPtrType(.{ .child = array.child, .flags = .{ .size = .many, .is_const = is_const } }),
         .base_addr = .{ .arr_elem = .{ .base = array_ptr.index, .index = @intCast(start) } },
         .byte_offset = 0,
     });
-    const slice_ty = try ip.internPtrType(.{
-        .child = array.child,
-        .flags = .{ .size = .slice, .is_const = is_const },
-    });
+    const slice_ty = try ip.internPtrType(.{ .child = array.child, .flags = .{ .size = .slice, .is_const = is_const } });
     const len_val = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = end - start } });
     return .{ .index = try ip.get(.{ .slice = .{ .ty = slice_ty, .ptr = many_ptr, .len = len_val } }) };
+}
+
+/// Re-slice a slice value (`s[start..end]`): a slice into the same backing, its
+/// many-ptr advanced by `start` past `s`'s own start offset and its `len` set to
+/// `end - start`. Bounds check against `s.len`.
+fn sliceSliceValue(sema: *Sema, s_val: Value, start: u64, end: u64) Error!?Value {
+    const ip = sema.intern_pool;
+    const s = ip.indexToKey(s_val.index).slice;
+    const backing_len = try sema.resolveUsizeInt(.{ .index = s.len }, "slice len");
+    if (end > backing_len) {
+        try sema.writer.print("end index {d} out of bounds for slice of length {d}\n", .{ end, backing_len });
+        return error.AnalysisFail;
+    }
+    // `s.ptr` is a many-ptr into the backing, possibly already carrying a start
+    // offset in its `.arr_elem` base; add `start` to it.
+    const sptr = ip.indexToKey(s.ptr).ptr;
+    const backing: InternPool.Index, const base_offset: u64 = if (sptr.base_addr == .arr_elem)
+        .{ sptr.base_addr.arr_elem.base, sptr.base_addr.arr_elem.index }
+    else
+        .{ s.ptr, 0 };
+    const many_ptr = try ip.internPtr(.{
+        .ty = sptr.ty, // reuse `s.ptr`'s many-pointer type
+        .base_addr = .{ .arr_elem = .{ .base = backing, .index = base_offset + start } },
+        .byte_offset = 0,
+    });
+    const len_val = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = end - start } });
+    return .{ .index = try ip.get(.{ .slice = .{ .ty = s.ty, .ptr = many_ptr, .len = len_val } }) };
 }
 
 /// `elem_val`: `indexable[index]` by value (the `for (a) |x|` capture and

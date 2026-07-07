@@ -1574,6 +1574,19 @@ test "compliance: array slicing (a[start..end])" {
     try expectMatchesZig(a, &.{"blk: { const arr = [_]u8{ 10, 20, 30 }; const s = arr[0..2]; const p = &s.len; break :blk p.*; }"}); // 2
 }
 
+test "compliance: slicing a slice and a string literal" {
+    const a = testing.allocator;
+    // Re-slicing a slice reads through the combined start offset.
+    try expectMatchesZig(a, &.{"blk: { const s: []const u8 = \"hello\"; const t = s[1..4]; break :blk t.len; }"}); // 3
+    try expectMatchesZig(a, &.{"blk: { const s: []const u8 = \"hello\"; const t = s[1..4]; break :blk t[0] + t[2]; }"}); // 'e' + 'l' = 209
+    try expectMatchesZig(a, &.{"blk: { const arr = [_]u8{ 10, 20, 30, 40 }; const s = arr[0..3]; const t = s[1..3]; break :blk t[0] + t[1]; }"}); // 50
+    // Slicing a string literal (a `*const [N:0]u8`) directly.
+    try expectMatchesZig(a, &.{"\"hello\"[1..3].len"}); // 2
+    try expectMatchesZig(a, &.{"blk: { const s = \"hi\"; const t = s[0..1]; break :blk t[0]; }"}); // 'h' = 104
+    // An end past the slice length is rejected on both sides.
+    try expectBothReject(a, &.{"blk: { const s: []const u8 = \"hi\"; const t = s[0..5]; break :blk t[0]; }"});
+}
+
 test "compliance: typed array initialization ([N]T = .{ ... })" {
     const a = testing.allocator;
     // The result-location form (array_init_elem_ptr / validate_ptr_array_init).
