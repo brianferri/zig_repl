@@ -559,6 +559,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .optional_payload_safe, .optional_payload_unsafe => sema.evalOptionalPayload(inst),
         .is_non_null => sema.evalIsNonNull(inst),
         .array_type => sema.evalArrayType(inst),
+        .array_type_sentinel => sema.evalArrayTypeSentinel(inst),
         .array_init => sema.evalArrayInit(inst),
         .array_init_ref => sema.evalArrayInitRef(inst),
         .array_init_anon => sema.evalArrayInitAnon(inst),
@@ -2909,6 +2910,46 @@ fn evalArrayType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const child = try sema.resolveDestType(bin.rhs, "array_type");
     const array_ty = try sema.intern_pool.internArrayType(.{ .len = len, .child = child });
     return .{ .index = array_ty };
+}
+
+/// `array_type_sentinel` (`[N:S]T`): `array_type` plus a sentinel terminator `S`
+/// coerced to the element type. Mirrors zirArrayTypeSentinel (resolve len + elem,
+/// coerce the sentinel, build the array type). The opaque-element and
+/// comptime-var-sentinel guards have no REPL analogue; the sentinel is always
+/// comptime-known here, and `coerceValueToType` rejects one that will not fit the
+/// element type. Compiler reference: src/Sema.zig:zirArrayTypeSentinel (~7490).
+fn evalArrayTypeSentinel(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.ArrayTypeSentinel, pl_node.payload_index).data;
+    const len = try sema.resolveArrayLen(extra.len, "array_type");
+    const elem_type = try sema.resolveDestType(extra.elem_type, "array_type");
+    const uncasted_sentinel = try sema.resolveRef(extra.sentinel);
+    const sentinel = try sema.coerceValueToType(uncasted_sentinel, elem_type, "array sentinel");
+    // resolveConstDefinedValue: the sentinel must be a defined comptime value.
+    if (sema.intern_pool.indexToKey(sentinel.index) == .undef) {
+        try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
+        return error.AnalysisFail;
+    }
+    const array_ty = try sema.intern_pool.internArrayType(.{
+        .len = len,
+        .sentinel = sentinel.index,
+        .child = elem_type,
+    });
+    try sema.checkSentinelType(elem_type);
+    return .{ .index = array_ty };
+}
+
+/// A sentinel's element type must be self-comparable, so the terminator can be
+/// tested for. Mirrors the compiler's `checkSentinelType` (an array/struct/slice
+/// element cannot carry a sentinel). Always the equality form (`==`).
+fn checkSentinelType(sema: *Sema, elem_type: InternPool.Index) Error!void {
+    if (!Type.fromIndex(elem_type).isSelfComparable(sema.intern_pool, true)) {
+        try sema.writer.writeAll("non-scalar sentinel type '");
+        try Type.print(.fromIndex(elem_type), sema.intern_pool, sema.writer);
+        try sema.writer.writeAll("'\n");
+        return error.AnalysisFail;
+    }
 }
 
 /// `vector_type lhs, rhs`: `lhs` is the lane count, `rhs` the element

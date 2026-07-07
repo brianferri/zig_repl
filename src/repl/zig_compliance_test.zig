@@ -1584,6 +1584,34 @@ test "compliance: typed array initialization ([N]T = .{ ... })" {
     try expectBothReject(a, &.{"blk: { const arr: [2]u8 = .{ 1, 2, 3 }; break :blk arr[0]; }"});
 }
 
+test "compliance: sentinel array types ([N:S]T)" {
+    const a = testing.allocator;
+    // The type renders with its sentinel, and values init/index/`len` like a
+    // plain array; the length excludes the sentinel.
+    try expectMatchesZig(a, &.{"[3:0]u8"});
+    try expectMatchesZig(a, &.{"blk: { const arr: [3:0]u8 = .{ 1, 2, 3 }; break :blk arr.len; }"}); // 3
+    try expectMatchesZig(a, &.{"blk: { const arr: [3:0]u8 = .{ 1, 2, 3 }; break :blk arr[1]; }"}); // 2
+    // Inferred length and a non-zero sentinel.
+    try expectMatchesZig(a, &.{"blk: { const arr = [_:9]u8{ 4, 5 }; break :blk arr.len; }"}); // 2
+    try expectMatchesZig(a, &.{"blk: { const arr = [_:9]u8{ 4, 5 }; break :blk arr[0]; }"}); // 4
+    // The sentinel is part of type identity: differing/absent sentinels are
+    // distinct types.
+    try expectMatchesZig(a, &.{"@as(type, [3:0]u8) == @as(type, [3:0]u8)"}); // true
+    try expectMatchesZig(a, &.{"@as(type, [3:0]u8) == @as(type, [3:1]u8)"}); // false
+    try expectMatchesZig(a, &.{"@as(type, [3:0]u8) == @as(type, [3]u8)"}); // false
+    // Sad paths reject on both sides, each on a distinct guard:
+    // out-of-range sentinel value (coercion),
+    try expectBothReject(a, &.{"blk: { const arr: [2:256]u8 = .{ 1, 2 }; break :blk arr[0]; }"});
+    // a fractional or wrong-typed sentinel (coercion),
+    try expectBothReject(a, &.{"blk: { const a: [2:1.5]u8 = .{ 1, 2 }; break :blk a[0]; }"});
+    try expectBothReject(a, &.{"blk: { const a: [2:\"hi\"]u8 = .{ 1, 2 }; break :blk a[0]; }"});
+    // an undefined sentinel (resolveConstDefinedValue),
+    try expectBothReject(a, &.{"blk: { const T = [3:undefined]u8; break :blk @sizeOf(T); }"});
+    // and a non-scalar element type -- a struct or a slice (checkSentinelType).
+    try expectBothReject(a, &.{"blk: { const S = struct { x: u8 }; const T = [2:S{ .x = 0 }]S; break :blk @sizeOf(T); }"});
+    try expectBothReject(a, &.{"blk: { const T = [2:\"x\"][]const u8; break :blk @sizeOf(T); }"});
+}
+
 test "compliance: union initialization and active-field access" {
     const a = testing.allocator;
     const U = "const U = union { a: u32, b: bool };";

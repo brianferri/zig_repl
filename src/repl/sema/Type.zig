@@ -188,6 +188,34 @@ pub fn print(ty: Type, pool: *const InternPool, writer: *std.Io.Writer) PrintErr
     }
 }
 
+/// Whether two values of this type can be compared with each other -- `==`/`!=`
+/// when `is_equality_cmp`, `<`/`>`/... otherwise. Verbatim port of the compiler's
+/// `Type.isSelfComparable` (src/Type.zig), keyed on the pool Key in place of
+/// `zigTypeTag`. The REPL models no `packed`/`opaque`/`frame`/`anyframe` values,
+/// so those fold to the same `false`/`is_equality_cmp` result the compiler gives.
+/// Used by the array-sentinel type check (`checkSentinelType`).
+pub fn isSelfComparable(ty: Type, pool: *const InternPool, is_equality_cmp: bool) bool {
+    return switch (pool.indexToKey(ty.index)) {
+        .int_type => true,
+        .simple_type => |s| switch (s) {
+            .usize, .isize, .c_char, .c_short, .c_ushort, .c_int, .c_uint, .c_long, .c_ulong, .c_longlong, .c_ulonglong, .comptime_int, // .int / .comptime_int
+            .f16, .f32, .f64, .f80, .f128, .c_longdouble, .comptime_float, // .float / .comptime_float
+            => true,
+            .bool, .type, .void, .anyerror, .enum_literal, .anyopaque => is_equality_cmp,
+            .noreturn, .undefined, .null, .generic_poison => false,
+        },
+        .vector_type => |vt| fromIndex(vt.child).isSelfComparable(pool, is_equality_cmp),
+        .enum_type, .error_set_type, .func_type, .anyframe_type => is_equality_cmp,
+        .error_union_type, .array_type => false,
+        // The REPL has only auto-layout aggregates; a non-packed struct/union is
+        // not self-comparable (the compiler allows `packed` only).
+        .struct_type, .union_type, .tuple_type => false,
+        .ptr_type => |pt| pt.flags.size != .slice and (is_equality_cmp or pt.flags.size == .c),
+        .opt_type => |child| is_equality_cmp and fromIndex(child).isSelfComparable(pool, is_equality_cmp),
+        else => false,
+    };
+}
+
 fn printPtr(pt: InternPool.Key.PtrType, pool: *const InternPool, writer: *std.Io.Writer) PrintError!void {
     assert(pt.child != .none);
     try writer.writeAll(switch (pt.flags.size) {
