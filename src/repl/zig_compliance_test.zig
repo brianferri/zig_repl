@@ -1833,6 +1833,31 @@ test "compliance: @Vector lane-wise bitwise, shift, and negation" {
     try expectBothReject(a, &.{"blk: { const x: @Vector(2, u8) = .{ 1, 2 }; const z = x & 3; break :blk z[0]; }"});
 }
 
+test "compliance: @select blends two vectors by a bool mask" {
+    const a = testing.allocator;
+    // pred[i] ? a[i] : b[i], lane by lane.
+    const P = "const p: @Vector(4, bool) = .{ true, false, true, false }; const x: @Vector(4, i32) = .{ 1, 2, 3, 4 }; const y: @Vector(4, i32) = .{ 10, 20, 30, 40 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ P ++ " const z = @select(i32, p, x, y); break :blk z[0] + z[1] + z[2] + z[3]; }"}); // 1+20+3+40 = 64
+    // A comparison mask feeds @select directly (lane-wise min).
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(4, i32) = .{ 1, 5, 3, 9 }; const y: @Vector(4, i32) = .{ 4, 2, 6, 1 }; const z = @select(i32, x < y, x, y); break :blk z[0] + z[1] + z[2] + z[3]; }"}); // 1+2+3+1 = 7
+    // Float lanes.
+    try expectMatchesZig(a, &.{"blk: { const p: @Vector(2, bool) = .{ true, false }; const x: @Vector(2, f32) = .{ 1.5, 2.5 }; const y: @Vector(2, f32) = .{ 9.0, 8.0 }; const z = @select(f32, p, x, y); break :blk z[1]; }"}); // 8
+}
+
+test "compliance: @shuffle picks lanes from two vectors by an i32 mask" {
+    const a = testing.allocator;
+    // A non-negative mask element selects `a`, a negative one selects `b` at ~i.
+    const AB = "const x: @Vector(4, i32) = .{ 10, 20, 30, 40 }; const y: @Vector(4, i32) = .{ 100, 200, 300, 400 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ AB ++ " const m: @Vector(4, i32) = .{ 0, -1, 2, -4 }; const z = @shuffle(i32, x, y, m); break :blk z[0] + z[1] + z[2] + z[3]; }"}); // 10+100+30+400 = 540
+    // The result length is the mask length; the operands may be shorter.
+    try expectMatchesZig(a, &.{"blk: { const x: @Vector(2, i32) = .{ 1, 2 }; const y: @Vector(2, i32) = .{ 3, 4 }; const m: @Vector(4, i32) = .{ 1, 0, -1, -2 }; const z = @shuffle(i32, x, y, m); break :blk z[0] + z[3]; }"}); // 2 + 4 = 6
+    // Reordering within a single vector (all-non-negative mask).
+    try expectMatchesZig(a, &.{"blk: { " ++ AB ++ " const m: @Vector(4, i32) = .{ 3, 2, 1, 0 }; const z = @shuffle(i32, x, y, m); break :blk z[0]; }"}); // 40
+    // An out-of-bounds mask index is rejected on both sides.
+    try expectBothReject(a, &.{"blk: { const x: @Vector(2, i32) = .{ 1, 2 }; const y: @Vector(2, i32) = .{ 3, 4 }; const m: @Vector(2, i32) = .{ 5, 0 }; const z = @shuffle(i32, x, y, m); break :blk z[0]; }"});
+    try expectReplDiagnostic(a, &.{"blk: { const x: @Vector(2, i32) = .{ 1, 2 }; const y: @Vector(2, i32) = .{ 3, 4 }; const m: @Vector(2, i32) = .{ 5, 0 }; const z = @shuffle(i32, x, y, m); break :blk z[0]; }"}, "selects out-of-bounds index");
+}
+
 test "compliance: @Vector and arrays are distinct but interconvertible" {
     const a = testing.allocator;
     // Distinct types (different type identity), but same-length arrays and

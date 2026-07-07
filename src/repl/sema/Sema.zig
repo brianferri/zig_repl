@@ -567,6 +567,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .elem_type => sema.evalElemType(inst),
         .splat_op_result_ty => sema.evalSplatOpResultType(inst),
         .splat => sema.evalSplat(inst),
+        .shuffle => sema.evalShuffle(inst),
         .validate_array_init_ty => sema.evalValidateArrayInitTy(inst, false),
         .validate_array_init_result_ty => sema.evalValidateArrayInitTy(inst, true),
         .ref => sema.evalRef(inst),
@@ -3161,6 +3162,41 @@ fn evalVectorType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = vector_ty };
 }
 
+/// `@select(T, pred, a, b)` (extended): a lane-wise blend of two vectors by a
+/// bool mask -- `pred[i] ? a[i] : b[i]`. The length comes from `pred` (a
+/// `@Vector(N, bool)`); `a`/`b` coerce to `@Vector(N, T)`. Mirrors zirSelect's
+/// comptime arm. Compiler reference: src/Sema.zig:zirSelect (~23127).
+fn evalSelect(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
+    const ip = sema.intern_pool;
+    const extra = sema.zir.extraData(Zir.Inst.Select, extended.operand).data;
+
+    const elem_ty = try sema.resolveDestType(extra.elem_type, "@select");
+    if (!isVectorElemType(ip, elem_ty)) {
+        try sema.writer.writeAll("@select: expected integer, float, bool, or pointer for the element type\n");
+        return error.AnalysisFail;
+    }
+    const pred = try sema.resolveRef(extra.pred);
+    const pred_info = indexableInfo(ip, Value.typeOf(pred, ip).index) orelse {
+        try sema.writer.writeAll("@select: expected vector or array for the predicate\n");
+        return error.AnalysisFail;
+    };
+    const vec_len = pred_info.len;
+
+    // Coerce `a`/`b` to `@Vector(vec_len, elem_ty)` (they may arrive as arrays).
+    const vec_ty = try ip.internVectorType(.{ .len = @intCast(vec_len), .child = elem_ty });
+    const a_agg = ip.indexToKey((try sema.coerceValueToType(try sema.resolveRef(extra.a), vec_ty, "@select")).index).aggregate;
+    const b_agg = ip.indexToKey((try sema.coerceValueToType(try sema.resolveRef(extra.b), vec_ty, "@select")).index).aggregate;
+    const pred_agg = ip.indexToKey(pred.index).aggregate;
+
+    const elems = try sema.gpa.alloc(InternPool.Index, @intCast(vec_len));
+    defer sema.gpa.free(elems);
+    for (elems, 0..) |*e, i| {
+        const chosen = if (InternPool.aggregateElementAt(pred_agg, i) == .bool_true) a_agg else b_agg;
+        e.* = InternPool.aggregateElementAt(chosen, i);
+    }
+    return .{ .index = try ip.internAggregate(.{ .ty = vec_ty, .storage = .{ .elems = elems } }) };
+}
+
 /// Predicate for `@Vector` element types -- concrete integer, float,
 /// bool, or pointer. comptime_int / comptime_float are excluded: a
 /// vector lane needs a fixed bit width. Mirrors the compiler's
@@ -3433,6 +3469,64 @@ fn evalSplat(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     @memset(elems, scalar.index);
     elems[count - 1] = sentinel;
     return .{ .index = try ip.internAggregate(.{ .ty = dest_ty, .storage = .{ .elems = elems } }) };
+}
+
+/// `@shuffle(T, a, b, mask)`: build a `@Vector(mask_len, T)` by picking a lane
+/// per mask element -- a non-negative `mask[i]` selects `a[mask[i]]`, a negative
+/// one selects `b[~mask[i]]` (so `-1`->`b[0]`, `-2`->`b[1]`, ...). Out-of-range
+/// indices are rejected. Mirrors zirShuffle -> analyzeShuffle's comptime arm.
+/// Compiler reference: src/Sema.zig:zirShuffle (~22932).
+fn evalShuffle(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.Shuffle, pl_node.payload_index).data;
+
+    const elem_ty = try sema.resolveDestType(extra.elem_type, "@shuffle");
+    if (!isVectorElemType(ip, elem_ty)) {
+        try sema.writer.writeAll("@shuffle: expected integer, float, bool, or pointer for the element type\n");
+        return error.AnalysisFail;
+    }
+    const mask = try sema.resolveRef(extra.mask);
+    const mask_len = (indexableInfo(ip, Value.typeOf(mask, ip).index) orelse {
+        try sema.writer.writeAll("@shuffle: expected vector or array for the mask\n");
+        return error.AnalysisFail;
+    }).len;
+    const av = try sema.resolveRef(extra.a);
+    const bv = try sema.resolveRef(extra.b);
+    const a_len = (indexableInfo(ip, Value.typeOf(av, ip).index) orelse return sema.failShuffleOperand(elem_ty)).len;
+    const b_len = (indexableInfo(ip, Value.typeOf(bv, ip).index) orelse return sema.failShuffleOperand(elem_ty)).len;
+
+    const mask_agg = ip.indexToKey(mask.index).aggregate;
+    const a_agg = ip.indexToKey(av.index).aggregate;
+    const b_agg = ip.indexToKey(bv.index).aggregate;
+
+    const elems = try sema.gpa.alloc(InternPool.Index, @intCast(mask_len));
+    defer sema.gpa.free(elems);
+    for (elems, 0..) |*e, i| {
+        const raw = sema.intAsI128(InternPool.aggregateElementAt(mask_agg, i)) orelse {
+            try sema.writer.writeAll("@shuffle: mask element is not a comptime integer\n");
+            return error.AnalysisFail;
+        };
+        // A non-negative index selects `a`; a negative one selects `b` at `~raw`.
+        const from_agg, const idx, const len = if (raw >= 0)
+            .{ a_agg, @as(u64, @intCast(raw)), a_len }
+        else
+            .{ b_agg, @as(u64, @intCast(~raw)), b_len };
+        if (idx >= len) {
+            try sema.writer.print("mask element at index '{d}' selects out-of-bounds index\n", .{i});
+            return error.AnalysisFail;
+        }
+        e.* = InternPool.aggregateElementAt(from_agg, idx);
+    }
+    const result_ty = try ip.internVectorType(.{ .len = @intCast(mask_len), .child = elem_ty });
+    return .{ .index = try ip.internAggregate(.{ .ty = result_ty, .storage = .{ .elems = elems } }) };
+}
+
+fn failShuffleOperand(sema: *Sema, elem_ty: InternPool.Index) Error {
+    sema.writer.writeAll("@shuffle: expected a vector of '") catch |e| return e;
+    Type.print(.fromIndex(elem_ty), sema.intern_pool, sema.writer) catch |e| return e;
+    sema.writer.writeAll("'\n") catch |e| return e;
+    return error.AnalysisFail;
 }
 
 /// The `{len, child}` of an array/vector type, or the compiler's "expected array
@@ -7066,6 +7160,7 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
         .in_comptime => return Value.bool_false,
 
+        .select => return sema.evalSelect(extended),
         .tuple_decl => return sema.evalTupleDecl(extended),
         .enum_decl => return sema.evalEnumDecl(inst),
         .union_decl => return sema.evalUnionDecl(inst),
