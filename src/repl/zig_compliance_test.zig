@@ -1791,6 +1791,30 @@ test "compliance: @Vector lane-wise comparison" {
     try expectBothReject(a, &.{"blk: { const p: @Vector(2, i32) = .{ 1, 2 }; const q: @Vector(3, i32) = .{ 1, 2, 3 }; const m = p == q; break :blk m[0]; }"});
 }
 
+test "compliance: @splat broadcasts a scalar to a vector or array" {
+    const a = testing.allocator;
+    // Every lane takes the scalar; the element type comes from the result type.
+    try expectMatchesZig(a, &.{"blk: { const v: @Vector(4, i32) = @splat(7); break :blk v[0] + v[3]; }"}); // 14
+    try expectMatchesZig(a, &.{"blk: { const v: @Vector(2, f32) = @splat(1.5); break :blk v[1]; }"}); // 1.5
+    try expectMatchesZig(a, &.{"blk: { const a2: [3]u8 = @splat(9); break :blk a2[0] + a2[2]; }"}); // 18
+    // @splat is the idiomatic way to combine a scalar with a vector (arithmetic
+    // and comparison both require two vectors).
+    try expectMatchesZig(a, &.{"blk: { const v: @Vector(4, i32) = .{ 1, 2, 3, 4 }; const z = v + @as(@Vector(4, i32), @splat(10)); break :blk z[2]; }"}); // 13
+    try expectMatchesZig(a, &.{"blk: { const v: @Vector(4, i32) = .{ 1, 9, 3, 9 }; const m = v == @as(@Vector(4, i32), @splat(9)); break :blk m[1]; }"}); // true
+    // A sentinel array keeps its terminator; the data slots take the scalar.
+    try expectMatchesZig(a, &.{"blk: { const s: [3:0]u8 = @splat(9); break :blk s[0] + s[2] + s.len; }"}); // 21
+    // The element type is unconstrained for an array target: a struct, a nested
+    // array, an enum, a bool, and a runtime-computed scalar all broadcast.
+    try expectMatchesZig(a, &.{"blk: { const S = struct { x: u8, y: u8 }; const arr: [3]S = @splat(.{ .x = 1, .y = 2 }); break :blk arr[2].x + arr[0].y; }"}); // 3
+    try expectMatchesZig(a, &.{"blk: { const arr: [2][3]u8 = @splat(.{ 7, 8, 9 }); break :blk arr[1][2]; }"}); // 9
+    try expectMatchesZig(a, &.{"blk: { const E = enum { red, green }; const arr: [3]E = @splat(.green); break :blk @intFromEnum(arr[1]); }"}); // 1
+    try expectMatchesZig(a, &.{"blk: { const v: @Vector(4, bool) = @splat(true); break :blk v[2]; }"}); // true
+    try expectMatchesZig(a, &.{"blk: { const x: u8 = 3; const v: @Vector(4, u8) = @splat(x); break :blk v[0] + x; }"}); // 6
+    // @splat to a non-array/vector type is rejected on both sides.
+    try expectBothReject(a, &.{"blk: { const x: i32 = @splat(5); break :blk x; }"});
+    try expectReplDiagnostic(a, &.{"blk: { const x: i32 = @splat(5); break :blk x; }"}, "expected array or vector type, found 'i32'");
+}
+
 test "compliance: @Vector and arrays are distinct but interconvertible" {
     const a = testing.allocator;
     // Distinct types (different type identity), but same-length arrays and

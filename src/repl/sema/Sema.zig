@@ -565,6 +565,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .array_init_anon => sema.evalArrayInitAnon(inst),
         .array_init_elem_type => sema.evalArrayInitElemType(inst),
         .elem_type => sema.evalElemType(inst),
+        .splat_op_result_ty => sema.evalSplatOpResultType(inst),
+        .splat => sema.evalSplat(inst),
         .validate_array_init_ty => sema.evalValidateArrayInitTy(inst, false),
         .validate_array_init_result_ty => sema.evalValidateArrayInitTy(inst, true),
         .ref => sema.evalRef(inst),
@@ -3330,6 +3332,52 @@ fn evalElemType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const ptr_ty = sema.optEuBaseType(try sema.resolveDestType(un_node.operand, "elem_type"));
     return .{ .index = sema.intern_pool.indexToKey(ptr_ty).ptr_type.child };
+}
+
+/// `splat_op_result_ty` (`@splat`'s operand type): the element type of the
+/// array/vector result location, used to type the scalar being broadcast.
+/// Mirrors zirSplatOpResultType. Compiler reference: src/Sema.zig (~7441).
+fn evalSplatOpResultType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const ty = sema.optEuBaseType(try sema.resolveDestType(un_node.operand, "@splat"));
+    return .{ .index = (try sema.expectArrayOrVector(ty)).child };
+}
+
+/// `splat` (`@splat(x)`): broadcast a scalar to every lane of the array/vector
+/// result type. Coerce the scalar to the element type and intern an aggregate
+/// with `repeated_elem` storage (a sentinel array keeps its terminator). Mirrors
+/// zirSplat -> the `splat` / `aggregateSplatValue` comptime path.
+fn evalSplat(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const bin = sema.binData(inst);
+    const dest_ty = sema.optEuBaseType(try sema.resolveDestType(bin.lhs, "@splat"));
+    const info = try sema.expectArrayOrVector(dest_ty);
+    const scalar = try sema.coerceValueToType(try sema.resolveRef(bin.rhs), info.child, "@splat");
+
+    const dest_key = ip.indexToKey(dest_ty);
+    const sentinel = if (dest_key == .array_type) dest_key.array_type.sentinel else .none;
+    if (sentinel == .none)
+        return .{ .index = try ip.internAggregate(.{ .ty = dest_ty, .storage = .{ .repeated_elem = scalar.index } }) };
+
+    // A sentinel array stores the scalar in each data slot, then the sentinel.
+    const count: usize = @intCast(ip.aggregateElementCount(dest_ty));
+    const elems = try sema.gpa.alloc(InternPool.Index, count);
+    defer sema.gpa.free(elems);
+    @memset(elems, scalar.index);
+    elems[count - 1] = sentinel;
+    return .{ .index = try ip.internAggregate(.{ .ty = dest_ty, .storage = .{ .elems = elems } }) };
+}
+
+/// The `{len, child}` of an array/vector type, or the compiler's "expected array
+/// or vector type, found '{f}'" error otherwise. Shared by the `@splat` handlers.
+fn expectArrayOrVector(sema: *Sema, ty: InternPool.Index) Error!IndexableInfo {
+    return indexableInfo(sema.intern_pool, ty) orelse {
+        try sema.writer.writeAll("expected array or vector type, found '");
+        try Type.print(.fromIndex(ty), sema.intern_pool, sema.writer);
+        try sema.writer.writeAll("'\n");
+        return error.AnalysisFail;
+    };
 }
 
 /// `validate_array_init_ty` (`[N]T{...}`) / `validate_array_init_result_ty`
