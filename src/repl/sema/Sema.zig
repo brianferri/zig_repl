@@ -108,16 +108,15 @@ fn_ret_ty: InternPool.Index = .none,
 /// propagates -- an instruction with any runtime operand yields a runtime
 /// value -- without every op having to thread it by hand.
 operand_comptime: bool = true,
-/// Read-only view of every previously-analysed line's ZIR. An entry is
-/// callable as a fn body when a Func value's `source_zir_id` references
-/// its index. Populated by the REPL driver; tests can leave this empty
-/// since they don't exercise cross-line calls.
-line_zir: []const Zir = &.{},
-/// The id THIS analyze pass's ZIR will have if registered. Used
-/// at evalFunc-intern time so the resulting Func's
-/// `source_zir_id` resolves correctly on future cross-line
-/// lookups. evalCall compares against `func.source_zir_id` to
-/// decide whether to swap `sema.zir` for the body eval.
+/// The owning session, holding every lowered file (`session.files`) plus the
+/// `@import` byte source and dedup table. A Func or container type carries a
+/// `source_zir_id` (a `File.Index`); crossing into that file's ZIR reads it
+/// from `session.files`. `null` in pure-Sema test paths (no session), which
+/// never cross files or import.
+session: ?*Session = null,
+/// The `File.Index` of the file being analysed. A type or Func defined here
+/// records it as its `source_zir_id`, so a later pass can swap `sema.zir` back
+/// to this file (`evalCall` compares against `func.source_zir_id`).
 current_zir_id: u32 = 0,
 /// Currently-active `Block`. Mirrors the compiler's
 /// `block: *Block` parameter threaded through every handler in
@@ -137,7 +136,7 @@ type_name_ctx: InternPool.NullTerminatedString = .empty,
 /// The type `@This()` resolves to -- the innermost container whose member is
 /// being evaluated. `.none` outside a container member. Mirrors the compiler's
 /// `block.namespace.owner_type`: one slot, set around a member's evaluation
-/// (`structDeclByName`). Enclosing containers are reached through each container
+/// (`containerDeclByName`). Enclosing containers are reached through each container
 /// type's `parent` field (the compiler's `Namespace.parent`), which `evalDeclVal`
 /// walks -- so this being a single slot is faithful, not a nesting limit.
 this_type: InternPool.Index = .none,
@@ -196,17 +195,14 @@ pub const ComptimeAlloc = struct {
 /// test paths without session state -- `evalDeclVal` errors and
 /// `bindDecls` is a no-op in that mode).
 ///
-/// Session-owned state (gpa, intern_pool, root_namespace,
-/// line_zir) is read straight off `session`. Per-call inputs
-/// (the ZIR to analyse + the diagnostic writer) are explicit
-/// parameters. `current_zir_id` is derived as
-/// `session.line_zir.items.len` -- the slot THIS pass's ZIR
-/// will occupy once committed by the REPL driver after a
-/// successful analyze.
-pub fn analyze(session: *Session, zir: Zir, writer: *std.Io.Writer) Error!?Value {
+/// The ZIR to analyse is the file already appended at `file_index`
+/// (`session.files`); the driver reserves that slot before calling so a module
+/// loaded mid-analysis takes a later `File.Index` and never collides.
+pub fn analyze(session: *Session, file_index: Session.Index, writer: *std.Io.Writer) Error!?Value {
     const gpa = session.gpa;
     const intern_pool = session.intern_pool;
     const namespace = session.root_namespace;
+    const zir = session.files.items[file_index].zir.?;
     // Zir may carry compile-error items that the front-end Pipeline
     // classifies as non-actionable (see `front/ZirErrors.zig`).
     // Pipeline gates Sema entry via `hasZirErrors`; Sema itself
@@ -228,8 +224,8 @@ pub fn analyze(session: *Session, zir: Zir, writer: *std.Io.Writer) Error!?Value
         .comptime_allocs = .empty,
         .namespace = namespace,
         .block = &top_block,
-        .line_zir = session.line_zir.items,
-        .current_zir_id = @intCast(session.line_zir.items.len),
+        .session = session,
+        .current_zir_id = file_index,
     };
     defer sema.results.deinit(gpa);
     defer sema.comptime_allocs.deinit(gpa);
@@ -3909,21 +3905,25 @@ const ZirFrame = struct {
     }
 };
 
-/// View the ZIR of the line that defined `source_zir_id` (a no-op when it is the
-/// current line), returning the previous frame; the caller `defer`s `.restore`.
-/// `ctx` names the operation for the diagnostic when that line's ZIR is no longer
-/// retained -- a REPL-only failure, since the compiler never discards a file's ZIR.
+/// View the ZIR of the file that defined `source_zir_id` (a no-op when it is the
+/// current file), returning the previous frame; the caller `defer`s `.restore`.
+/// `ctx` names the operation for the diagnostic when that file's ZIR is no longer
+/// available -- a REPL-only failure (a tombstoned failed line), since the
+/// compiler never discards a live file's ZIR.
 fn enterSourceZir(sema: *Sema, source_zir_id: u32, ctx: []const u8) Error!ZirFrame {
     const frame: ZirFrame = .{ .zir = sema.zir, .id = sema.current_zir_id };
     if (source_zir_id != sema.current_zir_id) {
-        if (source_zir_id >= sema.line_zir.len) {
-            try sema.writer.print("{s}: defining ZIR is no longer available\n", .{ctx});
-            return error.AnalysisFail;
-        }
-        sema.zir = sema.line_zir[source_zir_id];
+        const session = sema.session orelse return sema.failZirUnavailable(ctx);
+        if (source_zir_id >= session.files.items.len) return sema.failZirUnavailable(ctx);
+        sema.zir = session.files.items[source_zir_id].zir orelse return sema.failZirUnavailable(ctx);
         sema.current_zir_id = source_zir_id;
     }
     return frame;
+}
+
+fn failZirUnavailable(sema: *Sema, ctx: []const u8) Error {
+    try sema.writer.print("{s}: defining ZIR is no longer available\n", .{ctx});
+    return error.AnalysisFail;
 }
 
 /// The compiler's `failWithBadStructFieldAccess` diagnostic: a field lookup that
@@ -4344,8 +4344,8 @@ fn evalDeclLiteral(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             if (try sema.enumTagByName(res_ty, name)) |v| return v;
             return sema.failBadMemberAccess(res_ty, name);
         },
-        .struct_type => {
-            if (try sema.structDeclByName(res_ty, name)) |v| return v;
+        .struct_type, .union_type => {
+            if (try sema.containerDeclByName(res_ty, name)) |v| return v;
             return sema.failBadMemberAccess(res_ty, name);
         },
         else => {
@@ -4421,14 +4421,9 @@ fn unionIsTagged(sema: *Sema, union_ty: InternPool.Index) Error!bool {
 /// `field_names`; no field bodies are evaluated).
 fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
     const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
-    const zir = if (st.source_zir_id == sema.current_zir_id)
-        sema.zir
-    else if (st.source_zir_id < sema.line_zir.len)
-        sema.line_zir[st.source_zir_id]
-    else {
-        try sema.writer.writeAll("struct field count: defining ZIR is no longer available\n");
-        return error.AnalysisFail;
-    };
+    const frame = try sema.enterSourceZir(st.source_zir_id, "struct field count");
+    defer frame.restore(sema);
+    const zir = sema.zir;
     // An anonymous struct stores its field count on the `struct_init_anon` item.
     if (zir.instructions.items(.tag)[@intFromEnum(st.decl_inst)] == .struct_init_anon) {
         const pl_node = zir.instructions.items(.data)[@intFromEnum(st.decl_inst)].pl_node;
@@ -4472,7 +4467,7 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
     // `namespaceLookupRef` yields a `decl_ref`.
     if (container_ty == .type_type) {
         const container = try sema.loadValue(object_ptr);
-        if (try sema.structDeclByName(container.index, name)) |decl_val|
+        if (try sema.containerDeclByName(container.index, name)) |decl_val|
             return try sema.materializeConstPtr(decl_val);
         return sema.failBadMemberAccess(container.index, name);
     }
@@ -4564,7 +4559,7 @@ fn containerNamespace(sema: *Sema, container_ty: InternPool.Index) ?ContainerNam
     };
 }
 
-fn structDeclByName(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
+fn containerDeclByName(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
     const ns = sema.containerNamespace(container_ty) orelse return null;
     // Decls are not stored on the type; intern each decl name as we scan and
     // compare interned handles against the query, as the compiler's namespace
@@ -4613,8 +4608,8 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
     // namespace. We look decls/tags up from the type's ZIR rather than a persistent
     // Namespace (no Zcu).
     switch (ip.indexToKey(object.index)) {
-        .struct_type => {
-            if (try sema.structDeclByName(object.index, name)) |v| return v;
+        .struct_type, .union_type => {
+            if (try sema.containerDeclByName(object.index, name)) |v| return v;
             return sema.failBadMemberAccess(object.index, name);
         },
         .enum_type => {
@@ -4805,7 +4800,7 @@ fn evalHasDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// Whether container type `container_ty` declares a member named `name`, by
 /// scanning decl names only (no value evaluation). Mirrors the compiler's
-/// namespace name lookup; the value-resolving counterpart is `structDeclByName`.
+/// namespace name lookup; the value-resolving counterpart is `containerDeclByName`.
 fn containerHasDecl(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!bool {
     const ns = sema.containerNamespace(container_ty) orelse return false;
     const frame = try sema.enterSourceZir(ns.source_zir_id, "container decl");
@@ -5684,7 +5679,7 @@ fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         // as `lookupIdentifier` walks `namespace.parent`, before the session scope.
         var container = sema.this_type;
         while (container != .none) : (container = sema.containerParent(container)) {
-            if (try sema.structDeclByName(container, name)) |val| return val;
+            if (try sema.containerDeclByName(container, name)) |val| return val;
         }
     }
     if (try sema.lookupDecl(inst, "decl_val")) |found| {
@@ -5710,7 +5705,7 @@ fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir));
         var container = sema.this_type;
         while (container != .none) : (container = sema.containerParent(container)) {
-            if (try sema.structDeclByName(container, name)) |val| return try sema.materializeConstPtr(val);
+            if (try sema.containerDeclByName(container, name)) |val| return try sema.materializeConstPtr(val);
         }
     }
     const found = (try sema.lookupDecl(inst, "decl_ref")) orelse {
@@ -6976,7 +6971,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
             const args_slice: []const Zir.Inst.Index = @ptrCast(sema.zir.extra[extra.end..]);
             // `P.decl(x)`: the object is the struct type -> static call, no receiver.
             if (sema.intern_pool.indexToKey(object.index) == .struct_type) {
-                const callee = (try sema.structDeclByName(object.index, name)) orelse
+                const callee = (try sema.containerDeclByName(object.index, name)) orelse
                     return sema.failBadMemberAccess(object.index, name);
                 break :blk .{ callee, null, extra.data.flags.args_len, args_slice, object.index };
             }
@@ -6986,7 +6981,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
                 try sema.writer.writeAll("field_call: receiver is not a struct\n");
                 return error.AnalysisFail;
             }
-            const callee = (try sema.structDeclByName(struct_ty, name)) orelse {
+            const callee = (try sema.containerDeclByName(struct_ty, name)) orelse {
                 // UFCS `p.method()` miss: the compiler reports it against both a
                 // field and a member function (`callMethod`), distinct from a
                 // pure namespace member access.
@@ -7185,7 +7180,7 @@ fn evalTypeof(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// zirTypeofPeer: run the body, then fold peer resolution across the operands.
 /// `@This()` (extended `this`): the enclosing container type. Mirrors zirThis,
 /// which returns the block namespace's owner type; here it is the struct set by
-/// `structDeclByName` around a member's evaluation.
+/// `containerDeclByName` around a member's evaluation.
 fn evalThis(sema: *Sema) Error!?Value {
     if (sema.this_type == .none) {
         try sema.writer.writeAll("@This(): no enclosing container\n");

@@ -11,6 +11,19 @@ const Session = @import("Session.zig");
 const InternPool = @import("sema/InternPool.zig");
 const Value = @import("sema/Value.zig");
 
+/// Register `zir` as a session file and analyse it, the way `eval.run` drives
+/// Sema (the file must exist before analysis so its `File.Index` is fixed).
+/// Takes ownership of `zir`; the session frees it at `deinit`.
+fn analyzeZir(session: *Session, zir: std.zig.Zir, writer: *std.Io.Writer) anyerror!?Value {
+    var owned = zir;
+    const idx: Session.Index = @intCast(session.files.items.len);
+    session.files.append(session.gpa, .{ .zir = owned, .sub_file_path = null }) catch |err| {
+        owned.deinit(session.gpa);
+        return err;
+    };
+    return Sema.analyze(session, idx, writer);
+}
+
 fn evalSource(
     gpa: std.mem.Allocator,
     intern_pool: *InternPool,
@@ -18,7 +31,8 @@ fn evalSource(
     diag_buf: []u8,
 ) !Value {
     var result = try Pipeline.run(gpa, source);
-    defer result.deinit(gpa);
+    var taken = false;
+    defer if (!taken) result.deinit(gpa);
 
     try testing.expect(!result.hasParseErrors());
     try testing.expect(!result.hasZirErrors());
@@ -27,8 +41,10 @@ fn evalSource(
     var session = Session.init(gpa, intern_pool, ns);
     defer session.deinit();
 
+    const zir = result.takeZir(gpa);
+    taken = true;
     var writer = std.Io.Writer.fixed(diag_buf);
-    const maybe_value = try Sema.analyze(&session, result.zir, &writer);
+    const maybe_value = try analyzeZir(&session, zir, &writer);
     return maybe_value orelse error.NoValue;
 }
 
@@ -252,15 +268,18 @@ fn expectEvalFails(
     expected_diagnostic_substring: []const u8,
 ) !void {
     var result = try Pipeline.run(gpa, source);
-    defer result.deinit(gpa);
+    var taken = false;
+    defer if (!taken) result.deinit(gpa);
 
     const ns = try intern_pool.createNamespace(gpa, .none);
     var session = Session.init(gpa, intern_pool, ns);
     defer session.deinit();
 
+    const zir = result.takeZir(gpa);
+    taken = true;
     var diag_buf: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&diag_buf);
-    const sema_result = Sema.analyze(&session, result.zir, &writer);
+    const sema_result = analyzeZir(&session, zir, &writer);
     try testing.expectError(error.AnalysisFail, sema_result);
 
     const written = writer.buffered();

@@ -12,6 +12,8 @@ const Session = @import("Session.zig");
 const InternPool = @import("sema/InternPool.zig");
 const Value = @import("sema/Value.zig");
 const render = @import("render/Value.zig");
+const ModuleSource = @import("ModuleSource.zig");
+const NativeModuleSource = @import("NativeModuleSource.zig");
 
 // Shared across cases; sits under .zig-cache so `zig build` cleans it.
 const compliance_cache_dir = ".zig-cache/tmp/zig-repl-compliance";
@@ -221,6 +223,35 @@ fn expectReplAcceptsZigRejects(gpa: std.mem.Allocator, inputs: []const []const u
         error.ZigRunFailed => {},
         else => return err,
     }
+}
+
+/// A `ModuleSource` that serves one fixed source for every path, so a loader
+/// test needs no filesystem or toolchain layout -- it exercises the whole path
+/// from `@import` through AstGen to decl resolution against known source.
+const FixtureSource = struct {
+    src: [:0]const u8,
+    interface: ModuleSource = .{ .vtable = &vtable },
+
+    const vtable: ModuleSource.VTable = .{ .read = read };
+
+    fn read(source: *ModuleSource, gpa: std.mem.Allocator, path: []const u8) ModuleSource.Error![:0]u8 {
+        _ = path;
+        const self: *FixtureSource = @alignCast(@fieldParentPtr("interface", source));
+        const buf = try gpa.allocSentinel(u8, self.src.len, 0);
+        @memcpy(buf, self.src);
+        return buf;
+    }
+};
+
+/// Run one REPL expression against `session` and assert its rendered value.
+fn expectReplValue(session: *Session, source: []const u8, expected: []const u8) !void {
+    var diag: std.Io.Writer.Allocating = .init(session.gpa);
+    defer diag.deinit();
+    const value = (try eval.run(session, source, &diag.writer)).value orelse return error.NoValue;
+    var buf: [256]u8 = undefined;
+    var w = Io.Writer.fixed(&buf);
+    try render.render(value, session.intern_pool, &w);
+    try testing.expectEqualStrings(expected, std.mem.trimEnd(u8, w.buffered(), "\n"));
 }
 
 const assert = std.debug.assert;
@@ -1709,6 +1740,16 @@ test "compliance: union initialization and active-field access" {
         &.{"blk: { " ++ U ++ " const u = U{ .a = 5 }; break :blk u.b; }"},
         "access of union field 'b' while field 'a' is active",
     );
+}
+
+test "compliance: union member declarations and decl literals" {
+    const a = testing.allocator;
+    // A union type resolves a member declaration (`U.zero`), and a result-typed
+    // decl literal (`const x: U = .zero`) resolves the same declaration -- the two
+    // type-member paths a struct or enum already supported, generalized to unions.
+    const U = "const U = union(enum) { a: u8, b: bool, pub const zero = @This(){ .a = 0 }; };";
+    try expectMatchesZig(a, &.{"blk: { " ++ U ++ " break :blk U.zero.a; }"}); // 0
+    try expectMatchesZig(a, &.{"blk: { " ++ U ++ " const x: U = .zero; break :blk x.a; }"}); // 0
 }
 
 test "compliance: slices nested in structs and arrays of slices" {

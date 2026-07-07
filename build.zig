@@ -124,7 +124,20 @@ pub fn build(b: *std.Build) void {
     wasm_step.dependOn(&install_wasm.step);
     wasm_step.dependOn(&install_web.step);
 
-    const repl_tests = b.addTest(.{ .root_module = repl });
+    // The compliance tests load real `std`; the build hands them its path so they
+    // need not search for it. Scoped to a test-only module so the production
+    // `repl` (exe/tty/docs) never carries a build-machine path.
+    const test_options = b.addOptions();
+    test_options.addOption([]const u8, "zig_std_dir", b.pathJoin(&.{
+        b.graph.zig_lib_directory.path orelse ".", "std",
+    }));
+    const repl_test_module = b.createModule(.{
+        .root_source_file = b.path("src/repl/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    repl_test_module.addOptions("build_options", test_options);
+    const repl_tests = b.addTest(.{ .root_module = repl_test_module });
     const tty_tests = b.addTest(.{ .root_module = tty });
     const exe_tests = b.addTest(.{ .root_module = exe_module });
     const device_tests = b.addTest(.{ .root_module = device });

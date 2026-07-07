@@ -88,15 +88,26 @@ fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !O
         return error.ZirError;
     }
 
-    const value = try Sema.analyze(session, result.zir, diag);
-
-    // Keep only this line's ZIR: a Func bound here replays its body on a
-    // later cross-line call. Read the shape (a value) before `takeZir`
-    // consumes the result, then hand the ZIR to the session.
+    // Register this line as a file BEFORE analysing it, so its `File.Index` is
+    // fixed and any module `@import`d mid-analysis takes a later index without
+    // colliding. A Func bound here replays its body on a later cross-line call by
+    // that index. Read the shape before `takeZir` consumes the result.
     const shape = result.wrapped.shape;
     committed = true;
     var zir = result.takeZir(session.gpa);
-    errdefer zir.deinit(session.gpa);
-    try session.line_zir.append(session.gpa, zir);
+    const line_index: Session.Index = @intCast(session.files.items.len);
+    session.files.append(session.gpa, .{ .zir = zir, .sub_file_path = null }) catch |err| {
+        zir.deinit(session.gpa);
+        return err;
+    };
+
+    const value = Sema.analyze(session, line_index, diag) catch |err| {
+        // Tombstone the failed line: free its ZIR but keep the `File` slot (and
+        // any modules it loaded, at later indices) so `File.Index` values stay
+        // stable -- the compiler likewise retains failed files.
+        if (session.files.items[line_index].zir) |*z| z.deinit(session.gpa);
+        session.files.items[line_index].zir = null;
+        return err;
+    };
     return .{ .value = value, .shape = shape };
 }

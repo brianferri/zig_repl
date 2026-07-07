@@ -16,6 +16,7 @@ pub const commands = @import("drivers/commands/root.zig");
 // root. The tty driver's files are forced from its own module root.
 test {
     _ = @import("Session.zig");
+    _ = @import("NativeModuleSource.zig");
     _ = @import("eval.zig");
     _ = @import("drivers/commands/Command.zig");
     _ = @import("drivers/commands/registry.zig");
