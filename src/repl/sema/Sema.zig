@@ -498,7 +498,11 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .store_node => sema.evalStoreNode(inst),
         .struct_init_field_ptr => sema.evalFieldPtr(inst, true),
         .field_ptr => sema.evalFieldPtr(inst, false),
+        .field_ptr_named => sema.evalFieldPtrNamed(inst),
         .field_ptr_load => sema.evalFieldPtrLoad(inst),
+        .field_ptr_named_load => sema.evalFieldPtrNamedLoad(inst),
+        .has_field => sema.evalHasField(inst),
+        .has_decl => sema.evalHasDecl(inst),
         .opt_eu_base_ptr_init => sema.evalOptEuBasePtrInit(inst),
         .validate_ptr_struct_init => sema.evalValidatePtrStructInit(inst),
         .validate_struct_init_ty, .validate_struct_init_result_ty => sema.evalValidateStructInitTy(inst),
@@ -3958,6 +3962,16 @@ fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index, comptime initializing: bool) 
     const extra = sema.zir.extraData(Zir.Inst.Field, pl_node.payload_index).data;
     const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.field_name_start));
     const object_ptr = try sema.resolveRef(extra.lhs);
+    return sema.fieldPtr(object_ptr, name, initializing);
+}
+
+/// `&object.name` shared by `field_ptr` / `struct_init_field_ptr` (name from ZIR)
+/// and `field_ptr_named` (`&@field(object, "name")` / an `@field` lvalue, name
+/// from a comptime string). Mirrors the compiler's shared `fieldPtr`. `object_ptr`
+/// is the resolved operand pointer; `initializing` skips the active-field check on
+/// a union field being written.
+fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedString, comptime initializing: bool) Error!?Value {
+    const ip = sema.intern_pool;
     const parent_ty = ip.indexToKey(object_ptr.index).ptr.ty;
     const container_ty = ip.indexToKey(parent_ty).ptr_type.child;
 
@@ -4040,14 +4054,21 @@ fn containerParent(sema: *Sema, container_ty: InternPool.Index) InternPool.Index
 /// members (`comptime` blocks, tests) are skipped. Works for any nominal
 /// container -- struct, union, or enum -- since all share a decl namespace (the
 /// compiler's namespace lookup is container-kind agnostic).
-fn structDeclByName(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
-    const Namespace = struct { source_zir_id: u32, decl_inst: Zir.Inst.Index };
-    const ns: Namespace = switch (sema.intern_pool.indexToKey(container_ty)) {
+/// The ZIR coordinates of a container type's namespace (`struct`/`union`/`enum`),
+/// or null for a non-container. Shared by the decl-lookup walkers so the
+/// container-kind switch lives in one place.
+const ContainerNamespace = struct { source_zir_id: u32, decl_inst: Zir.Inst.Index };
+fn containerNamespace(sema: *Sema, container_ty: InternPool.Index) ?ContainerNamespace {
+    return switch (sema.intern_pool.indexToKey(container_ty)) {
         .struct_type => |st| .{ .source_zir_id = st.source_zir_id, .decl_inst = st.decl_inst },
         .union_type => |ut| .{ .source_zir_id = ut.source_zir_id, .decl_inst = ut.decl_inst },
         .enum_type => |et| .{ .source_zir_id = et.source_zir_id, .decl_inst = et.decl_inst },
-        else => return null,
+        else => null,
     };
+}
+
+fn structDeclByName(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
+    const ns = sema.containerNamespace(container_ty) orelse return null;
     // Decls are not stored on the type; intern each decl name as we scan and
     // compare interned handles against the query, as the compiler's namespace
     // lookup does.
@@ -4080,6 +4101,15 @@ fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // every arm below -- the `len` check, the namespace lookups, and diagnostics.
     const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.field_name_start));
     const object = try sema.loadValue(try sema.resolveRef(extra.lhs));
+    return sema.fieldPtrLoad(object, name);
+}
+
+/// `object.name` read shared by `field_ptr_load` (name from ZIR) and
+/// `field_ptr_named_load` (`@field`, name from a comptime string). Mirrors the
+/// compiler's `fieldPtrLoad`, which both `zirFieldPtrLoad` and
+/// `zirFieldPtrNamedLoad` call. `object` is the already-loaded operand value.
+fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedString) Error!?Value {
+    const ip = sema.intern_pool;
 
     // Mirror fieldVal, which switches on the object's type tag. A *type* used as a
     // value (`S.decl`, `E.tag`) is the `.type` arm: resolve the name in the type's
@@ -4146,6 +4176,149 @@ fn failNoMember(sema: *Sema, ty: InternPool.Index, name: InternPool.NullTerminat
     Type.print(.fromIndex(ty), sema.intern_pool, sema.writer) catch |e| return e;
     sema.writer.writeAll("'\n") catch |e| return e;
     return error.AnalysisFail;
+}
+
+/// `field_ptr_named_load` (`@field(object, "name")`): the same read as
+/// `field_ptr_load`, but the field name is a comptime string operand rather than
+/// a ZIR-encoded name. Mirrors zirFieldPtrNamedLoad -> fieldPtrLoad.
+fn evalFieldPtrNamedLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.FieldNamed, pl_node.payload_index).data;
+    const field_name = try sema.resolveConstStringIntern(extra.field_name);
+    const object = try sema.loadValue(try sema.resolveRef(extra.lhs));
+    return sema.fieldPtrLoad(object, field_name);
+}
+
+/// `field_ptr_named` (`&@field(object, "name")`, or `@field(...) = v`): the
+/// pointer form of `@field`, name from a comptime string. Mirrors
+/// zirFieldPtrNamed -> fieldPtr.
+fn evalFieldPtrNamed(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.FieldNamed, pl_node.payload_index).data;
+    const field_name = try sema.resolveConstStringIntern(extra.field_name);
+    const object_ptr = try sema.resolveRef(extra.lhs);
+    return sema.fieldPtr(object_ptr, field_name, false);
+}
+
+/// Resolve a comptime string operand -- the name arg of `@field` / `@hasField` /
+/// `@hasDecl` -- to an interned name. The operand is a comptime `[]const u8`: a
+/// string literal (`*const [N:0]u8`) or a slice of one. Unwrap to the backing
+/// `u8` aggregate, a start offset, and a length (as `aggregateElement` does),
+/// then read each byte. Mirrors the compiler's `resolveConstStringIntern`, which
+/// coerces the operand to `[]const u8` and interns its bytes.
+fn resolveConstStringIntern(sema: *Sema, ref: Zir.Inst.Ref) Error!InternPool.NullTerminatedString {
+    const ip = sema.intern_pool;
+    var agg = try sema.resolveRef(ref);
+    var start: u64 = 0;
+    var slice_len: ?u64 = null;
+    if (ip.indexToKey(agg.index) == .slice) {
+        const s = ip.indexToKey(agg.index).slice;
+        slice_len = try sema.resolveUsizeInt(.{ .index = s.len }, "string len");
+        const ptr = ip.indexToKey(s.ptr).ptr;
+        if (ptr.base_addr == .arr_elem) {
+            start = ptr.base_addr.arr_elem.index;
+            agg = .{ .index = ptr.base_addr.arr_elem.base };
+        } else {
+            agg = .{ .index = s.ptr };
+        }
+    }
+    while (ip.indexToKey(agg.index) == .ptr) agg = try sema.loadValue(agg);
+    const key = ip.indexToKey(agg.index);
+    const arr = if (key == .aggregate) ip.indexToKey(key.aggregate.ty) else key;
+    if (key != .aggregate or arr != .array_type or arr.array_type.child != .u8_type) {
+        try sema.writer.writeAll("expected a comptime string\n");
+        return error.AnalysisFail;
+    }
+    const len: usize = @intCast(slice_len orelse arr.array_type.len);
+    const bytes = try sema.gpa.alloc(u8, len);
+    defer sema.gpa.free(bytes);
+    for (bytes, 0..) |*b, i| {
+        const elem = InternPool.aggregateElementAt(key.aggregate, start + i);
+        b.* = @intCast(ip.indexToKey(elem).int.storage.u64);
+    }
+    return try ip.getOrPutString(sema.gpa, bytes);
+}
+
+/// `has_field` (`@hasField(T, "name")`): whether type `T` has a field named
+/// `name`. Mirrors zirHasField's type-tag switch: struct/union/enum by field or
+/// tag name, tuple by numeric index, array `len`, slice `ptr`/`len`. A type that
+/// has no fields at all is the compiler's "does not support '@hasField'" error.
+fn evalHasField(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const ty = try sema.resolveDestType(bin.lhs, "@hasField");
+    const field_name = try sema.resolveConstStringIntern(bin.rhs);
+    // The REPL's `*FieldByName` / `enumTagByName` are the lazy-from-ZIR analogue of
+    // the compiler's `nameIndex` (a field is a field, never a decl). A non-slice
+    // pointer, and every non-container type, fall through the switch to the fail --
+    // matching zirHasField, where only a slice pointer is answerable.
+    const has_field = hf: {
+        switch (ip.indexToKey(ty)) {
+            .ptr_type => |ptr_type| switch (ptr_type.flags.size) {
+                .slice => {
+                    if (field_name.eqlSlice("ptr", ip)) break :hf true;
+                    if (field_name.eqlSlice("len", ip)) break :hf true;
+                    break :hf false;
+                },
+                else => {},
+            },
+            .tuple_type => |tuple| {
+                const field_index = field_name.toUnsigned(ip) orelse break :hf false;
+                break :hf field_index < tuple.types.len;
+            },
+            .struct_type => break :hf (try sema.structFieldByName(ty, field_name)) != null,
+            .union_type => break :hf (try sema.unionFieldByName(ty, field_name)) != null,
+            .enum_type => break :hf (try sema.enumTagByName(ty, field_name)) != null,
+            .array_type => break :hf field_name.eqlSlice("len", ip),
+            else => {},
+        }
+        try sema.writer.writeAll("type '");
+        try Type.print(.fromIndex(ty), ip, sema.writer);
+        try sema.writer.writeAll("' does not support '@hasField'\n");
+        return error.AnalysisFail;
+    };
+    return .{ .index = if (has_field) .bool_true else .bool_false };
+}
+
+/// `has_decl` (`@hasDecl(T, "name")`): whether container type `T` declares a
+/// member named `name`. Mirrors zirHasDecl -> a namespace lookup; the REPL's
+/// single-file model has no visibility restriction, so a present name is
+/// accessible. Scans decl names without evaluating them (as `lookupInNamespace`
+/// does), so a decl whose body would fail still counts as present.
+fn evalHasDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const container_type = try sema.resolveDestType(bin.lhs, "@hasDecl");
+    const decl_name = try sema.resolveConstStringIntern(bin.rhs);
+    // checkNamespaceType: `@hasDecl` requires a container (the REPL has no opaque).
+    // A non-namespace type is a compile error, not a `false` result.
+    if (sema.containerNamespace(container_type) == null) {
+        try sema.writer.writeAll("expected struct, enum, union, or opaque; found '");
+        try Type.print(.fromIndex(container_type), sema.intern_pool, sema.writer);
+        try sema.writer.writeAll("'\n");
+        return error.AnalysisFail;
+    }
+    // getNamespace + lookupInNamespace; `.accessible` is always true in the REPL's
+    // single-file model, so a present name is the answer.
+    return .{ .index = if (try sema.containerHasDecl(container_type, decl_name)) .bool_true else .bool_false };
+}
+
+/// Whether container type `container_ty` declares a member named `name`, by
+/// scanning decl names only (no value evaluation). Mirrors the compiler's
+/// namespace name lookup; the value-resolving counterpart is `structDeclByName`.
+fn containerHasDecl(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!bool {
+    const ns = sema.containerNamespace(container_ty) orelse return false;
+    const frame = try sema.enterSourceZir(ns.source_zir_id, "container decl");
+    defer frame.restore(sema);
+    for (sema.zir.typeDecls(ns.decl_inst)) |decl_inst| {
+        const unwrapped = sema.zir.getDeclaration(decl_inst);
+        if (unwrapped.name == .empty) continue;
+        if ((try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(unwrapped.name))) == name) return true;
+    }
+    return false;
 }
 
 /// Write `elem` into slot `index` of an aggregate alloc's value (a struct field

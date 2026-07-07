@@ -157,6 +157,18 @@ pub const NullTerminatedString = enum(u32) {
     pub fn eqlSlice(string: NullTerminatedString, slice: []const u8, ip: *const InternPool) bool {
         return std.mem.eql(u8, ip.stringSlice(string), slice);
     }
+
+    /// The string parsed as a base-10 `u32`, or null if it is not a canonical
+    /// unsigned literal -- rejecting a leading zero and any `_` so a tuple field
+    /// name like `"01"` or `"1_0"` is not a valid index. Verbatim from the
+    /// compiler's `NullTerminatedString.toUnsigned` (used by `@hasField` on a
+    /// tuple).
+    pub fn toUnsigned(string: NullTerminatedString, ip: *const InternPool) ?u32 {
+        const slice = ip.stringSlice(string);
+        if (slice.len > 1 and slice[0] == '0') return null;
+        if (std.mem.indexOfScalar(u8, slice, '_')) |_| return null;
+        return std.fmt.parseUnsigned(u32, slice, 10) catch null;
+    }
 };
 
 /// Optional version of `NullTerminatedString`. Sentinel `none` is

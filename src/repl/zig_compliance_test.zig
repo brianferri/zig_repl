@@ -1207,6 +1207,93 @@ test "compliance: struct field defaults and missing-field validation" {
     try expectBothReject(a, &.{"blk: { const Q = struct { a: u8, b: u16 }; const q: Q = .{ .a = 7 }; break :blk q.a; }"});
 }
 
+test "compliance: @field reads a field by comptime-string name" {
+    // `@field(obj, "name")` is the same read as `obj.name`, name from a string.
+    const a = testing.allocator;
+    const S = "const S = struct { x: u32, y: u8 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ S ++ " const s = S{ .x = 7, .y = 3 }; break :blk @field(s, \"x\"); }"}); // 7
+    try expectMatchesZig(a, &.{"blk: { " ++ S ++ " const s = S{ .x = 7, .y = 3 }; break :blk @field(s, \"x\") + @field(s, \"y\"); }"}); // 10
+    // On a union it reads the active field; on an enum type it names a tag.
+    const U = "const U = union(enum) { a: u8, b: bool };";
+    try expectMatchesZig(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 5 }; break :blk @field(u, \"a\"); }"}); // 5
+    try expectMatchesZig(a, &.{"blk: { const E = enum { north, south }; break :blk @field(E, \"south\") == E.south; }"}); // true
+    // A slice's `len`/`ptr` and an array's `len` are reachable through @field too.
+    try expectMatchesZig(a, &.{"blk: { const s: []const u8 = \"hello\"; break :blk @field(s, \"len\"); }"}); // 5
+    try expectMatchesZig(a, &.{"blk: { const arr = [_]u8{ 1, 2, 3, 4 }; break :blk @field(arr, \"len\"); }"}); // 4
+    // The pointer form: `&@field(...)` and `@field(...) = v` (an lvalue).
+    try expectMatchesZig(a, &.{"blk: { " ++ S ++ " const s = S{ .x = 7, .y = 3 }; const p = &@field(s, \"x\"); break :blk p.*; }"}); // 7
+    try expectMatchesZig(a, &.{"blk: { " ++ S ++ " var s = S{ .x = 1, .y = 2 }; @field(s, \"x\") = 9; break :blk s.x; }"}); // 9
+    // The name may be any comptime `[]const u8`, not just a string literal.
+    try expectMatchesZig(a, &.{"blk: { " ++ S ++ " const s = S{ .x = 7, .y = 3 }; const n: []const u8 = \"x\"; break :blk @field(s, n); }"}); // 7
+    // Nested @field: the object of one @field is itself an @field result.
+    const N = "const N = struct { inner: struct { x: u8 } };";
+    try expectMatchesZig(a, &.{"blk: { " ++ N ++ " const s = N{ .inner = .{ .x = 3 } }; break :blk @field(@field(s, \"inner\"), \"x\"); }"}); // 3
+    // Sad paths: a missing field name, reading an inactive union field, @field on
+    // a non-aggregate, writing through a const, and a non-string name.
+    try expectBothReject(a, &.{"blk: { " ++ S ++ " const s = S{ .x = 1, .y = 2 }; break :blk @field(s, \"z\"); }"});
+    try expectBothReject(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 5 }; break :blk @field(u, \"b\"); }"});
+    try expectBothReject(a, &.{"blk: { const n: u32 = 5; break :blk @field(n, \"x\"); }"});
+    try expectBothReject(a, &.{"blk: { " ++ S ++ " const s = S{ .x = 1, .y = 2 }; @field(s, \"x\") = 9; break :blk s.x; }"});
+    try expectBothReject(a, &.{"blk: { " ++ S ++ " const s = S{ .x = 1, .y = 2 }; break :blk @field(s, 5); }"});
+}
+
+test "compliance: @hasField and @hasDecl" {
+    const a = testing.allocator;
+    // @hasField across the container kinds it supports.
+    try expectMatchesZig(a, &.{"blk: { const S = struct { x: u32, y: bool }; break :blk @hasField(S, \"x\"); }"}); // true
+    try expectMatchesZig(a, &.{"blk: { const S = struct { x: u32, y: bool }; break :blk @hasField(S, \"z\"); }"}); // false
+    try expectMatchesZig(a, &.{"blk: { const U = union { a: u8, b: bool }; break :blk @hasField(U, \"b\"); }"}); // true
+    try expectMatchesZig(a, &.{"blk: { const U = union(enum) { a: u8, b: bool }; break :blk @hasField(U, \"c\"); }"}); // false
+    try expectMatchesZig(a, &.{"blk: { const E = enum { a, b }; break :blk @hasField(E, \"a\"); }"}); // true
+    try expectMatchesZig(a, &.{"blk: { const E = enum { a, b }; break :blk @hasField(E, \"c\"); }"}); // false
+    try expectMatchesZig(a, &.{"blk: { const Tup = struct { u32, u8 }; break :blk @hasField(Tup, \"1\"); }"}); // true
+    try expectMatchesZig(a, &.{"blk: { const Tup = struct { u32, u8 }; break :blk @hasField(Tup, \"2\"); }"}); // false
+    // A tuple field name must be a canonical unsigned index: non-numeric, a
+    // leading zero, an underscore, or an out-of-range/overflowing value are false
+    // (toUnsigned's rules).
+    try expectMatchesZig(a, &.{"blk: { const Tup = struct { u32, u8 }; break :blk @hasField(Tup, \"a\"); }"}); // false
+    try expectMatchesZig(a, &.{"blk: { const Tup = struct { u32, u8 }; break :blk @hasField(Tup, \"01\"); }"}); // false (leading zero)
+    try expectMatchesZig(a, &.{"blk: { const Tup = struct { u32, u8 }; break :blk @hasField(Tup, \"1_0\"); }"}); // false (underscore)
+    try expectMatchesZig(a, &.{"blk: { const Tup = struct { u32, u8 }; break :blk @hasField(Tup, \"9999999999999999999999999\"); }"}); // false (overflows)
+    // A decl (not a field) is not a field: @hasField is false for a `pub const`.
+    try expectMatchesZig(a, &.{"blk: { const S = struct { a: i32, pub const nope = 1; }; break :blk @hasField(S, \"nope\"); }"}); // false
+    try expectMatchesZig(a, &.{"blk: { const U = union { a: u64, pub const nope = 1; }; break :blk @hasField(U, \"nope\"); }"}); // false
+    try expectMatchesZig(a, &.{"blk: { const E = enum { a, pub const nope = 1; }; break :blk @hasField(E, \"nope\"); }"}); // false
+    // The name may be any comptime `[]const u8`.
+    try expectMatchesZig(a, &.{"blk: { const S = struct { xx: u8 }; const n: []const u8 = \"xx\"; break :blk @hasField(S, n); }"}); // true
+    try expectMatchesZig(a, &.{"@hasField([3]u8, \"len\")"}); // true
+    try expectMatchesZig(a, &.{"@hasField([3]u8, \"ptr\")"}); // false
+    try expectMatchesZig(a, &.{"@hasField([]const u8, \"ptr\")"}); // true
+    try expectMatchesZig(a, &.{"@hasField([]const u8, \"len\")"}); // true
+    // @hasDecl checks the namespace; a value field is not a decl.
+    try expectMatchesZig(a, &.{"blk: { const T = struct { x: u8, const K = 9; }; break :blk @hasDecl(T, \"K\"); }"}); // true
+    try expectMatchesZig(a, &.{"blk: { const T = struct { x: u8, const K = 9; }; break :blk @hasDecl(T, \"x\"); }"}); // false (field, not decl)
+    try expectMatchesZig(a, &.{"blk: { const T = struct { fn f() void {} }; break :blk @hasDecl(T, \"f\"); }"}); // true
+    try expectMatchesZig(a, &.{"blk: { const T = struct { fn f() void {} }; break :blk @hasDecl(T, \"g\"); }"}); // false
+    // A non-pub decl and a `pub var` are both visible to @hasDecl within a file.
+    try expectMatchesZig(a, &.{"blk: { const B = struct { nope: i32, const hi = 1; }; break :blk @hasDecl(B, \"hi\"); }"}); // true
+    try expectMatchesZig(a, &.{"blk: { const B = struct { nope: i32, pub var blah = 3; }; break :blk @hasDecl(B, \"blah\"); }"}); // true
+    try expectMatchesZig(a, &.{"blk: { const B = struct { nope: i32, const hi = 1; }; break :blk @hasDecl(B, \"nope\"); }"}); // false (field)
+    // @hasDecl also works on enum and union namespaces, and takes a []const u8 name.
+    try expectMatchesZig(a, &.{"blk: { const E = enum { a, const N = 2; }; break :blk @hasDecl(E, \"N\"); }"}); // true
+    try expectMatchesZig(a, &.{"blk: { const T = struct { const K = 9; }; const n: []const u8 = \"K\"; break :blk @hasDecl(T, n); }"}); // true
+    // A nested container reached through a decl, and a decl that is itself a type.
+    try expectMatchesZig(a, &.{"blk: { const O = struct { const I = struct { const K = 7; }; }; break :blk @hasDecl(O.I, \"K\"); }"}); // true
+    try expectMatchesZig(a, &.{"blk: { const O = struct { const I = struct {}; }; break :blk @hasDecl(O, \"I\"); }"}); // true
+    // Sad paths: @hasField on a fieldless type -- a non-slice pointer (unlike a
+    // slice, not answerable), an optional, a vector, `void` -- all reject.
+    try expectBothReject(a, &.{"@hasField(u32, \"x\")"});
+    try expectBothReject(a, &.{"@hasField(*u32, \"x\")"});
+    try expectBothReject(a, &.{"@hasField(?u32, \"x\")"});
+    try expectBothReject(a, &.{"@hasField(@Vector(4, i32), \"x\")"});
+    try expectBothReject(a, &.{"@hasField(void, \"x\")"});
+    // @hasDecl on a non-container type (checkNamespaceType) rejects on both sides.
+    try expectBothReject(a, &.{"@hasDecl(u32, \"x\")"});
+    try expectBothReject(a, &.{"@hasDecl(bool, \"x\")"});
+    try expectBothReject(a, &.{"@hasDecl([3]u8, \"x\")"});
+    try expectBothReject(a, &.{"@hasDecl(?u32, \"x\")"});
+}
+
 test "compliance: explicit-type struct init (T{ ... })" {
     // The `T{ .a = ... }` form (struct_init) parallels the result-location
     // `.{ ... }` form: same defaults, same missing/unknown-field validation.
