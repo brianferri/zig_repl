@@ -201,6 +201,28 @@ fn expectReplDiagnostic(gpa: std.mem.Allocator, inputs: []const []const u8, need
     }
 }
 
+/// Assert a known, intentional divergence: the REPL accepts `inputs` while
+/// `zig run` rejects it. The comptime-only REPL evaluates everything at comptime
+/// and so cannot enforce rules that exist only at the runtime boundary (e.g. a
+/// global holding a pointer to a comptime field). Pinning both halves -- REPL
+/// success AND Zig rejection -- makes the deviation a contract: it fails loudly
+/// if the REPL later starts rejecting, or if Zig ever accepts.
+fn expectReplAcceptsZigRejects(gpa: std.mem.Allocator, inputs: []const []const u8) !void {
+    const out = runViaRepl(gpa, inputs) catch |err| switch (err) {
+        error.ParseError, error.ZirError, error.AnalysisFail => return error.TestUnexpectedReplRejection,
+        else => return err,
+    };
+    gpa.free(out);
+
+    if (runViaZig(gpa, inputs)) |zig_out| {
+        gpa.free(zig_out);
+        return error.TestUnexpectedZigSuccess;
+    } else |err| switch (err) {
+        error.ZigRunFailed => {},
+        else => return err,
+    }
+}
+
 const assert = std.debug.assert;
 
 test "compliance: comptime_int arithmetic" {
@@ -782,6 +804,47 @@ test "compliance: tuple index" {
         "const t = .{ 1, 2.5, 3 };",
         "t[0]",
     });
+}
+
+test "compliance: anonymous struct (.{ .a = ... }) field access" {
+    const a = testing.allocator;
+    // A named anonymous struct: access fields, mixed types, same line.
+    try expectMatchesZig(a, &.{"blk: { const p = .{ .a = 1, .b = 2 }; break :blk p.a + p.b; }"}); // 3
+    try expectMatchesZig(a, &.{"blk: { const p = .{ .x = @as(u8, 5), .y = true }; break :blk p.x; }"}); // 5
+    // Nested anonymous structs.
+    try expectMatchesZig(a, &.{"blk: { const p = .{ .x = @as(u8, 5), .z = .{ .w = 3 } }; break :blk p.x + p.z.w; }"}); // 8
+    // A field pointer into an anonymous struct.
+    try expectMatchesZig(a, &.{"blk: { const p = .{ .a = 1, .b = 2 }; const q = &p.b; break :blk q.*; }"}); // 2
+    // Bound to a session const and read on a LATER line (fields resolve by name
+    // from the stored aggregate, not by re-evaluating the init).
+    try expectMatchesZig(a, &.{ "const anon = .{ .a = 10, .b = 20 };", "anon.a + anon.b" }); // 30
+    // @TypeOf(.{ ... }) supports @hasField (a named anon struct is a struct type).
+    try expectMatchesZig(a, &.{"blk: { const T = @TypeOf(.{ .a = 1, .b = 2 }); break :blk @hasField(T, \"b\"); }"}); // true
+    try expectMatchesZig(a, &.{"blk: { const T = @TypeOf(.{ .a = 1 }); break :blk @hasField(T, \"c\"); }"}); // false
+    // Sad paths, all rejected on both sides: a missing field, a duplicate field
+    // name, and a store through a pointer to a const field.
+    try expectBothReject(a, &.{"blk: { const p = .{ .a = 1 }; break :blk p.missing; }"});
+    try expectBothReject(a, &.{"blk: { const p = .{ .a = 1, .a = 2 }; break :blk p.a; }"});
+    try expectBothReject(a, &.{"blk: { const p = .{ .a = 1 }; const q = &p.a; q.* = 5; break :blk q.*; }"});
+    // @hasField naming a missing field is false, but @hasField on the tuple form
+    // (positional `.{ 1, 2 }`) uses numeric indices, not the names.
+    try expectMatchesZig(a, &.{"blk: { const T = @TypeOf(.{ .a = 1 }); break :blk @hasField(T, \"a\"); }"}); // true
+    try expectMatchesZig(a, &.{"blk: { const T = @TypeOf(.{ 10, 20 }); break :blk @hasField(T, \"a\"); }"}); // false
+}
+
+// A container-scope pointer to an anonymous struct's field. An anon literal is
+// comptime-known, so its fields are comptime fields; `&anon.field` therefore
+// points to a comptime field, and a global holding that pointer is rejected by
+// the compiler ("global variable contains reference to comptime var"). The
+// field's declared type is irrelevant -- `@as(u8, ..)` is a comptime field just
+// as `comptime_int` is. The comptime-only REPL has no runtime-escape notion to
+// enforce that rule, so it reads the field value. The rejection is specific to a
+// global escape: function-local `&p.field` is accepted by both (see the
+// compliance test above).
+test "divergence: global pointer to a comptime anon-struct field" {
+    const a = testing.allocator;
+    try expectReplAcceptsZigRejects(a, &.{ "const anon = .{ .m = 7, .n = 8 };", "const r = &anon.n;", "r.*" }); // REPL: 8
+    try expectReplAcceptsZigRejects(a, &.{ "const anon = .{ .m = @as(u8, 7), .n = @as(u8, 8) };", "const r = &anon.n;", "r.*" }); // REPL: 8
 }
 
 test "compliance: prior decl used as a tuple element" {

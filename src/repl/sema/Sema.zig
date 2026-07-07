@@ -563,6 +563,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .array_init => sema.evalArrayInit(inst),
         .array_init_ref => sema.evalArrayInitRef(inst),
         .array_init_anon => sema.evalArrayInitAnon(inst),
+        .struct_init_anon => sema.evalStructInitAnon(inst),
         .array_init_elem_type => sema.evalArrayInitElemType(inst),
         .elem_type => sema.evalElemType(inst),
         .splat_op_result_ty => sema.evalSplatOpResultType(inst),
@@ -3346,6 +3347,43 @@ fn evalArrayInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = agg };
 }
 
+/// `struct_init_anon` (`.{ .a = 1, .b = 2 }`): a NAMED anonymous struct. Unlike
+/// the compiler -- which bakes an anon struct as a real struct type with inline
+/// fields -- this evaluator gives it a `struct_type` whose `decl_inst` is the
+/// `struct_init_anon` instruction itself (the reified `ContainerType.zir_index`
+/// analogue); the field names/types are re-resolved from that instruction's items
+/// on demand, exactly as a declared struct re-resolves from its `struct_decl`.
+/// The field values live in the aggregate (the `tuple_type` deviation, so
+/// `.{ .a = 1 }` and `.{ .a = 2 }` are NOT distinct types). Compiler reference:
+/// src/Sema.zig:zirStructInitAnon -> structInitAnon.
+fn evalStructInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const ip = sema.intern_pool;
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.StructInitAnon, pl_node.payload_index);
+
+    const values = try sema.gpa.alloc(InternPool.Index, extra.data.fields_len);
+    defer sema.gpa.free(values);
+    var extra_index = extra.end;
+    for (values) |*val| {
+        const item = sema.zir.extraData(Zir.Inst.StructInitAnon.Item, extra_index);
+        extra_index = item.end;
+        val.* = (try sema.resolveRef(item.data.init)).index;
+    }
+
+    const ctx = ip.stringSlice(sema.type_name_ctx);
+    const name_text = try std.fmt.allocPrint(sema.gpa, "{s}__struct_{d}", .{ ctx, @intFromEnum(inst) });
+    defer sema.gpa.free(name_text);
+    const struct_ty = try ip.internStructType(.{
+        .source_zir_id = sema.current_zir_id,
+        .decl_inst = inst,
+        .name = try ip.getOrPutString(sema.gpa, name_text),
+        .captures = &.{},
+        .parent = sema.this_type,
+    });
+    return .{ .index = try ip.internAggregate(.{ .ty = struct_ty, .storage = .{ .elems = values } }) };
+}
+
 /// Decode an `array_init[_ref]` MultiOp into an interned aggregate
 /// Index. First operand is the array type; the rest are element
 /// values coerced to the array's child type.
@@ -3927,12 +3965,37 @@ fn structFieldByName(
     const saved_this = sema.this_type;
     sema.this_type = struct_ty;
     defer sema.this_type = saved_this;
+    // An anonymous struct (`.{ .a = 1 }`) has no `struct_decl`; its fields live in
+    // the owning `struct_init_anon` instruction's items.
+    if (sema.zir.instructions.items(.tag)[@intFromEnum(st.decl_inst)] == .struct_init_anon)
+        return try sema.anonStructFieldByName(st.decl_inst, name);
     var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
     while (it.next()) |field| {
         if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name))) == name) {
             const ty = (try sema.resolveInlineBody(field.type_body, st.decl_inst)).index;
             return .{ .index = field.idx, .ty = ty };
         }
+    }
+    return null;
+}
+
+/// The index of an anonymous struct's field `name` (matching the
+/// `struct_init_anon` items), or null. Name-based only -- no init evaluation --
+/// so it works cross-line (a field's type/value comes from the stored aggregate,
+/// not from re-resolving its init, which is out of scope after the ZIR swap). The
+/// `FieldInfo.ty` is `.none`; callers that need the field type read it from the
+/// aggregate element (`fieldTypeFromValue`).
+fn anonStructFieldByName(sema: *Sema, decl_inst: Zir.Inst.Index, name: InternPool.NullTerminatedString) Error!?FieldInfo {
+    const ip = sema.intern_pool;
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(decl_inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.StructInitAnon, pl_node.payload_index);
+    var extra_index = extra.end;
+    var i: u32 = 0;
+    while (i < extra.data.fields_len) : (i += 1) {
+        const item = sema.zir.extraData(Zir.Inst.StructInitAnon.Item, extra_index);
+        extra_index = item.end;
+        if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(item.data.field_name))) == name)
+            return .{ .index = i, .ty = .none };
     }
     return null;
 }
@@ -4339,6 +4402,11 @@ fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
         try sema.writer.writeAll("struct field count: defining ZIR is no longer available\n");
         return error.AnalysisFail;
     };
+    // An anonymous struct stores its field count on the `struct_init_anon` item.
+    if (zir.instructions.items(.tag)[@intFromEnum(st.decl_inst)] == .struct_init_anon) {
+        const pl_node = zir.instructions.items(.data)[@intFromEnum(st.decl_inst)].pl_node;
+        return zir.extraData(Zir.Inst.StructInitAnon, pl_node.payload_index).data.fields_len;
+    }
     return @intCast(zir.getStructDecl(st.decl_inst).field_names.len);
 }
 
@@ -4421,8 +4489,14 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
             return error.AnalysisFail;
         },
     };
+    // An anonymous struct's field carries no ZIR-resolvable type (`.none`); read
+    // it from the stored aggregate element instead.
+    const field_ty = if (fld.ty != .none) fld.ty else blk: {
+        const agg = ip.indexToKey((try sema.loadValue(object_ptr)).index).aggregate;
+        break :blk Value.typeOf(.{ .index = InternPool.aggregateElementAt(agg, fld.index) }, ip).index;
+    };
     const field_ptr_ty = try ip.internPtrType(.{
-        .child = fld.ty,
+        .child = field_ty,
         .flags = .{ .size = .one, .is_const = ip.indexToKey(parent_ty).ptr_type.flags.is_const },
     });
     return .{ .index = try ip.internPtr(.{
