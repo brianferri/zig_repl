@@ -1770,6 +1770,27 @@ test "compliance: @Vector lane-wise arithmetic" {
     try expectReplDiagnostic(a, &.{"blk: { const x: @Vector(2, i32) = .{ 1, 2 }; const y: @Vector(3, i32) = .{ 1, 2, 3 }; const z = x + y; break :blk z[0]; }"}, "vector length mismatch");
 }
 
+test "compliance: @Vector lane-wise comparison" {
+    const a = testing.allocator;
+    // A vector comparison produces a `@Vector(N, bool)` mask, compared lane-wise.
+    const X = "const x: @Vector(4, i32) = .{ 1, 5, 3, 9 }; const y: @Vector(4, i32) = .{ 1, 2, 3, 4 };";
+    try expectMatchesZig(a, &.{"blk: { " ++ X ++ " const m = x == y; break :blk m[0]; }"}); // true
+    try expectMatchesZig(a, &.{"blk: { " ++ X ++ " const m = x == y; break :blk m[1]; }"}); // false
+    try expectMatchesZig(a, &.{"blk: { " ++ X ++ " const m = x != y; break :blk m[1]; }"}); // true
+    try expectMatchesZig(a, &.{"blk: { " ++ X ++ " const m = x < y; break :blk m[3]; }"}); // false (9 < 4)
+    try expectMatchesZig(a, &.{"blk: { " ++ X ++ " const m = x > y; break :blk m[1]; }"}); // true (5 > 2)
+    try expectMatchesZig(a, &.{"blk: { " ++ X ++ " const m = x <= y; break :blk m[0]; }"}); // true (1 <= 1)
+    try expectMatchesZig(a, &.{"blk: { " ++ X ++ " const m = x >= y; break :blk m[2]; }"}); // true (3 >= 3)
+    // Float lanes compare too.
+    try expectMatchesZig(a, &.{"blk: { const p: @Vector(2, f32) = .{ 1.5, 2.5 }; const q: @Vector(2, f32) = .{ 1.5, 1.0 }; const m = p >= q; break :blk m[1]; }"}); // true
+    // The mask is a `@Vector(N, bool)`.
+    try expectMatchesZig(a, &.{"blk: { const p: @Vector(2, i32) = .{ 1, 2 }; const q: @Vector(2, i32) = .{ 1, 3 }; const m = p == q; break :blk @as(type, @TypeOf(m)) == @as(type, @Vector(2, bool)); }"}); // true
+    // Same operand rules as arithmetic: a scalar operand and a length mismatch reject.
+    try expectBothReject(a, &.{"blk: { const p: @Vector(2, i32) = .{ 1, 2 }; const m = p == 1; break :blk m[0]; }"});
+    try expectReplDiagnostic(a, &.{"blk: { const p: @Vector(2, i32) = .{ 1, 2 }; const m = p == 1; break :blk m[0]; }"}, "mixed scalar and vector operands");
+    try expectBothReject(a, &.{"blk: { const p: @Vector(2, i32) = .{ 1, 2 }; const q: @Vector(3, i32) = .{ 1, 2, 3 }; const m = p == q; break :blk m[0]; }"});
+}
+
 test "compliance: @Vector and arrays are distinct but interconvertible" {
     const a = testing.allocator;
     // Distinct types (different type identity), but same-length arrays and

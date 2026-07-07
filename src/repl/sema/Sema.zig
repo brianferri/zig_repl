@@ -2091,6 +2091,10 @@ fn evalComparison(
     const lhs_key = ip.indexToKey(lhs_value.index);
     const rhs_key = ip.indexToKey(rhs_value.index);
 
+    // Vector operands compare lane-wise into a `@Vector(N, bool)` mask.
+    if (ip.indexToKey(Value.typeOf(lhs_value, ip).index) == .vector_type)
+        return try sema.evalVectorComparison(op, lhs_value, rhs_value, op_name);
+
     // Types, bools, and enum tags compare by interned identity: interning is
     // canonical, so equal values share an Index. Only `==`/`!=` are defined
     // (ordering is a type error). Mirrors zirCmpEq's `.type` branch and cmpScalar's
@@ -2124,24 +2128,54 @@ fn evalComparison(
         }
     }
 
-    // Comparison doesn't need to re-fit, so it only cares that peer
-    // resolution found a common int type -- the bignum values compare
-    // exactly across signedness and width.
-    if (resolveNumericPairToInt(ip, lhs_key, rhs_key)) |triple| {
+    return sema.scalarCompare(op, lhs_key, rhs_key, op_name);
+}
+
+/// Compare two numeric scalars to a `bool`, shared by `evalComparison` and each
+/// lane of `evalVectorComparison`: a common int type compares the bignums exactly
+/// (no re-fit needed), a float pair compares by storage, else a typed error.
+fn scalarCompare(sema: *Sema, op: std.math.CompareOperator, lhs_key: InternPool.Key, rhs_key: InternPool.Key, op_name: []const u8) Error!?Value {
+    if (resolveNumericPairToInt(sema.intern_pool, lhs_key, rhs_key)) |triple| {
         var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
         var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
         const lhs = triple.lhs.storage.toBigInt(&lhs_space);
         const rhs = triple.rhs.storage.toBigInt(&rhs_space);
-        const result = arith.compareInt(lhs, rhs, op);
-        return .{ .index = if (result) .bool_true else .bool_false };
+        return .{ .index = if (arith.compareInt(lhs, rhs, op)) .bool_true else .bool_false };
     }
-
     if (coerceNumericPairToFloat(lhs_key, rhs_key)) |pair| {
-        const result = compareFloatStorage(pair[0].storage, pair[1].storage, op);
-        return .{ .index = if (result) .bool_true else .bool_false };
+        return .{ .index = if (compareFloatStorage(pair[0].storage, pair[1].storage, op)) .bool_true else .bool_false };
     }
-
     return sema.failNumericOperands(op_name, lhs_key, rhs_key);
+}
+
+/// Lane-wise comparison of two `@Vector(N, T)` operands into a `@Vector(N, bool)`
+/// mask: compare each `(lhs[i], rhs[i])` pair to a `bool`. Same operand rules as
+/// `evalVectorArith` -- both must be vectors of the same length. Mirrors the
+/// compiler's element-wise `cmp` on vectors.
+fn evalVectorComparison(sema: *Sema, op: std.math.CompareOperator, lhs: Value, rhs: Value, op_name: []const u8) Error!?Value {
+    const ip = sema.intern_pool;
+    const lhs_vt = ip.indexToKey(Value.typeOf(lhs, ip).index).vector_type;
+    const rhs_ty_key = ip.indexToKey(Value.typeOf(rhs, ip).index);
+    if (rhs_ty_key != .vector_type) {
+        try sema.writer.print("{s}: mixed scalar and vector operands\n", .{op_name});
+        return error.AnalysisFail;
+    }
+    if (rhs_ty_key.vector_type.len != lhs_vt.len) {
+        try sema.writer.print("{s}: vector length mismatch\n", .{op_name});
+        return error.AnalysisFail;
+    }
+    const lhs_agg = ip.indexToKey(lhs.index).aggregate;
+    const rhs_agg = ip.indexToKey(rhs.index).aggregate;
+    const count: usize = @intCast(lhs_vt.len);
+    const elems = try sema.gpa.alloc(InternPool.Index, count);
+    defer sema.gpa.free(elems);
+    for (elems, 0..) |*e, i| {
+        const l = ip.indexToKey(InternPool.aggregateElementAt(lhs_agg, i));
+        const r = ip.indexToKey(InternPool.aggregateElementAt(rhs_agg, i));
+        e.* = (try sema.scalarCompare(op, l, r, op_name) orelse return null).index;
+    }
+    const vec_ty = try ip.internVectorType(.{ .len = @intCast(count), .child = .bool_type });
+    return .{ .index = try ip.internAggregate(.{ .ty = vec_ty, .storage = .{ .elems = elems } }) };
 }
 
 /// Compare two float storages of the same width. NaN comparisons follow
