@@ -2611,14 +2611,12 @@ fn evalStoreNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             try sema.writer.writeAll("unable to evaluate comptime expression: store through a pointer to a declaration\n");
             return error.AnalysisFail;
         },
-        // Store into one slot of an aggregate alloc (a struct field or an array
-        // element): coerce to the pointer's child type and rebuild the aggregate.
-        .field, .arr_elem => |f| {
-            const base = ip.indexToKey(f.base).ptr;
-            const agg_ty = ip.indexToKey(base.ty).ptr_type.child;
+        // Store into one slot of an aggregate (a struct field or an array/vector
+        // element): coerce to the pointer's child type, then rebuild the enclosing
+        // aggregate(s) up to the backing alloc.
+        .field, .arr_elem => {
             const coerced = try sema.coerceValueToType(rhs_value, ptr_ty_key.ptr_type.child, "store");
-            const base_alloc = try sema.lookupComptimeAlloc(base);
-            base_alloc.val = try sema.setAggregateElement(base_alloc.val, agg_ty, @intCast(f.index), coerced);
+            try sema.storeElement(ptr_key.ptr, coerced);
         },
     }
     return .{ .index = .void_value };
@@ -2659,12 +2657,19 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
         // pointer, so recurse.
         .field, .arr_elem => |f| {
             const parent = try sema.loadValue(.{ .index = f.base });
-            // A union value stores only the active field's payload, not a
-            // positional slot per field; reading a field pointer checks the
-            // active tag, mirroring `unionFieldPtr`'s comptime load.
-            if (ip.indexToKey(parent.index) == .un)
-                return try sema.loadUnionField(parent.index, @intCast(f.index));
-            return .{ .index = InternPool.aggregateElementAt(ip.indexToKey(parent.index).aggregate, @intCast(f.index)) };
+            return switch (ip.indexToKey(parent.index)) {
+                // A not-yet-initialised parent (mid array/struct init) projects to
+                // `undef`. Mirrors the compiler's `loadComptimePtrInner`, whose
+                // every level returns `.undef` when the value it projects from is
+                // `undef` (src/Sema/comptime_ptr_access.zig).
+                .undef => .{ .index = .undef },
+                // A union stores only the active field's payload, not a positional
+                // slot per field; reading a field pointer checks the active tag,
+                // mirroring `unionFieldPtr`'s comptime load.
+                .un => try sema.loadUnionField(parent.index, @intCast(f.index)),
+                .aggregate => |agg| .{ .index = InternPool.aggregateElementAt(agg, @intCast(f.index)) },
+                else => unreachable, // an element/field ptr always projects one of the above
+            };
         },
         else => {
             const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr);
@@ -4392,6 +4397,32 @@ fn setAggregateElement(
     }
     elems[index] = elem.index;
     return .{ .index = try ip.internAggregate(.{ .ty = agg_ty, .storage = .{ .elems = elems } }) };
+}
+
+/// Store `value` into the slot addressed by an element/field pointer, rebuilding
+/// the enclosing aggregate. The base may itself be an element/field pointer
+/// (`outer[i][j]`, `s.a.b`), so recurse until the backing comptime alloc is
+/// reached and update its value. Whole-aggregate read-modify-write, the recursive
+/// analogue of `setStructField` -- the compiler mutates in place via
+/// `MutableValue` / `beginComptimePtrMutation`, which this evaluator does not model.
+fn storeElement(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
+    const ip = sema.intern_pool;
+    const f = switch (ptr.base_addr) {
+        .field, .arr_elem => |f| f,
+        else => unreachable, // only element/field pointers reach here
+    };
+    const base_ptr = ip.indexToKey(f.base).ptr;
+    const agg_ty = ip.indexToKey(base_ptr.ty).ptr_type.child;
+    const parent = try sema.loadValue(.{ .index = f.base });
+    const new_parent = try sema.setAggregateElement(parent, agg_ty, @intCast(f.index), value);
+    switch (base_ptr.base_addr) {
+        .comptime_alloc => (try sema.lookupComptimeAlloc(base_ptr)).val = new_parent,
+        .field, .arr_elem => try sema.storeElement(base_ptr, new_parent),
+        .nav, .uav => {
+            try sema.writer.writeAll("unable to evaluate comptime expression: store through a pointer to a declaration\n");
+            return error.AnalysisFail;
+        },
+    }
 }
 
 /// `opt_eu_base_ptr_init`: strips the optional/error-union payload base before a

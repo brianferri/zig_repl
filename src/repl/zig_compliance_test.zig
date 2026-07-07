@@ -1718,6 +1718,14 @@ test "compliance: for loops (range and array)" {
     try expectMatchesZig(a, &.{"blk: { var s: u32 = 0; for (0..3) |i| { for (0..3) |j| { s += @intCast(i * j); } } break :blk s; }"});
 }
 
+test "compliance: nested aggregate init and element store" {
+    const a = testing.allocator;
+    // Storing through a nested element pointer rebuilds each enclosing aggregate.
+    try expectMatchesZig(a, &.{"blk: { const arr: [2][3]u8 = .{ .{ 1, 2, 3 }, .{ 4, 5, 6 } }; break :blk arr[1][0] + arr[0][2]; }"}); // 7
+    try expectMatchesZig(a, &.{"blk: { var m: [2][2]u8 = .{ .{ 1, 2 }, .{ 3, 4 } }; m[0][1] = 9; break :blk m[0][1] + m[1][0]; }"}); // 12
+    try expectMatchesZig(a, &.{"blk: { const S = struct { p: struct { x: u8 } }; var s: S = .{ .p = .{ .x = 1 } }; s.p.x = 7; break :blk s.p.x; }"}); // 7
+}
+
 test "compliance: @intFromPtr honors the pointer's alignment" {
     // The REPL's address is synthetic (it won't equal a real `zig run`
     // address), but both sides honor `@intFromPtr(&x) % align == 0`: zig's
