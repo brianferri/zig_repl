@@ -564,6 +564,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .array_init_ref => sema.evalArrayInitRef(inst),
         .array_init_anon => sema.evalArrayInitAnon(inst),
         .struct_init_anon => sema.evalStructInitAnon(inst),
+        .import => sema.evalImport(inst),
         .array_init_elem_type => sema.evalArrayInitElemType(inst),
         .elem_type => sema.evalElemType(inst),
         .splat_op_result_ty => sema.evalSplatOpResultType(inst),
@@ -3382,6 +3383,32 @@ fn evalStructInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .parent = sema.this_type,
     });
     return .{ .index = try ip.internAggregate(.{ .ty = struct_ty, .storage = .{ .elems = values } }) };
+}
+
+/// `@import("path")`: resolve a module or file to its container type. Mirrors
+/// the compiler's resolution (src/Zcu/PerThread.zig:doImport), which maps exactly
+/// three names to distinct built-in modules -- `std`, `root`, `builtin` -- and
+/// treats every other string as a module dependency or a relative `.zig`/`.zon`
+/// file. Each named module is handled in its own branch, as the compiler does,
+/// since the three resolve by different means. This evaluator does not load any
+/// of them yet, so they share a diagnostic; any other name reuses the compiler's
+/// "no module named" wording (its `error.ModuleNotFound`).
+fn evalImport(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const inst_data = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_tok;
+    const extra = sema.zir.extraData(Zir.Inst.Import, inst_data.payload_index).data;
+    const path = sema.zir.nullTerminatedString(extra.path);
+
+    if (std.mem.eql(u8, path, "std")) return sema.failUnloadedModule(path);
+    if (std.mem.eql(u8, path, "root")) return sema.failUnloadedModule(path);
+    if (std.mem.eql(u8, path, "builtin")) return sema.failUnloadedModule(path);
+
+    try sema.writer.print("no module named '{s}' available\n", .{path});
+    return error.AnalysisFail;
+}
+
+fn failUnloadedModule(sema: *Sema, path: []const u8) Error {
+    try sema.writer.print("@import(\"{s}\"): module loading is not supported\n", .{path});
+    return error.AnalysisFail;
 }
 
 /// Decode an `array_init[_ref]` MultiOp into an interned aggregate

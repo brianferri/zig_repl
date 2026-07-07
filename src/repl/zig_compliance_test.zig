@@ -2118,3 +2118,11 @@ test "sad paths: bad builtins and calls are rejected" {
     try expectBothReject(a, &.{"blk: { const x: u8 = 5; break :blk x(); }"});
     try expectReplDiagnostic(a, &.{"blk: { break :blk @sizeOf(); }"}, "expected 1 argument, found 0");
 }
+
+test "sad paths: @import of an unknown module is rejected" {
+    const a = testing.allocator;
+    // An unrecognised name is neither a known module nor a resolvable file, so
+    // it fails like the compiler's `error.ModuleNotFound` ("no module named ...").
+    try expectBothReject(a, &.{"@import(\"nonexistent\")"});
+    try expectReplDiagnostic(a, &.{"@import(\"nonexistent\")"}, "no module named 'nonexistent'");
+}
