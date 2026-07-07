@@ -3364,8 +3364,12 @@ fn validateArrayInitTy(sema: *Sema, init_count: u32, ty: InternPool.Index) Error
             try sema.writer.print("expected {d} vector elements; found {d}\n", .{ vt.len, init_count });
             return error.AnalysisFail;
         },
-        .tuple_type => |tt| if (init_count > tt.types.len) {
-            try sema.writer.print("expected at most {d} tuple fields; found {d}\n", .{ tt.types.len, init_count });
+        // The compiler allows FEWER than the field count (trailing comptime-
+        // defaulted fields may be omitted) and catches a genuine shortfall later
+        // in struct-init. This evaluator models no comptime tuple defaults, so
+        // every field is required -- an exact count, checked here.
+        .tuple_type => |tt| if (init_count != tt.types.len) {
+            try sema.writer.print("expected {d} tuple fields; found {d}\n", .{ tt.types.len, init_count });
             return error.AnalysisFail;
         },
         else => {

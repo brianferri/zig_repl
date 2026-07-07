@@ -1091,16 +1091,14 @@ test "vector_type: rejects element types without a fixed bit width" {
     try expectEvalFails(gpa, &pool, "@Vector(2, [3]u8)", "vector element type");
 }
 
-test "vector_type: coercing a value into a vector destination fails loudly" {
+test "vector_type: an array coerces into a same-length vector destination" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
 
-    // resolveDestType accepts vector types so they can be pointer/array
-    // children; coercing a value into one is not wired until vector
-    // values land, and must fail loudly rather than build a half-formed
-    // vector aggregate (which would trip aggregateElementCount).
-    try expectEvalFails(gpa, &pool, "@as(@Vector(4, i32), [_]i32{ 1, 2, 3, 4 })", "cannot coerce value");
+    // An array coerces to a vector of the same length (they share the aggregate
+    // representation); the coerced vector indexes lane-wise.
+    try expectEvalDecimal(gpa, &pool, "@as(@Vector(4, i32), [_]i32{ 1, 2, 3, 4 })[2]", "3");
 }
 
 test "opt_type: renders ?T across child kinds" {
