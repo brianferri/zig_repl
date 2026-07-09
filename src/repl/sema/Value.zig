@@ -55,6 +55,7 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
         .opt => |o| .{ .index = o.ty },
         .aggregate => |agg| .{ .index = agg.ty },
         .enum_tag => |et| .{ .index = et.ty },
+        .enum_literal => .{ .index = .enum_literal_type },
         .un => |uv| .{ .index = uv.ty },
         // Every remaining Key is a type used as a value, whose own type is
         // `type`. The value Keys above are exhaustive, so anything reaching

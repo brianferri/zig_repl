@@ -1750,6 +1750,24 @@ test "compliance: union member declarations and decl literals" {
     const U = "const U = union(enum) { a: u8, b: bool, pub const zero = @This(){ .a = 0 }; };";
     try expectMatchesZig(a, &.{"blk: { " ++ U ++ " break :blk U.zero.a; }"}); // 0
     try expectMatchesZig(a, &.{"blk: { " ++ U ++ " const x: U = .zero; break :blk x.a; }"}); // 0
+    // A tagged union compares to an enum literal by its active tag; a bare
+    // (untagged) union does not -- rejected on both sides.
+    try expectMatchesZig(a, &.{"blk: { " ++ U ++ " const t = U{ .a = 1 }; break :blk t == .a; }"}); // true
+    try expectMatchesZig(a, &.{"blk: { " ++ U ++ " const t = U{ .a = 1 }; break :blk t == .b; }"}); // false
+    try expectBothReject(a, &.{"blk: { const B = union { a: u8, b: bool }; const u = B{ .a = 1 }; break :blk u == .a; }"});
+    // A tag whose field type has no possible value (`noreturn`) can never be
+    // active, so the comparison is false -- the active-tag identity already
+    // yields this in a comptime evaluator (the compiler's `no_possible_value`
+    // shortcut is a runtime concern).
+    const N = "const N = union(enum) { a: u8, b: noreturn };";
+    try expectMatchesZig(a, &.{"blk: { " ++ N ++ " const u = N{ .a = 1 }; break :blk u == .b; }"}); // false
+    try expectMatchesZig(a, &.{"blk: { " ++ N ++ " const u = N{ .a = 1 }; break :blk u == .a; }"}); // true
+    // NPV recurses: a struct *of* noreturn is itself no-possible-value, but an
+    // optional of noreturn is not -- it can be null, so that tag can be active.
+    const NS = "const NS = union(enum) { a: u8, b: struct { x: noreturn } };";
+    try expectMatchesZig(a, &.{"blk: { " ++ NS ++ " const u = NS{ .a = 1 }; break :blk u == .b; }"}); // false
+    const NO = "const NO = union(enum) { a: u8, b: ?noreturn };";
+    try expectMatchesZig(a, &.{"blk: { " ++ NO ++ " const u = NO{ .b = null }; break :blk u == .b; }"}); // true
 }
 
 test "compliance: slices nested in structs and arrays of slices" {
@@ -2167,3 +2185,175 @@ test "sad paths: @import of an unknown module is rejected" {
     try expectBothReject(a, &.{"@import(\"nonexistent\")"});
     try expectReplDiagnostic(a, &.{"@import(\"nonexistent\")"}, "no module named 'nonexistent'");
 }
+
+test "@import loads a module container and resolves its decls" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+
+    var fixture: FixtureSource = .{ .src = "pub const marker = 123;" };
+    session.module_source = &fixture.interface;
+
+    // The file-root container resolves a public decl by value, and @hasDecl
+    // scans its names -- both drive `enterSourceZir` into the retained module
+    // ZIR. The second @import hits the cache (no reload).
+    try expectReplValue(&session, "@import(\"std\").marker", "123");
+    try expectReplValue(&session, "@hasDecl(@import(\"std\"), \"marker\")", "true");
+    try expectReplValue(&session, "@hasDecl(@import(\"std\"), \"nope\")", "false");
+}
+
+test "@import(std) reaches std.lang across files" {
+    const gpa = testing.allocator;
+    var io_instance: Io.Threaded = .init(gpa, .{});
+    defer io_instance.deinit();
+    const io = io_instance.io();
+
+    // The build injects the exact standard-library path (see build.zig); no
+    // runtime search.
+    var root = try std.Io.Dir.openDirAbsolute(io, @import("build_options").zig_std_dir, .{});
+    defer root.close(io);
+    var native: NativeModuleSource = .{ .io = io, .root = root };
+
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+    session.module_source = &native.interface;
+
+    // std.lang.ReduceOp lives in lang.zig, reached from std.zig by a relative
+    // import; `.Add` is its 6th tag (index 5). Resolving it exercises the whole
+    // multi-file path: std root -> relative lang.zig -> enum decl -> tag value.
+    try expectReplValue(&session, "@intFromEnum(@import(\"std\").lang.ReduceOp.Add)", "5");
+    // The container decls resolve lazily (no eager namespace scan), so exercise
+    // shapes beyond a flat enum: a decl-of-decl reach, a `union(enum)` type, and
+    // a decl nested inside that union with a field lookup.
+    try expectReplValue(&session, "@hasDecl(@import(\"std\").lang, \"Type\")", "true");
+    try expectReplValue(&session, "@hasDecl(@import(\"std\").lang.Type, \"Int\")", "true");
+    try expectReplValue(&session, "@hasField(@import(\"std\").lang.Type.Int, \"bits\")", "true");
+}
+
+test "@import(std) broad access probes" {
+    const gpa = testing.allocator;
+    var io_instance: Io.Threaded = .init(gpa, .{});
+    defer io_instance.deinit();
+    const io = io_instance.io();
+    var root = try std.Io.Dir.openDirAbsolute(io, @import("build_options").zig_std_dir, .{});
+    defer root.close(io);
+    var native: NativeModuleSource = .{ .io = io, .root = root };
+
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+    session.module_source = &native.interface;
+
+    // A spread of access shapes against real std, run in one session so each gap
+    // surfaces independently rather than the first aborting the rest.
+    const Probe = struct { src: []const u8, want: []const u8 };
+    const probes = [_]Probe{
+        // Top-level std decls (name scan; submodules not analysed yet).
+        .{ .src = "@hasDecl(@import(\"std\"), \"mem\")", .want = "true" },
+        .{ .src = "@hasDecl(@import(\"std\"), \"math\")", .want = "true" },
+        .{ .src = "@hasDecl(@import(\"std\"), \"no_such_decl\")", .want = "false" },
+        // std.lang enum tags at both ends.
+        .{ .src = "@intFromEnum(@import(\"std\").lang.ReduceOp.And)", .want = "0" },
+        .{ .src = "@intFromEnum(@import(\"std\").lang.ReduceOp.Mul)", .want = "6" },
+        // Container decls of each kind + an enum tag via @hasField.
+        .{ .src = "@hasDecl(@import(\"std\").lang, \"CallingConvention\")", .want = "true" },
+        .{ .src = "@hasField(@import(\"std\").lang.AtomicOrder, \"seq_cst\")", .want = "true" },
+        // union(enum) decls + nested struct fields.
+        .{ .src = "@hasDecl(@import(\"std\").lang.Type, \"Struct\")", .want = "true" },
+        .{ .src = "@hasField(@import(\"std\").lang.Type.Int, \"signedness\")", .want = "true" },
+        .{ .src = "@hasField(@import(\"std\").lang.Type.Pointer, \"size\")", .want = "true" },
+        // Submodule loads via relative import from std.zig.
+        .{ .src = "@hasDecl(@import(\"std\").math, \"pi\")", .want = "true" },
+        .{ .src = "@hasDecl(@import(\"std\").mem, \"eql\")", .want = "true" },
+        .{ .src = "@hasDecl(@import(\"std\").meta, \"Tag\")", .want = "true" },
+        // Stress: std.Io and its deeply-nested implementation files load and
+        // resolve. (Probes that reach `@typeInfo`-based std code -- e.g.
+        // `math.maxInt`, or `Io.Limit` whose `unlimited` tag is `maxInt(usize)`
+        // -- are omitted: they exercise the not-yet-implemented reflection this
+        // loader unblocks, not the loader itself.)
+        .{ .src = "@hasDecl(@import(\"std\"), \"Io\")", .want = "true" },
+        .{ .src = "@hasDecl(@import(\"std\").Io, \"Writer\")", .want = "true" },
+        .{ .src = "@hasDecl(@import(\"std\").Io, \"Reader\")", .want = "true" },
+        .{ .src = "@hasDecl(@import(\"std\").Io, \"File\")", .want = "true" },
+        .{ .src = "@hasDecl(@import(\"std\").Io, \"VTable\")", .want = "true" },
+        .{ .src = "@hasDecl(@import(\"std\").Io.Writer, \"Error\")", .want = "true" },
+        .{ .src = "@hasDecl(@import(\"std\").Io.net, \"IpAddress\")", .want = "true" },
+        // std.http resolves end-to-end through its transitive graph, down to an
+        // enum tag value (GET is the first Method variant).
+        .{ .src = "@hasDecl(@import(\"std\").http, \"Client\")", .want = "true" },
+        .{ .src = "@intFromEnum(@import(\"std\").http.Method.GET)", .want = "0" },
+        // std.fmt loads (comptime formatting itself needs @typeInfo, still ahead).
+        .{ .src = "@hasDecl(@import(\"std\").fmt, \"comptimePrint\")", .want = "true" },
+        // @typeInfo(int) builds a real std.lang.Type union; read its fields back.
+        .{ .src = "@typeInfo(u8).int.bits", .want = "8" },
+        .{ .src = "@typeInfo(u16).int.bits", .want = "16" },
+        .{ .src = "@intFromEnum(@typeInfo(u8).int.signedness)", .want = "1" }, // unsigned
+        .{ .src = "@intFromEnum(@typeInfo(i32).int.signedness)", .want = "0" }, // signed
+        // @typeInfo(float) payload, and payload-free categories via tag comparison.
+        .{ .src = "@typeInfo(f32).float.bits", .want = "32" },
+        .{ .src = "@typeInfo(f64).float.bits", .want = "64" },
+        .{ .src = "@typeInfo(u8) == .int", .want = "true" },
+        .{ .src = "@typeInfo(bool) == .bool", .want = "true" },
+        .{ .src = "@typeInfo(void) == .void", .want = "true" },
+        .{ .src = "@typeInfo(bool) == .int", .want = "false" },
+        // Payload-bearing categories.
+        .{ .src = "@typeInfo(?u8).optional.child == u8", .want = "true" },
+        .{ .src = "@typeInfo(@Vector(4, u8)).vector.len", .want = "4" },
+        .{ .src = "@typeInfo(@Vector(4, u8)).vector.child == u8", .want = "true" },
+        .{ .src = "@typeInfo([3]u8).array.len", .want = "3" },
+        .{ .src = "@typeInfo([3]u8).array.child == u8", .want = "true" },
+        .{ .src = "@typeInfo([3]u8).array.sentinel_ptr == null", .want = "true" },
+        .{ .src = "@typeInfo([3:0]u8).array.sentinel_ptr == null", .want = "false" },
+        .{ .src = "@typeInfo(*u8).pointer.child == u8", .want = "true" },
+        .{ .src = "@typeInfo(*u8).pointer.size == .one", .want = "true" },
+        .{ .src = "@typeInfo([]u8).pointer.size == .slice", .want = "true" },
+        .{ .src = "@typeInfo(*const u8).pointer.attrs.@\"const\"", .want = "true" },
+        .{ .src = "@typeInfo(*u8).pointer.attrs.@\"const\"", .want = "false" },
+        .{ .src = "@typeInfo(*align(4) u8).pointer.attrs.@\"align\" == 4", .want = "true" },
+        // Error union splits into its set and payload types; error set exposes its
+        // member names (null for the open `anyerror`).
+        .{ .src = "@typeInfo(anyerror!u8).error_union.payload == u8", .want = "true" },
+        .{ .src = "@typeInfo(anyerror!u8).error_union.error_set == anyerror", .want = "true" },
+        .{ .src = "@typeInfo(anyerror).error_set.error_names == null", .want = "true" },
+        .{ .src = "@typeInfo(error{ Foo, Bar }).error_set.error_names.?.len", .want = "2" },
+        .{ .src = "@typeInfo(error{Foo}).error_set.error_names.?[0][0]", .want = "70" },
+        // Enum reflection: tag type, mode, field names/values, decl names.
+        .{ .src = "@typeInfo(enum { a, b, c }).@\"enum\".field_names.len", .want = "3" },
+        .{ .src = "@typeInfo(enum { a, b, c }).@\"enum\".field_names[0][0]", .want = "97" },
+        .{ .src = "@typeInfo(enum { a, b }).@\"enum\".tag_type == u1", .want = "true" },
+        .{ .src = "@typeInfo(enum { a, b, c }).@\"enum\".tag_type == u2", .want = "true" },
+        .{ .src = "@typeInfo(enum(u8) { a = 5, b }).@\"enum\".field_values[0]", .want = "5" },
+        .{ .src = "@typeInfo(enum(u8) { a = 5, b }).@\"enum\".field_values[1]", .want = "6" },
+        .{ .src = "@typeInfo(enum { a }).@\"enum\".mode == .exhaustive", .want = "true" },
+        .{ .src = "@typeInfo(enum(u8) { a, _ }).@\"enum\".mode == .nonexhaustive", .want = "true" },
+        .{ .src = "@typeInfo(enum { a, pub const x = 1; }).@\"enum\".decl_names.len", .want = "1" },
+        .{ .src = "@typeInfo(enum { a, pub const x = 1; }).@\"enum\".decl_names[0][0] == 'x'", .want = "true" },
+        // A bare enum literal compares against a reflected enum value.
+        .{ .src = "@typeInfo(u8).int.signedness == .signed", .want = "false" },
+        // A `comptime_int` shifted by a typed amount (the shape maxInt produces).
+        .{ .src = "1 << @as(u16, 8)", .want = "256" },
+        // The payoff: real std functions driven by integer reflection.
+        .{ .src = "@import(\"std\").math.maxInt(u8)", .want = "255" },
+        .{ .src = "@import(\"std\").math.maxInt(i8)", .want = "127" },
+        .{ .src = "@import(\"std\").math.minInt(u8)", .want = "0" },
+        .{ .src = "@import(\"std\").math.minInt(i8)", .want = "-128" },
+    };
+
+    var failures: usize = 0;
+    for (probes) |p| {
+        expectReplValue(&session, p.src, p.want) catch |err| {
+            std.debug.print("PROBE FAILED ({s}): {s}\n", .{ @errorName(err), p.src });
+            failures += 1;
+        };
+    }
+    try testing.expectEqual(@as(usize, 0), failures);
+}
+

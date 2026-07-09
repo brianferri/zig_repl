@@ -1256,12 +1256,22 @@ test "cast builtins reject ptr_type destinations with their own diagnostic" {
     try expectEvalFails(gpa, &pool, "@as(*u8, @bitCast(@as(u64, 0)))", "operands must be fixed-width numeric types");
 }
 
-test "ptr_type: extensions we do not yet support fail with a structured diagnostic" {
+test "ptr_type: a sentinel-terminated pointer carries the coerced sentinel value" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
 
-    try expectEvalFails(gpa, &pool, "[*:0]const u8", "sentinel-terminated pointers not yet supported");
+    var diag_buf: [4096]u8 = undefined;
+    const value = try evalSource(gpa, &pool, "[*:0]const u8", &diag_buf);
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .ptr_type);
+    try testing.expectEqual(InternPool.Key.PtrType.Size.many, key.ptr_type.flags.size);
+    try testing.expectEqual(InternPool.Index.u8_type, key.ptr_type.child);
+    // The `0` sentinel is coerced to the child type, so it is a `u8` zero.
+    const sentinel = pool.indexToKey(key.ptr_type.sentinel);
+    try testing.expect(sentinel == .int);
+    try testing.expectEqual(InternPool.Index.u8_type, sentinel.int.ty);
+    try testing.expectEqual(@as(u64, 0), sentinel.int.storage.u64);
 }
 
 test "ptr_type: a non-power-of-two alignment is rejected" {

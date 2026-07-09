@@ -511,6 +511,10 @@ pub const SimpleValue = enum(u32) {
 pub const Key = union(enum) {
     simple_type: SimpleType,
     simple_value: SimpleValue,
+    /// A bare enum literal (`.foo`), type `enum_literal_type`; carries only the
+    /// name and coerces to a concrete enum/union on use. Mirrors the compiler's
+    /// `Key.enum_literal`.
+    enum_literal: NullTerminatedString,
     /// Concrete fixed-width integer type. Shape matches `@typeInfo(T).int`.
     int_type: std.lang.Type.Int,
     /// Payload is `.none` for untyped `anyframe`, or the child type's
@@ -766,6 +770,11 @@ pub const Key = union(enum) {
             /// resolve by index projection (the compiler splits them for byte
             /// stride vs field offset).
             arr_elem: BaseIndex,
+            /// A pointer to the payload of an optional: `base` is the pointer to
+            /// the optional (`*?T`), and loading resolves that optional's payload.
+            /// Produced by `optional_payload_*_ptr` (`p.?` in an lvalue context).
+            /// Mirrors the compiler's `BaseAddr.opt_payload`.
+            opt_payload: Index,
 
             pub const BaseIndex = struct {
                 base: Index,
@@ -1062,6 +1071,7 @@ pub const Key = union(enum) {
         switch (key) {
             .simple_type => |s| std.hash.autoHash(&hasher, s),
             .simple_value => |s| std.hash.autoHash(&hasher, s),
+            .enum_literal => |n| std.hash.autoHash(&hasher, n),
             .int_type => |it| {
                 std.hash.autoHash(&hasher, it.signedness);
                 std.hash.autoHash(&hasher, it.bits);
@@ -1105,6 +1115,7 @@ pub const Key = union(enum) {
                         std.hash.autoHash(&hasher, f.base);
                         std.hash.autoHash(&hasher, f.index);
                     },
+                    .opt_payload => |base| std.hash.autoHash(&hasher, base),
                 }
             },
             .error_set_type => |es| {
@@ -1228,6 +1239,7 @@ pub const Key = union(enum) {
         return switch (a) {
             .simple_type => |x| x == b.simple_type,
             .simple_value => |x| x == b.simple_value,
+            .enum_literal => |x| x == b.enum_literal,
             .int_type => |x| x.signedness == b.int_type.signedness and
                 x.bits == b.int_type.bits,
             .anyframe_type => |x| x == b.anyframe_type,
@@ -1284,6 +1296,7 @@ pub const Key = union(enum) {
                     .uav => |uav| uav.val == y.base_addr.uav.val and uav.orig_ty == y.base_addr.uav.orig_ty,
                     .field => |f| f.base == y.base_addr.field.base and f.index == y.base_addr.field.index,
                     .arr_elem => |f| f.base == y.base_addr.arr_elem.base and f.index == y.base_addr.arr_elem.index,
+                    .opt_payload => |base| base == y.base_addr.opt_payload,
                 };
             },
             .error_set_type => |x| std.mem.eql(NullTerminatedString, x.names, b.error_set_type.names),
@@ -1419,6 +1432,7 @@ pub const Key = union(enum) {
             .union_type,
             => true,
             .simple_value,
+            .enum_literal,
             .int,
             .float,
             .ptr,
@@ -1445,6 +1459,7 @@ const Item = struct {
     const Tag = enum(u8) {
         simple_type, // data = SimpleType ordinal == Index of the corresponding type
         simple_value, // data = SimpleValue ordinal == Index of the corresponding value
+        enum_literal, // data = the literal name (NullTerminatedString)
         type_int_unsigned, // data = bits
         type_int_signed, // data = bits
         type_anyframe, // data = Index of the frame's child type (or .none for untyped anyframe)
@@ -1506,6 +1521,10 @@ const Item = struct {
         // Pointer value with `BaseAddr.arr_elem`. Same PtrFieldRepr layout as
         // `ptr_field`. Mirrors the compiler's `Item.Tag.ptr_arr_elem`.
         ptr_arr_elem,
+        // Pointer value with `BaseAddr.opt_payload`. data = extra index of
+        // `PtrBase` (ty, base ptr, byte_offset). Mirrors the compiler's
+        // `Item.Tag.ptr_opt_payload`.
+        ptr_opt_payload,
         // Slice value. data = extra index of SliceRepr (3 u32 slots: ty, ptr,
         // len). Mirrors the compiler's `Item.Tag.ptr_slice`.
         ptr_slice,
@@ -1845,6 +1864,17 @@ const PtrFieldRepr = extern struct {
     index_hi: u32,
     byte_offset_lo: u32,
     byte_offset_hi: u32,
+};
+
+/// Extra-arena payload for base-plus-offset pointers -- `Item.Tag.ptr_opt_payload`
+/// (and, when it lands, `eu_payload`). Four u32 slots: ty, the base pointer, and
+/// the 64-bit byte_offset split high (`_a`) then low (`_b`). Mirrors the
+/// compiler's shared `InternPool.PtrBase`, field names included.
+const PtrBase = extern struct {
+    ty: u32,
+    base: u32,
+    byte_offset_a: u32,
+    byte_offset_b: u32,
 };
 
 /// Extra-arena payload for `Item.Tag.error_set_error`. Two u32 slots: the
@@ -2437,6 +2467,7 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
     switch (key) {
         .simple_type => |s| appendSimpleType(pool, s),
         .simple_value => |s| appendSimpleValue(pool, s),
+        .enum_literal => |n| pool.items.appendAssumeCapacity(.{ .tag = .enum_literal, .data = @intFromEnum(n) }),
         .int_type => |it| appendIntType(pool, it.signedness, it.bits),
         .anyframe_type => |child| appendAnyframeType(pool, child),
         .undef => |ty| {
@@ -2484,6 +2515,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
     return switch (item.tag) {
         .simple_type => .{ .simple_type = @enumFromInt(item.data) },
         .simple_value => .{ .simple_value = @enumFromInt(item.data) },
+        .enum_literal => .{ .enum_literal = @enumFromInt(item.data) },
         .type_int_unsigned => .{ .int_type = .{
             .signedness = .unsigned,
             .bits = @intCast(item.data),
@@ -2541,6 +2573,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .ptr_nav => ptrNavFromExtra(pool, item.data),
         .ptr_uav => ptrUavFromExtra(pool, item.data),
         .ptr_field => ptrFieldFromExtra(pool, item.data),
+        .ptr_opt_payload => ptrOptPayloadFromExtra(pool, item.data),
         .ptr_arr_elem => ptrArrElemFromExtra(pool, item.data),
         .ptr_slice => sliceFromExtra(pool, item.data),
         .type_error_set => errorSetTypeFromExtra(pool, item.data),
@@ -2797,6 +2830,15 @@ fn ptrFieldFromExtra(pool: *const InternPool, extra_index: u32) Key {
 
 fn ptrArrElemFromExtra(pool: *const InternPool, extra_index: u32) Key {
     return ptrBaseIndexFromExtra(pool, extra_index, true);
+}
+
+fn ptrOptPayloadFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const r = pool.extraData(PtrBase, extra_index);
+    return .{ .ptr = .{
+        .ty = @enumFromInt(r.ty),
+        .base_addr = .{ .opt_payload = @enumFromInt(r.base) },
+        .byte_offset = (@as(u64, r.byte_offset_a) << 32) | r.byte_offset_b,
+    } };
 }
 
 /// Decode a `PtrFieldRepr` into a `.field` or `.arr_elem` ptr (identical layout).
@@ -3175,6 +3217,15 @@ fn emitPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!void {
             });
             const tag: Item.Tag = if (p.base_addr == .field) .ptr_field else .ptr_arr_elem;
             pool.items.appendAssumeCapacity(.{ .tag = tag, .data = extra_index });
+        },
+        .opt_payload => |base| {
+            const extra_index = try pool.addExtra(PtrBase{
+                .ty = @intFromEnum(p.ty),
+                .base = @intFromEnum(base),
+                .byte_offset_a = @truncate(p.byte_offset >> 32),
+                .byte_offset_b = @truncate(p.byte_offset),
+            });
+            pool.items.appendAssumeCapacity(.{ .tag = .ptr_opt_payload, .data = extra_index });
         },
     }
 }
