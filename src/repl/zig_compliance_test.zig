@@ -2401,6 +2401,13 @@ test "@import(std) broad access probes" {
         .{ .src = "@typeInfo(@Tuple(&.{ u8, u16 })).@\"struct\".is_tuple", .want = "true" },
         .{ .src = "@typeInfo(@Tuple(&.{ u8, u16 })).@\"struct\".field_types.len == 2", .want = "true" },
         .{ .src = "@typeInfo(@Tuple(&.{ u8, u16 })).@\"struct\".field_types[1] == u16", .want = "true" },
+        // @Pointer reifies a pointer type from a size, attributes, child, and
+        // optional sentinel -- the inverse of @typeInfo's .pointer arm.
+        .{ .src = "@Pointer(.one, .{}, u8, null) == *u8", .want = "true" },
+        .{ .src = "@Pointer(.one, .{ .@\"const\" = true }, u8, null) == *const u8", .want = "true" },
+        .{ .src = "@Pointer(.slice, .{}, u8, null) == []u8", .want = "true" },
+        .{ .src = "@Pointer(.many, .{}, u8, @as(u8, 0)) == [*:0]u8", .want = "true" },
+        .{ .src = "@Pointer(.one, .{ .@\"align\" = 4 }, u32, null) == *align(4) u32", .want = "true" },
         // A bare enum literal compares against a reflected enum value.
         .{ .src = "@typeInfo(u8).int.signedness == .signed", .want = "false" },
         // A `comptime_int` shifted by a typed amount (the shape maxInt produces).

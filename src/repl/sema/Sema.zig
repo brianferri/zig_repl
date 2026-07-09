@@ -3289,6 +3289,93 @@ fn validateTupleFieldType(sema: *Sema, field_ty: InternPool.Index) Error!void {
     }
 }
 
+/// `@Pointer(size, attrs, child, sentinel)` (`reify_pointer`): reify a pointer
+/// type from a `Type.Pointer.Size`, a `Type.Pointer.Attributes`, the element
+/// type, and an optional sentinel. Mirrors zirReifyPointer.
+fn evalReifyPointer(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
+    const ip = sema.intern_pool;
+    const extra = sema.zir.extraData(Zir.Inst.ReifyPointer, extended.operand).data;
+
+    const size_ty = try sema.getStdLangType(.@"Type.Pointer.Size");
+    const attrs_ty = try sema.getStdLangType(.@"Type.Pointer.Attributes");
+
+    const size_val = try sema.coerceValueToType(try sema.resolveRef(extra.size), size_ty, "pointer size");
+    const size = try sema.interpretStdLangEnum(std.lang.Type.Pointer.Size, size_ty, size_val, "pointer size");
+
+    // Read the `Attributes` aggregate field by field (the REPL's stand-in for
+    // `interpretStdLangType` on a struct): const, volatile, allowzero, then the
+    // optional address space and alignment.
+    const attrs_val = try sema.coerceValueToType(try sema.resolveRef(extra.attrs), attrs_ty, "pointer attributes");
+    const attrs = ip.indexToKey(attrs_val.index).aggregate;
+    const is_const = InternPool.aggregateElementAt(attrs, 0) == .bool_true;
+    const is_volatile = InternPool.aggregateElementAt(attrs, 1) == .bool_true;
+    const is_allowzero = InternPool.aggregateElementAt(attrs, 2) == .bool_true;
+    const addrspace_opt = ip.indexToKey(InternPool.aggregateElementAt(attrs, 3)).opt.val;
+    const align_opt = ip.indexToKey(InternPool.aggregateElementAt(attrs, 4)).opt.val;
+
+    const address_space: std.lang.AddressSpace = if (addrspace_opt != .none)
+        try sema.interpretStdLangEnum(std.lang.AddressSpace, try sema.getStdLangType(.@"AddressSpace"), .{ .index = addrspace_opt }, "address space")
+    else
+        .generic;
+    const alignment: InternPool.Alignment = if (align_opt != .none)
+        try sema.alignmentFromValue(.{ .index = align_opt }, "pointer alignment")
+    else
+        .none;
+
+    const elem_ty = try sema.resolveDestType(extra.elem_ty, "pointer child");
+    if (elem_ty == .noreturn_type) {
+        try sema.writer.writeAll("pointer to noreturn not allowed\n");
+        return error.AnalysisFail;
+    }
+    if (elem_ty == .null_type) {
+        try sema.writer.writeAll("cannot reify pointer to '@TypeOf(null)'\n");
+        return error.AnalysisFail;
+    }
+    if (elem_ty == .anyopaque_type and size != .one) {
+        try sema.writer.writeAll("indexable pointer to opaque type not allowed\n");
+        return error.AnalysisFail;
+    }
+    if (ip.indexToKey(elem_ty) == .func_type and size != .one) {
+        try sema.writer.writeAll("function pointers must be single pointers\n");
+        return error.AnalysisFail;
+    }
+
+    const sentinel_ty = try ip.internOptionalType(elem_ty);
+    const sentinel_val = try sema.coerceValueToType(try sema.resolveRef(extra.sentinel), sentinel_ty, "pointer sentinel");
+    const opt_sentinel = ip.indexToKey(sentinel_val.index).opt.val;
+    if (opt_sentinel != .none) switch (size) {
+        .many, .slice => {},
+        .one, .c => {
+            try sema.writer.writeAll("sentinels are only allowed on slices and unknown-length pointers\n");
+            return error.AnalysisFail;
+        },
+    };
+
+    return .{ .index = try ip.internPtrType(.{
+        .child = elem_ty,
+        .sentinel = opt_sentinel,
+        .flags = .{
+            .size = size,
+            .is_const = is_const,
+            .is_volatile = is_volatile,
+            .is_allowzero = is_allowzero,
+            .address_space = address_space,
+            .alignment = alignment,
+        },
+    }) };
+}
+
+/// `reify_pointer_sentinel_ty`: the type `@Pointer`'s sentinel argument coerces
+/// to -- `?child`, or `?noreturn` when the child (opaque or `@TypeOf(null)`)
+/// cannot be an optional's payload. Mirrors zirReifyPointerSentinelTy.
+fn evalReifyPointerSentinelTy(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
+    const ip = sema.intern_pool;
+    const extra = sema.zir.extraData(Zir.Inst.UnNode, extended.operand).data;
+    const elem_ty = try sema.resolveDestType(extra.operand, "pointer child");
+    const child = if (elem_ty == .anyopaque_type or elem_ty == .null_type) .noreturn_type else elem_ty;
+    return .{ .index = try ip.internOptionalType(child) };
+}
+
 /// `array_type lhs, rhs`: `lhs` is the length operand, `rhs` the
 /// element type. Builds `[len]child` with no sentinel (the
 /// sentinel form is `array_type_sentinel`, a separate tag). Returns
@@ -3812,10 +3899,17 @@ fn resolveStdLangEnum(sema: *Sema, comptime decl: StdLangDecl, ref: Zir.Inst.Ref
     const E = @field(std.lang, @tagName(decl));
     const enum_ty = try sema.getStdLangType(decl);
     const val = try sema.coerceValueToType(try sema.resolveRef(ref), enum_ty, @tagName(decl));
+    return sema.interpretStdLangEnum(E, enum_ty, val, @tagName(decl));
+}
+
+/// Read an already-resolved `std.lang` enum `val` (of type `enum_ty`) as the
+/// native enum `E` -- the enum case of the compiler's `Value.interpret`: read the
+/// active tag's name and map it. `ctx` names the argument for diagnostics.
+fn interpretStdLangEnum(sema: *Sema, comptime E: type, enum_ty: InternPool.Index, val: Value, ctx: []const u8) Error!E {
     const idx = (try sema.enumTagFieldIndex(enum_ty, val)).?;
     const name = sema.intern_pool.stringSlice((try sema.enumFieldName(enum_ty, idx)).?);
     return std.meta.stringToEnum(E, name) orelse {
-        try sema.writer.print("{s}: unknown variant '{s}'\n", .{ @tagName(decl), name });
+        try sema.writer.print("{s}: unknown variant '{s}'\n", .{ ctx, name });
         return error.AnalysisFail;
     };
 }
@@ -8609,6 +8703,8 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
         .select => return sema.evalSelect(extended),
         .reify_tuple => return sema.evalReifyTuple(extended),
+        .reify_pointer => return sema.evalReifyPointer(extended),
+        .reify_pointer_sentinel_ty => return sema.evalReifyPointerSentinelTy(extended),
         .tuple_decl => return sema.evalTupleDecl(extended),
         .enum_decl => return sema.evalEnumDecl(inst),
         .union_decl => return sema.evalUnionDecl(inst),
