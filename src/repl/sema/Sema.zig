@@ -484,7 +484,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .int_from_enum => sema.evalIntFromEnum(inst),
         .tag_name => sema.evalTagName(inst),
         .enum_from_int => sema.evalEnumFromInt(inst),
-        .decl_literal, .decl_literal_no_coerce => sema.evalDeclLiteral(inst),
+        .decl_literal => sema.evalDeclLiteral(inst, true),
+        .decl_literal_no_coerce => sema.evalDeclLiteral(inst, false),
         .enum_literal => sema.evalEnumLiteral(inst),
         .int_from_bool => sema.evalIntFromBool(inst),
         .alloc, .alloc_mut, .alloc_comptime_mut => sema.evalAlloc(inst),
@@ -3059,10 +3060,41 @@ fn coerceValueToType(
             .enum_tag => |et| if (et.ty == dest_ty) return value,
             else => {},
         },
+        // `.union` arm: an enum literal / tag of the union's tag enum initialises
+        // the corresponding void-payload field (`const c: E = .foo`), as
+        // `coerceEnumToUnion` does; an already-correct union value passes through.
+        .union_type => switch (ip.indexToKey(value.index)) {
+            .un => |u| if (u.ty == dest_ty) return value,
+            .enum_literal, .enum_tag => return try sema.coerceEnumToUnion(value, dest_ty, op_name),
+            else => {},
+        },
         else => {},
     }
 
     try sema.writer.print("{s}: cannot coerce value to destination type\n", .{op_name});
+    return error.AnalysisFail;
+}
+
+/// Coerce an enum literal or tag to a tagged union by initialising the field the
+/// tag selects. Mirrors the compiler's `coerceEnumToUnion`: resolve the tag
+/// against the union's tag enum, then -- for a field with a single possible value
+/// (a void payload) -- build the union value; a field needing a real payload
+/// cannot be initialised from a bare tag.
+fn coerceEnumToUnion(sema: *Sema, value: Value, union_ty: InternPool.Index, op_name: []const u8) Error!Value {
+    const ip = sema.intern_pool;
+    const tag_enum = try sema.unionTagEnumType(union_ty);
+    const enum_tag = try sema.coerceValueToType(value, tag_enum, op_name);
+    const tag_idx = (try sema.enumTagFieldIndex(tag_enum, enum_tag)).?;
+    const tag_name = (try sema.enumFieldName(tag_enum, tag_idx)).?;
+    const field = (try sema.unionFieldByName(union_ty, tag_name)).?;
+    if (field.ty == .void_type) {
+        return .{ .index = try ip.internUnion(.{ .ty = union_ty, .tag = enum_tag.index, .val = .void_value }) };
+    }
+    if (try sema.isNoPossibleValue(field.ty)) {
+        try sema.writer.print("{s}: cannot initialize union field with uninstantiable type\n", .{op_name});
+        return error.AnalysisFail;
+    }
+    try sema.writer.print("{s}: cannot initialize union field '{s}' from a bare tag\n", .{ op_name, ip.stringSlice(tag_name) });
     return error.AnalysisFail;
 }
 
@@ -5023,6 +5055,7 @@ fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: Intern
     const kw: []const u8, const ct_name: InternPool.NullTerminatedString = switch (key) {
         .struct_type => |st| .{ "struct", st.name },
         .enum_type => |et| .{ "enum", et.name },
+        .union_type => |ut| .{ "union", ut.name },
         else => unreachable, // only container types reach a member-access miss
     };
     sema.writer.print("{s} '{s}' has no member named '{s}'\n", .{ kw, ip.stringSlice(ct_name), ip.stringSlice(name) }) catch |e| return e;
@@ -5102,7 +5135,14 @@ fn structFieldDefault(
         if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name))) != name) continue;
         const body = field.default_body orelse return .none;
         const ty = (try sema.resolveInlineBody(field.type_body, cf.decl_inst)).index;
-        return (try sema.coerceValueToType(try sema.resolveInlineBody(body, cf.decl_inst), ty, "field default")).index;
+        // AstGen compiles the default with `coerced_ty = decl_inst.toRef()`, so a
+        // decl literal in it (`= .foo`) takes its result type from the field's
+        // decl inst; bind that to the resolved field type before evaluating, then
+        // restore. Mirrors the compiler's inst_map put/remove around the init body.
+        try sema.results.put(sema.gpa, cf.decl_inst, .{ .index = ty });
+        const raw = sema.resolveInlineBody(body, cf.decl_inst);
+        _ = sema.results.remove(cf.decl_inst);
+        return (try sema.coerceValueToType(try raw, ty, "field default")).index;
     }
     return .none;
 }
@@ -5602,23 +5642,58 @@ fn evalEnumLiteral(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// `decl_literal` / `decl_literal_no_coerce`: `.name` resolved against the known
-/// result type's namespace (`const e: E = .b`). For an enum the name is a tag;
-/// for a struct/union it is a declaration. Mirrors zirDeclLiteral ->
-/// analyzeDeclLiteral -> fieldVal. A bare literal with no result type is an
-/// `enum_literal` value (see `evalEnumLiteral`).
-fn evalDeclLiteral(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+/// result type (`const e: E = .b`) -- a declaration if the type has one by that
+/// name, otherwise an enum/union tag. `decl_literal` then coerces the member to
+/// the result type (so a union tag becomes the union value). A bare literal with
+/// no result type is an `enum_literal` value (see `evalEnumLiteral`).
+fn evalDeclLiteral(sema: *Sema, inst: Zir.Inst.Index, comptime do_coerce: bool) Error!?Value {
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.Field, pl_node.payload_index).data;
     const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.field_name_start));
-    const res_ty = (try sema.resolveRef(extra.lhs)).index;
-    switch (sema.intern_pool.indexToKey(res_ty)) {
+    const orig_ty = (try sema.resolveRef(extra.lhs)).index;
+    return try sema.analyzeDeclLiteral(orig_ty, name, do_coerce);
+}
+
+/// Resolve `.name` against the result type `orig_ty`, then (for `decl_literal`)
+/// coerce the member to it. Mirrors zirDeclLiteral -> analyzeDeclLiteral: peel any
+/// error-union / optional / single-pointer wrapper; a generic-poison, enum-literal,
+/// or error-set result type degrades to a plain `enum_literal` value.
+fn analyzeDeclLiteral(sema: *Sema, orig_ty: InternPool.Index, name: InternPool.NullTerminatedString, comptime do_coerce: bool) Error!Value {
+    const ip = sema.intern_pool;
+    if (orig_ty == .generic_poison_type) return .{ .index = try ip.get(.{ .enum_literal = name }) };
+    var ty = orig_ty;
+    while (true) switch (ip.indexToKey(ty)) {
+        .error_union_type => |eu| ty = eu.payload_type,
+        .opt_type => |child| ty = child,
+        .ptr_type => |p| if (p.flags.size == .one) {
+            ty = p.child;
+        } else break,
+        .error_set_type => return .{ .index = try ip.get(.{ .enum_literal = name }) },
+        .simple_type => |s| if (s == .enum_literal) return .{ .index = try ip.get(.{ .enum_literal = name }) } else break,
+        else => break,
+    };
+    const uncoerced = try sema.fieldValOnType(ty, name);
+    return if (do_coerce) try sema.coerceValueToType(uncoerced, orig_ty, "decl literal") else uncoerced;
+}
+
+/// Type-level member access `T.name`: a namespace declaration takes precedence,
+/// then an enum tag or a union's tag-enum value. Mirrors the `.type` case of the
+/// compiler's `fieldVal` (union/enum/struct arms).
+fn fieldValOnType(sema: *Sema, ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!Value {
+    switch (sema.intern_pool.indexToKey(ty)) {
         .enum_type => {
-            if (try sema.enumTagByName(res_ty, name)) |v| return v;
-            return sema.failBadMemberAccess(res_ty, name);
+            if (try sema.containerDeclByName(ty, name)) |v| return v;
+            if (try sema.enumTagByName(ty, name)) |v| return v;
+            return sema.failBadMemberAccess(ty, name);
         },
-        .struct_type, .union_type => {
-            if (try sema.containerDeclByName(res_ty, name)) |v| return v;
-            return sema.failBadMemberAccess(res_ty, name);
+        .union_type => {
+            if (try sema.containerDeclByName(ty, name)) |v| return v;
+            if (try sema.enumTagByName(try sema.unionTagEnumType(ty), name)) |v| return v;
+            return sema.failBadMemberAccess(ty, name);
+        },
+        .struct_type => {
+            if (try sema.containerDeclByName(ty, name)) |v| return v;
+            return sema.failBadMemberAccess(ty, name);
         },
         else => {
             try sema.writer.writeAll("decl literal: result type is not a container with members\n");
