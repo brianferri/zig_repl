@@ -2369,6 +2369,27 @@ test "@import(std) broad access probes" {
         .{ .src = "@typeInfo(fn (u8) u8).@\"fn\".attrs.varargs", .want = "false" },
         .{ .src = "@typeInfo(fn (u8) u8).@\"fn\".param_attrs[0].@\"noalias\"", .want = "false" },
         .{ .src = "@typeInfo(fn (noalias *u8) void).@\"fn\".param_attrs[0].@\"noalias\"", .want = "true" },
+        // @Int reifies an integer type -- the inverse of @typeInfo's .int arm;
+        // the round-trip through @typeInfo recovers the same type.
+        .{ .src = "@Int(.unsigned, 8) == u8", .want = "true" },
+        .{ .src = "@Int(.signed, 16) == i16", .want = "true" },
+        .{ .src = "@Int(@typeInfo(u32).int.signedness, @typeInfo(u32).int.bits) == u32", .want = "true" },
+        .{ .src = "@typeInfo(@Int(.unsigned, 7)).int.bits == 7", .want = "true" },
+        .{ .src = "@Int(.unsigned, 0) == u0", .want = "true" },
+        // `.{}` reifies the empty tuple (a reserved well-known value); its type is
+        // stable and distinct from any populated tuple or named struct.
+        .{ .src = "@TypeOf(.{}) == @TypeOf(.{})", .want = "true" },
+        .{ .src = "@TypeOf(.{}) == @TypeOf(.{ 1, 2 })", .want = "false" },
+        .{ .src = "@TypeOf(.{}) == @TypeOf(.{ .x = 1 })", .want = "false" },
+        // A tuple reflects as a `Type.Struct` with `is_tuple = true`, positional
+        // field types, and no declarations -- the empty tuple has zero of each.
+        .{ .src = "@typeInfo(@TypeOf(.{})).@\"struct\".is_tuple", .want = "true" },
+        .{ .src = "@typeInfo(@TypeOf(.{})).@\"struct\".field_types.len == 0", .want = "true" },
+        .{ .src = "@typeInfo(@TypeOf(.{})).@\"struct\".decl_names.len == 0", .want = "true" },
+        .{ .src = "@typeInfo(@TypeOf(.{ 1, 2 })).@\"struct\".is_tuple", .want = "true" },
+        .{ .src = "@typeInfo(@TypeOf(.{ 1, 2 })).@\"struct\".field_types.len == 2", .want = "true" },
+        .{ .src = "@typeInfo(@TypeOf(.{ 1, 2 })).@\"struct\".field_types[0] == comptime_int", .want = "true" },
+        .{ .src = "@typeInfo(@TypeOf(.{ @as(u8, 3) })).@\"struct\".field_types[0] == u8", .want = "true" },
         // A bare enum literal compares against a reflected enum value.
         .{ .src = "@typeInfo(u8).int.signedness == .signed", .want = "false" },
         // A `comptime_int` shifted by a typed amount (the shape maxInt produces).

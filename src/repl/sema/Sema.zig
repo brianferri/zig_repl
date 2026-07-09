@@ -553,6 +553,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .dbg_stmt, .dbg_var_val, .dbg_var_ptr, .validate_const => null,
         .ensure_result_used, .ensure_result_non_error => sema.evalPassthroughUnNode(inst),
         .int_type => sema.evalIntType(inst),
+        .reify_int => sema.evalReifyInt(inst),
         .vector_type => sema.evalVectorType(inst),
         .optional_type => sema.evalOptionalType(inst),
         .optional_payload_safe, .optional_payload_unsafe => sema.evalOptionalPayload(inst),
@@ -3210,6 +3211,21 @@ fn evalIntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const int_type = sema.zir.instructions.items(.data)[@intFromEnum(inst)].int_type;
     const idx = try sema.intern_pool.internIntType(int_type.signedness, int_type.bit_count);
     return .{ .index = idx };
+}
+
+/// `@Int(signedness, bits)` (`reify_int`): reify an integer type from a
+/// `std.lang.Signedness` and a bit width -- the inverse of `@typeInfo`'s `.int`
+/// arm. Mirrors zirReifyInt.
+fn evalReifyInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const signedness = try sema.resolveStdLangEnum(.Signedness, extra.lhs);
+    const bits: u16 = @intCast(try sema.resolveInt(try sema.resolveRef(extra.rhs), .u16_type, "int bit width"));
+    if (bits == 0 and signedness == .signed) {
+        try sema.writer.print("signed integer cannot have bit width 0\n", .{});
+        return error.AnalysisFail;
+    }
+    return .{ .index = try sema.intern_pool.internIntType(signedness, bits) };
 }
 
 /// `array_type lhs, rhs`: `lhs` is the length operand, `rhs` the
