@@ -3663,9 +3663,55 @@ fn loadModuleFile(sema: *Sema, canonical: []const u8) Error!InternPool.Index {
 /// "Type.Int"), reached as `@import("std").lang` then walked by name. Mirrors the
 /// compiler's `getStdLangType` (which navigates the analyzed program's std
 /// namespace). Requires a frontend-injected module source.
-fn getStdLangType(sema: *Sema, path: []const u8) Error!InternPool.Index {
+/// The compiler's `Zcu.StdLangDecl`: each tag *is* a `std.lang` access path
+/// (`@"Type.Pointer.Size"` -> `std.lang.Type.Pointer.Size`), and its `access`
+/// derives that path by splitting `@tagName` on the last `.`. Two deviations from
+/// the compiler's enum: we carry only the type-kind decls (the func/string/panic
+/// entries drive `getStdLangValue`, which the missing runtime/panic layer never
+/// reaches), and `getStdLangType` re-walks the path per call rather than reading a
+/// memoized `EnumArray` (we have no persistent `Zcu` to memoize into). Parents
+/// still precede children, as `access` requires.
+const StdLangDecl = enum {
+    Signedness,
+    AddressSpace,
+    CallingConvention,
+    CallModifier,
+    AtomicOrder,
+    AtomicRmwOp,
+    ReduceOp,
+    FloatMode,
+    PrefetchOptions,
+    ExportOptions,
+    ExternOptions,
+    BranchHint,
+    Type,
+    @"Type.Fn",
+    @"Type.Fn.ParamAttributes",
+    @"Type.Fn.Attributes",
+    @"Type.Int",
+    @"Type.Float",
+    @"Type.Pointer",
+    @"Type.Pointer.Size",
+    @"Type.Pointer.Attributes",
+    @"Type.Array",
+    @"Type.Vector",
+    @"Type.Optional",
+    @"Type.ErrorUnion",
+    @"Type.ErrorSet",
+    @"Type.Enum",
+    @"Type.Enum.Mode",
+    @"Type.Union",
+    @"Type.Union.FieldAttributes",
+    @"Type.Struct",
+    @"Type.Struct.FieldAttributes",
+    @"Type.ContainerLayout",
+    @"Type.Spirv",
+    @"assembly.Clobbers",
+};
+
+fn getStdLangType(sema: *Sema, decl: StdLangDecl) Error!InternPool.Index {
     var container = try sema.resolveDeclType(try sema.importPath("std"), "lang");
-    var it = std.mem.tokenizeScalar(u8, path, '.');
+    var it = std.mem.tokenizeScalar(u8, @tagName(decl), '.');
     while (it.next()) |seg| container = try sema.resolveDeclType(container, seg);
     return container;
 }
@@ -3679,6 +3725,68 @@ fn resolveDeclType(sema: *Sema, container_ty: InternPool.Index, name: []const u8
     return v.index;
 }
 
+/// Resolve `ref` to a value of the named `std.lang` enum and return it as the
+/// native enum `E` -- the inverse of the `@typeInfo` arms' enum construction, and
+/// what the reification builtins read their categorical arguments through. Coerce
+/// to the enum type, read the active field's name, map it to `E`. Mirrors the
+/// compiler's `resolveStdLangEnum`; `std.meta.stringToEnum` stands in for its
+/// native tag lookup.
+fn resolveStdLangEnum(sema: *Sema, comptime decl: StdLangDecl, ref: Zir.Inst.Ref) Error!@field(std.lang, @tagName(decl)) {
+    const E = @field(std.lang, @tagName(decl));
+    const enum_ty = try sema.getStdLangType(decl);
+    const val = try sema.coerceValueToType(try sema.resolveRef(ref), enum_ty, @tagName(decl));
+    const idx = (try sema.enumTagFieldIndex(enum_ty, val)).?;
+    const name = sema.intern_pool.stringSlice((try sema.enumFieldName(enum_ty, idx)).?);
+    return std.meta.stringToEnum(E, name) orelse {
+        try sema.writer.print("{s}: unknown variant '{s}'\n", .{ @tagName(decl), name });
+        return error.AnalysisFail;
+    };
+}
+
+/// `std_lang_value` (extended): the `std.lang` type a builtin coerces a
+/// categorical argument against -- e.g. `@Int(.unsigned, _)` resolves `.unsigned`
+/// against the `Signedness` this yields. `small` selects which. Mirrors
+/// zirStdLangValue: most variants return the type via `getStdLangType`; the two
+/// calling-convention *values* resolve directly (`.c` is a target-dependent
+/// declaration, `.@"inline"` a payload-free tag).
+fn evalStdLangValue(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
+    const value: Zir.Inst.StdLangValue = @enumFromInt(extended.small);
+    const std_lang_type: StdLangDecl = switch (value) {
+        .atomic_order => .AtomicOrder,
+        .atomic_rmw_op => .AtomicRmwOp,
+        .calling_convention => .CallingConvention,
+        .address_space => .AddressSpace,
+        .float_mode => .FloatMode,
+        .signedness => .Signedness,
+        .reduce_op => .ReduceOp,
+        .call_modifier => .CallModifier,
+        .prefetch_options => .PrefetchOptions,
+        .export_options => .ExportOptions,
+        .extern_options => .ExternOptions,
+        .branch_hint => .BranchHint,
+        .clobbers => .@"assembly.Clobbers",
+        .pointer_size => .@"Type.Pointer.Size",
+        .pointer_attributes => .@"Type.Pointer.Attributes",
+        .fn_attributes => .@"Type.Fn.Attributes",
+        .container_layout => .@"Type.ContainerLayout",
+        .enum_mode => .@"Type.Enum.Mode",
+        .spirv_type_options => .@"Type.Spirv",
+
+        // Values are handled here: `.c` is a target-dependent declaration,
+        // `.@"inline"` a payload-free tag -- resolved directly, not as types.
+        .calling_convention_c => {
+            const cc_ty = try sema.getStdLangType(.@"CallingConvention");
+            const name = try sema.intern_pool.getOrPutString(sema.gpa, "c");
+            return (try sema.containerDeclByName(cc_ty, name)) orelse {
+                try sema.writer.print("std.lang is corrupt: CallingConvention.c\n", .{});
+                return error.AnalysisFail;
+            };
+        },
+        .calling_convention_inline => return .{ .index = try sema.callConvValue(.@"inline") },
+    };
+    return .{ .index = try sema.getStdLangType(std_lang_type) };
+}
+
 /// `@typeInfo(T)`: build the `std.lang.Type` union value describing `T`. Mirrors
 /// zirTypeInfo -- resolve `std.lang.Type`, then produce a union whose active tag
 /// is the type category and whose payload is the matching info struct. Requires
@@ -3688,13 +3796,13 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const ty = (try sema.resolveRef(un_node.operand)).index;
 
-    const type_info_ty = try sema.getStdLangType("Type");
+    const type_info_ty = try sema.getStdLangType(.@"Type");
     const tag_enum = try sema.unionTagEnumType(type_info_ty);
 
     switch (ip.indexToKey(ty)) {
         .int_type => |it| {
-            const int_info_ty = try sema.getStdLangType("Type.Int");
-            const signedness_ty = try sema.getStdLangType("Signedness");
+            const int_info_ty = try sema.getStdLangType(.@"Type.Int");
+            const signedness_ty = try sema.getStdLangType(.@"Signedness");
             const sign_idx = (try sema.enumFieldIndex(signedness_ty, try ip.getOrPutString(sema.gpa, @tagName(it.signedness)))).?;
             const sign_val = (try sema.enumValueFieldIndex(signedness_ty, sign_idx)).?;
             const bits_val = try ip.internInt(.{ .ty = .u16_type, .storage = .{ .u64 = it.bits } });
@@ -3713,7 +3821,7 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
                     .f128 => 128,
                     else => unreachable,
                 };
-                const float_info_ty = try sema.getStdLangType("Type.Float");
+                const float_info_ty = try sema.getStdLangType(.@"Type.Float");
                 var elems = [_]InternPool.Index{try ip.internInt(.{ .ty = .u16_type, .storage = .{ .u64 = bits } })};
                 const payload = try ip.internAggregate(.{ .ty = float_info_ty, .storage = .{ .elems = &elems } });
                 return try sema.typeInfoUnion(type_info_ty, tag_enum, "float", payload);
@@ -3729,13 +3837,13 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         },
         // `Type.Optional{ child: type }`.
         .opt_type => |child| {
-            const opt_ty = try sema.getStdLangType("Type.Optional");
+            const opt_ty = try sema.getStdLangType(.@"Type.Optional");
             var elems = [_]InternPool.Index{child};
             return try sema.typeInfoUnion(type_info_ty, tag_enum, "optional", try ip.internAggregate(.{ .ty = opt_ty, .storage = .{ .elems = &elems } }));
         },
         // `Type.Vector{ len: comptime_int, child: type }`.
         .vector_type => |vec| {
-            const vec_ty = try sema.getStdLangType("Type.Vector");
+            const vec_ty = try sema.getStdLangType(.@"Type.Vector");
             var elems = [_]InternPool.Index{
                 try ip.internInt(.{ .ty = .comptime_int_type, .storage = .{ .u64 = vec.len } }),
                 vec.child,
@@ -3744,7 +3852,7 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         },
         // `Type.Array{ len: comptime_int, child: type, sentinel: ?*const anyopaque }`.
         .array_type => |arr| {
-            const array_ty = try sema.getStdLangType("Type.Array");
+            const array_ty = try sema.getStdLangType(.@"Type.Array");
             var elems = [_]InternPool.Index{
                 try ip.internInt(.{ .ty = .comptime_int_type, .storage = .{ .u64 = arr.len } }),
                 arr.child,
@@ -3755,10 +3863,10 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         // `Type.Pointer{ size, attrs, child, sentinel_ptr }`, `attrs` being
         // `Attributes{ const, volatile, allowzero, addrspace: ?AddressSpace, align: ?usize }`.
         .ptr_type => |p| {
-            const pointer_ty = try sema.getStdLangType("Type.Pointer");
-            const size_ty = try sema.getStdLangType("Type.Pointer.Size");
-            const attrs_ty = try sema.getStdLangType("Type.Pointer.Attributes");
-            const addrspace_ty = try sema.getStdLangType("AddressSpace");
+            const pointer_ty = try sema.getStdLangType(.@"Type.Pointer");
+            const size_ty = try sema.getStdLangType(.@"Type.Pointer.Size");
+            const attrs_ty = try sema.getStdLangType(.@"Type.Pointer.Attributes");
+            const addrspace_ty = try sema.getStdLangType(.@"AddressSpace");
 
             const opt_addrspace = try ip.internOpt(.{
                 .ty = try ip.internOptionalType(addrspace_ty),
@@ -3788,7 +3896,7 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         },
         // `Type.ErrorUnion{ error_set: type, payload: type }`.
         .error_union_type => |eu| {
-            const eu_ty = try sema.getStdLangType("Type.ErrorUnion");
+            const eu_ty = try sema.getStdLangType(.@"Type.ErrorUnion");
             var elems = [_]InternPool.Index{ eu.error_set_type, eu.payload_type };
             return try sema.typeInfoUnion(type_info_ty, tag_enum, "error_union", try ip.internAggregate(.{ .ty = eu_ty, .storage = .{ .elems = &elems } }));
         },
@@ -3796,8 +3904,8 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .error_set_type => return try sema.typeInfoErrorSet(ty),
         // `Type.Enum{ tag_type, mode, field_names, field_values, decl_names }`.
         .enum_type => {
-            const enum_std_ty = try sema.getStdLangType("Type.Enum");
-            const mode_ty = try sema.getStdLangType("Type.Enum.Mode");
+            const enum_std_ty = try sema.getStdLangType(.@"Type.Enum");
+            const mode_ty = try sema.getStdLangType(.@"Type.Enum.Mode");
 
             // Read the field names and values through the field accessors (which
             // walk declared and generated-union-tag enums alike); a value is the
@@ -3827,9 +3935,9 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         // `Type.Union{ layout, tag_type: ?type, backing_integer: ?type,
         // field_names, field_types, field_attrs, decl_names }`.
         .union_type => {
-            const union_std_ty = try sema.getStdLangType("Type.Union");
-            const attrs_ty = try sema.getStdLangType("Type.Union.FieldAttributes");
-            const layout_ty = try sema.getStdLangType("Type.ContainerLayout");
+            const union_std_ty = try sema.getStdLangType(.@"Type.Union");
+            const attrs_ty = try sema.getStdLangType(.@"Type.Union.FieldAttributes");
+            const layout_ty = try sema.getStdLangType(.@"Type.ContainerLayout");
 
             // Names by position, type and explicit alignment by name -- composing the
             // existing field accessors, as the enum arm composes its own.
@@ -3864,14 +3972,23 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         // `Type.Struct{ is_tuple, layout, backing_integer: ?type, field_names,
         // field_types, field_attrs, decl_names }`. A `.struct_type` is never a
         // tuple (tuples are the `.tuple_type` Key), so `is_tuple` is false.
-        .struct_type => {
-            const struct_std_ty = try sema.getStdLangType("Type.Struct");
-            const attrs_ty = try sema.getStdLangType("Type.Struct.FieldAttributes");
-            const layout_ty = try sema.getStdLangType("Type.ContainerLayout");
+        // A tuple reflects as a `Type.Struct` too (`is_tuple = true`), as the
+        // compiler's `.@"struct"` arm folds `tuple_type` in: positional field
+        // names, its element types, and no declarations.
+        .struct_type, .tuple_type => {
+            const struct_std_ty = try sema.getStdLangType(.@"Type.Struct");
+            const attrs_ty = try sema.getStdLangType(.@"Type.Struct.FieldAttributes");
+            const layout_ty = try sema.getStdLangType(.@"Type.ContainerLayout");
+            const tuple: ?InternPool.Key.TupleType = switch (ip.indexToKey(ty)) {
+                .tuple_type => |tt| tt,
+                else => null,
+            };
 
-            // Names by position, everything else by name -- composing the existing
-            // field accessors, as the enum arm composes its own.
-            const count = try sema.structFieldCount(ty);
+            // Struct fields resolve by position/name through the field accessors;
+            // a tuple's come straight off its element-type list. The REPL's tuple
+            // type carries no comptime field values, so every tuple field is
+            // runtime (no default, not comptime).
+            const count = if (tuple) |tt| @as(u32, @intCast(tt.types.len)) else try sema.structFieldCount(ty);
             const names = try sema.gpa.alloc(InternPool.NullTerminatedString, count);
             defer sema.gpa.free(names);
             const types = try sema.gpa.alloc(InternPool.Index, count);
@@ -3879,13 +3996,24 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const attrs = try sema.gpa.alloc(InternPool.Index, count);
             defer sema.gpa.free(attrs);
             for (names, types, attrs, 0..) |*name, *field_ty, *attr, i| {
-                name.* = (try sema.structFieldNameAt(ty, @intCast(i))).?;
-                const f = (try sema.structFieldByName(ty, name.*)).?;
-                field_ty.* = f.ty;
-                const default = try sema.structFieldDefault(ty, name.*);
+                var is_comptime = false;
+                var align_bytes: ?u64 = null;
+                var default: InternPool.Index = .none;
+                if (tuple) |tt| {
+                    var buf: [16]u8 = undefined;
+                    name.* = try ip.getOrPutString(sema.gpa, std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable);
+                    field_ty.* = tt.types[i];
+                } else {
+                    name.* = (try sema.structFieldNameAt(ty, @intCast(i))).?;
+                    const f = (try sema.structFieldByName(ty, name.*)).?;
+                    field_ty.* = f.ty;
+                    is_comptime = f.is_comptime;
+                    align_bytes = f.align_bytes;
+                    default = try sema.structFieldDefault(ty, name.*);
+                }
                 var attr_elems = [_]InternPool.Index{
-                    if (f.is_comptime) .bool_true else .bool_false,
-                    try sema.alignOptValue(f.align_bytes),
+                    if (is_comptime) .bool_true else .bool_false,
+                    try sema.alignOptValue(align_bytes),
                     try sema.optRefValue(default),
                 };
                 attr.* = try ip.internAggregate(.{ .ty = attrs_ty, .storage = .{ .elems = &attr_elems } });
@@ -3893,23 +4021,23 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const field_names_val = try sema.internStringSlice(names);
             const field_types_val = try sema.internConstSlice(.type_type, types);
             const field_attrs_val = try sema.internConstSlice(attrs_ty, attrs);
-            const decl_names_val = try sema.typeInfoDecls(ty);
+            const decl_names_val = if (tuple != null) try sema.internStringSlice(&.{}) else try sema.typeInfoDecls(ty);
 
             // No layout model, so the reported layout is always `.auto` and the
             // packed backing integer is null.
             const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(std.lang.Type.ContainerLayout.auto))).?;
             const backing_integer_val = try sema.optTypeValue(.none);
 
-            var elems = [_]InternPool.Index{ .bool_false, layout_val.index, backing_integer_val, field_names_val, field_types_val, field_attrs_val, decl_names_val };
+            var elems = [_]InternPool.Index{ if (tuple != null) .bool_true else .bool_false, layout_val.index, backing_integer_val, field_names_val, field_types_val, field_attrs_val, decl_names_val };
             return try sema.typeInfoUnion(type_info_ty, tag_enum, "struct", try ip.internAggregate(.{ .ty = struct_std_ty, .storage = .{ .elems = &elems } }));
         },
         // `Type.Fn{ attrs: Attributes{ callconv, varargs }, is_generic,
         // return_type: ?type, param_types: []const ?type, param_attrs }`. A generic
         // parameter/return is `generic_poison_type`, exposed as a null element.
         .func_type => |ft| {
-            const fn_std_ty = try sema.getStdLangType("Type.Fn");
-            const param_attrs_ty = try sema.getStdLangType("Type.Fn.ParamAttributes");
-            const fn_attr_ty = try sema.getStdLangType("Type.Fn.Attributes");
+            const fn_std_ty = try sema.getStdLangType(.@"Type.Fn");
+            const param_attrs_ty = try sema.getStdLangType(.@"Type.Fn.ParamAttributes");
+            const fn_attr_ty = try sema.getStdLangType(.@"Type.Fn.Attributes");
             const opt_type_child = try ip.internOptionalType(.type_type);
 
             var func_is_generic = ft.return_type == .generic_poison_type;
@@ -4036,9 +4164,9 @@ fn typeInfoDecls(sema: *Sema, container_ty: InternPool.Index) Error!InternPool.I
 /// concern; a comptime evaluator has the resolved set in hand.
 fn typeInfoErrorSet(sema: *Sema, err_ty: ?InternPool.Index) Error!?Value {
     const ip = sema.intern_pool;
-    const type_info_ty = try sema.getStdLangType("Type");
+    const type_info_ty = try sema.getStdLangType(.@"Type");
     const tag_enum = try sema.unionTagEnumType(type_info_ty);
-    const error_set_ty = try sema.getStdLangType("Type.ErrorSet");
+    const error_set_ty = try sema.getStdLangType(.@"Type.ErrorSet");
 
     const slice_u8_ty = try sema.sliceConstU8SentinelTy();
     const slice_errors_ty = try ip.internPtrType(.{ .child = slice_u8_ty, .flags = .{ .size = .slice, .is_const = true } });
@@ -4852,7 +4980,7 @@ fn optTypeValue(sema: *Sema, val: InternPool.Index) Error!InternPool.Index {
 /// general `Value.uninterpret(cc, ...)`.
 fn callConvValue(sema: *Sema, cc: std.lang.CallingConvention) Error!InternPool.Index {
     const ip = sema.intern_pool;
-    const cc_ty = try sema.getStdLangType("CallingConvention");
+    const cc_ty = try sema.getStdLangType(.@"CallingConvention");
     const tag_enum = try sema.unionTagEnumType(cc_ty);
     switch (cc) {
         inline else => |payload, tag| {
@@ -8378,21 +8506,7 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             return Value{ .index = Value.typeOf(lhs, sema.intern_pool).index };
         },
 
-        // Bridge into std.lang.* (CallingConvention, AtomicOrder,
-        // AddressSpace, ...). Compiler reference:
-        // src/Sema.zig:zirStdLangValue ~24709 + getStdLangType.
-        // Full end-to-end requires the `std` module loader
-        // -- without it we have no interned Type for the std.lang
-        // container. Surface as a named diagnostic so the gap is
-        // visible (vs the generic `inline else` fallback).
-        .std_lang_value => {
-            const small: std.zig.Zir.Inst.StdLangValue = @enumFromInt(extended.small);
-            try sema.writer.print(
-                "extended.std_lang_value(.{s}): std.lang access requires module loading\n",
-                .{@tagName(small)},
-            );
-            return error.AnalysisFail;
-        },
+        .std_lang_value => return sema.evalStdLangValue(extended),
 
         inline else => |op| {
             try sema.writer.print("unsupported extended ZIR opcode: {s}\n", .{@tagName(op)});
