@@ -6364,11 +6364,10 @@ fn resolveArrayLen(sema: *Sema, ref: Zir.Inst.Ref, op_name: []const u8) Error!u6
     return sema.resolveUsizeInt(try sema.resolveRef(ref), op_name);
 }
 
-/// Coerce `value` to `usize` and read it as a `u64`. The comptime-known
-/// integers that lengths, indices, and alignments are built from always fit.
-/// Shared by `resolveArrayLen` (lengths / indices) and `alignmentFromValue`.
-fn resolveUsizeInt(sema: *Sema, value: Value, op_name: []const u8) Error!u64 {
-    const coerced = try sema.coerceValueToType(value, .usize_type, op_name);
+/// Coerce `value` to the integer type `ty` and read it as a `u64`. Mirrors the
+/// compiler's `resolveInt`; `resolveUsizeInt` is the `.usize_type` case.
+fn resolveInt(sema: *Sema, value: Value, ty: InternPool.Index, op_name: []const u8) Error!u64 {
+    const coerced = try sema.coerceValueToType(value, ty, op_name);
     const key = sema.intern_pool.indexToKey(coerced.index);
     if (key != .int) {
         try sema.writer.print("{s}: expected an integer\n", .{op_name});
@@ -6376,9 +6375,16 @@ fn resolveUsizeInt(sema: *Sema, value: Value, op_name: []const u8) Error!u64 {
     }
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     return key.int.storage.toBigInt(&space).toInt(u64) catch {
-        try sema.writer.print("{s}: value out of usize range\n", .{op_name});
+        try sema.writer.print("{s}: value out of range\n", .{op_name});
         return error.AnalysisFail;
     };
+}
+
+/// Coerce `value` to `usize` and read it as a `u64`. The comptime-known integers
+/// that lengths, indices, and alignments are built from always fit. Shared by
+/// `resolveArrayLen` (lengths / indices) and `alignmentFromValue`.
+fn resolveUsizeInt(sema: *Sema, value: Value, op_name: []const u8) Error!u64 {
+    return sema.resolveInt(value, .usize_type, op_name);
 }
 
 fn coerceToErrorUnion(
