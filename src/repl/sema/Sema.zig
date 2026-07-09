@@ -506,7 +506,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .struct_init => sema.evalStructInit(inst, false),
         .struct_init_ref => sema.evalStructInit(inst, true),
         .struct_init_empty => sema.evalStructInitEmpty(inst),
-        .validate_deref => sema.evalValidateDeref(inst),
+        .deref => sema.evalDeref(inst),
+        .ref_deref => sema.evalRefDeref(inst),
         .validate_ref_ty => sema.evalValidateRefTy(inst),
         .coerce_ptr_elem_ty => sema.evalCoercePtrElemTy(inst),
         .load => sema.evalLoad(inst),
@@ -2674,20 +2675,51 @@ fn evalResolveInferredAlloc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return try sema.resolveRef(un_node.operand);
 }
 
-/// `validate_deref ptr`: AstGen emits this before a `ptr.*` load or a
-/// `ptr.* = value` store to check the operand can be dereferenced. Mirrors
-/// `src/Sema.zig:zirValidateDeref`: rejects non-pointers, many/slice pointers
-/// (which require index syntax), and the deref of an undefined pointer. The
-/// compiler's one-possible-value exception to the undef check is omitted --
-/// this evaluator has no OPV classifier, and an undef deref is a hard error
-/// for every pointee it currently models. Produces no value.
-fn evalValidateDeref(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+/// `deref ptr`: the `ptr.*` load. Mirrors `src/Sema.zig:zirDeref` --
+/// `validateDeref` then `analyzeLoad`. AstGen folds the former standalone
+/// `validate_deref` + `load` pair into this single instruction.
+fn evalDeref(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     assert(un_node.operand != .none);
+    const operand = try sema.resolveRef(un_node.operand);
+    try sema.validateDeref(operand);
+    return try sema.loadValue(operand);
+}
 
+/// `ref_deref ptr`: `ptr.*` in a reference context (`&ptr.*`). Mirrors
+/// `zirRefDeref` -- validate, then a single-item pointer surfaces as itself and a
+/// C pointer narrows to `.one`. Many/slice never reach here (`validateDeref`
+/// rejects them).
+fn evalRefDeref(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
     const ip = sema.intern_pool;
     const operand = try sema.resolveRef(un_node.operand);
+    try sema.validateDeref(operand);
+    const ptr_type = ip.indexToKey(operand.typeOf(ip).toIndex()).ptr_type;
+    switch (ptr_type.flags.size) {
+        .one => return operand,
+        .c => {
+            var flags = ptr_type.flags;
+            flags.size = .one;
+            flags.is_allowzero = false;
+            const single_ptr_ty = try ip.internPtrType(.{ .child = ptr_type.child, .sentinel = ptr_type.sentinel, .flags = flags });
+            return try sema.coerceValueToType(operand, single_ptr_ty, "@as");
+        },
+        .many, .slice => unreachable,
+    }
+}
+
+/// Check that `operand` (a value) can be dereferenced. Mirrors
+/// `src/Sema.zig:validateDeref`: rejects non-pointers, many/slice pointers
+/// (which require index syntax), and the deref of an undefined pointer. The
+/// compiler's one-possible-value exception to the undef check is omitted --
+/// this evaluator has no OPV classifier, and an undef deref is a hard error
+/// for every pointee it currently models.
+fn validateDeref(sema: *Sema, operand: Value) Error!void {
+    const ip = sema.intern_pool;
     const operand_ty = operand.typeOf(ip);
     const ty_key = ip.indexToKey(operand_ty.toIndex());
     if (ty_key != .ptr_type) {
@@ -2715,7 +2747,6 @@ fn evalValidateDeref(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         try sema.writer.writeAll("cannot dereference undefined value\n");
         return error.AnalysisFail;
     }
-    return .{ .index = .void_value };
 }
 
 /// `store_node ptr, value`: deref `ptr` to find its `comptime_alloc`
@@ -5642,12 +5673,13 @@ fn wellKnownRefToValue(ref: Zir.Inst.Ref) ?Value {
         return Value{ .index = @enumFromInt(ref_int) };
     }
 
-    inline for (@typeInfo(Zir.Inst.Ref).@"enum".fields) |field| {
-        if (comptime std.mem.eql(u8, field.name, "none")) continue;
-        if (comptime !@hasField(InternPool.Index, field.name)) continue;
-        if (comptime field.value <= @intFromEnum(InternPool.Index.enum_literal_type)) continue;
-        if (ref_int == field.value) {
-            return Value{ .index = @field(InternPool.Index, field.name) };
+    const ref_info = @typeInfo(Zir.Inst.Ref).@"enum";
+    inline for (ref_info.field_names, ref_info.field_values) |name, value| {
+        if (comptime std.mem.eql(u8, name, "none")) continue;
+        if (comptime !@hasField(InternPool.Index, name)) continue;
+        if (comptime value <= @intFromEnum(InternPool.Index.enum_literal_type)) continue;
+        if (ref_int == value) {
+            return Value{ .index = @field(InternPool.Index, name) };
         }
     }
     return null;

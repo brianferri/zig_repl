@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run the REPL");
     run_step.dependOn(&run_cmd.step);
 
@@ -128,9 +128,7 @@ pub fn build(b: *std.Build) void {
     // need not search for it. Scoped to a test-only module so the production
     // `repl` (exe/tty/docs) never carries a build-machine path.
     const test_options = b.addOptions();
-    test_options.addOption([]const u8, "zig_std_dir", b.pathJoin(&.{
-        b.graph.zig_lib_directory.path orelse ".", "std",
-    }));
+    test_options.addOption([]const u8, "zig_std_dir", zigStdDir(b));
     const repl_test_module = b.createModule(.{
         .root_source_file = b.path("src/repl/root.zig"),
         .target = target,
@@ -148,4 +146,17 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     test_step.dependOn(&b.addRunArtifact(device_tests).step);
     test_step.dependOn(&b.addRunArtifact(terminal_tests).step);
+}
+
+/// The running compiler's `std` source directory. Reuses the compiler's own
+/// discovery (`std.zig.findZigLibDirFromSelfExe`): walk up from the `zig`
+/// executable testing for `lib/zig/std/std.zig` then `lib/std/std.zig`, so it is
+/// layout-agnostic across system installs and unpacked tarballs. Resolved at
+/// configure time and injected as a build option the tests read.
+fn zigStdDir(b: *std.Build) []const u8 {
+    const io = b.graph.io;
+    const cwd = std.zig.getResolvedCwd(io, b.allocator) catch @panic("cannot resolve cwd");
+    const lib_dir = std.zig.findZigLibDirFromSelfExe(b.allocator, io, cwd, b.graph.zig_exe) catch
+        @panic("cannot locate zig lib dir from zig executable");
+    return b.pathJoin(&.{ lib_dir.path.?, "std" });
 }

@@ -215,6 +215,8 @@ pub fn write(
         .struct_init_empty,
         .struct_init_empty_ref_result,
         .struct_init_empty_result,
+        .deref,
+        .ref_deref,
         .tag_name,
         .tan,
         .trunc,
@@ -223,7 +225,6 @@ pub fn write(
         .typeof,
         .typeof_log2_int_type,
         .validate_const,
-        .validate_deref,
         .validate_struct_init_result_ty,
         .validate_struct_init_ty,
         => {

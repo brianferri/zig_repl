@@ -2813,26 +2813,34 @@ fn ptrBaseIndexFromExtra(pool: *const InternPool, extra_index: u32, is_arr_elem:
     } };
 }
 
-/// Read an all-u32 extra-arena payload `T` back from `extra_index`. The `*Repr`
-/// structs (and the packed `Float64`/`Float80`/`Float128`) pre-flatten every
-/// field to u32 -- Index/enum via `@intFromEnum`, u64 split into lo/hi -- so the
-/// struct is its own wire form: `@sizeOf(T) / 4` consecutive slots bitcast to
-/// `T`. Pairs with `addExtra`.
+/// Read an all-u32 extra-arena payload `T` back from `extra_index`, one field per
+/// consecutive slot in declaration order. The `*Repr` structs pre-flatten every
+/// field to u32 -- Index/enum via `@intFromEnum`, u64 split into lo/hi, flag
+/// packs bitcast at the call site -- so each field maps to exactly one slot; the
+/// comptime `field.type == u32` check pins that contract. Pairs with `addExtra`.
 fn extraData(pool: *const InternPool, comptime T: type, extra_index: u32) T {
-    const pieces_len = comptime @divExact(@sizeOf(T), @sizeOf(u32));
-    assert(extra_index + pieces_len <= pool.extra.items.len);
-    const pieces: [pieces_len]u32 = pool.extra.items[extra_index..][0..pieces_len].*;
-    return @bitCast(pieces);
+    const info = @typeInfo(T).@"struct";
+    assert(extra_index + info.field_names.len <= pool.extra.items.len);
+    var result: T = undefined;
+    inline for (info.field_names, info.field_types, 0..) |name, field_type, i| {
+        comptime assert(field_type == u32);
+        @field(result, name) = pool.extra.items[extra_index + i];
+    }
+    return result;
 }
 
 /// Append an all-u32 extra-arena payload `repr` and return its start index --
-/// the write side of `extraData`. Since a `*Repr` is its own wire form, the
-/// struct bitcasts directly to its `[N]u32` slots, so layout lives in the
-/// struct definition alone (no hand-synced slot counts between emit and read).
+/// the write side of `extraData`. Each field is one slot in declaration order,
+/// so layout lives in the struct definition alone (no hand-synced slot counts
+/// between emit and read).
 fn addExtra(pool: *InternPool, repr: anytype) Allocator.Error!u32 {
-    const pieces: [@divExact(@sizeOf(@TypeOf(repr)), @sizeOf(u32))]u32 = @bitCast(repr);
+    const info = @typeInfo(@TypeOf(repr)).@"struct";
     const index: u32 = @intCast(pool.extra.items.len);
-    try pool.extra.appendSlice(pool.gpa, &pieces);
+    try pool.extra.ensureUnusedCapacity(pool.gpa, info.field_names.len);
+    inline for (info.field_names, info.field_types) |name, field_type| {
+        comptime assert(field_type == u32);
+        pool.extra.appendAssumeCapacity(@field(repr, name));
+    }
     return index;
 }
 
@@ -3063,29 +3071,29 @@ fn emitFloat(pool: *InternPool, float: Key.Float) Allocator.Error!void {
         },
         .f64_type => {
             assert(float.storage == .f64);
-            const extra_index = try addFloatExtra(pool, Float64.pack(float.storage.f64));
+            const extra_index = try addExtra(pool, Float64.pack(float.storage.f64));
             pool.items.appendAssumeCapacity(.{ .tag = .float_f64, .data = extra_index });
         },
         .f80_type => {
             assert(float.storage == .f80);
-            const extra_index = try addFloatExtra(pool, Float80.pack(float.storage.f80));
+            const extra_index = try addExtra(pool, Float80.pack(float.storage.f80));
             pool.items.appendAssumeCapacity(.{ .tag = .float_f80, .data = extra_index });
         },
         .f128_type => {
             assert(float.storage == .f128);
-            const extra_index = try addFloatExtra(pool, Float128.pack(float.storage.f128));
+            const extra_index = try addExtra(pool, Float128.pack(float.storage.f128));
             pool.items.appendAssumeCapacity(.{ .tag = .float_f128, .data = extra_index });
         },
         .c_longdouble_type => switch (float.storage) {
             .f80 => |v| {
-                const extra_index = try addFloatExtra(pool, Float80.pack(v));
+                const extra_index = try addExtra(pool, Float80.pack(v));
                 pool.items.appendAssumeCapacity(.{
                     .tag = .float_c_longdouble_f80,
                     .data = extra_index,
                 });
             },
             inline .f16, .f32, .f64, .f128 => |v| {
-                const extra_index = try addFloatExtra(pool, Float128.pack(@floatCast(v)));
+                const extra_index = try addExtra(pool, Float128.pack(@floatCast(v)));
                 pool.items.appendAssumeCapacity(.{
                     .tag = .float_c_longdouble_f128,
                     .data = extra_index,
@@ -3094,7 +3102,7 @@ fn emitFloat(pool: *InternPool, float: Key.Float) Allocator.Error!void {
         },
         .comptime_float_type => {
             assert(float.storage == .f128);
-            const extra_index = try addFloatExtra(pool, Float128.pack(float.storage.f128));
+            const extra_index = try addExtra(pool, Float128.pack(float.storage.f128));
             pool.items.appendAssumeCapacity(.{
                 .tag = .float_comptime_float,
                 .data = extra_index,
@@ -3104,17 +3112,6 @@ fn emitFloat(pool: *InternPool, float: Key.Float) Allocator.Error!void {
     }
 }
 
-/// Append a packed Float64/Float80/Float128 to `extra` and return its
-/// starting u32 index. The struct is laid out as `@sizeOf(T) / 4`
-/// consecutive u32 slots.
-fn addFloatExtra(pool: *InternPool, value: anytype) Allocator.Error!u32 {
-    const T = @TypeOf(value);
-    const pieces_len = comptime @divExact(@sizeOf(T), @sizeOf(u32));
-    const pieces: [pieces_len]u32 = @bitCast(value);
-    const extra_index: u32 = @intCast(pool.extra.items.len);
-    try pool.extra.appendSlice(pool.gpa, &pieces);
-    return extra_index;
-}
 
 /// Intern a float value with any storage form.
 pub fn internFloat(pool: *InternPool, float: Key.Float) Allocator.Error!Index {
