@@ -2390,6 +2390,17 @@ test "@import(std) broad access probes" {
         .{ .src = "@typeInfo(@TypeOf(.{ 1, 2 })).@\"struct\".field_types.len == 2", .want = "true" },
         .{ .src = "@typeInfo(@TypeOf(.{ 1, 2 })).@\"struct\".field_types[0] == comptime_int", .want = "true" },
         .{ .src = "@typeInfo(@TypeOf(.{ @as(u8, 3) })).@\"struct\".field_types[0] == u8", .want = "true" },
+        // @Vector reifies a vector type (lowered to vector_type ZIR), the inverse
+        // of @typeInfo's .vector arm.
+        .{ .src = "@Vector(4, u8) == @Vector(4, u8)", .want = "true" },
+        .{ .src = "@typeInfo(@Vector(4, u8)).vector.len == 4", .want = "true" },
+        .{ .src = "@typeInfo(@Vector(4, u8)).vector.child == u8", .want = "true" },
+        // @Tuple reifies a tuple type from a []const type. Its fields are plain
+        // (not comptime), so reflect the field types/count rather than comparing
+        // against a tuple literal whose fields are comptime.
+        .{ .src = "@typeInfo(@Tuple(&.{ u8, u16 })).@\"struct\".is_tuple", .want = "true" },
+        .{ .src = "@typeInfo(@Tuple(&.{ u8, u16 })).@\"struct\".field_types.len == 2", .want = "true" },
+        .{ .src = "@typeInfo(@Tuple(&.{ u8, u16 })).@\"struct\".field_types[1] == u16", .want = "true" },
         // A bare enum literal compares against a reflected enum value.
         .{ .src = "@typeInfo(u8).int.signedness == .signed", .want = "false" },
         // A `comptime_int` shifted by a typed amount (the shape maxInt produces).

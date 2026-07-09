@@ -3229,6 +3229,66 @@ fn evalReifyInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = try sema.intern_pool.internIntType(signedness, bits) };
 }
 
+/// `@Tuple(types)` (`reify_tuple`): build a tuple type from a `[]const type`.
+/// Mirrors zirReifyTuple. The REPL's tuple type carries only element types, so
+/// `getTupleType`'s parallel `values` array (all `.none` upstream, for comptime
+/// fields) has no analogue here.
+fn evalReifyTuple(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
+    const ip = sema.intern_pool;
+    const extra = sema.zir.extraData(Zir.Inst.UnNode, extended.operand).data;
+
+    const types_uncoerced = try sema.resolveRef(extra.operand);
+    const types_slice_val = try sema.coerceValueToType(types_uncoerced, try sema.sliceConstTypeTy(), "tuple field types");
+    const types_array_val = try sema.derefSliceAsArray(types_slice_val);
+    const array = ip.indexToKey(types_array_val.index).aggregate;
+    const fields_len: u32 = @intCast(ip.indexToKey(array.ty).array_type.len);
+
+    const field_types = try sema.gpa.alloc(InternPool.Index, fields_len);
+    defer sema.gpa.free(field_types);
+    for (field_types, 0..) |*field_ty, field_idx| {
+        const field_ty_val = InternPool.aggregateElementAt(array, field_idx);
+        if (ip.indexToKey(field_ty_val) == .undef) {
+            try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
+            return error.AnalysisFail;
+        }
+        try sema.validateTupleFieldType(field_ty_val);
+        field_ty.* = field_ty_val;
+    }
+    return .{ .index = try ip.internTupleType(field_types) };
+}
+
+/// Dereference a comptime slice to its backing array value. The compiler's
+/// `derefSliceAsArray` re-types the slice pointer as a single pointer to the array
+/// and `pointerDeref`s it; a `&.{ ... }` literal -- every reification argument --
+/// backs its slice with an anonymous-constant pointer to the whole array, which
+/// `loadValue` (our `pointerDeref`) resolves directly. Offset (element-pointer)
+/// slices do not arise here.
+fn derefSliceAsArray(sema: *Sema, slice_val: Value) Error!Value {
+    const ip = sema.intern_pool;
+    const ptr = ip.indexToKey(ip.indexToKey(slice_val.index).slice.ptr).ptr;
+    switch (ptr.base_addr) {
+        .uav, .nav => return try sema.loadValue(.{ .index = ip.indexToKey(slice_val.index).slice.ptr }),
+        else => {
+            try sema.writer.writeAll("reify: expected a comptime array-backed slice\n");
+            return error.AnalysisFail;
+        },
+    }
+}
+
+/// Reject a tuple field type that cannot be embedded, as the compiler's
+/// `validateTupleFieldType` does. Only `anyopaque` and `noreturn` are expressible
+/// here (the REPL has no nominal opaque types).
+fn validateTupleFieldType(sema: *Sema, field_ty: InternPool.Index) Error!void {
+    if (field_ty == .anyopaque_type) {
+        try sema.writer.writeAll("opaque types have unknown size and therefore cannot be directly embedded in tuples\n");
+        return error.AnalysisFail;
+    }
+    if (field_ty == .noreturn_type) {
+        try sema.writer.writeAll("tuple fields cannot be 'noreturn'\n");
+        return error.AnalysisFail;
+    }
+}
+
 /// `array_type lhs, rhs`: `lhs` is the length operand, `rhs` the
 /// element type. Builds `[len]child` with no sentinel (the
 /// sentinel form is `array_type_sentinel`, a separate tag). Returns
@@ -4131,6 +4191,13 @@ fn sliceConstU8SentinelTy(sema: *Sema) Error!InternPool.Index {
     const ip = sema.intern_pool;
     const u8_zero = try ip.internInt(.{ .ty = .u8_type, .storage = .{ .u64 = 0 } });
     return try ip.internPtrType(.{ .child = .u8_type, .sentinel = u8_zero, .flags = .{ .size = .slice, .is_const = true } });
+}
+
+/// `[]const type` -- the type a reification builtin coerces its type-list argument
+/// to. The compiler reserves this as a well-known InternPool index; the REPL
+/// interns it on demand, as it does the other slice types.
+fn sliceConstTypeTy(sema: *Sema) Error!InternPool.Index {
+    return try sema.intern_pool.internPtrType(.{ .child = .type_type, .flags = .{ .size = .slice, .is_const = true } });
 }
 
 /// Build a `[]const [:0]const u8` slice value from interned name handles (each a
@@ -6816,6 +6883,10 @@ fn internTypedWellKnownRef(sema: *Sema, ref: Zir.Inst.Ref) Error!?Value {
         const idx = try sema.intern_pool.get(.{ .undef = ty });
         return .{ .index = idx };
     }
+
+    // `[]const type` -- the type the reification builtins coerce their type-list
+    // argument to (e.g. `@Tuple`). Interned on demand like the other slice types.
+    if (ref == .slice_const_type_type) return .{ .index = try sema.sliceConstTypeTy() };
     return null;
 }
 
@@ -8537,6 +8608,7 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .in_comptime => return Value.bool_false,
 
         .select => return sema.evalSelect(extended),
+        .reify_tuple => return sema.evalReifyTuple(extended),
         .tuple_decl => return sema.evalTupleDecl(extended),
         .enum_decl => return sema.evalEnumDecl(inst),
         .union_decl => return sema.evalUnionDecl(inst),
