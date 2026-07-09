@@ -3880,10 +3880,11 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
                 name.* = (try sema.structFieldNameAt(ty, @intCast(i))).?;
                 const f = (try sema.structFieldByName(ty, name.*)).?;
                 field_ty.* = f.ty;
+                const default = try sema.structFieldDefault(ty, name.*);
                 var attr_elems = [_]InternPool.Index{
                     if (f.is_comptime) .bool_true else .bool_false,
                     try sema.alignOptValue(f.align_bytes),
-                    try sema.optRefValue(f.default),
+                    try sema.optRefValue(default),
                 };
                 attr.* = try ip.internAggregate(.{ .ty = attrs_ty, .storage = .{ .elems = &attr_elems } });
             }
@@ -4649,18 +4650,17 @@ fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: Intern
     return error.AnalysisFail;
 }
 
-/// A resolved container field: its declaration index and type. Shared by the
-/// struct and union lookups so their results are one type at call sites.
-/// A resolved container field. `index`/`ty` serve every caller; the reflection
-/// attributes (`is_comptime`, coerced `default` value or `.none`, explicit
-/// `align_bytes` or null) are populated by the struct/union by-name lookups that
-/// already visit the field, so `@typeInfo` composes those accessors instead of a
-/// second bespoke walk. Void-typed and default-less fields leave them at rest.
+/// A resolved container field. `index`/`ty` serve every caller. The reflection
+/// attributes (`is_comptime`, explicit `align_bytes` or null) come free from the
+/// same ZIR field the by-name lookup already visits. The field's default value is
+/// deliberately absent: the compiler resolves defaults in a pass (`field_defaults`
+/// via `ensureStructDefaultsResolved`) separate from field types and reads them
+/// only for aggregate init and `@typeInfo`, never during field access -- see
+/// `structFieldDefault`. Void-typed and align-less fields leave the rest at rest.
 const FieldInfo = struct {
     index: u32,
     ty: InternPool.Index,
     is_comptime: bool = false,
-    default: InternPool.Index = .none,
     align_bytes: ?u64 = null,
 };
 
@@ -4691,23 +4691,41 @@ fn structFieldByName(
     var it = sema.zir.getStructDecl(cf.decl_inst).iterateFields();
     while (it.next()) |field| {
         if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name))) == name) {
-            const ty = (try sema.resolveInlineBody(field.type_body, cf.decl_inst)).index;
-            // The default is coerced to the field type, as the compiler's resolved
-            // `field_defaults` are, so a reflected pointer to it casts back cleanly.
-            const default: InternPool.Index = if (field.default_body) |body|
-                (try sema.coerceValueToType(try sema.resolveInlineBody(body, cf.decl_inst), ty, "field default")).index
-            else
-                .none;
             return .{
                 .index = field.idx,
-                .ty = ty,
+                .ty = (try sema.resolveInlineBody(field.type_body, cf.decl_inst)).index,
                 .is_comptime = field.is_comptime,
-                .default = default,
                 .align_bytes = try sema.fieldAlignBytes(field.align_body, cf.decl_inst),
             };
         }
     }
     return null;
+}
+
+/// A struct field's declared default value, coerced to the field type, or `.none`
+/// if it has none. Mirrors the compiler's `field_defaults` (populated by
+/// `ensureStructDefaultsResolved`): a resolution pass separate from field types,
+/// consulted only by aggregate init and `@typeInfo`. Field access must not run it
+/// -- a default like `= .auto` resolves against the field type, not the accessing
+/// scope, so evaluating it off the access path would misbind. An anonymous struct
+/// has no declared defaults (its values come from the init), so it yields `.none`.
+fn structFieldDefault(
+    sema: *Sema,
+    struct_ty: InternPool.Index,
+    name: InternPool.NullTerminatedString,
+) Error!InternPool.Index {
+    const ip = sema.intern_pool;
+    const cf = try sema.enterContainer(struct_ty, "struct field default");
+    defer cf.restore(sema);
+    if (sema.zir.instructions.items(.tag)[@intFromEnum(cf.decl_inst)] == .struct_init_anon) return .none;
+    var it = sema.zir.getStructDecl(cf.decl_inst).iterateFields();
+    while (it.next()) |field| {
+        if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name))) != name) continue;
+        const body = field.default_body orelse return .none;
+        const ty = (try sema.resolveInlineBody(field.type_body, cf.decl_inst)).index;
+        return (try sema.coerceValueToType(try sema.resolveInlineBody(body, cf.decl_inst), ty, "field default")).index;
+    }
+    return .none;
 }
 
 /// The index of an anonymous struct's field `name` (matching the
@@ -5777,21 +5795,20 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         n.* = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(fp.field_name_start));
     }
 
-    // Fill each declared field the init omitted with its default, composing the
-    // field accessors (`structFieldByName` resolves and coerces the default) as
+    // Fill each declared field the init omitted with its default, as
     // `finishStructInit` does.
     const count = try sema.structFieldCount(struct_ty);
     var i: u32 = 0;
     while (i < count) : (i += 1) {
         const name = (try sema.structFieldNameAt(struct_ty, i)).?;
         if (std.mem.indexOfScalar(InternPool.NullTerminatedString, stored, name) != null) continue;
-        const field = (try sema.structFieldByName(struct_ty, name)).?;
-        if (field.default == .none) {
+        const default = try sema.structFieldDefault(struct_ty, name);
+        if (default == .none) {
             try sema.writer.print("missing struct field: {s}\n", .{ip.stringSlice(name)});
             return error.AnalysisFail;
         }
         const alloc = try sema.lookupComptimeAlloc(ip.indexToKey(object_ptr.index).ptr);
-        alloc.val = try sema.setAggregateElement(alloc.val, struct_ty, i, .{ .index = field.default });
+        alloc.val = try sema.setAggregateElement(alloc.val, struct_ty, i, .{ .index = default });
     }
     return null;
 }
@@ -5948,18 +5965,17 @@ fn evalStructInitEmpty(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// explicit-field and empty forms.
 fn finishStructInit(sema: *Sema, struct_ty: InternPool.Index, elems: []InternPool.Index, comptime is_ref: bool) Error!Value {
     const ip = sema.intern_pool;
-    // Each unwritten field takes its declared default; `structFieldByName` already
-    // resolves and coerces it (`FieldInfo.default`), so compose it rather than
-    // re-resolving the body here.
+    // Each unwritten field takes its declared default, resolved by the same pass
+    // `@typeInfo` uses (`structFieldDefault`), kept off the field-access path.
     for (elems, 0..) |*elem, i| {
         if (elem.* != .none) continue;
         const name = (try sema.structFieldNameAt(struct_ty, @intCast(i))).?;
-        const field = (try sema.structFieldByName(struct_ty, name)).?;
-        if (field.default == .none) {
+        const default = try sema.structFieldDefault(struct_ty, name);
+        if (default == .none) {
             try sema.writer.print("missing struct field: {s}\n", .{ip.stringSlice(name)});
             return error.AnalysisFail;
         }
-        elem.* = field.default;
+        elem.* = default;
     }
 
     const value: Value = .{ .index = try ip.internAggregate(.{ .ty = struct_ty, .storage = .{ .elems = elems } }) };
