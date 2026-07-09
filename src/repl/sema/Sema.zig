@@ -4846,42 +4846,29 @@ fn isNoPossibleValue(sema: *Sema, ty: InternPool.Index) Error!bool {
 }
 
 /// A struct is NPV if any of its fields has an NPV type (a comptime field cannot,
-/// as it holds a concrete value, so iterating all resolved field types is safe).
+/// as it holds a concrete value). Reads each field type through `structFieldByName`.
 fn structHasNpvField(sema: *Sema, struct_ty: InternPool.Index) Error!bool {
-    const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
-    const frame = try sema.enterSourceZir(st.source_zir_id, "struct field type");
-    defer frame.restore(sema);
-    const saved_this = sema.this_type;
-    sema.this_type = struct_ty;
-    defer sema.this_type = saved_this;
-    var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
-    while (it.next()) |field| {
-        const field_ty = (try sema.resolveInlineBody(field.type_body, st.decl_inst)).index;
-        if (try sema.isNoPossibleValue(field_ty)) return true;
+    const count = try sema.structFieldCount(struct_ty);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const name = (try sema.structFieldNameAt(struct_ty, i)).?;
+        if (try sema.isNoPossibleValue((try sema.structFieldByName(struct_ty, name)).?.ty)) return true;
     }
     return false;
 }
 
 /// A union is NPV iff every field has an NPV type (no tag can ever be active --
-/// the compiler's `possible_tags == 0`).
+/// the compiler's `possible_tags == 0`). Reads each field type through
+/// `unionFieldByName`.
 fn unionAllFieldsNpv(sema: *Sema, union_ty: InternPool.Index) Error!bool {
-    const ut = sema.intern_pool.indexToKey(union_ty).union_type;
-    const frame = try sema.enterSourceZir(ut.source_zir_id, "union field type");
-    defer frame.restore(sema);
-    const saved_this = sema.this_type;
-    sema.this_type = union_ty;
-    defer sema.this_type = saved_this;
-    var it = sema.zir.getUnionDecl(ut.decl_inst).iterateFields();
-    var any = false;
-    while (it.next()) |field| {
-        any = true;
-        const field_ty = if (field.type_body) |body|
-            (try sema.resolveInlineBody(body, ut.decl_inst)).index
-        else
-            .void_type;
-        if (!try sema.isNoPossibleValue(field_ty)) return false;
+    const count = try sema.unionFieldCount(union_ty);
+    if (count == 0) return false;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const name = (try sema.unionFieldNameAt(union_ty, i)).?;
+        if (!try sema.isNoPossibleValue((try sema.unionFieldByName(union_ty, name)).?.ty)) return false;
     }
-    return any;
+    return true;
 }
 
 fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPool.Index {
@@ -4971,10 +4958,7 @@ fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error
     defer sema.this_type = saved_this;
 
     const decl = sema.zir.getEnumDecl(et.decl_inst);
-    const tag_ty = if (decl.tag_type_body) |body|
-        (try sema.resolveInlineBody(body, et.decl_inst)).index
-    else
-        try sema.enumIntTagType(@intCast(decl.field_names.len));
+    const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
 
     var it = decl.iterateFields();
     var next_auto: i128 = 0;
@@ -5010,10 +4994,7 @@ fn generatedTagScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Er
     sema.this_type = union_ty;
     defer sema.this_type = saved_this;
     const decl = sema.zir.getUnionDecl(ut.decl_inst);
-    const tag_ty = if (decl.kind == .tagged_enum_explicit)
-        (try sema.resolveInlineBody(decl.arg_type_body.?, ut.decl_inst)).index
-    else
-        try sema.enumIntTagType(@intCast(decl.field_names.len));
+    const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
     var it = decl.iterateFields();
     while (it.next()) |field| {
         const field_name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
@@ -5025,8 +5006,8 @@ fn generatedTagScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Er
 
 /// The integer tag type of an enum -- an explicit `enum(T)` backing (or a
 /// `union(enum(T))`'s explicit `T` for a generated tag enum), else the auto
-/// smallest-unsigned. Mirrors `LoadedEnumType.int_tag_type`; `enumFieldScan`
-/// resolves the same tag type inline during its field walk.
+/// smallest-unsigned. Mirrors `LoadedEnumType.int_tag_type`, and is the single
+/// source `enumFieldScan`/`generatedTagScan` draw the tag type from for coercion.
 fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Index {
     const ip = sema.intern_pool;
     const et = ip.indexToKey(enum_ty).enum_type;
@@ -5786,22 +5767,21 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         n.* = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(fp.field_name_start));
     }
 
-    const st = ip.indexToKey(struct_ty).struct_type;
-    const frame = try sema.enterSourceZir(st.source_zir_id, "struct init");
-    defer frame.restore(sema);
-    var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
-    while (it.next()) |field| {
-        const fname = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
-        if (std.mem.indexOfScalar(InternPool.NullTerminatedString, stored, fname) != null) continue;
-        const default_body = field.default_body orelse {
-            try sema.writer.print("missing struct field: {s}\n", .{sema.zir.nullTerminatedString(field.name)});
+    // Fill each declared field the init omitted with its default, composing the
+    // field accessors (`structFieldByName` resolves and coerces the default) as
+    // `finishStructInit` does.
+    const count = try sema.structFieldCount(struct_ty);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const name = (try sema.structFieldNameAt(struct_ty, i)).?;
+        if (std.mem.indexOfScalar(InternPool.NullTerminatedString, stored, name) != null) continue;
+        const field = (try sema.structFieldByName(struct_ty, name)).?;
+        if (field.default == .none) {
+            try sema.writer.print("missing struct field: {s}\n", .{ip.stringSlice(name)});
             return error.AnalysisFail;
-        };
-        const field_ty = (try sema.resolveInlineBody(field.type_body, st.decl_inst)).index;
-        const raw = try sema.resolveInlineBody(default_body, st.decl_inst);
-        const value = try sema.coerceValueToType(raw, field_ty, "struct field default");
+        }
         const alloc = try sema.lookupComptimeAlloc(ip.indexToKey(object_ptr.index).ptr);
-        alloc.val = try sema.setAggregateElement(alloc.val, struct_ty, field.idx, value);
+        alloc.val = try sema.setAggregateElement(alloc.val, struct_ty, i, .{ .index = field.default });
     }
     return null;
 }
@@ -5958,24 +5938,18 @@ fn evalStructInitEmpty(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// explicit-field and empty forms.
 fn finishStructInit(sema: *Sema, struct_ty: InternPool.Index, elems: []InternPool.Index, comptime is_ref: bool) Error!Value {
     const ip = sema.intern_pool;
-    const st = ip.indexToKey(struct_ty).struct_type;
-    const frame = try sema.enterSourceZir(st.source_zir_id, "struct init");
-    defer frame.restore(sema);
-    // Field type/default bodies belong to this struct's namespace; expose it as
-    // `this_type` so a `closure_get` in one resolves its captured value.
-    const saved_this = sema.this_type;
-    sema.this_type = struct_ty;
-    defer sema.this_type = saved_this;
-    var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
-    while (it.next()) |field| {
-        if (elems[field.idx] != .none) continue;
-        const default_body = field.default_body orelse {
-            try sema.writer.print("missing struct field: {s}\n", .{sema.zir.nullTerminatedString(field.name)});
+    // Each unwritten field takes its declared default; `structFieldByName` already
+    // resolves and coerces it (`FieldInfo.default`), so compose it rather than
+    // re-resolving the body here.
+    for (elems, 0..) |*elem, i| {
+        if (elem.* != .none) continue;
+        const name = (try sema.structFieldNameAt(struct_ty, @intCast(i))).?;
+        const field = (try sema.structFieldByName(struct_ty, name)).?;
+        if (field.default == .none) {
+            try sema.writer.print("missing struct field: {s}\n", .{ip.stringSlice(name)});
             return error.AnalysisFail;
-        };
-        const field_ty = (try sema.resolveInlineBody(field.type_body, st.decl_inst)).index;
-        const raw = try sema.resolveInlineBody(default_body, st.decl_inst);
-        elems[field.idx] = (try sema.coerceValueToType(raw, field_ty, "struct field default")).index;
+        }
+        elem.* = field.default;
     }
 
     const value: Value = .{ .index = try ip.internAggregate(.{ .ty = struct_ty, .storage = .{ .elems = elems } }) };
