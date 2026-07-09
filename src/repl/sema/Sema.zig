@@ -3822,6 +3822,88 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             var elems = [_]InternPool.Index{ try sema.enumIntTagTypeOf(ty), mode_val.index, field_names_val, field_values_val, decl_names_val };
             return try sema.typeInfoUnion(type_info_ty, tag_enum, "enum", try ip.internAggregate(.{ .ty = enum_std_ty, .storage = .{ .elems = &elems } }));
         },
+        // `Type.Union{ layout, tag_type: ?type, backing_integer: ?type,
+        // field_names, field_types, field_attrs, decl_names }`.
+        .union_type => {
+            const union_std_ty = try sema.getStdLangType("Type.Union");
+            const attrs_ty = try sema.getStdLangType("Type.Union.FieldAttributes");
+            const layout_ty = try sema.getStdLangType("Type.ContainerLayout");
+            const opt_type_ty = try ip.internOptionalType(.type_type);
+
+            // Names by position, type and explicit alignment by name -- composing the
+            // existing field accessors, as the enum arm composes its own.
+            const count = try sema.unionFieldCount(ty);
+            const names = try sema.gpa.alloc(InternPool.NullTerminatedString, count);
+            defer sema.gpa.free(names);
+            const types = try sema.gpa.alloc(InternPool.Index, count);
+            defer sema.gpa.free(types);
+            const attrs = try sema.gpa.alloc(InternPool.Index, count);
+            defer sema.gpa.free(attrs);
+            for (names, types, attrs, 0..) |*name, *field_ty, *attr, i| {
+                name.* = (try sema.unionFieldNameAt(ty, @intCast(i))).?;
+                const f = (try sema.unionFieldByName(ty, name.*)).?;
+                field_ty.* = f.ty;
+                var attr_elems = [_]InternPool.Index{try sema.alignOptValue(f.align_bytes)};
+                attr.* = try ip.internAggregate(.{ .ty = attrs_ty, .storage = .{ .elems = &attr_elems } });
+            }
+            const field_names_val = try sema.internStringSlice(names);
+            const field_types_val = try sema.internConstSlice(.type_type, types);
+            const field_attrs_val = try sema.internConstSlice(attrs_ty, attrs);
+            const decl_names_val = try sema.typeInfoDecls(ty);
+
+            // No layout model, so the reported layout is always `.auto` and the
+            // packed backing integer is null.
+            const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(std.lang.Type.ContainerLayout.auto))).?;
+            const tag_type_val = try ip.internOpt(.{
+                .ty = opt_type_ty,
+                .val = if (try sema.unionIsTagged(ty)) try sema.unionTagEnumType(ty) else .none,
+            });
+            const backing_integer_val = try ip.internOpt(.{ .ty = opt_type_ty, .val = .none });
+
+            var elems = [_]InternPool.Index{ layout_val.index, tag_type_val, backing_integer_val, field_names_val, field_types_val, field_attrs_val, decl_names_val };
+            return try sema.typeInfoUnion(type_info_ty, tag_enum, "union", try ip.internAggregate(.{ .ty = union_std_ty, .storage = .{ .elems = &elems } }));
+        },
+        // `Type.Struct{ is_tuple, layout, backing_integer: ?type, field_names,
+        // field_types, field_attrs, decl_names }`. A `.struct_type` is never a
+        // tuple (tuples are the `.tuple_type` Key), so `is_tuple` is false.
+        .struct_type => {
+            const struct_std_ty = try sema.getStdLangType("Type.Struct");
+            const attrs_ty = try sema.getStdLangType("Type.Struct.FieldAttributes");
+            const layout_ty = try sema.getStdLangType("Type.ContainerLayout");
+
+            // Names by position, everything else by name -- composing the existing
+            // field accessors, as the enum arm composes its own.
+            const count = try sema.structFieldCount(ty);
+            const names = try sema.gpa.alloc(InternPool.NullTerminatedString, count);
+            defer sema.gpa.free(names);
+            const types = try sema.gpa.alloc(InternPool.Index, count);
+            defer sema.gpa.free(types);
+            const attrs = try sema.gpa.alloc(InternPool.Index, count);
+            defer sema.gpa.free(attrs);
+            for (names, types, attrs, 0..) |*name, *field_ty, *attr, i| {
+                name.* = (try sema.structFieldNameAt(ty, @intCast(i))).?;
+                const f = (try sema.structFieldByName(ty, name.*)).?;
+                field_ty.* = f.ty;
+                var attr_elems = [_]InternPool.Index{
+                    if (f.is_comptime) .bool_true else .bool_false,
+                    try sema.alignOptValue(f.align_bytes),
+                    try sema.optRefValue(f.default),
+                };
+                attr.* = try ip.internAggregate(.{ .ty = attrs_ty, .storage = .{ .elems = &attr_elems } });
+            }
+            const field_names_val = try sema.internStringSlice(names);
+            const field_types_val = try sema.internConstSlice(.type_type, types);
+            const field_attrs_val = try sema.internConstSlice(attrs_ty, attrs);
+            const decl_names_val = try sema.typeInfoDecls(ty);
+
+            // No layout model, so the reported layout is always `.auto` and the
+            // packed backing integer is null.
+            const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(std.lang.Type.ContainerLayout.auto))).?;
+            const backing_integer_val = try ip.internOpt(.{ .ty = try ip.internOptionalType(.type_type), .val = .none });
+
+            var elems = [_]InternPool.Index{ .bool_false, layout_val.index, backing_integer_val, field_names_val, field_types_val, field_attrs_val, decl_names_val };
+            return try sema.typeInfoUnion(type_info_ty, tag_enum, "struct", try ip.internAggregate(.{ .ty = struct_std_ty, .storage = .{ .elems = &elems } }));
+        },
         else => return sema.failTypeInfoUnsupported(ty),
     }
 }
@@ -4536,7 +4618,18 @@ fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: Intern
 
 /// A resolved container field: its declaration index and type. Shared by the
 /// struct and union lookups so their results are one type at call sites.
-const FieldInfo = struct { index: u32, ty: InternPool.Index };
+/// A resolved container field. `index`/`ty` serve every caller; the reflection
+/// attributes (`is_comptime`, coerced `default` value or `.none`, explicit
+/// `align_bytes` or null) are populated by the struct/union by-name lookups that
+/// already visit the field, so `@typeInfo` composes those accessors instead of a
+/// second bespoke walk. Void-typed and default-less fields leave them at rest.
+const FieldInfo = struct {
+    index: u32,
+    ty: InternPool.Index,
+    is_comptime: bool = false,
+    default: InternPool.Index = .none,
+    align_bytes: ?u64 = null,
+};
 
 /// Resolve a struct field by name to its index and type. Iterates the struct
 /// decl's fields via the stdlib `iterateFields`, matching name bytes; the field
@@ -4571,7 +4664,19 @@ fn structFieldByName(
     while (it.next()) |field| {
         if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name))) == name) {
             const ty = (try sema.resolveInlineBody(field.type_body, st.decl_inst)).index;
-            return .{ .index = field.idx, .ty = ty };
+            // The default is coerced to the field type, as the compiler's resolved
+            // `field_defaults` are, so a reflected pointer to it casts back cleanly.
+            const default: InternPool.Index = if (field.default_body) |body|
+                (try sema.coerceValueToType(try sema.resolveInlineBody(body, st.decl_inst), ty, "field default")).index
+            else
+                .none;
+            return .{
+                .index = field.idx,
+                .ty = ty,
+                .is_comptime = field.is_comptime,
+                .default = default,
+                .align_bytes = try sema.fieldAlignBytes(field.align_body, st.decl_inst),
+            };
         }
     }
     return null;
@@ -4620,8 +4725,47 @@ fn unionFieldByName(
                 (try sema.resolveInlineBody(body, ut.decl_inst)).index
             else
                 .void_type;
-            return .{ .index = field.idx, .ty = ty };
+            return .{
+                .index = field.idx,
+                .ty = ty,
+                .align_bytes = try sema.fieldAlignBytes(field.align_body, ut.decl_inst),
+            };
         }
+    }
+    return null;
+}
+
+/// A field's explicit `align(N)` in bytes, or null when it has no alignment body.
+/// The `field.align_body` an iterator yields for struct and union fields; mirrors
+/// the compiler's `explicitFieldAlignment` collapsing to null when unspecified.
+fn fieldAlignBytes(sema: *Sema, align_body: ?[]const Zir.Inst.Index, decl_inst: Zir.Inst.Index) Error!?u64 {
+    const body = align_body orelse return null;
+    return try sema.resolveUsizeInt(try sema.resolveInlineBody(body, decl_inst), "field alignment");
+}
+
+/// An explicit field alignment as an interned `?usize` -- `null` when unspecified,
+/// else the byte count. The `@"align"` field of `@typeInfo`'s `FieldAttributes`.
+fn alignOptValue(sema: *Sema, align_bytes: ?u64) Error!InternPool.Index {
+    const ip = sema.intern_pool;
+    const opt_usize = try ip.internOptionalType(.usize_type);
+    return try ip.internOpt(.{
+        .ty = opt_usize,
+        .val = if (align_bytes) |bytes| try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = bytes } }) else .none,
+    });
+}
+
+/// The interned name of a struct's field at `index`, mirroring `unionFieldNameAt`
+/// -- lets `@typeInfo`'s struct arm iterate by position while `structFieldByName`
+/// supplies each field's type and attributes.
+fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
+    const ip = sema.intern_pool;
+    const st = ip.indexToKey(struct_ty).struct_type;
+    const frame = try sema.enterSourceZir(st.source_zir_id, "struct field name");
+    defer frame.restore(sema);
+    var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
+    while (it.next()) |field| {
+        if (field.idx == index)
+            return try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
     }
     return null;
 }
