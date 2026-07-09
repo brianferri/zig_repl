@@ -7,6 +7,10 @@ pub const eval = @import("eval.zig");
 pub const sema = @import("sema/root.zig");
 pub const front = @import("front/root.zig");
 pub const render = @import("render/root.zig");
+/// A `ModuleSource` reading a real directory. Native frontends wire it to the
+/// system standard library so `@import("std")` resolves; locating that directory
+/// is the frontend's job (the core opens no files itself).
+pub const NativeModuleSource = @import("NativeModuleSource.zig");
 /// Generic command framework (`:name` dispatch). Frontends register their own
 /// command set with `commands.Registry`; the frontend-specific
 /// commands live in the frontend modules.
