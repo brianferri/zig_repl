@@ -564,6 +564,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .array_init_ref => sema.evalArrayInitRef(inst),
         .array_init_anon => sema.evalArrayInitAnon(inst),
         .struct_init_anon => sema.evalStructInitAnon(inst),
+        .struct_init_empty_result => sema.evalStructInitEmptyResult(inst, false),
+        .struct_init_empty_ref_result => sema.evalStructInitEmptyResult(inst, true),
         .import => sema.evalImport(inst),
         .type_info => sema.evalTypeInfo(inst),
         .array_init_elem_type => sema.evalArrayInitElemType(inst),
@@ -6013,11 +6015,60 @@ fn evalStructInitEmpty(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         try sema.writer.writeAll("struct init: type does not support struct initialization syntax\n");
         return error.AnalysisFail;
     }
+    return try sema.structInitEmpty(struct_ty);
+}
+
+/// The value of `T{}` for a struct: every field takes its declared default (or a
+/// missing-field error). Mirrors the compiler's `structInitEmpty`; shared by the
+/// typed (`struct_init_empty`) and result-typed (`struct_init_empty_result`)
+/// forms.
+fn structInitEmpty(sema: *Sema, struct_ty: InternPool.Index) Error!Value {
     const count = try sema.structFieldCount(struct_ty);
     const elems = try sema.gpa.alloc(InternPool.Index, count);
     defer sema.gpa.free(elems);
     @memset(elems, .none);
     return try sema.finishStructInit(struct_ty, elems, false);
+}
+
+/// `struct_init_empty_result` / `struct_init_empty_ref_result`: `.{}` whose type
+/// comes from the surrounding result type. An untyped (generic-poison) operand --
+/// `.{}` bound to an `anytype` parameter -- is the empty tuple; a concrete struct
+/// fills its defaults. Mirrors zirStructInitEmptyResult; the `is_ref` variant
+/// returns a `*const` to the value.
+fn evalStructInitEmptyResult(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Error!?Value {
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const ty = try sema.resolveDestType(un_node.operand, "struct init");
+    const value: Value = if (ty == .generic_poison_type)
+        .{ .index = .empty_tuple }
+    else switch (sema.intern_pool.indexToKey(ty)) {
+        .struct_type, .tuple_type => try sema.structInitEmpty(ty),
+        .array_type, .vector_type => try sema.arrayInitEmpty(ty),
+        .union_type => {
+            try sema.writer.writeAll("union initializer must initialize one field\n");
+            return error.AnalysisFail;
+        },
+        else => {
+            try sema.writer.writeAll("struct init: type does not support struct initialization syntax\n");
+            return error.AnalysisFail;
+        },
+    };
+    return if (is_ref) try sema.materializeConstPtr(value) else value;
+}
+
+/// The value of `T{}` for an array or vector: valid only at length 0, yielding the
+/// empty aggregate. Mirrors the compiler's `arrayInitEmpty`.
+fn arrayInitEmpty(sema: *Sema, obj_ty: InternPool.Index) Error!Value {
+    const key = sema.intern_pool.indexToKey(obj_ty);
+    const arr_len = switch (key) {
+        .array_type => |at| at.len,
+        .vector_type => |vt| vt.len,
+        else => unreachable,
+    };
+    if (arr_len != 0) {
+        try sema.writer.print("expected {d} {s} elements; found 0\n", .{ arr_len, if (key == .array_type) "array" else "vector" });
+        return error.AnalysisFail;
+    }
+    return .{ .index = try sema.intern_pool.internAggregate(.{ .ty = obj_ty, .storage = .{ .elems = &.{} } }) };
 }
 
 /// Complete a struct init: fill each unwritten field (`elems[i] == .none`) from
