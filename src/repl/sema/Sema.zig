@@ -3901,6 +3901,45 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             var elems = [_]InternPool.Index{ .bool_false, layout_val.index, backing_integer_val, field_names_val, field_types_val, field_attrs_val, decl_names_val };
             return try sema.typeInfoUnion(type_info_ty, tag_enum, "struct", try ip.internAggregate(.{ .ty = struct_std_ty, .storage = .{ .elems = &elems } }));
         },
+        // `Type.Fn{ attrs: Attributes{ callconv, varargs }, is_generic,
+        // return_type: ?type, param_types: []const ?type, param_attrs }`. A generic
+        // parameter/return is `generic_poison_type`, exposed as a null element.
+        .func_type => |ft| {
+            const fn_std_ty = try sema.getStdLangType("Type.Fn");
+            const param_attrs_ty = try sema.getStdLangType("Type.Fn.ParamAttributes");
+            const fn_attr_ty = try sema.getStdLangType("Type.Fn.Attributes");
+            const opt_type_child = try ip.internOptionalType(.type_type);
+
+            var func_is_generic = ft.return_type == .generic_poison_type;
+            const param_type_vals = try sema.gpa.alloc(InternPool.Index, ft.param_types.len);
+            defer sema.gpa.free(param_type_vals);
+            const param_attr_vals = try sema.gpa.alloc(InternPool.Index, ft.param_types.len);
+            defer sema.gpa.free(param_attr_vals);
+            for (param_type_vals, param_attr_vals, 0..) |*pt_val, *pa_val, i| {
+                const param_ty = ft.param_types[i];
+                const is_generic = param_ty == .generic_poison_type;
+                // Per-parameter flag masks cap at 32 params (the compiler's `u5`).
+                const narrow = std.math.cast(u5, i);
+                const is_comptime = if (narrow) |n| ft.paramIsComptime(n) else false;
+                const is_noalias = if (narrow) |n| ft.paramIsNoalias(n) else false;
+                if (is_generic or is_comptime) func_is_generic = true;
+                pt_val.* = try sema.optTypeValue(if (is_generic) .none else param_ty);
+                var pa_elems = [_]InternPool.Index{if (is_noalias) .bool_true else .bool_false};
+                pa_val.* = try ip.internAggregate(.{ .ty = param_attrs_ty, .storage = .{ .elems = &pa_elems } });
+            }
+            const param_types_val = try sema.internConstSlice(opt_type_child, param_type_vals);
+            const param_attrs_val = try sema.internConstSlice(param_attrs_ty, param_attr_vals);
+            const return_type_val = try sema.optTypeValue(if (ft.return_type == .generic_poison_type) .none else ft.return_type);
+
+            var attr_elems = [_]InternPool.Index{
+                try sema.callConvValue(ft.cc),
+                if (ft.is_var_args) .bool_true else .bool_false,
+            };
+            const attrs_val = try ip.internAggregate(.{ .ty = fn_attr_ty, .storage = .{ .elems = &attr_elems } });
+
+            var elems = [_]InternPool.Index{ attrs_val, if (func_is_generic) .bool_true else .bool_false, return_type_val, param_types_val, param_attrs_val };
+            return try sema.typeInfoUnion(type_info_ty, tag_enum, "fn", try ip.internAggregate(.{ .ty = fn_std_ty, .storage = .{ .elems = &elems } }));
+        },
         else => return sema.failTypeInfoUnsupported(ty),
     }
 }
@@ -4801,6 +4840,29 @@ fn alignOptValue(sema: *Sema, align_bytes: ?u64) Error!InternPool.Index {
 fn optTypeValue(sema: *Sema, val: InternPool.Index) Error!InternPool.Index {
     const ip = sema.intern_pool;
     return try ip.internOpt(.{ .ty = try ip.internOptionalType(.type_type), .val = val });
+}
+
+/// A `std.lang.CallingConvention` union value for `cc` (`@typeInfo`'s
+/// `Fn.Attributes.callconv`). Payload-free conventions -- `.auto` and friends,
+/// the ones a comptime-only function carries -- build from the active tag with a
+/// void payload; the arch-specific payload-bearing conventions have no comptime
+/// instances here and are not modelled. A focused stand-in for the compiler's
+/// general `Value.uninterpret(cc, ...)`.
+fn callConvValue(sema: *Sema, cc: std.lang.CallingConvention) Error!InternPool.Index {
+    const ip = sema.intern_pool;
+    const cc_ty = try sema.getStdLangType("CallingConvention");
+    const tag_enum = try sema.unionTagEnumType(cc_ty);
+    switch (cc) {
+        inline else => |payload, tag| {
+            if (@TypeOf(payload) != void) {
+                try sema.writer.print("@typeInfo: calling convention '{s}' is not modelled\n", .{@tagName(tag)});
+                return error.AnalysisFail;
+            }
+            const idx = (try sema.enumFieldIndex(tag_enum, try ip.getOrPutString(sema.gpa, @tagName(tag)))).?;
+            const tag_val = (try sema.enumValueFieldIndex(tag_enum, idx)).?;
+            return try ip.internUnion(.{ .ty = cc_ty, .tag = tag_val.index, .val = .void_value });
+        },
+    }
 }
 
 /// The interned name of a struct's field at `index`, mirroring `unionFieldNameAt`
@@ -7778,6 +7840,26 @@ fn resolveDeclaredRetType(sema: *Sema, info: Zir.FnInfo, break_target: Zir.Inst.
     return .void_type;
 }
 
+/// Read `noalias_bits` and `is_var_args` from a `func_fancy` instruction. They
+/// trail the optional cc / return-type fields in its `extra` (per the compiler's
+/// `zirFuncFancy`), which `getFnInfo` does not surface; a plain `func` /
+/// `func_inferred` has neither. `noalias_bits` is indexed by parameter position.
+fn funcFancyExtras(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) struct { noalias_bits: u32, is_var_args: bool } {
+    if (tag != .func_fancy) return .{ .noalias_bits = 0, .is_var_args = false };
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.FuncFancy, pl_node.payload_index);
+    const bits = extra.data.bits;
+    var xi = extra.end;
+    if (bits.has_cc_ref and !bits.has_cc_body) xi += 1;
+    if (bits.has_cc_body) xi += 1 + sema.zir.extra[xi];
+    if (bits.has_ret_ty_ref and !bits.has_ret_ty_body) xi += 1;
+    if (bits.has_ret_ty_body) xi += 1 + sema.zir.extra[xi];
+    return .{
+        .noalias_bits = if (bits.has_any_noalias) sema.zir.extra[xi] else 0,
+        .is_var_args = bits.is_var_args,
+    };
+}
+
 fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
@@ -7802,10 +7884,14 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     }
     sema.block.params.clearRetainingCapacity();
 
+    const tag = sema.zir.instructions.items(.tag)[@intFromEnum(inst)];
+    const fancy = sema.funcFancyExtras(inst, tag);
     const fn_ty = try sema.intern_pool.internFuncType(.{
         .param_types = params,
         .return_type = ret_ty,
         .comptime_bits = comptime_bits,
+        .noalias_bits = fancy.noalias_bits,
+        .is_var_args = fancy.is_var_args,
     });
     // No body -> this is a fn TYPE expression (`fn () void`),
     // not a fn declaration. Return the FuncType Index directly

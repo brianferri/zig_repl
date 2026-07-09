@@ -2359,6 +2359,16 @@ test "@import(std) broad access probes" {
         .{ .src = "@typeInfo(struct { x: u8 = 5 }).@\"struct\".field_attrs[0].default_value_ptr != null", .want = "true" },
         .{ .src = "@typeInfo(struct { x: u8 align(4) }).@\"struct\".field_attrs[0].@\"align\" == 4", .want = "true" },
         .{ .src = "@intFromEnum(@typeInfo(struct { x: u8 }).@\"struct\".layout)", .want = "0" },
+        // Function type reflection: params, return, calling convention, attributes.
+        .{ .src = "@typeInfo(fn (u8) u8).@\"fn\".param_types.len", .want = "1" },
+        .{ .src = "@typeInfo(fn (u8, bool) u8).@\"fn\".param_types.len", .want = "2" },
+        .{ .src = "@typeInfo(fn (u8) u8).@\"fn\".param_types[0].? == u8", .want = "true" },
+        .{ .src = "@typeInfo(fn (u8) u8).@\"fn\".return_type.? == u8", .want = "true" },
+        .{ .src = "@typeInfo(fn (u8) u8).@\"fn\".is_generic", .want = "false" },
+        .{ .src = "@typeInfo(fn (u8) u8).@\"fn\".attrs.@\"callconv\" == .auto", .want = "true" },
+        .{ .src = "@typeInfo(fn (u8) u8).@\"fn\".attrs.varargs", .want = "false" },
+        .{ .src = "@typeInfo(fn (u8) u8).@\"fn\".param_attrs[0].@\"noalias\"", .want = "false" },
+        .{ .src = "@typeInfo(fn (noalias *u8) void).@\"fn\".param_attrs[0].@\"noalias\"", .want = "true" },
         // A bare enum literal compares against a reflected enum value.
         .{ .src = "@typeInfo(u8).int.signedness == .signed", .want = "false" },
         // A `comptime_int` shifted by a typed amount (the shape maxInt produces).
