@@ -576,6 +576,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .shuffle => sema.evalShuffle(inst),
         .validate_array_init_ty => sema.evalValidateArrayInitTy(inst, false),
         .validate_array_init_result_ty => sema.evalValidateArrayInitTy(inst, true),
+        .validate_array_init_ref_ty => sema.evalValidateArrayInitRefTy(inst),
         .ref => sema.evalRef(inst),
         .elem_ptr_load => sema.evalElemPtrLoad(inst),
         // `elem_ptr` is the for-loop by-ref capture (`for (&arr) |*e|`), `_node`
@@ -4490,6 +4491,38 @@ fn validateArrayInitTy(sema: *Sema, init_count: u32, ty: InternPool.Index) Error
             return error.AnalysisFail;
         },
     }
+}
+
+/// `validate_array_init_ref_ty`: the array type a `&.{ ... }` init should build,
+/// derived from the result pointer type -- `[elem_count]child` for a slice or
+/// many-pointer result, otherwise the pointer's child type. Mirrors
+/// zirValidateArrayInitRefTy.
+fn evalValidateArrayInitRefTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.ArrayInitRefTy, pl_node.payload_index).data;
+    const maybe_wrapped_ptr_ty = try sema.resolveDestType(extra.ptr_ty, "array init");
+    if (maybe_wrapped_ptr_ty == .generic_poison_type) return .{ .index = .generic_poison_type };
+    const ptr_ty = sema.optEuBaseType(maybe_wrapped_ptr_ty);
+    assert(ip.indexToKey(ptr_ty) == .ptr_type); // validated by a previous instruction
+    switch (ip.indexToKey(ptr_ty)) {
+        .ptr_type => |ptr_type| switch (ptr_type.flags.size) {
+            // Use an array of the correct length for a slice or many-pointer result.
+            .slice, .many => return .{ .index = try ip.internArrayType(.{
+                .len = extra.elem_count,
+                .child = ptr_type.child,
+                .sentinel = ptr_type.sentinel,
+            }) },
+            else => {},
+        },
+        else => {},
+    }
+    // Otherwise, we just want the pointer child type.
+    const ret_ty = ip.indexToKey(ptr_ty).ptr_type.child;
+    if (ret_ty == .anyopaque_type) return .{ .index = .generic_poison_type };
+    const arr_ty = sema.optEuBaseType(ret_ty);
+    try sema.validateArrayInitTy(extra.elem_count, arr_ty);
+    return .{ .index = ret_ty };
 }
 
 /// `validate_ref_ty` (`&expr` with a known result type): checks the
