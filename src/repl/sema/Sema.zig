@@ -3828,7 +3828,6 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const union_std_ty = try sema.getStdLangType("Type.Union");
             const attrs_ty = try sema.getStdLangType("Type.Union.FieldAttributes");
             const layout_ty = try sema.getStdLangType("Type.ContainerLayout");
-            const opt_type_ty = try ip.internOptionalType(.type_type);
 
             // Names by position, type and explicit alignment by name -- composing the
             // existing field accessors, as the enum arm composes its own.
@@ -3854,11 +3853,8 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             // No layout model, so the reported layout is always `.auto` and the
             // packed backing integer is null.
             const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(std.lang.Type.ContainerLayout.auto))).?;
-            const tag_type_val = try ip.internOpt(.{
-                .ty = opt_type_ty,
-                .val = if (try sema.unionIsTagged(ty)) try sema.unionTagEnumType(ty) else .none,
-            });
-            const backing_integer_val = try ip.internOpt(.{ .ty = opt_type_ty, .val = .none });
+            const tag_type_val = try sema.optTypeValue(if (try sema.unionIsTagged(ty)) try sema.unionTagEnumType(ty) else .none);
+            const backing_integer_val = try sema.optTypeValue(.none);
 
             var elems = [_]InternPool.Index{ layout_val.index, tag_type_val, backing_integer_val, field_names_val, field_types_val, field_attrs_val, decl_names_val };
             return try sema.typeInfoUnion(type_info_ty, tag_enum, "union", try ip.internAggregate(.{ .ty = union_std_ty, .storage = .{ .elems = &elems } }));
@@ -3899,13 +3895,24 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             // No layout model, so the reported layout is always `.auto` and the
             // packed backing integer is null.
             const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(std.lang.Type.ContainerLayout.auto))).?;
-            const backing_integer_val = try ip.internOpt(.{ .ty = try ip.internOptionalType(.type_type), .val = .none });
+            const backing_integer_val = try sema.optTypeValue(.none);
 
             var elems = [_]InternPool.Index{ .bool_false, layout_val.index, backing_integer_val, field_names_val, field_types_val, field_attrs_val, decl_names_val };
             return try sema.typeInfoUnion(type_info_ty, tag_enum, "struct", try ip.internAggregate(.{ .ty = struct_std_ty, .storage = .{ .elems = &elems } }));
         },
         else => return sema.failTypeInfoUnsupported(ty),
     }
+}
+
+/// A pointer of type `ptr_ty` addressing the anonymous constant `val` -- the
+/// compiler's `uav` base. The pointee is carried inline, so the pointer is self-
+/// contained. Shared by every const-pointer-to-a-value construction.
+fn uavPtr(sema: *Sema, ptr_ty: InternPool.Index, val: InternPool.Index) Error!InternPool.Index {
+    return try sema.intern_pool.internPtr(.{
+        .ty = ptr_ty,
+        .base_addr = .{ .uav = .{ .val = val, .orig_ty = ptr_ty } },
+        .byte_offset = 0,
+    });
 }
 
 /// Build a `?*const anyopaque` value pointing at `val` (a sentinel), or null when
@@ -3915,11 +3922,7 @@ fn optRefValue(sema: *Sema, val: InternPool.Index) Error!InternPool.Index {
     const ip = sema.intern_pool;
     const ptr_ty = try ip.internPtrType(.{ .child = .anyopaque_type, .flags = .{ .size = .one, .is_const = true } });
     const opt_ty = try ip.internOptionalType(ptr_ty);
-    const payload: InternPool.Index = if (val == .none) .none else try ip.internPtr(.{
-        .ty = ptr_ty,
-        .base_addr = .{ .uav = .{ .val = val, .orig_ty = ptr_ty } },
-        .byte_offset = 0,
-    });
+    const payload: InternPool.Index = if (val == .none) .none else try sema.uavPtr(ptr_ty, val);
     return try ip.internOpt(.{ .ty = opt_ty, .val = payload });
 }
 
@@ -3932,7 +3935,7 @@ fn internConstSlice(sema: *Sema, child: InternPool.Index, elems: []const InternP
     const array_val = try ip.internAggregate(.{ .ty = array_ty, .storage = .{ .elems = elems } });
     const slice_ty = try ip.internPtrType(.{ .child = child, .flags = .{ .size = .slice, .is_const = true } });
     const manyptr_ty = try ip.internPtrType(.{ .child = child, .flags = .{ .size = .many, .is_const = true } });
-    const ptr = try ip.internPtr(.{ .ty = manyptr_ty, .base_addr = .{ .uav = .{ .val = array_val, .orig_ty = manyptr_ty } }, .byte_offset = 0 });
+    const ptr = try sema.uavPtr(manyptr_ty, array_val);
     return try ip.get(.{ .slice = .{ .ty = slice_ty, .ptr = ptr, .len = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = elems.len } }) } });
 }
 
@@ -4773,6 +4776,13 @@ fn alignOptValue(sema: *Sema, align_bytes: ?u64) Error!InternPool.Index {
         .ty = opt_usize,
         .val = if (align_bytes) |bytes| try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = bytes } }) else .none,
     });
+}
+
+/// A `?type` value -- `null` for `.none`, else the type. `@typeInfo`'s optional
+/// `tag_type` / `backing_integer` container fields.
+fn optTypeValue(sema: *Sema, val: InternPool.Index) Error!InternPool.Index {
+    const ip = sema.intern_pool;
+    return try ip.internOpt(.{ .ty = try ip.internOptionalType(.type_type), .val = val });
 }
 
 /// The interned name of a struct's field at `index`, mirroring `unionFieldNameAt`
@@ -5980,17 +5990,11 @@ fn evalRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// compiler storing an unnamed constant as an anon decl.
 fn materializeConstPtr(sema: *Sema, value: Value) Error!Value {
     const ip = sema.intern_pool;
-    const child_ty = Value.typeOf(value, ip).index;
     const ptr_ty = try ip.internPtrType(.{
-        .child = child_ty,
+        .child = Value.typeOf(value, ip).index,
         .flags = .{ .size = .one, .is_const = true },
     });
-    const ptr_idx = try ip.internPtr(.{
-        .ty = ptr_ty,
-        .base_addr = .{ .uav = .{ .val = value.index, .orig_ty = ptr_ty } },
-        .byte_offset = 0,
-    });
-    return .{ .index = ptr_idx };
+    return .{ .index = try sema.uavPtr(ptr_ty, value.index) };
 }
 
 /// `elem_ptr_load lhs, rhs`: load the aggregate behind pointer
