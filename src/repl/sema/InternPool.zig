@@ -85,6 +85,8 @@ pub const Index = enum(u32) {
     /// return type when AstGen marks the signature generic; `evalCall`
     /// re-resolves the concrete type once the comptime args are bound.
     generic_poison_type,
+    /// The zero-field tuple type -- `@TypeOf(.{})`.
+    empty_tuple_type,
 
     // Values.
     /// `undefined` (untyped)
@@ -105,6 +107,8 @@ pub const Index = enum(u32) {
     bool_true,
     /// `false`
     bool_false,
+    /// `.{}` -- the empty tuple value, of type `empty_tuple_type`.
+    empty_tuple,
 
     /// Used by Air/Sema only.
     none = std.math.maxInt(u32),
@@ -115,9 +119,9 @@ pub const Index = enum(u32) {
     /// (inclusive) is a type whose Key shape can be looked up via `get`
     /// without further checks. Dynamic indices fall outside this range.
     pub const first_type: Index = .u0_type;
-    pub const last_type: Index = .generic_poison_type;
+    pub const last_type: Index = .empty_tuple_type;
     pub const first_value: Index = .undef;
-    pub const last_value: Index = .bool_false;
+    pub const last_value: Index = .empty_tuple;
 
     pub fn isWellKnownType(index: Index) bool {
         const raw = @intFromEnum(index);
@@ -130,7 +134,7 @@ pub const Index = enum(u32) {
     }
 };
 
-const first_dynamic_index: u32 = @intFromEnum(Index.bool_false) + 1;
+const first_dynamic_index: u32 = @intFromEnum(Index.empty_tuple) + 1;
 
 /// Stable handle to an interned, null-terminated string. Mirrors the
 /// compiler's `InternPool.NullTerminatedString` (`src/InternPool.zig`
@@ -2389,6 +2393,7 @@ const static_keys: [first_dynamic_index]Key = .{
     .{ .simple_type = .undefined },
     .{ .simple_type = .enum_literal },
     .{ .simple_type = .generic_poison },
+    .{ .tuple_type = .{ .types = &.{} } },
 
     // Untyped `undefined` -- same shape as the compiler.
     .{ .undef = .undefined_type },
@@ -2400,6 +2405,7 @@ const static_keys: [first_dynamic_index]Key = .{
     .{ .simple_value = .null },
     .{ .simple_value = .true },
     .{ .simple_value = .false },
+    .{ .aggregate = .{ .ty = .empty_tuple_type, .storage = .{ .elems = &.{} } } },
 };
 
 fn populateWellKnown(pool: *InternPool) Allocator.Error!void {
