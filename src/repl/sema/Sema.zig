@@ -3289,17 +3289,25 @@ fn evalReifyTuple(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Valu
     return .{ .index = try ip.internTupleType(field_types) };
 }
 
-/// Dereference a comptime slice to its backing array value. The compiler's
-/// `derefSliceAsArray` re-types the slice pointer as a single pointer to the array
-/// and `pointerDeref`s it; a `&.{ ... }` literal -- every reification argument --
-/// backs its slice with an anonymous-constant pointer to the whole array, which
+/// Dereference a comptime slice (or a pointer to an array) to its backing array
+/// value. The compiler's `derefSliceAsArray` re-types the slice pointer as a
+/// single pointer to the array and `pointerDeref`s it (and passes a pointer-to-
+/// array straight through); a `&.{ ... }` literal -- every reification argument --
+/// backs its pointer with an anonymous-constant to the whole array, which
 /// `loadValue` (our `pointerDeref`) resolves directly. Offset (element-pointer)
 /// slices do not arise here.
-fn derefSliceAsArray(sema: *Sema, slice_val: Value) Error!Value {
+fn derefSliceAsArray(sema: *Sema, val: Value) Error!Value {
     const ip = sema.intern_pool;
-    const ptr = ip.indexToKey(ip.indexToKey(slice_val.index).slice.ptr).ptr;
-    switch (ptr.base_addr) {
-        .uav, .nav => return try sema.loadValue(.{ .index = ip.indexToKey(slice_val.index).slice.ptr }),
+    const array_ptr: InternPool.Index = switch (ip.indexToKey(val.index)) {
+        .slice => |s| s.ptr,
+        .ptr => val.index,
+        else => {
+            try sema.writer.writeAll("reify: expected a comptime array-backed slice\n");
+            return error.AnalysisFail;
+        },
+    };
+    switch (ip.indexToKey(array_ptr).ptr.base_addr) {
+        .uav, .nav => return try sema.loadValue(.{ .index = array_ptr }),
         else => {
             try sema.writer.writeAll("reify: expected a comptime array-backed slice\n");
             return error.AnalysisFail;
@@ -3406,6 +3414,98 @@ fn evalReifyPointerSentinelTy(sema: *Sema, extended: Zir.Inst.Extended.InstData)
     const elem_ty = try sema.resolveDestType(extra.operand, "pointer child");
     const child = if (elem_ty == .anyopaque_type or elem_ty == .null_type) .noreturn_type else elem_ty;
     return .{ .index = try ip.internOptionalType(child) };
+}
+
+/// `reify_slice_arg_ty`: the array-pointer type a reification slice argument
+/// coerces to -- `*const [len]out`, `len` from the operand slice's length. Mirrors
+/// zirReifySliceArgTy. Only the `@Fn` parameter-attributes mapping (sized by the
+/// parameter-types slice) is needed until the nominal container constructors land.
+fn evalReifySliceArgTy(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
+    const ip = sema.intern_pool;
+    const extra = sema.zir.extraData(Zir.Inst.UnNode, extended.operand).data;
+    const info: Zir.Inst.ReifySliceArgInfo = @enumFromInt(extended.small);
+    const in_scalar_ty: InternPool.Index, const out_scalar_ty: InternPool.Index = switch (info) {
+        .type_to_fn_param_attrs => .{ .type_type, try sema.getStdLangType(.@"Type.Fn.ParamAttributes") },
+        else => {
+            try sema.writer.print("reify: slice argument mapping '{s}' is not supported\n", .{@tagName(info)});
+            return error.AnalysisFail;
+        },
+    };
+    const operand_ty = try ip.internPtrType(.{ .child = in_scalar_ty, .flags = .{ .size = .slice, .is_const = true } });
+    const operand_val = try sema.coerceValueToType(try sema.resolveRef(extra.operand), operand_ty, "reify slice argument");
+    const len = try sema.resolveUsizeInt(.{ .index = ip.indexToKey(operand_val.index).slice.len }, "reify slice argument length");
+    const arr_ty = try ip.internArrayType(.{ .len = len, .child = out_scalar_ty });
+    return .{ .index = try ip.internPtrType(.{ .child = arr_ty, .flags = .{ .size = .one, .is_const = true } }) };
+}
+
+/// Read a resolved `std.lang.CallingConvention` union value as the native enum --
+/// the calling-convention inverse of `callConvValue`. Only payload-free tags are
+/// modelled (the arch tags carry `CommonOptions`), matching the forward direction.
+fn interpretCallConv(sema: *Sema, val: Value) Error!std.lang.CallingConvention {
+    const ip = sema.intern_pool;
+    const un = ip.indexToKey(val.index).un;
+    const tag_enum = ip.indexToKey(un.tag).enum_tag.ty;
+    const idx = (try sema.enumTagFieldIndex(tag_enum, .{ .index = un.tag })).?;
+    const name = ip.stringSlice((try sema.enumFieldName(tag_enum, idx)).?);
+    const tag = std.meta.stringToEnum(std.meta.Tag(std.lang.CallingConvention), name) orelse {
+        try sema.writer.print("calling convention: unknown variant '{s}'\n", .{name});
+        return error.AnalysisFail;
+    };
+    switch (tag) {
+        inline else => |t| {
+            if (@FieldType(std.lang.CallingConvention, @tagName(t)) != void) {
+                try sema.writer.print("calling convention '{s}' is not modelled\n", .{@tagName(t)});
+                return error.AnalysisFail;
+            }
+            return @unionInit(std.lang.CallingConvention, @tagName(t), {});
+        },
+    }
+}
+
+/// `@Fn(param_types, param_attrs, return_type, attrs)` (`reify_fn`): reify a
+/// function type from its parameter types, per-parameter attributes, return type,
+/// and function attributes (calling convention, varargs). Mirrors zirReifyFn; the
+/// comptime-only evaluator omits the runtime-representability checks
+/// (checkParamType / checkReturnTypeAndCallConv).
+fn evalReifyFn(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
+    const ip = sema.intern_pool;
+    const extra = sema.zir.extraData(Zir.Inst.ReifyFn, extended.operand).data;
+
+    const param_types_slice = try sema.coerceValueToType(try sema.resolveRef(extra.param_types), try sema.sliceConstTypeTy(), "fn parameter types");
+    const param_types_arr = ip.indexToKey((try sema.derefSliceAsArray(param_types_slice)).index).aggregate;
+    const params_len: u32 = @intCast(ip.indexToKey(param_types_arr.ty).array_type.len);
+
+    const param_attrs_arr = ip.indexToKey((try sema.derefSliceAsArray(try sema.resolveRef(extra.param_attrs))).index).aggregate;
+
+    const ret_ty = try sema.resolveDestType(extra.ret_ty, "fn return type");
+
+    const fn_attrs_val = try sema.coerceValueToType(try sema.resolveRef(extra.fn_attrs), try sema.getStdLangType(.@"Type.Fn.Attributes"), "fn attributes");
+    const fn_attrs = ip.indexToKey(fn_attrs_val.index).aggregate;
+    const cc = try sema.interpretCallConv(.{ .index = InternPool.aggregateElementAt(fn_attrs, 0) });
+    const varargs = InternPool.aggregateElementAt(fn_attrs, 1) == .bool_true;
+
+    var noalias_bits: u32 = 0;
+    const param_types = try sema.gpa.alloc(InternPool.Index, params_len);
+    defer sema.gpa.free(param_types);
+    for (param_types, 0..) |*param_ty, param_idx| {
+        param_ty.* = InternPool.aggregateElementAt(param_types_arr, param_idx);
+        const param_attr = ip.indexToKey(InternPool.aggregateElementAt(param_attrs_arr, param_idx)).aggregate;
+        if (InternPool.aggregateElementAt(param_attr, 0) == .bool_true) {
+            if (param_idx > 31) {
+                try sema.writer.writeAll("this compiler implementation only supports 'noalias' on the first 32 parameters\n");
+                return error.AnalysisFail;
+            }
+            noalias_bits |= @as(u32, 1) << @intCast(param_idx);
+        }
+    }
+
+    return .{ .index = try ip.internFuncType(.{
+        .param_types = param_types,
+        .noalias_bits = noalias_bits,
+        .return_type = ret_ty,
+        .cc = cc,
+        .is_var_args = varargs,
+    }) };
 }
 
 /// `array_type lhs, rhs`: `lhs` is the length operand, `rhs` the
@@ -8780,6 +8880,8 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .reify_tuple => return sema.evalReifyTuple(extended),
         .reify_pointer => return sema.evalReifyPointer(extended),
         .reify_pointer_sentinel_ty => return sema.evalReifyPointerSentinelTy(extended),
+        .reify_slice_arg_ty => return sema.evalReifySliceArgTy(extended),
+        .reify_fn => return sema.evalReifyFn(extended),
         .tuple_decl => return sema.evalTupleDecl(extended),
         .enum_decl => return sema.evalEnumDecl(inst),
         .union_decl => return sema.evalUnionDecl(inst),

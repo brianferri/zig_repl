@@ -2408,6 +2408,17 @@ test "@import(std) broad access probes" {
         .{ .src = "@Pointer(.slice, .{}, u8, null) == []u8", .want = "true" },
         .{ .src = "@Pointer(.many, .{}, u8, @as(u8, 0)) == [*:0]u8", .want = "true" },
         .{ .src = "@Pointer(.one, .{ .@\"align\" = 4 }, u32, null) == *align(4) u32", .want = "true" },
+        // @Fn reifies a function type from parameter types, per-parameter
+        // attributes, return type, and function attributes (calling convention,
+        // varargs). The `.{}` attribute arguments exercise decl-literal defaults
+        // (Type.Fn.Attributes.callconv = .auto).
+        .{ .src = "@Fn(&.{u8}, &.{.{}}, u8, .{}) == fn (u8) u8", .want = "true" },
+        .{ .src = "@Fn(&.{ u8, bool }, &.{ .{}, .{} }, void, .{}) == fn (u8, bool) void", .want = "true" },
+        .{ .src = "@Fn(&.{*u8}, &.{.{ .@\"noalias\" = true }}, void, .{}) == fn (noalias *u8) void", .want = "true" },
+        // A struct field's `= .auto` decl-literal default resolves against the
+        // field type (CallingConvention), not the enclosing container -- the
+        // field-default decl_inst binding. `.{}` fills the field from its default.
+        .{ .src = "(struct { cc: @import(\"std\").lang.CallingConvention = .auto }{}).cc == .auto", .want = "true" },
         // A bare enum literal compares against a reflected enum value.
         .{ .src = "@typeInfo(u8).int.signedness == .signed", .want = "false" },
         // A `comptime_int` shifted by a typed amount (the shape maxInt produces).
