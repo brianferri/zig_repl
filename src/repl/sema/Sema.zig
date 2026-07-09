@@ -4579,6 +4579,36 @@ fn failZirUnavailable(sema: *Sema, ctx: []const u8) Error {
     return error.AnalysisFail;
 }
 
+/// A container's resolution context: its source ZIR frame, the `this_type` that
+/// `@This()` resolves to while inside, and the `decl_inst` its field/decl bodies
+/// hang off. Restored together. Everything the field and decl accessors need to
+/// read a nominal container's ZIR, in one place.
+const ContainerFrame = struct {
+    zir: ZirFrame,
+    saved_this: InternPool.Index,
+    decl_inst: Zir.Inst.Index,
+
+    fn restore(cf: ContainerFrame, sema: *Sema) void {
+        sema.this_type = cf.saved_this;
+        cf.zir.restore(sema);
+    }
+};
+
+/// Enter a nominal container's resolution context. A generated tag enum has no
+/// ZIR of its own -- it resolves in its owner union's context (the compiler's
+/// `owner_union`), so the owner is unwrapped here rather than at each call site.
+fn enterContainer(sema: *Sema, container_ty: InternPool.Index, ctx: []const u8) Error!ContainerFrame {
+    const owner = switch (sema.intern_pool.indexToKey(container_ty)) {
+        .enum_type => |et| if (et.generated_union != .none) et.generated_union else container_ty,
+        else => container_ty,
+    };
+    const ns = sema.containerNamespace(owner).?;
+    const zir = try sema.enterSourceZir(ns.source_zir_id, ctx);
+    const saved_this = sema.this_type;
+    sema.this_type = owner;
+    return .{ .zir = zir, .saved_this = saved_this, .decl_inst = ns.decl_inst };
+}
+
 /// The compiler's `failWithBadStructFieldAccess` diagnostic: a field lookup that
 /// misses names both the field and the struct. Shared by every field-access site
 /// (`field_ptr`, field loads, struct init) so the wording is one message keyed on
@@ -4644,30 +4674,25 @@ fn structFieldByName(
     name: InternPool.NullTerminatedString,
 ) Error!?FieldInfo {
     const ip = sema.intern_pool;
-    const st = ip.indexToKey(struct_ty).struct_type;
     // Intern each ZIR field name as we scan and compare interned handles against
     // the (already interned) query -- the compiler resolves struct fields lazily
     // too (`resolveStructFieldTypes` interns each ZIR name), and `getOrPutString`
-    // dedups so repeated resolution is stable.
-    const frame = try sema.enterSourceZir(st.source_zir_id, "struct field");
-    defer frame.restore(sema);
-    // The field type body belongs to this struct's namespace: expose it as
-    // `this_type` so a `closure_get` (a captured outer type) resolves.
-    const saved_this = sema.this_type;
-    sema.this_type = struct_ty;
-    defer sema.this_type = saved_this;
+    // dedups so repeated resolution is stable. `this_type` is the struct, so a
+    // `closure_get` (a captured outer type) in a field body resolves.
+    const cf = try sema.enterContainer(struct_ty, "struct field");
+    defer cf.restore(sema);
     // An anonymous struct (`.{ .a = 1 }`) has no `struct_decl`; its fields live in
     // the owning `struct_init_anon` instruction's items.
-    if (sema.zir.instructions.items(.tag)[@intFromEnum(st.decl_inst)] == .struct_init_anon)
-        return try sema.anonStructFieldByName(st.decl_inst, name);
-    var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
+    if (sema.zir.instructions.items(.tag)[@intFromEnum(cf.decl_inst)] == .struct_init_anon)
+        return try sema.anonStructFieldByName(cf.decl_inst, name);
+    var it = sema.zir.getStructDecl(cf.decl_inst).iterateFields();
     while (it.next()) |field| {
         if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name))) == name) {
-            const ty = (try sema.resolveInlineBody(field.type_body, st.decl_inst)).index;
+            const ty = (try sema.resolveInlineBody(field.type_body, cf.decl_inst)).index;
             // The default is coerced to the field type, as the compiler's resolved
             // `field_defaults` are, so a reflected pointer to it casts back cleanly.
             const default: InternPool.Index = if (field.default_body) |body|
-                (try sema.coerceValueToType(try sema.resolveInlineBody(body, st.decl_inst), ty, "field default")).index
+                (try sema.coerceValueToType(try sema.resolveInlineBody(body, cf.decl_inst), ty, "field default")).index
             else
                 .none;
             return .{
@@ -4675,7 +4700,7 @@ fn structFieldByName(
                 .ty = ty,
                 .is_comptime = field.is_comptime,
                 .default = default,
-                .align_bytes = try sema.fieldAlignBytes(field.align_body, st.decl_inst),
+                .align_bytes = try sema.fieldAlignBytes(field.align_body, cf.decl_inst),
             };
         }
     }
@@ -4712,23 +4737,19 @@ fn unionFieldByName(
     name: InternPool.NullTerminatedString,
 ) Error!?FieldInfo {
     const ip = sema.intern_pool;
-    const ut = ip.indexToKey(union_ty).union_type;
-    const frame = try sema.enterSourceZir(ut.source_zir_id, "union field");
-    defer frame.restore(sema);
-    const saved_this = sema.this_type;
-    sema.this_type = union_ty;
-    defer sema.this_type = saved_this;
-    var it = sema.zir.getUnionDecl(ut.decl_inst).iterateFields();
+    const cf = try sema.enterContainer(union_ty, "union field");
+    defer cf.restore(sema);
+    var it = sema.zir.getUnionDecl(cf.decl_inst).iterateFields();
     while (it.next()) |field| {
         if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name))) == name) {
             const ty = if (field.type_body) |body|
-                (try sema.resolveInlineBody(body, ut.decl_inst)).index
+                (try sema.resolveInlineBody(body, cf.decl_inst)).index
             else
                 .void_type;
             return .{
                 .index = field.idx,
                 .ty = ty,
-                .align_bytes = try sema.fieldAlignBytes(field.align_body, ut.decl_inst),
+                .align_bytes = try sema.fieldAlignBytes(field.align_body, cf.decl_inst),
             };
         }
     }
@@ -4759,10 +4780,9 @@ fn alignOptValue(sema: *Sema, align_bytes: ?u64) Error!InternPool.Index {
 /// supplies each field's type and attributes.
 fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
     const ip = sema.intern_pool;
-    const st = ip.indexToKey(struct_ty).struct_type;
-    const frame = try sema.enterSourceZir(st.source_zir_id, "struct field name");
-    defer frame.restore(sema);
-    var it = sema.zir.getStructDecl(st.decl_inst).iterateFields();
+    const cf = try sema.enterContainer(struct_ty, "struct field name");
+    defer cf.restore(sema);
+    var it = sema.zir.getStructDecl(cf.decl_inst).iterateFields();
     while (it.next()) |field| {
         if (field.idx == index)
             return try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
@@ -4772,10 +4792,9 @@ fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) Error
 
 /// A union type's declared field count, read from its source ZIR.
 fn unionFieldCount(sema: *Sema, union_ty: InternPool.Index) Error!u32 {
-    const ut = sema.intern_pool.indexToKey(union_ty).union_type;
-    const frame = try sema.enterSourceZir(ut.source_zir_id, "union field count");
-    defer frame.restore(sema);
-    return @intCast(sema.zir.getUnionDecl(ut.decl_inst).field_names.len);
+    const cf = try sema.enterContainer(union_ty, "union field count");
+    defer cf.restore(sema);
+    return @intCast(sema.zir.getUnionDecl(cf.decl_inst).field_names.len);
 }
 
 /// The interned name of a union's field at `index`, for the active-field
@@ -4783,10 +4802,9 @@ fn unionFieldCount(sema: *Sema, union_ty: InternPool.Index) Error!u32 {
 /// index is out of range.
 fn unionFieldNameAt(sema: *Sema, union_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
     const ip = sema.intern_pool;
-    const ut = ip.indexToKey(union_ty).union_type;
-    const frame = try sema.enterSourceZir(ut.source_zir_id, "union field name");
-    defer frame.restore(sema);
-    var it = sema.zir.getUnionDecl(ut.decl_inst).iterateFields();
+    const cf = try sema.enterContainer(union_ty, "union field name");
+    defer cf.restore(sema);
+    var it = sema.zir.getUnionDecl(cf.decl_inst).iterateFields();
     while (it.next()) |field| {
         if (field.idx == index)
             return try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
@@ -4874,19 +4892,16 @@ fn unionAllFieldsNpv(sema: *Sema, union_ty: InternPool.Index) Error!bool {
 fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPool.Index {
     const ip = sema.intern_pool;
     const ut = ip.indexToKey(union_ty).union_type;
-    const frame = try sema.enterSourceZir(ut.source_zir_id, "union tag type");
-    defer frame.restore(sema);
-    const decl = sema.zir.getUnionDecl(ut.decl_inst);
-    // The tag-type body belongs to the union's namespace: expose it as `this_type`
-    // so a `closure_get` (a captured `E` / `T`) resolves.
-    const saved_this = sema.this_type;
-    sema.this_type = union_ty;
-    defer sema.this_type = saved_this;
+    // `this_type` is the union, so a `closure_get` (a captured `E` / `T`) in the
+    // tag-type body resolves.
+    const cf = try sema.enterContainer(union_ty, "union tag type");
+    defer cf.restore(sema);
+    const decl = sema.zir.getUnionDecl(cf.decl_inst);
     // `union(E)`: the tag is the existing enum `E` (the `arg_type_body`), which
     // must be an enum. `union(enum)` / `union(enum(T))` / bare `union` generate a
     // tag enum keyed on the union (its int type resolved in `generatedTagLookup`).
     if (decl.kind == .tagged_explicit) {
-        const ty = (try sema.resolveInlineBody(decl.arg_type_body.?, ut.decl_inst)).index;
+        const ty = (try sema.resolveInlineBody(decl.arg_type_body.?, cf.decl_inst)).index;
         if (ip.indexToKey(ty) != .enum_type) {
             try sema.writer.writeAll("expected enum tag type, found '");
             try Type.print(.fromIndex(ty), ip, sema.writer);
@@ -4911,9 +4926,9 @@ fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPool.In
 fn enumFieldCount(sema: *Sema, enum_ty: InternPool.Index) Error!u32 {
     const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
     if (et.generated_union != .none) return try sema.unionFieldCount(et.generated_union);
-    const frame = try sema.enterSourceZir(et.source_zir_id, "enum field count");
-    defer frame.restore(sema);
-    return @intCast(sema.zir.getEnumDecl(et.decl_inst).field_names.len);
+    const cf = try sema.enterContainer(enum_ty, "enum field count");
+    defer cf.restore(sema);
+    return @intCast(sema.zir.getEnumDecl(cf.decl_inst).field_names.len);
 }
 
 /// The integer tag type of an auto-numbered enum with `field_count` fields: the
@@ -4951,13 +4966,10 @@ fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error
     // auto-numbered from 0 with no explicit values or tag type.
     if (et.generated_union != .none) return try sema.generatedTagScan(enum_ty, match);
 
-    const frame = try sema.enterSourceZir(et.source_zir_id, "enum field");
-    defer frame.restore(sema);
-    const saved_this = sema.this_type;
-    sema.this_type = enum_ty;
-    defer sema.this_type = saved_this;
+    const cf = try sema.enterContainer(enum_ty, "enum field");
+    defer cf.restore(sema);
 
-    const decl = sema.zir.getEnumDecl(et.decl_inst);
+    const decl = sema.zir.getEnumDecl(cf.decl_inst);
     const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
 
     var it = decl.iterateFields();
@@ -4965,7 +4977,7 @@ fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error
     var pos: u32 = 0;
     while (it.next()) |field| : (pos += 1) {
         const cur: i128 = if (field.value_body) |body| blk: {
-            const raw = try sema.resolveInlineBody(body, et.decl_inst);
+            const raw = try sema.resolveInlineBody(body, cf.decl_inst);
             break :blk sema.intAsI128(raw.index) orelse {
                 try sema.writer.writeAll("enum: tag value is not an integer\n");
                 return error.AnalysisFail;
@@ -4984,16 +4996,12 @@ fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error
 /// an ordinary auto enum whose int mode is explicit only for `tagged_enum_explicit`.
 fn generatedTagScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?EnumMatchResult {
     const ip = sema.intern_pool;
-    const union_ty = ip.indexToKey(enum_ty).enum_type.generated_union;
-    const ut = ip.indexToKey(union_ty).union_type;
-    const frame = try sema.enterSourceZir(ut.source_zir_id, "union tag field");
-    defer frame.restore(sema);
-    // The explicit `T` in `union(enum(T))` may capture an outer decl; expose the
-    // union as `this_type` so its `closure_get` resolves.
-    const saved_this = sema.this_type;
-    sema.this_type = union_ty;
-    defer sema.this_type = saved_this;
-    const decl = sema.zir.getUnionDecl(ut.decl_inst);
+    // `enterContainer` unwraps the generated tag enum to its owner union: the
+    // union's ZIR frame, and the union as `this_type` so a `closure_get` in an
+    // explicit `union(enum(T))` tag resolves.
+    const cf = try sema.enterContainer(enum_ty, "union tag field");
+    defer cf.restore(sema);
+    const decl = sema.zir.getUnionDecl(cf.decl_inst);
     const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
     var it = decl.iterateFields();
     while (it.next()) |field| {
@@ -5009,29 +5017,21 @@ fn generatedTagScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Er
 /// smallest-unsigned. Mirrors `LoadedEnumType.int_tag_type`, and is the single
 /// source `enumFieldScan`/`generatedTagScan` draw the tag type from for coercion.
 fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Index {
-    const ip = sema.intern_pool;
-    const et = ip.indexToKey(enum_ty).enum_type;
+    const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
+    const cf = try sema.enterContainer(enum_ty, "enum tag type");
+    defer cf.restore(sema);
+    // A generated tag enum reads its explicit `T` from the owner union's decl;
+    // a declared enum reads its `enum(T)` backing from its own.
     if (et.generated_union != .none) {
-        const ut = ip.indexToKey(et.generated_union).union_type;
-        const frame = try sema.enterSourceZir(ut.source_zir_id, "enum tag type");
-        defer frame.restore(sema);
-        const saved_this = sema.this_type;
-        sema.this_type = et.generated_union;
-        defer sema.this_type = saved_this;
-        const decl = sema.zir.getUnionDecl(ut.decl_inst);
+        const decl = sema.zir.getUnionDecl(cf.decl_inst);
         return if (decl.kind == .tagged_enum_explicit)
-            (try sema.resolveInlineBody(decl.arg_type_body.?, ut.decl_inst)).index
+            (try sema.resolveInlineBody(decl.arg_type_body.?, cf.decl_inst)).index
         else
             try sema.enumIntTagType(@intCast(decl.field_names.len));
     }
-    const frame = try sema.enterSourceZir(et.source_zir_id, "enum tag type");
-    defer frame.restore(sema);
-    const saved_this = sema.this_type;
-    sema.this_type = enum_ty;
-    defer sema.this_type = saved_this;
-    const decl = sema.zir.getEnumDecl(et.decl_inst);
+    const decl = sema.zir.getEnumDecl(cf.decl_inst);
     return if (decl.tag_type_body) |body|
-        (try sema.resolveInlineBody(body, et.decl_inst)).index
+        (try sema.resolveInlineBody(body, cf.decl_inst)).index
     else
         try sema.enumIntTagType(@intCast(decl.field_names.len));
 }
@@ -5041,9 +5041,9 @@ fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Ind
 fn enumNonexhaustive(sema: *Sema, enum_ty: InternPool.Index) Error!bool {
     const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
     if (et.generated_union != .none) return false;
-    const frame = try sema.enterSourceZir(et.source_zir_id, "enum mode");
-    defer frame.restore(sema);
-    return sema.zir.getEnumDecl(et.decl_inst).nonexhaustive;
+    const cf = try sema.enterContainer(enum_ty, "enum mode");
+    defer cf.restore(sema);
+    return sema.zir.getEnumDecl(cf.decl_inst).nonexhaustive;
 }
 
 /// If `(field_name, value)` matches `match`, build the `enum_tag` result. The
