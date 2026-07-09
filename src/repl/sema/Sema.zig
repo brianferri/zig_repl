@@ -7855,13 +7855,19 @@ fn funcFancyExtras(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) struct 
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.FuncFancy, pl_node.payload_index);
     const bits = extra.data.bits;
-    var xi = extra.end;
-    if (bits.has_cc_ref and !bits.has_cc_body) xi += 1;
-    if (bits.has_cc_body) xi += 1 + sema.zir.extra[xi];
-    if (bits.has_ret_ty_ref and !bits.has_ret_ty_body) xi += 1;
-    if (bits.has_ret_ty_body) xi += 1 + sema.zir.extra[xi];
+    var extra_index = extra.end;
+    if (bits.has_cc_body) {
+        extra_index += 1 + sema.zir.extra[extra_index];
+    } else if (bits.has_cc_ref) {
+        extra_index += 1;
+    }
+    if (bits.has_ret_ty_body) {
+        extra_index += 1 + sema.zir.extra[extra_index];
+    } else if (bits.has_ret_ty_ref) {
+        extra_index += 1;
+    }
     return .{
-        .noalias_bits = if (bits.has_any_noalias) sema.zir.extra[xi] else 0,
+        .noalias_bits = if (bits.has_any_noalias) sema.zir.extra[extra_index] else 0,
         .is_var_args = bits.is_var_args,
     };
 }
