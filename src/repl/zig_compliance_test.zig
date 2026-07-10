@@ -1030,6 +1030,15 @@ test "compliance: unwrapping a comptime-known null is rejected by both" {
     try expectBothReject(testing.allocator, &.{"@as(?i32, null).?"});
 }
 
+test "compliance: struct/union init through an optional result location" {
+    // A `fn () ?T` returning `.{...}` drives the result-location pointer path: the
+    // `*?T` alloc projects to `*T` (opt_eu_base_ptr_init), the payload is written
+    // into an undef optional, and for a union the field-pointer store makes that
+    // field active.
+    try expectMatchesZig(testing.allocator, &.{"(struct { const S = struct { a: u8, b: u8 }; fn f() ?S { return .{ .a = 3, .b = 9 }; } }).f().?.b"});
+    try expectMatchesZig(testing.allocator, &.{"(struct { const U = union(enum) { x: u8, y: u16 }; fn f() ?U { return .{ .x = 7 }; } }).f().?.x"});
+}
+
 test "compliance: optional null test drives if-capture and orelse" {
     // `if (opt) |v|` and `orelse` both lower to `is_non_null` -> `condbr`.
     try expectMatchesZig(testing.allocator, &.{"blk: { const x: ?u32 = 7; break :blk if (x) |v| v else 0; }"});

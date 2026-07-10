@@ -2997,7 +2997,12 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
         // where the pointer is formed (`analyzeOptionalPayloadPtr`).
         .opt_payload => |base| {
             const opt = try sema.loadValue(.{ .index = base });
-            return .{ .index = ip.indexToKey(opt.index).opt.val };
+            // A not-yet-initialised optional (a result `*?T` mid-init) projects to
+            // `undef`, as the `.field`/`.arr_elem` arm above does.
+            return switch (ip.indexToKey(opt.index)) {
+                .undef => .{ .index = .undef },
+                else => .{ .index = ip.indexToKey(opt.index).opt.val },
+            };
         },
         else => {
             const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr);
@@ -4160,24 +4165,29 @@ fn evalOptionalPayload(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// The safe/unsafe distinction is a runtime null-check with no comptime analogue.
 fn evalOptionalPayloadPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
-    const optional_ptr = try sema.resolveRef(un_node.operand);
-    const ip = sema.intern_pool;
+    return try sema.optPayloadPtr(try sema.resolveRef(un_node.operand), false);
+}
 
+/// Given a pointer to an optional (`*?T`), yield a pointer to its payload (`*T`) as
+/// an `.opt_payload` projection keeping the source pointer's flags. When
+/// `initializing` (a result-location `*?T` about to be written), the payload is
+/// being created, so skip the null check; otherwise (`p.?`) a `null` is an error.
+fn optPayloadPtr(sema: *Sema, optional_ptr: Value, comptime initializing: bool) Error!Value {
+    const ip = sema.intern_pool;
     const ptr_type = ip.indexToKey(optional_ptr.typeOf(ip).toIndex()).ptr_type;
     const opt_key = ip.indexToKey(ptr_type.child);
     if (opt_key != .opt_type) {
         try sema.writer.writeAll("optional unwrap: pointer child is not an optional\n");
         return error.AnalysisFail;
     }
-
-    const opt_val = try sema.loadValue(optional_ptr);
-    if (ip.indexToKey(opt_val.index).opt.val == .none) {
-        try sema.writer.writeAll("unable to unwrap null\n");
-        return error.AnalysisFail;
+    if (!initializing) {
+        const opt_val = try sema.loadValue(optional_ptr);
+        if (ip.indexToKey(opt_val.index).opt.val == .none) {
+            try sema.writer.writeAll("unable to unwrap null\n");
+            return error.AnalysisFail;
+        }
     }
-
     const child_ptr_ty = try ip.internPtrType(.{ .child = opt_key.opt_type, .sentinel = ptr_type.sentinel, .flags = ptr_type.flags });
     return .{ .index = try ip.internPtr(.{
         .ty = child_ptr_ty,
@@ -6963,6 +6973,16 @@ fn storeElement(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
     };
     const base_ptr = ip.indexToKey(f.base).ptr;
     const agg_ty = ip.indexToKey(base_ptr.ty).ptr_type.child;
+    // A union stores only the active field's payload, so a store through
+    // `&u.field` makes that field active -- a fresh `.un` with the field's tag --
+    // rather than a positional slot update. Mirrors `evalUnionInit`'s tag lookup.
+    if (ip.indexToKey(agg_ty) == .union_type) {
+        const tag_enum = try sema.unionTagEnumType(agg_ty);
+        const tag = (try sema.enumValueFieldIndex(tag_enum, @intCast(f.index))).?;
+        const new_union = Value{ .index = try ip.internUnion(.{ .ty = agg_ty, .tag = tag.index, .val = value.index }) };
+        try sema.storePointee(base_ptr, new_union);
+        return;
+    }
     const parent = try sema.loadValue(.{ .index = f.base });
     const new_parent = try sema.setAggregateElement(parent, agg_ty, @intCast(f.index), value);
     try sema.storePointee(base_ptr, new_parent);
@@ -6981,8 +7001,9 @@ fn storePointee(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
         .comptime_alloc => (try sema.lookupComptimeAlloc(ptr)).val = value,
         .field, .arr_elem => try sema.storeElement(ptr, value),
         .opt_payload => |base| {
-            const opt_val = try sema.loadValue(.{ .index = base });
-            const opt_ty = ip.indexToKey(opt_val.index).opt.ty;
+            // Take the optional's type from the base pointer, not the current value:
+            // an initializing store writes into an `undef` optional that carries none.
+            const opt_ty = ip.indexToKey(ip.indexToKey(base).ptr.ty).ptr_type.child;
             const new_opt = Value{ .index = try ip.internOpt(.{ .ty = opt_ty, .val = value.index }) };
             try sema.storePointee(ip.indexToKey(base).ptr, new_opt);
         },
@@ -6993,14 +7014,20 @@ fn storePointee(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
     }
 }
 
-/// `opt_eu_base_ptr_init`: strips the optional/error-union payload base before a
-/// result-location init. For a plain struct/array the operand is already the
-/// base, so this is the identity, mirroring `optEuBasePtrInit`'s non-opt/EU
-/// path.
+/// `opt_eu_base_ptr_init`: project a result-location pointer down to the payload
+/// base it will initialize. A `*?T` (or nested `*??T`) becomes a `*T`, so the
+/// following `struct_init_field_ptr` sees the struct/union, not the wrapper.
+/// Mirrors `optEuBasePtrInit`'s loop; a plain struct/array is already the base and
+/// falls straight out. The error-union arm is unmodeled (no result-init path forms
+/// one), so an `E!T` base falls through and fails at the field access downstream.
 fn evalOptEuBasePtrInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const ip = sema.intern_pool;
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
-    return try sema.resolveRef(un_node.operand);
+    var base_ptr = try sema.resolveRef(un_node.operand);
+    while (ip.indexToKey(ip.indexToKey(base_ptr.typeOf(ip).toIndex()).ptr_type.child) == .opt_type)
+        base_ptr = try sema.optPayloadPtr(base_ptr, true);
+    return base_ptr;
 }
 
 /// `validate_ptr_struct_init`: after a `.{ ... }` init's explicit field stores,
@@ -7019,6 +7046,17 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const first = sema.zir.extraData(Zir.Inst.Field, datas[@intFromEnum(body[0])].pl_node.payload_index).data;
     const object_ptr = try sema.resolveRef(first.lhs);
     const struct_ty = ip.indexToKey(ip.indexToKey(object_ptr.index).ptr.ty).ptr_type.child;
+
+    // A union's single field-pointer store already set the active tag, so there is
+    // nothing to default; more than one initializer is the "multiple active fields"
+    // error. Mirrors `validateUnionInit`.
+    if (ip.indexToKey(struct_ty) == .union_type) {
+        if (body.len != 1) {
+            try sema.writer.writeAll("cannot initialize multiple union fields at once; unions can only have one active field\n");
+            return error.AnalysisFail;
+        }
+        return null;
+    }
 
     // The interned names explicitly initialized, to test each declared field
     // against by handle. Interned from the current ZIR before the swap below.
