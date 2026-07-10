@@ -825,22 +825,80 @@ pub const Key = union(enum) {
         types: []const Index,
     };
 
-    /// Named struct type. `(source_zir_id, decl_inst)` is the nominal
-    /// identity; `name` is the fully-qualified name (e.g. `repl.P`).
-    /// Fields are not stored -- they are resolved on demand from the
-    /// decl's ZIR (see the `struct_type` Key doc).
+    /// The identity of a container type (struct/enum/union), mirroring the
+    /// compiler's `ContainerType`. A container is one of three flavors and is
+    /// hashed/compared per flavor (see `hashContainerId`/`eqlContainerId`):
+    ///  - `declared`: from source ZIR, identified by its instruction plus captures;
+    ///  - `reified`: from `@Enum`/`@Struct`/`@Union` or an anonymous init,
+    ///    identified by its instruction plus a `type_hash` that Sema computes over
+    ///    the type's fields/attributes (kept out of the InternPool to avoid an
+    ///    over-complex Key);
+    ///  - `generated_union_tag`: a union's auto-generated tag enum, identified by
+    ///    the union index alone.
+    /// The REPL's instruction token is `(source_zir_id, decl_inst)` where the
+    /// compiler uses one `TrackedInst.Index`; captures are a flat `[]const Index`
+    /// rather than the compiler's owned/external split.
+    pub const ContainerId = union(enum) {
+        declared: Declared,
+        reified: Reified,
+        generated_union_tag: Index,
+
+        pub const Declared = struct {
+            source_zir_id: u32,
+            decl_inst: std.zig.Zir.Inst.Index,
+            /// Comptime values captured from the enclosing scope at declaration
+            /// time (`const Line = struct { a: P }` captures `P`). A `closure_get`
+            /// in a field/decl body reads these by index. Stored on the type
+            /// because the defining scope is gone by the time a body is lazily
+            /// resolved. Two instantiations of one generic decl (`Box(u8)` vs
+            /// `Box(u16)`) capture different values and are distinct types.
+            captures: []const Index = &.{},
+        };
+        pub const Reified = struct {
+            source_zir_id: u32,
+            decl_inst: std.zig.Zir.Inst.Index,
+            type_hash: u64,
+        };
+
+        /// The source-ZIR instruction token. A generated tag enum has none -- it
+        /// resolves through its owner union, which is unwrapped before this is read.
+        pub fn sourceZirId(self: ContainerId) u32 {
+            return switch (self) {
+                .declared => |d| d.source_zir_id,
+                .reified => |r| r.source_zir_id,
+                .generated_union_tag => unreachable,
+            };
+        }
+        pub fn declInst(self: ContainerId) std.zig.Zir.Inst.Index {
+            return switch (self) {
+                .declared => |d| d.decl_inst,
+                .reified => |r| r.decl_inst,
+                .generated_union_tag => unreachable,
+            };
+        }
+        /// Captures live only on a declared type; reified/generated have none.
+        pub fn captures(self: ContainerId) []const Index {
+            return switch (self) {
+                .declared => |d| d.captures,
+                else => &.{},
+            };
+        }
+        /// The owner union of a generated tag enum, or `.none` for other flavors.
+        pub fn generatedUnion(self: ContainerId) Index {
+            return switch (self) {
+                .generated_union_tag => |idx| idx,
+                else => .none,
+            };
+        }
+    };
+
+    /// Named struct type. `id` is the nominal identity; `name` is the
+    /// fully-qualified name (e.g. `repl.P`). Fields are not stored on a declared
+    /// struct -- they are resolved on demand from the decl's ZIR (see the
+    /// `struct_type` Key doc).
     pub const StructType = struct {
-        source_zir_id: u32,
-        decl_inst: std.zig.Zir.Inst.Index,
         name: NullTerminatedString,
-        /// Comptime values captured from the enclosing scope at declaration time
-        /// (`const Line = struct { a: P }` captures `P`). A `closure_get` in a
-        /// field/decl body reads these by index. Stored on the type because the
-        /// defining scope is gone by the time a body is lazily resolved. Part of
-        /// identity (hash/eql): two instantiations of one generic struct decl
-        /// (`Box(u8)` vs `Box(u16)`) capture different values and are distinct
-        /// types, matching the compiler's `ContainerType.declared`.
-        captures: []const Index = &.{},
+        id: ContainerId,
         /// The enclosing container this type is declared in, or `.none` at the
         /// session/file top level. The REPL's stand-in for `Namespace.parent`:
         /// `evalDeclVal` walks it outward so a nested container resolves an
@@ -849,21 +907,12 @@ pub const Key = union(enum) {
         parent: Index = .none,
     };
 
-    /// A named enum type. Nominal like `StructType`: identity is the declaration
-    /// site plus captures; field names / tag type / values are resolved on demand
-    /// from the decl's ZIR, not stored. Mirrors `getDeclaredEnumType`'s shell.
+    /// A named enum type. Nominal like `StructType`; field names / tag type /
+    /// values are resolved on demand from the decl's ZIR for a declared enum, or
+    /// stored at creation for a reified one. Mirrors `getDeclaredEnumType`'s shell.
     pub const EnumType = struct {
-        source_zir_id: u32,
-        decl_inst: std.zig.Zir.Inst.Index,
         name: NullTerminatedString,
-        captures: []const Index = &.{},
-        /// When set, this enum is the auto-generated tag type of that union: its
-        /// fields are the union's, auto-numbered from 0, resolved through this
-        /// back-reference. Mirrors the compiler's `generated_union_tag` container
-        /// (`LoadedEnumType.owner_union`): identity is the union index alone, and
-        /// `captures`/`source_zir_id`/`decl_inst` are inert (the compiler stores
-        /// `.empty` captures and a `.none` zir_index). `.none` for a declared enum.
-        generated_union: Index = .none,
+        id: ContainerId,
         /// Enclosing container, or `.none`. See `StructType.parent`.
         parent: Index = .none,
     };
@@ -871,10 +920,8 @@ pub const Key = union(enum) {
     /// A named union type. Nominal like `EnumType`; field names/types resolved on
     /// demand from the decl's ZIR. Mirrors `getDeclaredUnionType`'s shell.
     pub const UnionType = struct {
-        source_zir_id: u32,
-        decl_inst: std.zig.Zir.Inst.Index,
         name: NullTerminatedString,
-        captures: []const Index = &.{},
+        id: ContainerId,
         /// Enclosing container, or `.none`. See `StructType.parent`.
         parent: Index = .none,
     };
@@ -1130,36 +1177,16 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, @as(u32, @intCast(tt.types.len)));
                 for (tt.types) |ty| std.hash.autoHash(&hasher, ty);
             },
-            // Nominal: identity is the declaration site plus its captures. `name`
-            // is derived from the site, so it is excluded here (and in `eql`).
-            .struct_type => |st| {
-                std.hash.autoHash(&hasher, st.source_zir_id);
-                std.hash.autoHash(&hasher, st.decl_inst);
-                // Captures are part of identity: two instantiations of one generic
-                // struct decl (`Box(u8)` vs `Box(u16)`) capture different values
-                // and are distinct types, as `ContainerType.declared` hashes them.
-                for (st.captures) |c| std.hash.autoHash(&hasher, c);
-            },
-            // A union's generated tag enum is identified by that union index
-            // alone (the compiler's `generated_union_tag` hash arm); a declared
-            // enum by its nominal-plus-captures identity, like `struct_type`.
-            .enum_type => |et| if (et.generated_union != .none) {
-                std.hash.autoHash(&hasher, et.generated_union);
-            } else {
-                std.hash.autoHash(&hasher, et.source_zir_id);
-                std.hash.autoHash(&hasher, et.decl_inst);
-                for (et.captures) |c| std.hash.autoHash(&hasher, c);
-            },
+            // Nominal: identity is the container flavor and its per-flavor data
+            // (`name` is derived from the site, so it is excluded here and in
+            // `eql`). One helper covers struct/enum/union alike.
+            .struct_type => |st| hashContainerId(&hasher, st.id),
+            .enum_type => |et| hashContainerId(&hasher, et.id),
             .enum_tag => |et| {
                 std.hash.autoHash(&hasher, et.ty);
                 std.hash.autoHash(&hasher, et.int);
             },
-            // Same nominal-plus-captures identity as `enum_type`.
-            .union_type => |ut| {
-                std.hash.autoHash(&hasher, ut.source_zir_id);
-                std.hash.autoHash(&hasher, ut.decl_inst);
-                for (ut.captures) |c| std.hash.autoHash(&hasher, c);
-            },
+            .union_type => |ut| hashContainerId(&hasher, ut.id),
             .un => |uv| {
                 std.hash.autoHash(&hasher, uv.ty);
                 std.hash.autoHash(&hasher, uv.tag);
@@ -1305,30 +1332,13 @@ pub const Key = union(enum) {
             },
             .error_set_type => |x| std.mem.eql(NullTerminatedString, x.names, b.error_set_type.names),
             .tuple_type => |x| std.mem.eql(Index, x.types, b.tuple_type.types),
-            .struct_type => |x| blk: {
-                const y = b.struct_type;
-                break :blk x.source_zir_id == y.source_zir_id and x.decl_inst == y.decl_inst and
-                    std.mem.eql(Index, x.captures, y.captures);
-            },
-            .enum_type => |x| blk: {
-                const y = b.enum_type;
-                // A generated tag enum compares by owner union alone; this also
-                // keeps it distinct from any declared enum (whose generated_union
-                // is `.none`). Mirrors the compiler's `generated_union_tag` arm.
-                if (x.generated_union != .none or y.generated_union != .none)
-                    break :blk x.generated_union == y.generated_union;
-                break :blk x.source_zir_id == y.source_zir_id and x.decl_inst == y.decl_inst and
-                    std.mem.eql(Index, x.captures, y.captures);
-            },
+            .struct_type => |x| eqlContainerId(x.id, b.struct_type.id),
+            .enum_type => |x| eqlContainerId(x.id, b.enum_type.id),
             .enum_tag => |x| blk: {
                 const y = b.enum_tag;
                 break :blk x.ty == y.ty and x.int == y.int;
             },
-            .union_type => |x| blk: {
-                const y = b.union_type;
-                break :blk x.source_zir_id == y.source_zir_id and x.decl_inst == y.decl_inst and
-                    std.mem.eql(Index, x.captures, y.captures);
-            },
+            .union_type => |x| eqlContainerId(x.id, b.union_type.id),
             .un => |x| blk: {
                 const y = b.un;
                 break :blk x.ty == y.ty and x.tag == y.tag and x.val == y.val;
@@ -1453,6 +1463,43 @@ pub const Key = union(enum) {
         };
     }
 };
+
+/// Hash a container type's identity by flavor. The active tag is folded in first so
+/// a `declared` and a `reified` type sharing an instruction never collide. Captures
+/// (declared) and the Sema-computed `type_hash` (reified) are part of identity; a
+/// generated tag enum is identified by its owner union alone. `name` is derived
+/// from the site, so it is excluded (as in `eqlContainerId`).
+fn hashContainerId(hasher: *std.hash.Wyhash, id: Key.ContainerId) void {
+    std.hash.autoHash(hasher, @as(std.meta.Tag(Key.ContainerId), id));
+    switch (id) {
+        .declared => |d| {
+            std.hash.autoHash(hasher, d.source_zir_id);
+            std.hash.autoHash(hasher, d.decl_inst);
+            for (d.captures) |c| std.hash.autoHash(hasher, c);
+        },
+        .reified => |r| {
+            std.hash.autoHash(hasher, r.source_zir_id);
+            std.hash.autoHash(hasher, r.decl_inst);
+            std.hash.autoHash(hasher, r.type_hash);
+        },
+        .generated_union_tag => |idx| std.hash.autoHash(hasher, idx),
+    }
+}
+
+/// Container identity equality, the counterpart to `hashContainerId`: different
+/// flavors are never equal, and each flavor compares its own identity data.
+fn eqlContainerId(x: Key.ContainerId, y: Key.ContainerId) bool {
+    if (@as(std.meta.Tag(Key.ContainerId), x) != @as(std.meta.Tag(Key.ContainerId), y)) return false;
+    return switch (x) {
+        .declared => |xd| xd.source_zir_id == y.declared.source_zir_id and
+            xd.decl_inst == y.declared.decl_inst and
+            std.mem.eql(Index, xd.captures, y.declared.captures),
+        .reified => |xr| xr.source_zir_id == y.reified.source_zir_id and
+            xr.decl_inst == y.reified.decl_inst and
+            xr.type_hash == y.reified.type_hash,
+        .generated_union_tag => |xi| xi == y.generated_union_tag,
+    };
+}
 
 /// Tagged storage. `data` interpretation depends on `tag`. Naming mirrors
 /// the compiler's `Item.Tag` to keep ports legible.
@@ -1774,23 +1821,77 @@ const RepeatedRepr = extern struct {
     elem_val: u32,
 };
 
-/// Extra-arena payload for `Item.Tag.type_struct`. Three u32 slots: the nominal
-/// identity (source_zir_id, decl_inst) and the interned name handle.
+/// A container's identity flavor is folded onto its `captures_len` slot, mirroring
+/// the compiler's `CapturesLen`: a real value is a declared type's capture count;
+/// the sentinels select a reified or generated-tag type whose trailing data differs
+/// (see `appendContainerId`/`readContainerId`). Captures, `type_hash`, and
+/// `owner_union` are mutually exclusive trailing data, so one word selects all of it.
+const captures_len_reified: u32 = std.math.maxInt(u32);
+const captures_len_generated_union_tag: u32 = std.math.maxInt(u32) - 1;
+
+/// The `captures_len` slot value for a container identity (see the sentinels above).
+fn containerCapturesLen(id: Key.ContainerId) u32 {
+    return switch (id) {
+        .declared => |d| @intCast(d.captures.len),
+        .reified => captures_len_reified,
+        .generated_union_tag => captures_len_generated_union_tag,
+    };
+}
+
+/// Append a container's identity trailing data after its fixed repr, in the
+/// compiler's order (owner_union? / zir_index? / type_hash? / captures?). The fixed
+/// repr's `captures_len` slot (from `containerCapturesLen`) selects which are
+/// present; the REPL's zir token is the pair `(source_zir_id, decl_inst)`.
+fn appendContainerId(pool: *InternPool, id: Key.ContainerId) Allocator.Error!void {
+    switch (id) {
+        .generated_union_tag => |owner_union| try pool.extra.append(pool.gpa, @intFromEnum(owner_union)),
+        .declared => |d| {
+            try pool.extra.append(pool.gpa, d.source_zir_id);
+            try pool.extra.append(pool.gpa, @intFromEnum(d.decl_inst));
+            // An all-u32 `[]Index`, same reinterpret trick as tuple/error-set types.
+            try pool.extra.appendSlice(pool.gpa, @ptrCast(d.captures));
+        },
+        .reified => |r| {
+            try pool.extra.append(pool.gpa, r.source_zir_id);
+            try pool.extra.append(pool.gpa, @intFromEnum(r.decl_inst));
+            try pool.extra.append(pool.gpa, @truncate(r.type_hash));
+            try pool.extra.append(pool.gpa, @truncate(r.type_hash >> 32));
+        },
+    }
+}
+
+/// Decode container identity trailing at `off`, the counterpart to
+/// `appendContainerId`. A declared type's captures borrow `extra`.
+fn readContainerId(pool: *const InternPool, captures_len: u32, off: u32) Key.ContainerId {
+    if (captures_len == captures_len_generated_union_tag)
+        return .{ .generated_union_tag = @enumFromInt(pool.extra.items[off]) };
+    const source_zir_id = pool.extra.items[off];
+    const decl_inst: std.zig.Zir.Inst.Index = @enumFromInt(pool.extra.items[off + 1]);
+    if (captures_len == captures_len_reified) return .{ .reified = .{
+        .source_zir_id = source_zir_id,
+        .decl_inst = decl_inst,
+        .type_hash = @as(u64, pool.extra.items[off + 3]) << 32 | pool.extra.items[off + 2],
+    } };
+    return .{ .declared = .{
+        .source_zir_id = source_zir_id,
+        .decl_inst = decl_inst,
+        .captures = @ptrCast(pool.extra.items[off + 2 ..][0..captures_len]),
+    } };
+}
+
+/// Extra-arena payload for `Item.Tag.type_struct`: the interned name, the enclosing
+/// `parent`, and the container identity's flavor/capture count, with the identity
+/// trailing data following (see `appendContainerId`).
 const StructTypeRepr = extern struct {
-    source_zir_id: u32,
-    decl_inst: u32,
     name: u32,
     parent: u32,
+    captures_len: u32,
 };
 
-/// Extra-arena payload for `Item.Tag.type_enum`. Like `StructTypeRepr` (nominal
-/// identity + name, captures trailing) plus `generated_union`: the union whose
-/// tag type this enum is, or `.none` for a source-declared enum.
+/// Extra-arena payload for `Item.Tag.type_enum`. Like `StructTypeRepr` plus
+/// `field_data`.
 const EnumTypeRepr = extern struct {
-    source_zir_id: u32,
-    decl_inst: u32,
     name: u32,
-    generated_union: u32,
     parent: u32,
     /// Offset into `extra` of this enum's resolved field storage
     /// (`[int_tag_type, names_len, values_len, names..., values...]`, `values`
@@ -1798,6 +1899,7 @@ const EnumTypeRepr = extern struct {
     /// identity -- filled after creation, so it is excluded from the dedup Key
     /// (`enumTypeFromExtra` does not read it).
     field_data: u32,
+    captures_len: u32,
 };
 
 /// Sentinel `EnumTypeRepr.field_data` value meaning the enum's fields have not been
@@ -1813,12 +1915,11 @@ const EnumTagRepr = extern struct {
 };
 
 /// Extra-arena payload for `Item.Tag.type_union`. Same shape/trailing as
-/// `EnumTypeRepr` (nominal identity + name, captures trailing).
+/// `StructTypeRepr` (name + parent + identity, identity data trailing).
 const UnionTypeRepr = extern struct {
-    source_zir_id: u32,
-    decl_inst: u32,
     name: u32,
     parent: u32,
+    captures_len: u32,
 };
 
 /// Extra-arena payload for `Item.Tag.union_value`. Three u32 slots: union type,
@@ -2644,16 +2745,11 @@ fn tupleTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
 
 fn structTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
     const r = pool.extraData(StructTypeRepr, extra_index);
-    const captures_at = extra_index + @sizeOf(StructTypeRepr) / 4;
-    const captures_len = pool.extra.items[captures_at];
-    const raw_captures = pool.extra.items[captures_at + 1 ..][0..captures_len];
+    const id_at = extra_index + @sizeOf(StructTypeRepr) / 4;
     return .{
         .struct_type = .{
-            .source_zir_id = r.source_zir_id,
-            .decl_inst = @enumFromInt(r.decl_inst),
             .name = @enumFromInt(r.name),
-            // Reinterpret the u32 slice as `[]const Index`, sharing the extra arena.
-            .captures = @ptrCast(raw_captures),
+            .id = readContainerId(pool, r.captures_len, id_at),
             .parent = @enumFromInt(r.parent),
         },
     };
@@ -2661,15 +2757,10 @@ fn structTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
 
 fn enumTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
     const r = pool.extraData(EnumTypeRepr, extra_index);
-    const captures_at = extra_index + @sizeOf(EnumTypeRepr) / 4;
-    const captures_len = pool.extra.items[captures_at];
-    const raw_captures = pool.extra.items[captures_at + 1 ..][0..captures_len];
+    const id_at = extra_index + @sizeOf(EnumTypeRepr) / 4;
     return .{ .enum_type = .{
-        .source_zir_id = r.source_zir_id,
-        .decl_inst = @enumFromInt(r.decl_inst),
         .name = @enumFromInt(r.name),
-        .captures = @ptrCast(raw_captures),
-        .generated_union = @enumFromInt(r.generated_union),
+        .id = readContainerId(pool, r.captures_len, id_at),
         .parent = @enumFromInt(r.parent),
     } };
 }
@@ -2686,14 +2777,10 @@ fn sliceFromExtra(pool: *const InternPool, extra_index: u32) Key {
 
 fn unionTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
     const r = pool.extraData(UnionTypeRepr, extra_index);
-    const captures_at = extra_index + @sizeOf(UnionTypeRepr) / 4;
-    const captures_len = pool.extra.items[captures_at];
-    const raw_captures = pool.extra.items[captures_at + 1 ..][0..captures_len];
+    const id_at = extra_index + @sizeOf(UnionTypeRepr) / 4;
     return .{ .union_type = .{
-        .source_zir_id = r.source_zir_id,
-        .decl_inst = @enumFromInt(r.decl_inst),
         .name = @enumFromInt(r.name),
-        .captures = @ptrCast(raw_captures),
+        .id = readContainerId(pool, r.captures_len, id_at),
         .parent = @enumFromInt(r.parent),
     } };
 }
@@ -3271,35 +3358,28 @@ fn emitTupleType(pool: *InternPool, tt: Key.TupleType) Allocator.Error!void {
     pool.items.appendAssumeCapacity(.{ .tag = .type_tuple, .data = extra_index });
 }
 
-/// Emit a `type_struct` Item. Three u32 slots: source_zir_id,
-/// decl_inst, name.
+/// Emit a `type_struct` Item: the fixed `StructTypeRepr` then the container
+/// identity's trailing data (see `appendContainerId`).
 fn emitStructType(pool: *InternPool, st: Key.StructType) Allocator.Error!void {
     const extra_index = try pool.addExtra(StructTypeRepr{
-        .source_zir_id = st.source_zir_id,
-        .decl_inst = @intFromEnum(st.decl_inst),
         .name = @intFromEnum(st.name),
         .parent = @intFromEnum(st.parent),
+        .captures_len = containerCapturesLen(st.id),
     });
-    // Trailing the fixed repr: a `captures_len` count then the captured Indices
-    // (an all-u32 `[]Index`, same reinterpret trick as tuple/error-set types).
-    try pool.extra.append(pool.gpa, @intCast(st.captures.len));
-    try pool.extra.appendSlice(pool.gpa, @ptrCast(st.captures));
+    try pool.appendContainerId(st.id);
     pool.items.appendAssumeCapacity(.{ .tag = .type_struct, .data = extra_index });
 }
 
 /// Emit a `type_enum` Item. Same layout as `type_struct` (fixed repr + trailing
-/// captures).
+/// identity data).
 fn emitEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!void {
     const extra_index = try pool.addExtra(EnumTypeRepr{
-        .source_zir_id = et.source_zir_id,
-        .decl_inst = @intFromEnum(et.decl_inst),
         .name = @intFromEnum(et.name),
-        .generated_union = @intFromEnum(et.generated_union),
         .parent = @intFromEnum(et.parent),
         .field_data = fields_unresolved,
+        .captures_len = containerCapturesLen(et.id),
     });
-    try pool.extra.append(pool.gpa, @intCast(et.captures.len));
-    try pool.extra.appendSlice(pool.gpa, @ptrCast(et.captures));
+    try pool.appendContainerId(et.id);
     pool.items.appendAssumeCapacity(.{ .tag = .type_enum, .data = extra_index });
 }
 
@@ -3366,16 +3446,15 @@ fn emitEnumTag(pool: *InternPool, et: Key.EnumTag) Allocator.Error!void {
     pool.items.appendAssumeCapacity(.{ .tag = .enum_tag, .data = extra_index });
 }
 
-/// Emit a `type_union` Item. Same layout as `type_enum` (fixed repr + captures).
+/// Emit a `type_union` Item. Same layout as `type_enum` (fixed repr + trailing
+/// identity data).
 fn emitUnionType(pool: *InternPool, ut: Key.UnionType) Allocator.Error!void {
     const extra_index = try pool.addExtra(UnionTypeRepr{
-        .source_zir_id = ut.source_zir_id,
-        .decl_inst = @intFromEnum(ut.decl_inst),
         .name = @intFromEnum(ut.name),
         .parent = @intFromEnum(ut.parent),
+        .captures_len = containerCapturesLen(ut.id),
     });
-    try pool.extra.append(pool.gpa, @intCast(ut.captures.len));
-    try pool.extra.appendSlice(pool.gpa, @ptrCast(ut.captures));
+    try pool.appendContainerId(ut.id);
     pool.items.appendAssumeCapacity(.{ .tag = .type_union, .data = extra_index });
 }
 
@@ -4543,9 +4622,8 @@ test "fullyQualifiedName: a member of a named container nests under it" {
     // qualify under that name. This exercises the owner-type recursion
     // (`containerTypeName`) that activates once a container owns a scope.
     const outer = try pool.internStructType(.{
-        .source_zir_id = 0,
-        .decl_inst = @enumFromInt(1),
         .name = try pool.getOrPutString(pool.gpa, "repl.Outer"),
+        .id = .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(1) } },
     });
     const ns = try pool.createNamespace(pool.gpa, .none);
     pool.namespacePtr(ns).owner_type = outer;

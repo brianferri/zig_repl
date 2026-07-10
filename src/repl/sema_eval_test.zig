@@ -1075,12 +1075,11 @@ test "struct_type: nominal identity keys on (source_zir_id, decl_inst)" {
     defer pool.deinit();
 
     const name_a = try pool.getOrPutString(gpa, "repl.A");
-    const a1 = try pool.internStructType(.{ .source_zir_id = 0, .decl_inst = @enumFromInt(2), .name = name_a });
-    const a2 = try pool.internStructType(.{ .source_zir_id = 0, .decl_inst = @enumFromInt(2), .name = name_a });
+    const a1 = try pool.internStructType(.{ .name = name_a, .id = .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(2) } } });
+    const a2 = try pool.internStructType(.{ .name = name_a, .id = .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(2) } } });
     const b = try pool.internStructType(.{
-        .source_zir_id = 0,
-        .decl_inst = @enumFromInt(3),
         .name = try pool.getOrPutString(gpa, "repl.B"),
+        .id = .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(3) } },
     });
 
     // Same declaration site dedups to one type; a different site is a
