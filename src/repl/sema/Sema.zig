@@ -5599,6 +5599,18 @@ fn unionFieldByName(
     name: InternPool.NullTerminatedString,
 ) Error!?FieldInfo {
     const ip = sema.intern_pool;
+    // A reified union has no ZIR; its fields are read from storage.
+    if (ip.unionFields(union_ty)) |f| {
+        for (f.names, 0..) |n, i| {
+            if (n != name) continue;
+            return .{
+                .index = @intCast(i),
+                .ty = f.types[i],
+                .align_bytes = if (f.aligns.len == 0 or f.aligns[i] == .none) null else @intCast(sema.intAsI128(f.aligns[i]).?),
+            };
+        }
+        return null;
+    }
     const cf = try sema.enterContainer(union_ty, "union field");
     defer cf.restore(sema);
     var it = sema.zir.getUnionDecl(cf.decl_inst).iterateFields();
@@ -5686,6 +5698,8 @@ fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) Error
 
 /// A union type's declared field count, read from its source ZIR.
 fn unionFieldCount(sema: *Sema, union_ty: InternPool.Index) Error!u32 {
+    // A reified union has no ZIR; its field count comes from stored fields.
+    if (sema.intern_pool.unionFields(union_ty)) |f| return @intCast(f.names.len);
     const cf = try sema.enterContainer(union_ty, "union field count");
     defer cf.restore(sema);
     return @intCast(sema.zir.getUnionDecl(cf.decl_inst).field_names.len);
@@ -5696,6 +5710,8 @@ fn unionFieldCount(sema: *Sema, union_ty: InternPool.Index) Error!u32 {
 /// index is out of range.
 fn unionFieldNameAt(sema: *Sema, union_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
     const ip = sema.intern_pool;
+    // A reified union has no ZIR; its field names are stored.
+    if (ip.unionFields(union_ty)) |f| return if (index < f.names.len) f.names[index] else null;
     const cf = try sema.enterContainer(union_ty, "union field name");
     defer cf.restore(sema);
     var it = sema.zir.getUnionDecl(cf.decl_inst).iterateFields();
@@ -5785,6 +5801,16 @@ fn unionAllFieldsNpv(sema: *Sema, union_ty: InternPool.Index) Error!bool {
 
 fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPool.Index {
     const ip = sema.intern_pool;
+    // A reified union with an explicit tag enum uses it; an untagged one gets a
+    // generated tag enum keyed on the union (auto-numbered), like a declared bare
+    // union -- so its values still carry a tag.
+    if (ip.unionFields(union_ty)) |f| {
+        if (f.tag_type != .none) return f.tag_type;
+        return try ip.internEnumType(.{
+            .name = ip.indexToKey(union_ty).union_type.name,
+            .id = .{ .generated_union_tag = union_ty },
+        });
+    }
     const ut = ip.indexToKey(union_ty).union_type;
     // `this_type` is the union, so a `closure_get` (a captured `E` / `T`) in the
     // tag-type body resolves.
@@ -5916,17 +5942,25 @@ fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.En
 /// an ordinary auto enum whose int mode is explicit only for `tagged_enum_explicit`.
 fn generatedTagScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?EnumMatchResult {
     const ip = sema.intern_pool;
+    const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
+    // A reified union has no ZIR; its generated tag reads the union's stored fields.
+    // A generated tag enum is auto-numbered, so each tag value equals its position.
+    const owner = ip.indexToKey(enum_ty).enum_type.id.generatedUnion();
+    if (ip.unionFields(owner)) |f| {
+        for (f.names, 0..) |field_name, idx| {
+            if (try sema.matchEnumField(enum_ty, tag_ty, match, field_name, @intCast(idx), @intCast(idx))) |m| return m;
+        }
+        return null;
+    }
     // `enterContainer` unwraps the generated tag enum to its owner union: the
     // union's ZIR frame, and the union as `this_type` so a `closure_get` in an
     // explicit `union(enum(T))` tag resolves.
     const cf = try sema.enterContainer(enum_ty, "union tag field");
     defer cf.restore(sema);
     const decl = sema.zir.getUnionDecl(cf.decl_inst);
-    const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
     var it = decl.iterateFields();
     while (it.next()) |field| {
         const field_name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
-        // A generated tag enum is auto-numbered, so its value equals its position.
         if (try sema.matchEnumField(enum_ty, tag_ty, match, field_name, field.idx, field.idx)) |m| return m;
     }
     return null;
@@ -5941,6 +5975,12 @@ fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Ind
     // A reified enum has no ZIR; its tag type is stored. (A declared enum's fields
     // are not yet resolved when this is called during resolution, so it reads ZIR.)
     if (sema.intern_pool.enumFields(enum_ty)) |f| return f.int_tag_type;
+    // The generated tag enum of a reified union is auto-numbered (the union has no
+    // ZIR, and a reified union carries no explicit int tag type).
+    const gu = et.id.generatedUnion();
+    if (gu != .none and sema.intern_pool.unionFields(gu) != null) {
+        return try sema.enumIntTagType(try sema.unionFieldCount(gu));
+    }
     const cf = try sema.enterContainer(enum_ty, "enum tag type");
     defer cf.restore(sema);
     // A generated tag enum reads its explicit `T` from the owner union's decl;
@@ -6216,6 +6256,8 @@ fn evalTagName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// Read from the union decl's ZIR `kind`, mirroring `unionTagType != null`
 /// (`tag_usage == .tagged`). Auto/extern/packed unions are untagged.
 fn unionIsTagged(sema: *Sema, union_ty: InternPool.Index) Error!bool {
+    // A reified union has no ZIR; it is tagged iff it stores an explicit tag enum.
+    if (sema.intern_pool.unionFields(union_ty)) |f| return f.tag_type != .none;
     const ut = sema.intern_pool.indexToKey(union_ty).union_type;
     const frame = try sema.enterSourceZir(ut.id.sourceZirId(), "union kind");
     defer frame.restore(sema);
@@ -6368,7 +6410,11 @@ fn containerNamespace(sema: *Sema, container_ty: InternPool.Index) ?ContainerNam
             .declared => |d| .{ .source_zir_id = d.source_zir_id, .decl_inst = d.decl_inst },
             else => null,
         },
-        .union_type => |ut| .{ .source_zir_id = ut.id.sourceZirId(), .decl_inst = ut.id.declInst() },
+        // A reified union has an empty namespace (no source decls).
+        .union_type => |ut| switch (ut.id) {
+            .declared => |d| .{ .source_zir_id = d.source_zir_id, .decl_inst = d.decl_inst },
+            else => null,
+        },
         // A generated tag enum resolves through the owner union's namespace; a
         // reified enum has an empty namespace (no source decls).
         .enum_type => |et| switch (et.id) {

@@ -1920,10 +1920,15 @@ const EnumTagRepr = extern struct {
 };
 
 /// Extra-arena payload for `Item.Tag.type_union`. Same shape/trailing as
-/// `StructTypeRepr` (name + parent + identity, identity data trailing).
+/// `StructTypeRepr` (name + parent + `field_data` + identity, identity data
+/// trailing).
 const UnionTypeRepr = extern struct {
     name: u32,
     parent: u32,
+    /// Offset into `extra` of this union's resolved field storage (see
+    /// `unionFields`), or `fields_unresolved`. Filled by a reified union; a declared
+    /// union reads its fields from ZIR. Not part of identity.
+    field_data: u32,
     captures_len: u32,
 };
 
@@ -3550,10 +3555,83 @@ fn emitUnionType(pool: *InternPool, ut: Key.UnionType) Allocator.Error!void {
     const extra_index = try pool.addExtra(UnionTypeRepr{
         .name = @intFromEnum(ut.name),
         .parent = @intFromEnum(ut.parent),
+        .field_data = fields_unresolved,
         .captures_len = containerCapturesLen(ut.id),
     });
     try pool.appendContainerId(ut.id);
     pool.items.appendAssumeCapacity(.{ .tag = .type_union, .data = extra_index });
+}
+
+/// The resolved fields of a reified union, borrowing into `extra`. Mirrors the
+/// comptime-relevant part of `LoadedUnionType`. `tag_type` is the explicit tag enum
+/// (`.none` for an untagged union); `backing_int` is the packed backing integer
+/// (`.none` unless a packed union); `aligns` is empty when no field has an explicit
+/// alignment. Union fields carry no comptime/default (unlike struct fields). Storage
+/// block layout: `[layout, tag_type, backing_int, fields_len, aligns_len, names...,
+/// types..., aligns...]`.
+pub const UnionFields = struct {
+    layout: std.lang.Type.ContainerLayout,
+    tag_type: Index,
+    backing_int: Index,
+    names: []const NullTerminatedString,
+    types: []const Index,
+    aligns: []const Index,
+};
+
+/// This union's resolved fields, or null if it stores none (a declared union, which
+/// reads its fields from ZIR).
+pub fn unionFields(pool: *const InternPool, union_ty: Index) ?UnionFields {
+    const item = pool.items.get(@intFromEnum(union_ty));
+    assert(item.tag == .type_union);
+    const off = pool.extra.items[item.data + @offsetOf(UnionTypeRepr, "field_data") / 4];
+    if (off == fields_unresolved) return null;
+    const fields_len = pool.extra.items[off + 3];
+    const aligns_len = pool.extra.items[off + 4];
+    var base = off + 5;
+    const names: []const NullTerminatedString = @ptrCast(pool.extra.items[base..][0..fields_len]);
+    base += fields_len;
+    const types: []const Index = @ptrCast(pool.extra.items[base..][0..fields_len]);
+    base += fields_len;
+    return .{
+        .layout = @enumFromInt(pool.extra.items[off]),
+        .tag_type = @enumFromInt(pool.extra.items[off + 1]),
+        .backing_int = @enumFromInt(pool.extra.items[off + 2]),
+        .names = names,
+        .types = types,
+        .aligns = @ptrCast(pool.extra.items[base..][0..aligns_len]),
+    };
+}
+
+/// Store a reified union's resolved fields (idempotent -- a no-op once set). Each
+/// `aligns[i]` is `.none` for a field without an explicit alignment; the slice is
+/// empty when no field has one. Only the `field_data` slot is filled, in place.
+pub fn setUnionFields(
+    pool: *InternPool,
+    union_ty: Index,
+    layout: std.lang.Type.ContainerLayout,
+    tag_type: Index,
+    backing_int: Index,
+    names: []const NullTerminatedString,
+    types: []const Index,
+    aligns: []const Index,
+) Allocator.Error!void {
+    assert(types.len == names.len);
+    assert(aligns.len == 0 or aligns.len == names.len);
+    const item = pool.items.get(@intFromEnum(union_ty));
+    assert(item.tag == .type_union);
+    const slot = item.data + @offsetOf(UnionTypeRepr, "field_data") / 4;
+    if (pool.extra.items[slot] != fields_unresolved) return;
+    const off: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.ensureUnusedCapacity(pool.gpa, 5 + names.len + types.len + aligns.len);
+    pool.extra.appendAssumeCapacity(@intFromEnum(layout));
+    pool.extra.appendAssumeCapacity(@intFromEnum(tag_type));
+    pool.extra.appendAssumeCapacity(@intFromEnum(backing_int));
+    pool.extra.appendAssumeCapacity(@intCast(names.len));
+    pool.extra.appendAssumeCapacity(@intCast(aligns.len));
+    for (names) |n| pool.extra.appendAssumeCapacity(@intFromEnum(n));
+    for (types) |t| pool.extra.appendAssumeCapacity(@intFromEnum(t));
+    for (aligns) |a| pool.extra.appendAssumeCapacity(@intFromEnum(a));
+    pool.extra.items[slot] = off;
 }
 
 /// Emit a `union_value` Item. Three u32 slots: `ty`, `tag`, `val`.
