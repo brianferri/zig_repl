@@ -9188,7 +9188,8 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
             const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
             const extra = sema.zir.extraData(Zir.Inst.FieldCall, pl_node.payload_index);
             const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.data.field_name_start));
-            const object = try sema.loadValue(try sema.resolveRef(extra.data.obj_ptr));
+            const object_ptr = try sema.resolveRef(extra.data.obj_ptr);
+            const object = try sema.loadValue(object_ptr);
             const args_slice: []const Zir.Inst.Index = @ptrCast(sema.zir.extra[extra.end..]);
             // Mirror `fieldCallBind`: a type object (`T.decl(x)`) resolves the
             // declaration in T's namespace with no receiver; a value object
@@ -9201,7 +9202,25 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
             const lookup_ty = if (is_type) object.index else object.typeOf(sema.intern_pool).toIndex();
             const callee = (try sema.containerDeclByName(lookup_ty, name)) orelse
                 return sema.failBadMemberAccess(lookup_ty, name);
-            break :blk .{ callee, if (is_type) null else object, extra.data.flags.args_len, args_slice, lookup_ty };
+            // Bind the value method's receiver from `m`'s first parameter, as
+            // `fieldCallBind` does: a `*T` receiver -- a single/C pointer to the
+            // value's type -- or an `anytype` first parameter takes the object
+            // pointer (so the method reads or mutates through it); a by-value `T`
+            // takes the loaded value.
+            const self: ?Value = if (is_type) null else self: {
+                const callee_func = sema.intern_pool.indexToKey(callee.index);
+                if (callee_func != .func) break :self object;
+                const first_params = sema.intern_pool.indexToKey(callee_func.func.ty).func_type.param_types;
+                if (first_params.len == 0) break :self object;
+                if (first_params[0] == .generic_poison_type) break :self object_ptr;
+                const p0 = sema.intern_pool.indexToKey(first_params[0]);
+                if (p0 == .ptr_type and
+                    (p0.ptr_type.flags.size == .one or p0.ptr_type.flags.size == .c) and
+                    p0.ptr_type.child == lookup_ty)
+                    break :self object_ptr;
+                break :self object;
+            };
+            break :blk .{ callee, self, extra.data.flags.args_len, args_slice, lookup_ty };
         },
     };
 
