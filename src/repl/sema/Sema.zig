@@ -4325,10 +4325,11 @@ fn evalImport(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// reused by builtins that reach into std (e.g. `getStdLangType`) so they go
 /// through import semantics rather than a raw file load.
 fn importPath(sema: *Sema, path: []const u8) Error!InternPool.Index {
-    // `std` resolves to its root file; `root` and `builtin` are not loaded yet.
+    // `std` resolves to its root file; `builtin` is generated for the native target;
+    // `root` (the compilation's own root file) has no REPL equivalent.
     if (std.mem.eql(u8, path, "std")) return sema.loadModuleFile("std.zig");
     if (std.mem.eql(u8, path, "root")) return sema.failUnloadedModule(path);
-    if (std.mem.eql(u8, path, "builtin")) return sema.failUnloadedModule(path);
+    if (std.mem.eql(u8, path, "builtin")) return sema.loadBuiltinModule("builtin");
 
     // Any other string is a relative file (a named module dependency would need
     // an import graph the REPL has no equivalent of). Resolve it against the
@@ -4382,7 +4383,16 @@ fn loadModuleFile(sema: *Sema, canonical: []const u8) Error!InternPool.Index {
         return error.AnalysisFail;
     };
     defer sema.gpa.free(bytes);
+    return sema.lowerModule(canonical, bytes);
+}
 
+/// Lower a module's source `bytes` (from a provider file or generated in-process,
+/// like `builtin`) into its file-root container type, appending the file and
+/// recording it in the `import_table`. Callers dedup via `import_table` first. The
+/// file-root struct's identity mirrors `loadModuleFile` (a declared container keyed
+/// on the new `File.Index`), so its decls and relative imports resolve lazily.
+fn lowerModule(sema: *Sema, canonical: []const u8, bytes: [:0]const u8) Error!InternPool.Index {
+    const session = sema.session.?;
     // The Ast references `bytes` and AstGen reads the Ast, so both live only
     // through lowering; the resulting Zir is what the session retains.
     var tree = try std.zig.Ast.parse(sema.gpa, bytes, .zig);
@@ -4416,6 +4426,22 @@ fn loadModuleFile(sema: *Sema, canonical: []const u8) Error!InternPool.Index {
     });
     session.files.items[file_index].root_type = root_type;
     return root_type;
+}
+
+/// The `builtin` module, generated for the native target. The compiler emits it
+/// per compilation (`src/Builtin.zig`); the REPL evaluates native code, so
+/// `sema/Builtin.zig` serializes the REPL's own `@import("builtin").target` into
+/// the same expanded-literal shape -- enough for the target-dependent decls the
+/// REPL reaches (calling conventions: `CallingConvention.c` is
+/// `builtin.target.cCallingConvention()`).
+fn loadBuiltinModule(sema: *Sema, canonical: []const u8) Error!InternPool.Index {
+    const session = sema.session orelse return sema.failUnloadedModule(canonical);
+    if (session.import_table.get(canonical)) |idx| return session.files.items[idx].root_type;
+    if (session.module_source == null) return sema.failUnloadedModule(canonical);
+
+    const bytes = try @import("Builtin.zig").generate(sema.gpa);
+    defer sema.gpa.free(bytes);
+    return sema.lowerModule(canonical, bytes);
 }
 
 /// Resolve a type declared in `std.lang` (a dotted `path` like "Type" or

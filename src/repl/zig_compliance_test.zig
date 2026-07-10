@@ -2471,6 +2471,12 @@ test "@import(std) broad access probes" {
         .{ .src = "@import(\"std\").math.maxInt(i8)", .want = "127" },
         .{ .src = "@import(\"std\").math.minInt(u8)", .want = "0" },
         .{ .src = "@import(\"std\").math.minInt(i8)", .want = "-128" },
+        // The generated `builtin` module serialises the native target; evaluating
+        // it drives @memcpy (the dynamic-linker buffer) and its `cCallingConvention`
+        // builds a `?CallingConvention` union through an optional result location.
+        // The assertions are target-agnostic: the concrete arch/CC vary by host.
+        .{ .src = "@TypeOf(@import(\"builtin\").target) == @import(\"std\").Target", .want = "true" },
+        .{ .src = "@TypeOf(@import(\"builtin\").target.cCallingConvention().?) == @import(\"std\").builtin.CallingConvention", .want = "true" },
     };
 
     var failures: usize = 0;
