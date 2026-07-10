@@ -5567,7 +5567,14 @@ fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: Intern
         .struct_type => |st| .{ "struct", st.name },
         .enum_type => |et| .{ "enum", et.name },
         .union_type => |ut| .{ "union", ut.name },
-        else => unreachable, // only container types reach a member-access miss
+        // A non-container type reaches here only through a field call on a type
+        // that carries no namespace (`u8.foo()`); name it via its printed form.
+        else => {
+            sema.writer.print("type '", .{}) catch |e| return e;
+            Type.print(.fromIndex(container_ty), ip, sema.writer) catch |e| return e;
+            sema.writer.print("' has no member named '{s}'\n", .{ip.stringSlice(name)}) catch |e| return e;
+            return error.AnalysisFail;
+        },
     };
     sema.writer.print("{s} '{s}' has no member named '{s}'\n", .{ kw, ip.stringSlice(ct_name), ip.stringSlice(name) }) catch |e| return e;
     return error.AnalysisFail;
@@ -9092,27 +9099,18 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
             const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.data.field_name_start));
             const object = try sema.loadValue(try sema.resolveRef(extra.data.obj_ptr));
             const args_slice: []const Zir.Inst.Index = @ptrCast(sema.zir.extra[extra.end..]);
-            // `P.decl(x)`: the object is the struct type -> static call, no receiver.
-            if (sema.intern_pool.indexToKey(object.index) == .struct_type) {
-                const callee = (try sema.containerDeclByName(object.index, name)) orelse
-                    return sema.failBadMemberAccess(object.index, name);
-                break :blk .{ callee, null, extra.data.flags.args_len, args_slice, object.index };
-            }
-            // `p.method(x)`: the object is a struct value -> bind it as the receiver.
-            const struct_ty = object.typeOf(sema.intern_pool).toIndex();
-            if (sema.intern_pool.indexToKey(struct_ty) != .struct_type) {
-                try sema.writer.writeAll("field_call: receiver is not a struct\n");
-                return error.AnalysisFail;
-            }
-            const callee = (try sema.containerDeclByName(struct_ty, name)) orelse {
-                // UFCS `p.method()` miss: the compiler reports it against both a
-                // field and a member function (`callMethod`), distinct from a
-                // pure namespace member access.
-                const st_name = sema.intern_pool.stringSlice(sema.intern_pool.indexToKey(struct_ty).struct_type.name);
-                try sema.writer.print("no field or member function named '{s}' in '{s}'\n", .{ sema.intern_pool.stringSlice(name), st_name });
-                return error.AnalysisFail;
-            };
-            break :blk .{ callee, object, extra.data.flags.args_len, args_slice, struct_ty };
+            // Mirror `fieldCallBind`: a type object (`T.decl(x)`) resolves the
+            // declaration in T's namespace with no receiver; a value object
+            // (`v.method(x)`) binds the value and resolves the method in its type's
+            // namespace. `containerDeclByName` (the REPL's `getNamespace` lookup)
+            // returns null for a type without one -- e.g. an enum, as in
+            // `std.Target.Os.Tag.defaultVersionRange(...)`, or the value's type in
+            // `builtin.target.cCallingConvention()`.
+            const is_type = object.typeOf(sema.intern_pool).toIndex() == .type_type;
+            const lookup_ty = if (is_type) object.index else object.typeOf(sema.intern_pool).toIndex();
+            const callee = (try sema.containerDeclByName(lookup_ty, name)) orelse
+                return sema.failBadMemberAccess(lookup_ty, name);
+            break :blk .{ callee, if (is_type) null else object, extra.data.flags.args_len, args_slice, lookup_ty };
         },
     };
 
