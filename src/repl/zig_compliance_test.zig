@@ -354,6 +354,11 @@ test "compliance: @as fixed-width int -> fixed-width float" {
 
 test "compliance: @intFromFloat truncate" {
     try expectMatchesZig(testing.allocator, &.{"@as(i32, @intFromFloat(@as(f64, 3.7)))"});
+    // Target-width and c_* destinations are int types too (routed through intInfo,
+    // not a bare `.int_type` Key check).
+    try expectMatchesZig(testing.allocator, &.{"@as(usize, @intFromFloat(@as(f64, 5.9)))"});
+    try expectMatchesZig(testing.allocator, &.{"@as(isize, @intFromFloat(@as(f64, -3.8)))"});
+    try expectMatchesZig(testing.allocator, &.{"@as(c_int, @intFromFloat(@as(f64, 7.2)))"});
 }
 
 test "compliance: @floatFromInt rounding" {

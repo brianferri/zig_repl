@@ -1619,8 +1619,9 @@ fn materialiseIntFromFloat(
         const idx = try sema.intern_pool.internComptimeInt(big);
         return .{ .index = idx };
     }
-    if (dest_key == .int_type) {
-        const dest_int = dest_key.int_type;
+    // `intInfo` accepts every fixed-width int -- `intN`, `usize`/`isize`, and the
+    // `c_*` types -- not just `.int_type`, matching the compiler's `.int` arm.
+    if (Type.fromIndex(dest_type_index).intInfo(sema.intern_pool)) |dest_int| {
         if (!big.fitsInTwosComp(dest_int.signedness, dest_int.bits)) {
             try sema.writer.print(
                 "@intFromFloat: value does not fit in {c}{d}\n",
