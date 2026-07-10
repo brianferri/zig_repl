@@ -491,6 +491,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .enum_literal => sema.evalEnumLiteral(inst),
         .int_from_bool => sema.evalIntFromBool(inst),
         .alloc, .alloc_mut, .alloc_comptime_mut => sema.evalAlloc(inst),
+        .ret_ptr => sema.evalRetPtr(),
         .alloc_inferred, .alloc_inferred_comptime => sema.evalAllocInferred(true),
         .alloc_inferred_mut, .alloc_inferred_comptime_mut => sema.evalAllocInferred(false),
         .store_to_inferred_ptr => sema.evalStoreToInferredPtr(inst),
@@ -2698,6 +2699,16 @@ fn evalAlloc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const child_ty = try sema.resolveDestType(un_node.operand, "alloc");
     const undef_idx = try sema.intern_pool.get(.{ .undef = child_ty });
     return try sema.pushComptimeAlloc(child_ty, .{ .index = undef_idx }, false, .none);
+}
+
+/// `ret_ptr`: the result pointer a function returns its value through when the
+/// return type is result-located (a by-value aggregate). In a comptime block the
+/// compiler's `zirRetPtr` allocates a comptime slot of the return type; the body
+/// writes the return value into it and `ret_load` reads it back.
+fn evalRetPtr(sema: *Sema) Error!?Value {
+    const ret_ty = sema.fn_ret_ty;
+    const undef_idx = try sema.intern_pool.get(.{ .undef = ret_ty });
+    return try sema.pushComptimeAlloc(ret_ty, .{ .index = undef_idx }, false, .none);
 }
 
 /// `make_ptr_const`: freeze an `alloc`'s pointer to `*const T` once the value
