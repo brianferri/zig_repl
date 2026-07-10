@@ -2461,3 +2461,66 @@ test "@import(std) broad access probes" {
     try testing.expectEqual(@as(usize, 0), failures);
 }
 
+test "reify constructors: value paths and rejected inputs" {
+    const gpa = testing.allocator;
+    var io_instance: Io.Threaded = .init(gpa, .{});
+    defer io_instance.deinit();
+    const io = io_instance.io();
+    var root = try std.Io.Dir.openDirAbsolute(io, @import("build_options").zig_std_dir, .{});
+    defer root.close(io);
+    var native: NativeModuleSource = .{ .io = io, .root = root };
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+    session.module_source = &native.interface;
+
+    // Values of reified types round-trip through their stored fields: an enum tag,
+    // a struct field, and both a tagged and an (auto, untagged) union field. The
+    // untagged union still carries a generated tag enum, so its value is well-formed.
+    const values = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "@intFromEnum(@Enum(u8, .exhaustive, &.{ \"a\", \"b\" }, &.{ 0, 1 }).b) == 1", .want = "true" },
+        .{ .src = "(@Struct(.auto, null, &.{ \"a\", \"b\" }, &.{ u8, bool }, &.{ .{}, .{} }){ .a = 3, .b = true }).b", .want = "true" },
+        .{ .src = "(@Union(.auto, @Enum(u8, .exhaustive, &.{\"x\"}, &.{0}), &.{\"x\"}, &.{u8}, &.{.{}}){ .x = 7 }).x == 7", .want = "true" },
+        .{ .src = "(@Union(.auto, null, &.{\"x\"}, &.{u8}, &.{.{}}){ .x = 7 }).x == 7", .want = "true" },
+        // A reified container reflects its stored layout and packed backing integer
+        // (a declared container, which stores neither, still reports `.auto`).
+        .{ .src = "@typeInfo(@Struct(.@\"extern\", null, &.{\"a\"}, &.{u8}, &.{.{}})).@\"struct\".layout == .@\"extern\"", .want = "true" },
+        .{ .src = "@typeInfo(@Struct(.@\"packed\", null, &.{\"a\"}, &.{u8}, &.{.{}})).@\"struct\".layout == .@\"packed\"", .want = "true" },
+        .{ .src = "@typeInfo(@Struct(.@\"packed\", u8, &.{\"a\"}, &.{u8}, &.{.{}})).@\"struct\".backing_integer == u8", .want = "true" },
+        .{ .src = "@typeInfo(@Union(.@\"extern\", null, &.{\"a\"}, &.{u8}, &.{.{}})).@\"union\".layout == .@\"extern\"", .want = "true" },
+        .{ .src = "@typeInfo(@Union(.@\"packed\", u8, &.{\"a\"}, &.{u8}, &.{.{}})).@\"union\".backing_integer == u8", .want = "true" },
+    };
+    for (values) |p| try expectReplValue(&session, p.src, p.want);
+
+    // Invalid reifications are rejected with the compiler's wording. Each names one
+    // rule the constructor enforces (validation the arguments cannot express away).
+    const rejected = [_]struct { src: []const u8, needle: []const u8 }{
+        .{ .src = "@Struct(.auto, null, &.{\"a\"}, &.{u8}, &.{.{ .@\"comptime\" = true }})", .needle = "comptime field without default initialization value" },
+        .{ .src = "@Struct(.@\"packed\", null, &.{\"a\"}, &.{u8}, &.{.{ .@\"align\" = 4 }})", .needle = "packed struct fields cannot be aligned" },
+        .{ .src = "@Struct(.auto, u8, &.{\"a\"}, &.{u8}, &.{.{}})", .needle = "non-packed struct does not support backing integer type" },
+        .{ .src = "@Union(.@\"extern\", @Enum(u8, .exhaustive, &.{\"x\"}, &.{0}), &.{\"x\"}, &.{u8}, &.{.{}})", .needle = "extern union does not support enum tag type" },
+        .{ .src = "@Union(.@\"packed\", null, &.{\"a\"}, &.{u8}, &.{.{ .@\"align\" = 4 }})", .needle = "packed union fields cannot be aligned" },
+        // Field access on a reified type reads stored fields; a miss names the type.
+        .{ .src = "(@Struct(.auto, null, &.{\"a\"}, &.{u8}, &.{.{}}){ .a = 1 }).b", .needle = "no field named 'b'" },
+        .{ .src = "@Enum(u8, .exhaustive, &.{\"a\"}, &.{0}).zzz", .needle = "has no member named 'zzz'" },
+    };
+    for (rejected) |p| {
+        var diag: std.Io.Writer.Allocating = .init(gpa);
+        defer diag.deinit();
+        if (eval.run(&session, p.src, &diag.writer)) |_| {
+            std.debug.print("expected rejection but accepted: {s}\n", .{p.src});
+            return error.TestUnexpectedAcceptance;
+        } else |err| switch (err) {
+            error.AnalysisFail => {},
+            else => return err,
+        }
+        if (std.mem.indexOf(u8, diag.written(), p.needle) == null) {
+            std.debug.print("diagnostic for '{s}' did not contain '{s}':\n{s}\n", .{ p.src, p.needle, diag.written() });
+            return error.TestDiagnosticMismatch;
+        }
+    }
+}
+
+

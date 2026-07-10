@@ -4654,11 +4654,15 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const field_attrs_val = try sema.internConstSlice(attrs_ty, attrs);
             const decl_names_val = try sema.typeInfoDecls(ty);
 
-            // No layout model, so the reported layout is always `.auto` and the
-            // packed backing integer is null.
-            const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(std.lang.Type.ContainerLayout.auto))).?;
+            // A reified union stores its layout and (for a packed union) its backing
+            // integer; a declared one has neither modelled, so it reports `.auto` and
+            // a null backing integer. The inferred backing of a packed union with no
+            // explicit backing needs layout resolution, which is not modelled.
+            const uf = ip.unionFields(ty);
+            const layout = if (uf) |f| f.layout else .auto;
+            const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(layout))).?;
             const tag_type_val = try sema.optTypeValue(if (try sema.unionIsTagged(ty)) try sema.unionTagEnumType(ty) else .none);
-            const backing_integer_val = try sema.optTypeValue(.none);
+            const backing_integer_val = try sema.optTypeValue(if (uf) |f| f.backing_int else .none);
 
             var elems = [_]InternPool.Index{ layout_val.index, tag_type_val, backing_integer_val, field_names_val, field_types_val, field_attrs_val, decl_names_val };
             return try sema.typeInfoUnion(type_info_ty, tag_enum, "union", try ip.internAggregate(.{ .ty = union_std_ty, .storage = .{ .elems = &elems } }));
@@ -4720,10 +4724,13 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const field_attrs_val = try sema.internConstSlice(attrs_ty, attrs);
             const decl_names_val = if (tuple_types != null) try sema.internStringSlice(&.{}) else try sema.typeInfoDecls(ty);
 
-            // No layout model, so the reported layout is always `.auto` and the
-            // packed backing integer is null.
-            const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(std.lang.Type.ContainerLayout.auto))).?;
-            const backing_integer_val = try sema.optTypeValue(.none);
+            // A reified struct stores its layout and packed backing integer; a
+            // declared struct (or a tuple) has none modelled, so it reports `.auto`
+            // and a null backing integer.
+            const sf: ?InternPool.StructFields = if (tuple_types == null) ip.structFields(ty) else null;
+            const layout = if (sf) |f| f.layout else .auto;
+            const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(layout))).?;
+            const backing_integer_val = try sema.optTypeValue(if (sf) |f| f.backing_int else .none);
 
             var elems = [_]InternPool.Index{ if (tuple_types != null) .bool_true else .bool_false, layout_val.index, backing_integer_val, field_names_val, field_types_val, field_attrs_val, decl_names_val };
             return try sema.typeInfoUnion(type_info_ty, tag_enum, "struct", try ip.internAggregate(.{ .ty = struct_std_ty, .storage = .{ .elems = &elems } }));
