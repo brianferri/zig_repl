@@ -9120,7 +9120,14 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
         return error.AnalysisFail;
     }
     const func = callee_key.func;
-    const func_ty = sema.intern_pool.indexToKey(func.ty).func_type;
+    var func_ty = sema.intern_pool.indexToKey(func.ty).func_type;
+    // `param_types` borrows the pool's `extra`; evaluating the arguments below
+    // interns values that can reallocate it. Copy onto stable storage and rebind
+    // so every later read (the param loop, `paramIsComptime`) is safe. The other
+    // `func_ty` fields are copied scalars, unaffected by reallocation.
+    const param_types = try sema.gpa.dupe(InternPool.Index, func_ty.param_types);
+    defer sema.gpa.free(param_types);
+    func_ty.param_types = param_types;
 
     const args_len = explicit_len + @as(u32, @intFromBool(self_val != null));
     if (func_ty.param_types.len != args_len) {
@@ -9130,7 +9137,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
         );
         return error.AnalysisFail;
     }
-    const raw_args = try sema.evalCallArgs(inst, self_val, explicit_len, args_body);
+    const raw_args = try sema.evalCallArgs(inst, self_val, explicit_len, args_body, func_ty.param_types);
     defer sema.gpa.free(raw_args);
 
     // The callee's body sees its container as `@This()` and resolves bare
@@ -9226,12 +9233,20 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
 /// `explicit_len` come from `args_body`. Coercion to the parameter type happens
 /// in `evalCall` once the callee's ZIR is in scope, because a generic
 /// parameter's type is only known there, per instantiation.
+///
+/// Before each argument body runs, the call instruction is bound to that
+/// argument's parameter type, so a result-type-dependent expression -- a
+/// `decl_literal` like `.tag`, whose type ref AstGen points at the call -- reads
+/// it. Mirrors `analyzeArg` (src/Sema.zig) mapping `call_inst` to the parameter
+/// type. A generic parameter's type is the poison marker here; the argument then
+/// yields its own natural type, resolved against the concrete type in `evalCall`.
 fn evalCallArgs(
     sema: *Sema,
     inst: Zir.Inst.Index,
     self_val: ?Value,
     explicit_len: u32,
     args_body: []const Zir.Inst.Index,
+    param_types: []const InternPool.Index,
 ) Error![]Value {
     const base: u32 = @intFromBool(self_val != null);
     const arg_values = try sema.gpa.alloc(Value, base + explicit_len);
@@ -9240,7 +9255,10 @@ fn evalCallArgs(
     for (0..explicit_len) |i| {
         const start = if (i == 0) explicit_len else @intFromEnum(args_body[i - 1]);
         const end = @intFromEnum(args_body[i]);
-        arg_values[base + i] = try sema.resolveInlineBody(args_body[start..end], inst);
+        const param_idx = base + i;
+        const param_ty: InternPool.Index = if (param_idx < param_types.len) param_types[param_idx] else .generic_poison_type;
+        try sema.results.put(sema.gpa, inst, .{ .index = param_ty });
+        arg_values[param_idx] = try sema.resolveInlineBody(args_body[start..end], inst);
     }
     return arg_values;
 }
