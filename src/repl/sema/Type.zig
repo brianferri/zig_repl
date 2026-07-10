@@ -181,6 +181,200 @@ pub fn intInfo(ty: Type, pool: *const InternPool) ?std.lang.Type.Int {
     };
 }
 
+/// The `std.lang.TypeId` of `ty`. Mirrors `Type.zigTypeTag`.
+pub fn zigTypeTag(ty: Type, pool: *const InternPool) std.lang.TypeId {
+    return pool.zigTypeTag(ty.index);
+}
+
+/// The child type of a pointer/array/vector/optional/anyframe. Mirrors
+/// `Type.childType`.
+pub fn childType(ty: Type, pool: *const InternPool) Type {
+    return .fromIndex(pool.childType(ty.index));
+}
+
+/// Bit width of a float type. Mirrors `Type.floatBits`; `c_longdouble` resolves
+/// against the host target, like the sibling `intInfo` c-type arms.
+pub fn floatBits(ty: Type) u16 {
+    return switch (ty.index) {
+        .f16_type => 16,
+        .f32_type => 32,
+        .f64_type => 64,
+        .f80_type => 80,
+        .f128_type, .comptime_float_type => 128,
+        .c_longdouble_type => target.cTypeBitSize(.longdouble),
+        else => unreachable,
+    };
+}
+
+/// Whether `ty` is a pointer at runtime -- a real pointer, or a pointer-like
+/// optional. Mirrors `Type.isPtrAtRuntime`.
+pub fn isPtrAtRuntime(ty: Type, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(ty.index)) {
+        .ptr_type => |ptr_type| switch (ptr_type.flags.size) {
+            .slice => false,
+            .one, .many, .c => true,
+        },
+        .opt_type => |child| switch (pool.indexToKey(child)) {
+            .ptr_type => |p| switch (p.flags.size) {
+                .slice, .c => false,
+                .many, .one => !p.flags.is_allowzero,
+            },
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// A pointer whose size is `.slice`. Mirrors `Type.isSlice`.
+pub fn isSlice(ty: Type, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(ty.index)) {
+        .ptr_type => |ptr_type| ptr_type.flags.size == .slice,
+        else => false,
+    };
+}
+
+/// A `const` pointer. Mirrors `Type.isConstPtr`.
+pub fn isConstPtr(ty: Type, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(ty.index)) {
+        .ptr_type => |ptr_type| ptr_type.flags.is_const,
+        else => false,
+    };
+}
+
+/// A `volatile` pointer. Mirrors `Type.isVolatilePtr`.
+pub fn isVolatilePtr(ty: Type, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(ty.index)) {
+        .ptr_type => |ptr_type| ptr_type.flags.is_volatile,
+        else => false,
+    };
+}
+
+/// A pointer-like optional (`?*T`, `?[*]T`, `[*c]T`) -- represented as a bare
+/// pointer with null as the zero address. Mirrors `Type.isPtrLikeOptional`.
+pub fn isPtrLikeOptional(ty: Type, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(ty.index)) {
+        .ptr_type => |ptr_type| ptr_type.flags.size == .c,
+        .opt_type => |child| switch (pool.indexToKey(child)) {
+            .ptr_type => |ptr_type| switch (ptr_type.flags.size) {
+                .slice, .c => false,
+                .many, .one => !ptr_type.flags.is_allowzero,
+            },
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// Whether a pointer (or pointer-like optional) admits the null address.
+/// Mirrors `Type.ptrAllowsZero`.
+pub fn ptrAllowsZero(ty: Type, pool: *const InternPool) bool {
+    return ty.isPtrLikeOptional(pool) or pool.indexToKey(ty.index).ptr_type.flags.is_allowzero;
+}
+
+/// The child of an optional (or a C pointer, which represents itself). Mirrors
+/// `Type.optionalChild`; asserts `ty` is an optional or a C pointer.
+pub fn optionalChild(ty: Type, pool: *const InternPool) Type {
+    return switch (pool.indexToKey(ty.index)) {
+        .opt_type => |child| .fromIndex(child),
+        .ptr_type => |ptr_type| blk: {
+            assert(ptr_type.flags.size == .c);
+            break :blk ty;
+        },
+        else => unreachable,
+    };
+}
+
+/// `{len, sentinel, elem_type}` of an array type. Mirrors `Type.arrayInfo`; the
+/// sentinel is an interned value `Index` (`null` when absent), so callers compare
+/// it by identity as the compiler compares its `Value` after coercion.
+pub const ArrayInfo = struct { len: u64, sentinel: ?InternPool.Index, elem_type: Type };
+pub fn arrayInfo(ty: Type, pool: *const InternPool) ArrayInfo {
+    const at = pool.indexToKey(ty.index).array_type;
+    return .{
+        .len = at.len,
+        .sentinel = if (at.sentinel == .none) null else at.sentinel,
+        .elem_type = .fromIndex(at.child),
+    };
+}
+
+/// Element count of a vector. Mirrors `Type.vectorLen`.
+pub fn vectorLen(ty: Type, pool: *const InternPool) u32 {
+    return pool.indexToKey(ty.index).vector_type.len;
+}
+
+/// The element type of a vector; otherwise `ty` itself. Mirrors `Type.scalarType`.
+pub fn scalarType(ty: Type, pool: *const InternPool) Type {
+    return switch (ty.zigTypeTag(pool)) {
+        .vector => ty.childType(pool),
+        else => ty,
+    };
+}
+
+/// The payload type of an error union. Mirrors `Type.errorUnionPayload`.
+pub fn errorUnionPayload(ty: Type, pool: *const InternPool) Type {
+    return .fromIndex(pool.indexToKey(ty.index).error_union_type.payload_type);
+}
+
+/// The error-set type of an error union. Mirrors `Type.errorUnionSet`.
+pub fn errorUnionSet(ty: Type, pool: *const InternPool) Type {
+    return .fromIndex(pool.indexToKey(ty.index).error_union_type.error_set_type);
+}
+
+/// A tuple type. Mirrors `Type.isTuple`.
+pub fn isTuple(ty: Type, pool: *const InternPool) bool {
+    return pool.indexToKey(ty.index) == .tuple_type;
+}
+
+/// The element type of an indexable type (array/vector, or a pointer to one, or a
+/// many/slice/C pointer). Mirrors `Type.indexableElem`.
+pub fn indexableElem(ty: Type, pool: *const InternPool) Type {
+    return switch (pool.indexToKey(ty.index)) {
+        inline .array_type, .vector_type => |arr| .fromIndex(arr.child),
+        .ptr_type => |ptr_type| switch (ptr_type.flags.size) {
+            .many, .slice, .c => .fromIndex(ptr_type.child),
+            .one => switch (pool.indexToKey(ptr_type.child)) {
+                inline .array_type, .vector_type => |arr| .fromIndex(arr.child),
+                else => unreachable,
+            },
+        },
+        else => unreachable,
+    };
+}
+
+/// The pointer's type info. Mirrors `Type.ptrInfo`; asserts `ty` is a pointer.
+pub fn ptrInfo(ty: Type, pool: *const InternPool) InternPool.Key.PtrType {
+    return switch (pool.indexToKey(ty.index)) {
+        .ptr_type => |p| p,
+        // A pointer-like optional carries its pointer info on the payload.
+        .opt_type => |child| pool.indexToKey(child).ptr_type,
+        else => unreachable,
+    };
+}
+
+/// Whether `ty` contains comptime-only state, so its values are never runtime-
+/// known. Mirrors `Type.comptimeOnly` (which classifies via `Type.classify`):
+/// `fully_comptime`/`partially_comptime` are comptime-only. Derived directly over
+/// the Key here, recursing on the child for optional/array/vector/error-union, as
+/// `classify` does. Nominal containers (struct/union/enum) need resolved layout
+/// this pool-only query cannot reach; they are treated as not comptime-only until
+/// the container-layout subsystem lands (they are unreachable on the `@memcpy`
+/// element path, which recurses only through the arms below).
+pub fn comptimeOnly(ty: Type, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(ty.index)) {
+        .simple_type => |t| switch (t) {
+            .type, .comptime_int, .comptime_float, .enum_literal, .null, .undefined => true,
+            else => false,
+        },
+        .func_type => true,
+        .int_type, .error_set_type, .ptr_type, .anyframe_type => false,
+        .array_type => |arr| Type.fromIndex(arr.child).comptimeOnly(pool),
+        .vector_type => |vec| Type.fromIndex(vec.child).comptimeOnly(pool),
+        .opt_type => |child| Type.fromIndex(child).comptimeOnly(pool),
+        .error_union_type => |eu| Type.fromIndex(eu.payload_type).comptimeOnly(pool),
+        else => false,
+    };
+}
+
 /// `Alignment.fromByteUnits(target.cTypeAlignment(c))` -- the compiler's
 /// `cTypeAlign` helper, inlined for the two `abi*` switches.
 fn cTypeAlign(c: std.Target.CType) InternPool.Alignment {
