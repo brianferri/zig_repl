@@ -441,6 +441,19 @@ pub const Alignment = enum(u6) {
             else => @as(u64, 1) << @intFromEnum(a),
         };
     }
+
+    /// Compare two alignments, treating `.none` as the weakest. Mirrors the
+    /// compiler's `Alignment.compare` / `toRelaxedCompareUnits`.
+    pub fn compare(lhs: Alignment, op: std.math.CompareOperator, rhs: Alignment) bool {
+        return std.math.compare(lhs.toRelaxedCompareUnits(), op, rhs.toRelaxedCompareUnits());
+    }
+
+    pub fn toRelaxedCompareUnits(a: Alignment) u8 {
+        const n: u8 = @intFromEnum(a);
+        assert(n <= @intFromEnum(Alignment.none));
+        if (n == @intFromEnum(Alignment.none)) return 0;
+        return n + 1;
+    }
 };
 
 /// A `comptime { ... }` top-level block. Mirrors the compiler's

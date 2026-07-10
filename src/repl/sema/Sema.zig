@@ -19,6 +19,7 @@ const Limb = std.math.big.Limb;
 const InternPool = @import("InternPool.zig");
 const Value = @import("Value.zig");
 const Type = @import("Type.zig");
+const render_value = @import("../render/Value.zig");
 const arith = @import("arith.zig");
 const InputShape = @import("../front/InputShape.zig");
 const Session = @import("../Session.zig");
@@ -45,6 +46,11 @@ pub const Error = Allocator.Error || std.Io.Writer.Error || error{
 };
 
 gpa: Allocator,
+/// Scratch allocator freed at the end of this evaluation, mirroring the
+/// compiler's `sema.arena` (freed at end-of-analysis). Backs short-lived
+/// structures that outlive a single call but not the evaluation, such as an
+/// `InMemoryCoercionResult`'s nested reason tree.
+arena: Allocator,
 intern_pool: *InternPool,
 zir: Zir,
 writer: *std.Io.Writer,
@@ -215,8 +221,12 @@ pub fn analyze(session: *Session, file_index: Session.Index, writer: *std.Io.Wri
     var top_block: Block = .{};
     defer top_block.deinit(gpa);
 
+    var arena_instance = std.heap.ArenaAllocator.init(gpa);
+    defer arena_instance.deinit();
+
     var sema: Sema = .{
         .gpa = gpa,
+        .arena = arena_instance.allocator(),
         .intern_pool = intern_pool,
         .zir = zir,
         .writer = writer,
@@ -3045,6 +3055,716 @@ fn lookupComptimeAlloc(sema: *Sema, ptr: InternPool.Key.Ptr) Error!*ComptimeAllo
     const idx: u32 = @intFromEnum(ptr.base_addr.comptime_alloc);
     assert(idx < sema.comptime_allocs.items.len);
     return &sema.comptime_allocs.items[idx];
+}
+
+/// The result of `coerceInMemoryAllowed`. Mirrors the compiler's
+/// `InMemoryCoercionResult` (src/Sema.zig) variant-for-variant, including the
+/// recursive `child` reason tree (allocated in `sema.arena`, like the compiler).
+/// The compiler's `report` appends `LazySrcLoc`-anchored notes to a `Zcu.ErrorMsg`;
+/// the REPL has neither, so its `report` writes the same note text to `sema.writer`
+/// (the one bit that legitimately cannot port -- the note *sink*).
+const InMemoryCoercionResult = union(enum) {
+    ok: Strategy,
+    no_match: Pair,
+    int_not_coercible: Int,
+    comptime_int_not_coercible: TypeValuePair,
+    error_union_payload: PairAndChild,
+    array_len: IntPair,
+    array_sentinel: Sentinel,
+    array_elem: PairAndChild,
+    vector_len: IntPair,
+    vector_elem: PairAndChild,
+    optional_shape: Pair,
+    optional_child: PairAndChild,
+    from_anyerror,
+    missing_error: []const InternPool.NullTerminatedString,
+    fn_var_args: bool,
+    fn_generic: bool,
+    fn_param_count: IntPair,
+    fn_param_noalias: IntPair,
+    fn_param_comptime: ComptimeParam,
+    fn_param: Param,
+    fn_cc: CC,
+    fn_return_type: PairAndChild,
+    ptr_child: PairAndChild,
+    ptr_addrspace: AddressSpace,
+    ptr_sentinel: Sentinel,
+    ptr_size: Size,
+    ptr_const: Pair,
+    ptr_volatile: Pair,
+    ptr_allowzero: Pair,
+    ptr_bit_range: BitRange,
+    ptr_alignment: AlignPair,
+    double_ptr_to_anyopaque: Pair,
+    slice_to_anyopaque: Pair,
+
+    const Strategy = enum { none, same_type, bit_cast, ptr_cast, error_cast };
+    const Pair = struct { actual: Type, wanted: Type };
+    const TypeValuePair = struct { actual: Value, wanted: Type };
+    const PairAndChild = struct { child: *InMemoryCoercionResult, actual: Type, wanted: Type };
+    const Param = struct { child: *InMemoryCoercionResult, actual: Type, wanted: Type, index: u64 };
+    const ComptimeParam = struct { index: u64, wanted: bool };
+    // `unreachable_value` indicates no sentinel.
+    const Sentinel = struct { actual: Value, wanted: Value, ty: Type };
+    const Int = struct {
+        actual_signedness: std.lang.Signedness,
+        wanted_signedness: std.lang.Signedness,
+        actual_bits: u16,
+        wanted_bits: u16,
+    };
+    const IntPair = struct { actual: u64, wanted: u64 };
+    const AlignPair = struct { actual: InternPool.Alignment, wanted: InternPool.Alignment };
+    const Size = struct { actual: std.lang.Type.Pointer.Size, wanted: std.lang.Type.Pointer.Size };
+    const AddressSpace = struct { actual: std.lang.AddressSpace, wanted: std.lang.AddressSpace };
+    const CC = struct { actual: std.lang.CallingConvention, wanted: std.lang.CallingConvention };
+    const BitRange = struct { actual_host: u16, wanted_host: u16, actual_offset: u16, wanted_offset: u16 };
+
+    fn dupe(child: *const InMemoryCoercionResult, arena: Allocator) !*InMemoryCoercionResult {
+        const res = try arena.create(InMemoryCoercionResult);
+        res.* = child.*;
+        return res;
+    }
+
+    /// Write the reason chain as diagnostic notes to `sema.writer`, mirroring the
+    /// compiler's `report`. Type/value formatting goes through `Type.print` /
+    /// `render_value.render` instead of the compiler's `{f}` value formatters; the
+    /// `no_match` case's "declared here" notes are `LazySrcLoc`-only, so they are
+    /// omitted (the caller's message already names the two types).
+    fn report(res: *const InMemoryCoercionResult, sema: *Sema) Error!void {
+        const ip = sema.intern_pool;
+        const w = sema.writer;
+        var cur = res;
+        while (true) switch (cur.*) {
+            .ok => unreachable,
+            .no_match => break,
+            .int_not_coercible => |int| {
+                try w.print("{s} {d}-bit int cannot represent all possible {s} {d}-bit values\n", .{
+                    @tagName(int.wanted_signedness), int.wanted_bits, @tagName(int.actual_signedness), int.actual_bits,
+                });
+                break;
+            },
+            .comptime_int_not_coercible => |int| {
+                try w.writeAll("type '");
+                try Type.print(int.wanted, ip, w);
+                try w.writeAll("' cannot represent value '");
+                try render_value.render(int.actual, ip, w);
+                try w.writeAll("'\n");
+                break;
+            },
+            .error_union_payload => |pair| {
+                try noteTwoTypes(sema, "error union payload '", pair.actual, "' cannot cast into error union payload '", pair.wanted);
+                cur = pair.child;
+            },
+            .array_len => |lens| {
+                try w.print("array of length {d} cannot cast into an array of length {d}\n", .{ lens.actual, lens.wanted });
+                break;
+            },
+            .array_sentinel => |sentinel| {
+                try noteSentinel(sema, "source array cannot be guaranteed to maintain '", "destination array requires '", "array sentinel '", "' cannot cast into array sentinel '", sentinel);
+                break;
+            },
+            .array_elem => |pair| {
+                try noteTwoTypes(sema, "array element type '", pair.actual, "' cannot cast into array element type '", pair.wanted);
+                cur = pair.child;
+            },
+            .vector_len => |lens| {
+                try w.print("vector of length {d} cannot cast into a vector of length {d}\n", .{ lens.actual, lens.wanted });
+                break;
+            },
+            .vector_elem => |pair| {
+                try noteTwoTypes(sema, "vector element type '", pair.actual, "' cannot cast into vector element type '", pair.wanted);
+                cur = pair.child;
+            },
+            .optional_shape => |pair| {
+                try noteTwoTypes(sema, "optional type child '", pair.actual.optionalChild(ip), "' cannot cast into optional type child '", pair.wanted.optionalChild(ip));
+                break;
+            },
+            .optional_child => |pair| {
+                try noteTwoTypes(sema, "optional type child '", pair.actual, "' cannot cast into optional type child '", pair.wanted);
+                cur = pair.child;
+            },
+            .from_anyerror => {
+                try w.writeAll("global error set cannot cast into a smaller set\n");
+                break;
+            },
+            .missing_error => |missing_errors| {
+                for (missing_errors) |err| try w.print("'error.{s}' not a member of destination error set\n", .{ip.stringSlice(err)});
+                break;
+            },
+            .fn_var_args => |wanted_var_args| {
+                try w.writeAll(if (wanted_var_args) "non-variadic function cannot cast into a variadic function\n" else "variadic function cannot cast into a non-variadic function\n");
+                break;
+            },
+            .fn_generic => |wanted_generic| {
+                try w.writeAll(if (wanted_generic) "non-generic function cannot cast into a generic function\n" else "generic function cannot cast into a non-generic function\n");
+                break;
+            },
+            .fn_param_count => |lens| {
+                try w.print("function with {d} parameters cannot cast into a function with {d} parameters\n", .{ lens.actual, lens.wanted });
+                break;
+            },
+            .fn_param_noalias => |param| {
+                var index: u6 = 0;
+                var actual_noalias = false;
+                while (true) : (index += 1) {
+                    const actual: u1 = @truncate(param.actual >> index);
+                    const wanted: u1 = @truncate(param.wanted >> index);
+                    if (actual != wanted) {
+                        actual_noalias = actual == 1;
+                        break;
+                    }
+                }
+                if (!actual_noalias) {
+                    try w.print("regular parameter {d} cannot cast into a noalias parameter\n", .{index});
+                } else {
+                    try w.print("noalias parameter {d} cannot cast into a regular parameter\n", .{index});
+                }
+                break;
+            },
+            .fn_param_comptime => |param| {
+                if (param.wanted) {
+                    try w.print("non-comptime parameter {d} cannot cast into a comptime parameter\n", .{param.index});
+                } else {
+                    try w.print("comptime parameter {d} cannot cast into a non-comptime parameter\n", .{param.index});
+                }
+                break;
+            },
+            .fn_param => |param| {
+                try w.print("parameter {d} '", .{param.index});
+                try Type.print(param.actual, ip, w);
+                try w.writeAll("' cannot cast into '");
+                try Type.print(param.wanted, ip, w);
+                try w.writeAll("'\n");
+                cur = param.child;
+            },
+            .fn_cc => |cc| {
+                try w.print("calling convention '{s}' cannot cast into calling convention '{s}'\n", .{ @tagName(cc.actual), @tagName(cc.wanted) });
+                break;
+            },
+            .fn_return_type => |pair| {
+                try noteTwoTypes(sema, "return type '", pair.actual, "' cannot cast into return type '", pair.wanted);
+                cur = pair.child;
+            },
+            .ptr_child => |pair| {
+                try noteTwoTypes(sema, "pointer type child '", pair.actual, "' cannot cast into pointer type child '", pair.wanted);
+                cur = pair.child;
+            },
+            .ptr_addrspace => |addr_space| {
+                try w.print("address space '{s}' cannot cast into address space '{s}'\n", .{ @tagName(addr_space.actual), @tagName(addr_space.wanted) });
+                break;
+            },
+            .ptr_sentinel => |sentinel| {
+                try noteSentinel(sema, "", "destination pointer requires '", "pointer sentinel '", "' cannot cast into pointer sentinel '", sentinel);
+                break;
+            },
+            .ptr_size => |size| {
+                try w.print("a {s} cannot cast into a {s}\n", .{ pointerSizeString(size.actual), pointerSizeString(size.wanted) });
+                break;
+            },
+            .ptr_const => |pair| {
+                if (pair.actual.isConstPtr(ip) and !pair.wanted.isConstPtr(ip)) {
+                    try w.writeAll("cast discards const qualifier\n");
+                } else {
+                    try noteTwoTypes(sema, "mutable '", pair.wanted, "' would allow illegal const pointers stored to type '", pair.actual);
+                }
+                break;
+            },
+            .ptr_volatile => |pair| {
+                if (pair.actual.isVolatilePtr(ip) and !pair.wanted.isVolatilePtr(ip)) {
+                    try w.writeAll("cast discards volatile qualifier\n");
+                } else {
+                    try noteTwoTypes(sema, "mutable '", pair.wanted, "' would allow illegal volatile pointers stored to type '", pair.actual);
+                }
+                break;
+            },
+            .ptr_allowzero => |pair| {
+                const wanted_allow_zero = pair.wanted.ptrAllowsZero(ip);
+                const actual_allow_zero = pair.actual.ptrAllowsZero(ip);
+                if (actual_allow_zero and !wanted_allow_zero) {
+                    try noteTwoTypes(sema, "'", pair.actual, "' could have null values which are illegal in type '", pair.wanted);
+                } else {
+                    try noteTwoTypes(sema, "mutable '", pair.wanted, "' would allow illegal null values stored to type '", pair.actual);
+                }
+                break;
+            },
+            .ptr_bit_range => |bit_range| {
+                if (bit_range.actual_host != bit_range.wanted_host)
+                    try w.print("pointer host size '{d}' cannot cast into pointer host size '{d}'\n", .{ bit_range.actual_host, bit_range.wanted_host });
+                if (bit_range.actual_offset != bit_range.wanted_offset)
+                    try w.print("pointer bit offset '{d}' cannot cast into pointer bit offset '{d}'\n", .{ bit_range.actual_offset, bit_range.wanted_offset });
+                break;
+            },
+            .ptr_alignment => |pair| {
+                try w.print("pointer alignment '{d}' cannot cast into pointer alignment '{d}'\n", .{ pair.actual.toByteUnits() orelse 0, pair.wanted.toByteUnits() orelse 0 });
+                break;
+            },
+            .double_ptr_to_anyopaque => |pair| {
+                try noteTwoTypes(sema, "cannot implicitly cast double pointer '", pair.actual, "' to anyopaque pointer '", pair.wanted);
+                break;
+            },
+            .slice_to_anyopaque => |pair| {
+                try noteTwoTypes(sema, "cannot implicitly cast slice '", pair.actual, "' to anyopaque pointer '", pair.wanted);
+                try w.writeAll("consider using '.ptr'\n");
+                break;
+            },
+        };
+    }
+};
+
+/// A `report` note of the shape `<pre>TYPE<mid>TYPE'\n` (the two-type notes that
+/// pepper `InMemoryCoercionResult.report`).
+fn noteTwoTypes(sema: *Sema, pre: []const u8, a: Type, mid: []const u8, b: Type) Error!void {
+    const w = sema.writer;
+    try w.writeAll(pre);
+    try Type.print(a, sema.intern_pool, w);
+    try w.writeAll(mid);
+    try Type.print(b, sema.intern_pool, w);
+    try w.writeAll("'\n");
+}
+
+/// The sentinel-mismatch note shared by `array_sentinel` and `ptr_sentinel`
+/// (`unreachable_value` means "no sentinel").
+fn noteSentinel(sema: *Sema, missing_actual: []const u8, missing_wanted: []const u8, both_pre: []const u8, both_mid: []const u8, sentinel: InMemoryCoercionResult.Sentinel) Error!void {
+    const ip = sema.intern_pool;
+    const w = sema.writer;
+    if (sentinel.wanted.index == .unreachable_value) {
+        try w.writeAll(missing_actual);
+        try render_value.render(sentinel.actual, ip, w);
+        try w.writeAll("'\n");
+    } else if (sentinel.actual.index == .unreachable_value) {
+        try w.writeAll(missing_wanted);
+        try render_value.render(sentinel.wanted, ip, w);
+        try w.writeAll("'\n");
+    } else {
+        try w.writeAll(both_pre);
+        try render_value.render(sentinel.actual, ip, w);
+        try w.writeAll(both_mid);
+        try render_value.render(sentinel.wanted, ip, w);
+        try w.writeAll("'\n");
+    }
+}
+
+fn pointerSizeString(size: std.lang.Type.Pointer.Size) []const u8 {
+    return switch (size) {
+        .one => "single pointer",
+        .many => "many pointer",
+        .c => "C pointer",
+        .slice => "slice",
+    };
+}
+
+/// If types `A` and `B` have identical representations in runtime memory, they are
+/// "in-memory coercible" -- `A` coerces to `B`, and so do pointers (`*const A` ->
+/// `*const B`). Mirrors the compiler's `coerceInMemoryAllowed`, arm for arm. The
+/// REPL drops the `block`/`*_src` (no `LazySrcLoc`) and `target` (single host
+/// target) parameters. `src_val` refines the comptime-int arm's diagnostic.
+fn coerceInMemoryAllowed(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_mut: bool, src_val: ?Value) Error!InMemoryCoercionResult {
+    const ip = sema.intern_pool;
+    if (dest_ty.index == src_ty.index) return .{ .ok = .same_type };
+
+    const dest_tag = dest_ty.zigTypeTag(ip);
+    const src_tag = src_ty.zigTypeTag(ip);
+
+    // Differently-named integers with the same number of bits.
+    if (dest_tag == .int and src_tag == .int) {
+        const dest_info = dest_ty.intInfo(ip).?;
+        const src_info = src_ty.intInfo(ip).?;
+        if (dest_info.signedness == src_info.signedness and dest_info.bits == src_info.bits) return .{ .ok = .bit_cast };
+        if ((src_info.signedness == dest_info.signedness and dest_info.bits < src_info.bits) or
+            (dest_info.signedness == .signed and src_info.signedness == .unsigned and dest_info.bits <= src_info.bits) or
+            (dest_info.signedness == .unsigned and src_info.signedness == .signed))
+        {
+            return .{ .int_not_coercible = .{
+                .actual_signedness = src_info.signedness,
+                .wanted_signedness = dest_info.signedness,
+                .actual_bits = src_info.bits,
+                .wanted_bits = dest_info.bits,
+            } };
+        }
+    }
+
+    // Comptime int to regular int.
+    if (dest_tag == .int and src_tag == .comptime_int) {
+        if (src_val) |val| {
+            if (!sema.intFitsInType(val, dest_ty)) {
+                return .{ .comptime_int_not_coercible = .{ .wanted = dest_ty, .actual = val } };
+            }
+        }
+    }
+
+    // Differently-named floats with the same number of bits.
+    if (dest_tag == .float and src_tag == .float) {
+        if (dest_ty.floatBits() == src_ty.floatBits()) return .{ .ok = .bit_cast };
+    }
+
+    // Pointers / Pointer-like Optionals.
+    if (dest_ty.isPtrAtRuntime(ip) and src_ty.isPtrAtRuntime(ip)) {
+        return try sema.coerceInMemoryAllowedPtrs(dest_ty, src_ty, dest_is_mut);
+    }
+
+    // Slices.
+    if (dest_ty.isSlice(ip) and src_ty.isSlice(ip)) {
+        return try sema.coerceInMemoryAllowedPtrs(dest_ty, src_ty, dest_is_mut);
+    }
+
+    // Functions.
+    if (dest_tag == .@"fn" and src_tag == .@"fn") {
+        return try sema.coerceInMemoryAllowedFns(dest_ty, src_ty, dest_is_mut);
+    }
+
+    // Error Unions.
+    if (dest_tag == .error_union and src_tag == .error_union) {
+        const dest_payload = dest_ty.errorUnionPayload(ip);
+        const src_payload = src_ty.errorUnionPayload(ip);
+        const payload_strat = switch (try sema.coerceInMemoryAllowed(dest_payload, src_payload, dest_is_mut, null)) {
+            .ok => |strat| strat,
+            else => |payload_result| return .{ .error_union_payload = .{
+                .child = try payload_result.dupe(sema.arena),
+                .actual = src_payload,
+                .wanted = dest_payload,
+            } },
+        };
+        switch (try sema.coerceInMemoryAllowed(dest_ty.errorUnionSet(ip), src_ty.errorUnionSet(ip), dest_is_mut, null)) {
+            .ok => {},
+            else => |err_set_result| return err_set_result,
+        }
+        return switch (payload_strat) {
+            .same_type => .{ .ok = .error_cast },
+            else => .{ .ok = .none },
+        };
+    }
+
+    // Error Sets.
+    if (dest_tag == .error_set and src_tag == .error_set) {
+        switch (try sema.coerceInMemoryAllowedErrorSets(dest_ty, src_ty)) {
+            .ok => |strat| assert(strat == .error_cast),
+            else => |result| return result,
+        }
+        if (dest_is_mut) {
+            switch (try sema.coerceInMemoryAllowedErrorSets(src_ty, dest_ty)) {
+                .ok => |strat| assert(strat == .error_cast),
+                else => |result| return result,
+            }
+        }
+        return .{ .ok = .error_cast };
+    }
+
+    // Arrays.
+    if (dest_tag == .array and src_tag == .array) {
+        const dest_info = dest_ty.arrayInfo(ip);
+        const src_info = src_ty.arrayInfo(ip);
+        if (dest_info.len != src_info.len) return .{ .array_len = .{ .actual = src_info.len, .wanted = dest_info.len } };
+        const child = try sema.coerceInMemoryAllowed(dest_info.elem_type, src_info.elem_type, dest_is_mut, null);
+        const child_strat = switch (child) {
+            .ok => |strat| strat,
+            .no_match => |no_match| return .{ .no_match = no_match },
+            else => return .{ .array_elem = .{
+                .child = try child.dupe(sema.arena),
+                .actual = src_info.elem_type,
+                .wanted = dest_info.elem_type,
+            } },
+        };
+        // The compiler coerces the src sentinel to the dest element type before
+        // comparing; interned sentinels of the same element type compare by identity.
+        const ok_sent = (dest_info.sentinel == null and src_info.sentinel == null) or
+            (src_info.sentinel != null and dest_info.sentinel != null and dest_info.sentinel.? == src_info.sentinel.?);
+        if (!ok_sent) {
+            return .{ .array_sentinel = .{
+                .actual = if (src_info.sentinel) |s| .{ .index = s } else .{ .index = .unreachable_value },
+                .wanted = if (dest_info.sentinel) |s| .{ .index = s } else .{ .index = .unreachable_value },
+                .ty = dest_info.elem_type,
+            } };
+        }
+        return .{ .ok = switch (child_strat) { .bit_cast => .bit_cast, else => .none } };
+    }
+
+    // Vectors.
+    if (dest_tag == .vector and src_tag == .vector) {
+        const dest_len = dest_ty.vectorLen(ip);
+        const src_len = src_ty.vectorLen(ip);
+        if (dest_len != src_len) return .{ .vector_len = .{ .actual = src_len, .wanted = dest_len } };
+        const dest_elem_ty = dest_ty.scalarType(ip);
+        const src_elem_ty = src_ty.scalarType(ip);
+        switch (try sema.coerceInMemoryAllowed(dest_elem_ty, src_elem_ty, dest_is_mut, null)) {
+            .ok => |child_strat| return .{ .ok = switch (child_strat) {
+                .bit_cast => .bit_cast,
+                .ptr_cast => .ptr_cast,
+                else => .none,
+            } },
+            else => |child_result| return .{ .vector_elem = .{
+                .child = try child_result.dupe(sema.arena),
+                .actual = src_elem_ty,
+                .wanted = dest_elem_ty,
+            } },
+        }
+    }
+
+    // Optionals.
+    if (dest_tag == .optional and src_tag == .optional) {
+        if (dest_ty.isPtrAtRuntime(ip) or src_ty.isPtrAtRuntime(ip)) {
+            return .{ .optional_shape = .{ .actual = src_ty, .wanted = dest_ty } };
+        }
+        const dest_child_type = dest_ty.optionalChild(ip);
+        const src_child_type = src_ty.optionalChild(ip);
+        const child = try sema.coerceInMemoryAllowed(dest_child_type, src_child_type, dest_is_mut, null);
+        if (child != .ok) return .{ .optional_child = .{
+            .child = try child.dupe(sema.arena),
+            .actual = src_child_type,
+            .wanted = dest_child_type,
+        } };
+        return .{ .ok = .none };
+    }
+
+    // Tuples (with in-memory-coercible fields). The REPL's `tuple_type` stores only
+    // field types (no comptime markers), so every field is non-comptime -- the
+    // compiler's `structFieldIsComptime` parity check is trivially satisfied.
+    if (dest_ty.isTuple(ip) and src_ty.isTuple(ip)) tuple: {
+        const dest_types = ip.indexToKey(dest_ty.index).tuple_type.types;
+        const src_types = ip.indexToKey(src_ty.index).tuple_type.types;
+        if (dest_types.len != src_types.len) break :tuple;
+        for (dest_types, src_types) |dft, sft| {
+            const field = try sema.coerceInMemoryAllowed(.fromIndex(dft), .fromIndex(sft), dest_is_mut, null);
+            if (field != .ok) break :tuple;
+        }
+        return .{ .ok = .none };
+    }
+
+    return .{ .no_match = .{ .actual = dest_ty, .wanted = src_ty } };
+}
+
+/// Whether a `comptime_int` value fits in fixed-width int `ty`. Mirrors
+/// `Value.intFitsInType` via `std.math.big.int`'s `fitsInTwosComp`.
+fn intFitsInType(sema: *Sema, val: Value, ty: Type) bool {
+    const info = ty.intInfo(sema.intern_pool).?;
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const big = sema.intern_pool.indexToKey(val.index).int.storage.toBigInt(&space);
+    return big.fitsInTwosComp(info.signedness, info.bits);
+}
+
+/// Pointer (and slice) in-memory coercion. Mirrors `coerceInMemoryAllowedPtrs`.
+/// The REPL's no-layout pointer model carries no packed host-size/bit-offset, so
+/// the compiler's `ptr_bit_range` check is a no-op here and is omitted.
+fn coerceInMemoryAllowedPtrs(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_mut: bool) Error!InMemoryCoercionResult {
+    const ip = sema.intern_pool;
+    const dest_info = dest_ty.ptrInfo(ip);
+    const src_info = src_ty.ptrInfo(ip);
+
+    const ok_ptr_size = src_info.flags.size == dest_info.flags.size or src_info.flags.size == .c or dest_info.flags.size == .c;
+    if (!ok_ptr_size) return .{ .ptr_size = .{ .actual = src_info.flags.size, .wanted = dest_info.flags.size } };
+
+    const ok_const = src_info.flags.is_const == dest_info.flags.is_const or (!dest_is_mut and dest_info.flags.is_const);
+    if (!ok_const) return .{ .ptr_const = .{ .actual = src_ty, .wanted = dest_ty } };
+
+    const ok_volatile = src_info.flags.is_volatile == dest_info.flags.is_volatile or (!dest_is_mut and dest_info.flags.is_volatile);
+    if (!ok_volatile) return .{ .ptr_volatile = .{ .actual = src_ty, .wanted = dest_ty } };
+
+    const dest_allowzero = dest_ty.ptrAllowsZero(ip);
+    const src_allowzero = src_ty.ptrAllowsZero(ip);
+    const ok_allowzero = src_allowzero == dest_allowzero or (!dest_is_mut and dest_allowzero);
+    if (!ok_allowzero) return .{ .ptr_allowzero = .{ .actual = src_ty, .wanted = dest_ty } };
+
+    if (dest_info.flags.address_space != src_info.flags.address_space) {
+        return .{ .ptr_addrspace = .{ .actual = src_info.flags.address_space, .wanted = dest_info.flags.address_space } };
+    }
+
+    const dest_child: Type = .fromIndex(dest_info.child);
+    const src_child: Type = .fromIndex(src_info.child);
+    const child = try sema.coerceInMemoryAllowed(dest_child, src_child, dest_is_mut or !dest_info.flags.is_const, null);
+    if (child != .ok) allow: {
+        // `*[n:s]T` -> `*[n]T` (dropping the sentinel) is allowed when immutable.
+        if (!dest_is_mut and src_child.zigTypeTag(ip) == .array and dest_child.zigTypeTag(ip) == .array and
+            src_child.arrayInfo(ip).len == dest_child.arrayInfo(ip).len and
+            src_child.arrayInfo(ip).sentinel != null and dest_child.arrayInfo(ip).sentinel == null and
+            .ok == try sema.coerceInMemoryAllowed(dest_child.childType(ip), src_child.childType(ip), !dest_info.flags.is_const, null))
+        {
+            break :allow;
+        }
+        return .{ .ptr_child = .{
+            .child = try child.dupe(sema.arena),
+            .actual = .fromIndex(src_info.child),
+            .wanted = .fromIndex(dest_info.child),
+        } };
+    }
+
+    const sentinel_ok = ok: {
+        const ss = src_info.sentinel;
+        const ds = dest_info.sentinel;
+        if (ss == .none and ds == .none) break :ok true;
+        if (ss != .none and ds != .none and ds == ss) break :ok true;
+        if (src_info.flags.size == .c) break :ok true;
+        if (!dest_is_mut and dest_info.sentinel == .none) break :ok true;
+        break :ok false;
+    };
+    if (!sentinel_ok) {
+        return .{ .ptr_sentinel = .{
+            .actual = if (src_info.sentinel == .none) .{ .index = .unreachable_value } else .{ .index = src_info.sentinel },
+            .wanted = if (dest_info.sentinel == .none) .{ .index = .unreachable_value } else .{ .index = dest_info.sentinel },
+            .ty = .fromIndex(dest_info.child),
+        } };
+    }
+
+    if (src_info.flags.alignment != .none or dest_info.flags.alignment != .none or dest_info.child != src_info.child) {
+        const src_align = if (src_info.flags.alignment == .none) (src_child.abiAlignment(ip) orelse .none) else src_info.flags.alignment;
+        const dest_align = if (dest_info.flags.alignment == .none) (dest_child.abiAlignment(ip) orelse .none) else dest_info.flags.alignment;
+        if (dest_align.compare(if (dest_is_mut) .neq else .gt, src_align)) {
+            return .{ .ptr_alignment = .{ .actual = src_align, .wanted = dest_align } };
+        }
+    }
+
+    return .{ .ok = .ptr_cast };
+}
+
+/// Function-type in-memory coercion. Mirrors `coerceInMemoryAllowedFns`.
+fn coerceInMemoryAllowedFns(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_mut: bool) Error!InMemoryCoercionResult {
+    const ip = sema.intern_pool;
+    const dest_info = ip.indexToKey(dest_ty.index).func_type;
+    const src_info = ip.indexToKey(src_ty.index).func_type;
+
+    if (dest_info.is_var_args != src_info.is_var_args) return .{ .fn_var_args = dest_info.is_var_args };
+
+    const callconv_ok = callconvCoerceAllowed(src_info.cc, dest_info.cc) and
+        (!dest_is_mut or callconvCoerceAllowed(dest_info.cc, src_info.cc));
+    if (!callconv_ok) return .{ .fn_cc = .{ .actual = src_info.cc, .wanted = dest_info.cc } };
+
+    const src_is_runtime = fnTypeHasRuntimeBits(src_ty, ip);
+    const dest_is_runtime = fnTypeHasRuntimeBits(dest_ty, ip);
+    if (src_is_runtime != dest_is_runtime) return .{ .fn_generic = !dest_is_runtime };
+
+    if (!switch (src_info.return_type) {
+        .generic_poison_type => true,
+        .noreturn_type => !dest_is_mut,
+        else => false,
+    }) {
+        const rt = try sema.coerceInMemoryAllowed(.fromIndex(dest_info.return_type), .fromIndex(src_info.return_type), dest_is_mut, null);
+        if (rt != .ok) return .{ .fn_return_type = .{
+            .child = try rt.dupe(sema.arena),
+            .actual = .fromIndex(src_info.return_type),
+            .wanted = .fromIndex(dest_info.return_type),
+        } };
+    }
+
+    if (dest_info.param_types.len != src_info.param_types.len) {
+        return .{ .fn_param_count = .{ .actual = src_info.param_types.len, .wanted = dest_info.param_types.len } };
+    }
+    if (dest_info.noalias_bits != src_info.noalias_bits) {
+        return .{ .fn_param_noalias = .{ .actual = src_info.noalias_bits, .wanted = dest_info.noalias_bits } };
+    }
+
+    for (0..dest_info.param_types.len) |param_i| {
+        const dest_param_ty: Type = .fromIndex(dest_info.param_types[param_i]);
+        const src_param_ty: Type = .fromIndex(src_info.param_types[param_i]);
+
+        comptime_param: {
+            const src_is_comptime = src_info.paramIsComptime(@intCast(param_i));
+            const dest_is_comptime = dest_info.paramIsComptime(@intCast(param_i));
+            if (src_is_comptime == dest_is_comptime) break :comptime_param;
+            if (!dest_is_mut and src_is_comptime and !dest_is_comptime and dest_param_ty.comptimeOnly(ip)) break :comptime_param;
+            return .{ .fn_param_comptime = .{ .index = param_i, .wanted = dest_is_comptime } };
+        }
+
+        if (src_param_ty.index != .generic_poison_type and dest_param_ty.index != .generic_poison_type) {
+            // Cast direction is reversed for parameters.
+            const param = try sema.coerceInMemoryAllowed(src_param_ty, dest_param_ty, dest_is_mut, null);
+            if (param != .ok) return .{ .fn_param = .{
+                .child = try param.dupe(sema.arena),
+                .actual = dest_param_ty,
+                .wanted = src_param_ty,
+                .index = param_i,
+            } };
+        }
+    }
+
+    return .{ .ok = .none };
+}
+
+/// Whether a function type has runtime bits (i.e. is not generic). Mirrors
+/// `Type.fnHasRuntimeBits` using `comptimeOnly` for the param-class check.
+fn fnTypeHasRuntimeBits(fn_ty: Type, pool: *const InternPool) bool {
+    const info = pool.indexToKey(fn_ty.index).func_type;
+    if (info.comptime_bits != 0) return false;
+    for (info.param_types) |param_ty| {
+        if (param_ty == .generic_poison_type) return false;
+        if (Type.fromIndex(param_ty).comptimeOnly(pool)) return false;
+    }
+    if (info.return_type == .generic_poison_type) return false;
+    return true;
+}
+
+/// Whether calling convention `src_cc` coerces to `dest_cc`. Copied verbatim from
+/// the compiler's `callconvCoerceAllowed`; the host target is the single REPL target.
+fn callconvCoerceAllowed(src_cc: std.lang.CallingConvention, dest_cc: std.lang.CallingConvention) bool {
+    const target = &@import("builtin").target;
+    const Tag = std.lang.CallingConvention.Tag;
+    if (@as(Tag, src_cc) != @as(Tag, dest_cc)) return false;
+
+    switch (src_cc) {
+        inline else => |src_data, tag| {
+            const dest_data = @field(dest_cc, @tagName(tag));
+            if (@TypeOf(src_data) != void and @hasField(@TypeOf(src_data), "incoming_stack_alignment")) {
+                const default_stack_align = target.stackAlignment();
+                const src_stack_align = src_data.incoming_stack_alignment orelse default_stack_align;
+                const dest_stack_align = dest_data.incoming_stack_alignment orelse default_stack_align;
+                if (dest_stack_align < src_stack_align) return false;
+            }
+            switch (@TypeOf(src_data)) {
+                void, std.lang.CallingConvention.CommonOptions => {},
+                std.lang.CallingConvention.X86RegparmOptions => {
+                    if (src_data.register_params != dest_data.register_params) return false;
+                },
+                std.lang.CallingConvention.ArcInterruptOptions => {
+                    if (src_data.type != dest_data.type) return false;
+                },
+                std.lang.CallingConvention.ArmInterruptOptions => {
+                    if (src_data.type != dest_data.type) return false;
+                },
+                std.lang.CallingConvention.MicroblazeInterruptOptions => {
+                    if (src_data.type != dest_data.type) return false;
+                },
+                std.lang.CallingConvention.MipsInterruptOptions => {
+                    if (src_data.mode != dest_data.mode) return false;
+                },
+                std.lang.CallingConvention.RiscvInterruptOptions => {
+                    if (src_data.mode != dest_data.mode) return false;
+                },
+                std.lang.CallingConvention.ShInterruptOptions => {
+                    if (src_data.save != dest_data.save) return false;
+                },
+                std.lang.CallingConvention.SpirvKernelOptions,
+                std.lang.CallingConvention.SpirvFragmentOptions,
+                std.lang.CallingConvention.SpirvMeshOptions,
+                => {},
+                else => comptime unreachable,
+            }
+        },
+    }
+    return true;
+}
+
+/// Error-set in-memory coercion. Mirrors `coerceInMemoryAllowedErrorSets` for the
+/// error-set flavours the REPL models -- concrete named sets, `anyerror`, and the
+/// `adhoc` marker. The REPL has no per-function inferred-error-set subsystem
+/// (`fn_ret_ty_ies` / `inferred_error_set_type`), so those arms do not apply: an
+/// `adhoc` destination accepts (as the compiler does, minus recording the set).
+fn coerceInMemoryAllowedErrorSets(sema: *Sema, dest_ty: Type, src_ty: Type) Error!InMemoryCoercionResult {
+    const ip = sema.intern_pool;
+    if (dest_ty.index == .anyerror_type or dest_ty.index == .adhoc_inferred_error_set_type) return .{ .ok = .error_cast };
+    const dest_names = ip.indexToKey(dest_ty.index).error_set_type.names;
+
+    if (src_ty.index == .anyerror_type) return .from_anyerror;
+    if (src_ty.index == .adhoc_inferred_error_set_type) return .{ .ok = .error_cast };
+    const src_names = ip.indexToKey(src_ty.index).error_set_type.names;
+
+    var missing_error_buf: std.ArrayListUnmanaged(InternPool.NullTerminatedString) = .empty;
+    defer missing_error_buf.deinit(sema.gpa);
+    for (src_names) |name| {
+        if (std.mem.indexOfScalar(InternPool.NullTerminatedString, dest_names, name) == null) {
+            try missing_error_buf.append(sema.gpa, name);
+        }
+    }
+    if (missing_error_buf.items.len != 0) {
+        return .{ .missing_error = try sema.arena.dupe(InternPool.NullTerminatedString, missing_error_buf.items) };
+    }
+    return .{ .ok = .error_cast };
 }
 
 /// Coerce a Value to a destination type using the same paths
