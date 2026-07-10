@@ -883,6 +883,11 @@ pub const Key = union(enum) {
             /// Produced by `optional_payload_*_ptr` (`p.?` in an lvalue context).
             /// Mirrors the compiler's `BaseAddr.opt_payload`.
             opt_payload: Index,
+            /// A pointer to the payload of an error union: `base` is the pointer to
+            /// the error union (`*E!T`), and loading resolves that union's payload.
+            /// Produced by `err_union_payload_unsafe_ptr` (the payload branch of a
+            /// pointer-form `catch`/`try`). Mirrors the compiler's `BaseAddr.eu_payload`.
+            eu_payload: Index,
 
             pub const BaseIndex = struct {
                 base: Index,
@@ -1286,7 +1291,7 @@ pub const Key = union(enum) {
                         std.hash.autoHash(&hasher, f.base);
                         std.hash.autoHash(&hasher, f.index);
                     },
-                    .opt_payload => |base| std.hash.autoHash(&hasher, base),
+                    .opt_payload, .eu_payload => |base| std.hash.autoHash(&hasher, base),
                 }
             },
             .error_set_type => |es| {
@@ -1449,6 +1454,7 @@ pub const Key = union(enum) {
                     .field => |f| f.base == y.base_addr.field.base and f.index == y.base_addr.field.index,
                     .arr_elem => |f| f.base == y.base_addr.arr_elem.base and f.index == y.base_addr.arr_elem.index,
                     .opt_payload => |base| base == y.base_addr.opt_payload,
+                    .eu_payload => |base| base == y.base_addr.eu_payload,
                 };
             },
             .error_set_type => |x| std.mem.eql(NullTerminatedString, x.names, b.error_set_type.names),
@@ -1698,6 +1704,9 @@ const Item = struct {
         // `PtrBase` (ty, base ptr, byte_offset). Mirrors the compiler's
         // `Item.Tag.ptr_opt_payload`.
         ptr_opt_payload,
+        // Pointer value with `BaseAddr.eu_payload`. Same `PtrBase` layout as
+        // `ptr_opt_payload`. Mirrors the compiler's `Item.Tag.ptr_eu_payload`.
+        ptr_eu_payload,
         // Slice value. data = extra index of SliceRepr (3 u32 slots: ty, ptr,
         // len). Mirrors the compiler's `Item.Tag.ptr_slice`.
         ptr_slice,
@@ -2116,9 +2125,9 @@ const PtrFieldRepr = extern struct {
 };
 
 /// Extra-arena payload for base-plus-offset pointers -- `Item.Tag.ptr_opt_payload`
-/// (and, when it lands, `eu_payload`). Four u32 slots: ty, the base pointer, and
-/// the 64-bit byte_offset split high (`_a`) then low (`_b`). Mirrors the
-/// compiler's shared `InternPool.PtrBase`, field names included.
+/// and `ptr_eu_payload`. Four u32 slots: ty, the base pointer, and the 64-bit
+/// byte_offset split high (`_a`) then low (`_b`). Mirrors the compiler's shared
+/// `InternPool.PtrBase`, field names included.
 const PtrBase = extern struct {
     ty: u32,
     base: u32,
@@ -3098,7 +3107,8 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .ptr_nav => ptrNavFromExtra(pool, item.data),
         .ptr_uav => ptrUavFromExtra(pool, item.data),
         .ptr_field => ptrFieldFromExtra(pool, item.data),
-        .ptr_opt_payload => ptrOptPayloadFromExtra(pool, item.data),
+        .ptr_opt_payload => ptrOptPayloadFromExtra(pool, item.data, false),
+        .ptr_eu_payload => ptrOptPayloadFromExtra(pool, item.data, true),
         .ptr_arr_elem => ptrArrElemFromExtra(pool, item.data),
         .ptr_slice => sliceFromExtra(pool, item.data),
         .type_error_set => errorSetTypeFromExtra(pool, item.data),
@@ -3343,11 +3353,13 @@ fn ptrArrElemFromExtra(pool: *const InternPool, extra_index: u32) Key {
     return ptrBaseIndexFromExtra(pool, extra_index, true);
 }
 
-fn ptrOptPayloadFromExtra(pool: *const InternPool, extra_index: u32) Key {
+/// Decode a `PtrBase` into an `.opt_payload` or `.eu_payload` ptr (identical layout).
+fn ptrOptPayloadFromExtra(pool: *const InternPool, extra_index: u32, is_eu: bool) Key {
     const r = pool.extraData(PtrBase, extra_index);
+    const base: Index = @enumFromInt(r.base);
     return .{ .ptr = .{
         .ty = @enumFromInt(r.ty),
-        .base_addr = .{ .opt_payload = @enumFromInt(r.base) },
+        .base_addr = if (is_eu) .{ .eu_payload = base } else .{ .opt_payload = base },
         .byte_offset = (@as(u64, r.byte_offset_a) << 32) | r.byte_offset_b,
     } };
 }
@@ -3729,14 +3741,15 @@ fn emitPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!void {
             const tag: Item.Tag = if (p.base_addr == .field) .ptr_field else .ptr_arr_elem;
             pool.items.appendAssumeCapacity(.{ .tag = tag, .data = extra_index });
         },
-        .opt_payload => |base| {
+        .opt_payload, .eu_payload => |base| {
             const extra_index = try pool.addExtra(PtrBase{
                 .ty = @intFromEnum(p.ty),
                 .base = @intFromEnum(base),
                 .byte_offset_a = @truncate(p.byte_offset >> 32),
                 .byte_offset_b = @truncate(p.byte_offset),
             });
-            pool.items.appendAssumeCapacity(.{ .tag = .ptr_opt_payload, .data = extra_index });
+            const tag: Item.Tag = if (p.base_addr == .opt_payload) .ptr_opt_payload else .ptr_eu_payload;
+            pool.items.appendAssumeCapacity(.{ .tag = tag, .data = extra_index });
         },
     }
 }

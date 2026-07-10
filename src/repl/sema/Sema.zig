@@ -534,8 +534,15 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .error_value => sema.evalErrorValue(inst),
         .error_union_type => sema.evalErrorUnionType(inst),
         .err_union_code => sema.evalErrUnionCode(inst),
+        .err_union_code_ptr => sema.evalErrUnionCodePtr(inst),
         .err_union_payload_unsafe => sema.evalErrUnionPayloadUnsafe(inst),
+        .err_union_payload_unsafe_ptr => sema.evalErrUnionPayloadUnsafePtr(inst),
         .is_non_err => sema.evalIsNonErr(inst),
+        .is_non_err_ptr => sema.evalIsNonErrPtr(inst),
+        .ret_is_non_err => sema.evalRetIsNonErr(inst),
+        .ensure_err_union_payload_void => sema.evalEnsureErrUnionPayloadVoid(inst),
+        .@"try" => sema.evalTry(inst),
+        .try_ptr => sema.evalTryPtr(inst),
         .loop => sema.evalLoop(inst),
         .for_len => sema.evalForLen(inst),
         .switch_block,
@@ -2679,7 +2686,7 @@ fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         // A field/element pointer's address needs the byte offset within the
         // aggregate, which auto-layout aggregates don't expose here; a payload
         // pointer sits inside the optional's storage the same way.
-        .field, .arr_elem, .opt_payload => {
+        .field, .arr_elem, .opt_payload, .eu_payload => {
             try sema.writer.writeAll("@intFromPtr: address of an aggregate element is not supported\n");
             return error.AnalysisFail;
         },
@@ -2741,7 +2748,7 @@ fn freezeBacking(sema: *Sema, ptr: InternPool.Key.Ptr) void {
     switch (ptr.base_addr) {
         .comptime_alloc => |idx| sema.comptime_allocs.items[@intFromEnum(idx)].is_const = true,
         .field, .arr_elem => |f| sema.freezeBacking(ip.indexToKey(f.base).ptr),
-        .opt_payload => |base| sema.freezeBacking(ip.indexToKey(base).ptr),
+        .opt_payload, .eu_payload => |base| sema.freezeBacking(ip.indexToKey(base).ptr),
         .nav, .uav => {},
     }
 }
@@ -3014,6 +3021,25 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
             return switch (ip.indexToKey(opt.index)) {
                 .undef => .{ .index = .undef },
                 else => .{ .index = ip.indexToKey(opt.index).opt.val },
+            };
+        },
+        // A pointer to an error union's payload (`err_union_payload_unsafe_ptr`,
+        // the payload branch of a pointer-form `catch`/`try`): load the union
+        // behind `base` and project its payload. The non-error case is checked
+        // where the pointer is formed (`is_non_err_ptr`); a comptime-known error
+        // reaching here means the wrong branch was taken.
+        .eu_payload => |base| {
+            const eu = try sema.loadValue(.{ .index = base });
+            return switch (ip.indexToKey(eu.index)) {
+                .undef => .{ .index = .undef },
+                .error_union => |e| switch (e.val) {
+                    .payload => |p| .{ .index = p },
+                    .err_name => {
+                        try sema.writer.writeAll("err_union_payload: operand carries an error, not a payload\n");
+                        return error.AnalysisFail;
+                    },
+                },
+                else => unreachable,
             };
         },
         else => {
@@ -4931,14 +4957,24 @@ fn optPayloadPtr(sema: *Sema, optional_ptr: Value, comptime initializing: bool) 
 /// `analyzeIsNull(invert_logic = true)`: the operand is always a
 /// comptime-known value here, so the answer is `makeBool(!isNull)`, where
 /// `isNull` is `opt.val == .none` (Value.isNull's `.opt` arm).
-/// `checkNullableType` rejects a non-optional operand. The `_ptr` variant
-/// (`if (p.*) |v|`) is unmodeled -- it needs a deref of the pointer's slot.
+/// `checkNullableType` rejects a non-optional operand.
 /// Compiler reference: src/Sema.zig:zirIsNonNull (~17416).
 fn evalIsNonNull(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
-    const operand = try sema.resolveRef(un_node.operand);
+    return try sema.isNonNullVal(try sema.resolveRef(un_node.operand));
+}
+
+/// `is_non_null_ptr` (`if (p.*) |v|`): the same null test on a pointer to an
+/// optional (`*?T`) -- load it, then test. Mirrors `zirIsNonNullPtr`.
+fn evalIsNonNullPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    return try sema.isNonNullVal(try sema.loadValue(try sema.resolveRef(un_node.operand)));
+}
+
+/// The non-null predicate on an optional value. Mirrors `analyzeIsNull`.
+fn isNonNullVal(sema: *Sema, operand: Value) Error!Value {
     const ip = sema.intern_pool;
     const key = ip.indexToKey(operand.index);
     if (key != .opt) {
@@ -4947,8 +4983,7 @@ fn evalIsNonNull(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         try sema.writer.writeAll("'\n");
         return error.AnalysisFail;
     }
-    const is_null = key.opt.val == .none;
-    return .{ .index = if (is_null) .bool_false else .bool_true };
+    return .{ .index = if (key.opt.val == .none) .bool_false else .bool_true };
 }
 
 /// `array_init`: build the aggregate value. `array_init_ref`: build
@@ -7763,6 +7798,14 @@ fn storePointee(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
             const new_opt = Value{ .index = try ip.internOpt(.{ .ty = opt_ty, .val = value.index }) };
             try sema.storePointee(ip.indexToKey(base).ptr, new_opt);
         },
+        .eu_payload => |base| {
+            // Rebuild the error union as a non-error carrying the new payload, then
+            // store it back through the base. The union type comes from the base
+            // pointer (an initializing store writes into an `undef` union).
+            const eu_ty = ip.indexToKey(ip.indexToKey(base).ptr.ty).ptr_type.child;
+            const new_eu = Value{ .index = try ip.internErrorUnion(.{ .ty = eu_ty, .val = .{ .payload = value.index } }) };
+            try sema.storePointee(ip.indexToKey(base).ptr, new_eu);
+        },
         .nav, .uav => {
             try sema.writer.writeAll("unable to evaluate comptime expression: store through a pointer to a declaration\n");
             return error.AnalysisFail;
@@ -9124,29 +9167,143 @@ fn evalErrorUnionType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// REPL input means the AstGen lowering guaranteed the wrong shape.
 fn evalErrUnionCode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     assert(un_node.operand != .none);
+    return try sema.errUnionCodeVal(try sema.resolveRef(un_node.operand));
+}
 
+/// `err_union_code_ptr operand`: the error code from a pointer to an error union
+/// (`*E!T`) -- load it, then extract. Mirrors `zirErrUnionCodePtr`
+/// (`analyzeLoad` -> `analyzeErrUnionCode`).
+fn evalErrUnionCodePtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
+    return try sema.errUnionCodeVal(try sema.loadValue(try sema.resolveRef(un_node.operand)));
+}
+
+/// The error code of an error-union value whose active variant is `.err_name`,
+/// as an `err` of the union's error-set type. Mirrors `analyzeErrUnionCode`.
+fn errUnionCodeVal(sema: *Sema, operand_value: Value) Error!Value {
     const ip = sema.intern_pool;
-    const operand_value = try sema.resolveRef(un_node.operand);
     const operand_key = ip.indexToKey(operand_value.index);
     if (operand_key != .error_union) {
         try sema.writer.print("err_union_code: operand is not an error union\n", .{});
         return error.AnalysisFail;
     }
-
     const eu_type = ip.indexToKey(operand_key.error_union.ty).error_union_type;
     switch (operand_key.error_union.val) {
-        .err_name => |name| {
-            const err_idx = try ip.internErr(.{ .ty = eu_type.error_set_type, .name = name });
-            return .{ .index = err_idx };
-        },
+        .err_name => |name| return .{ .index = try ip.internErr(.{ .ty = eu_type.error_set_type, .name = name }) },
         .payload => {
             try sema.writer.print("err_union_code: operand carries a payload, not an error\n", .{});
             return error.AnalysisFail;
         },
     }
+}
+
+/// `err_union_payload_unsafe_ptr operand`: given a pointer to an error union
+/// (`*E!T`), yield a pointer to its payload (`*T`) as an `.eu_payload` projection
+/// keeping the source pointer's flags. Mirrors `analyzeErrUnionPayloadPtr`'s
+/// comptime path (`initializing = false`, so a comptime-known error is rejected).
+fn evalErrUnionPayloadUnsafePtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
+    return try sema.errUnionPayloadPtr(try sema.resolveRef(un_node.operand), false);
+}
+
+/// Given a pointer to an error union (`*E!T`), form a pointer to its payload
+/// (`*T`) as an `.eu_payload` projection keeping the source pointer's flags. When
+/// `initializing` (a result-location `*E!T` about to be written), the payload is
+/// being created, so skip the error check; otherwise a comptime-known error is the
+/// "caught unreachable"/error-return-trace case. The `optPayloadPtr` analog for
+/// error unions -- mirrors `analyzeErrUnionPayloadPtr`.
+fn errUnionPayloadPtr(sema: *Sema, eu_ptr: Value, comptime initializing: bool) Error!Value {
+    const ip = sema.intern_pool;
+    const ptr_type = ip.indexToKey(eu_ptr.typeOf(ip).toIndex()).ptr_type;
+    const eu_key = ip.indexToKey(ptr_type.child);
+    if (eu_key != .error_union_type) {
+        try sema.writer.writeAll("err_union_payload: pointer child is not an error union\n");
+        return error.AnalysisFail;
+    }
+    if (!initializing) {
+        const eu_val = try sema.loadValue(eu_ptr);
+        if (ip.indexToKey(eu_val.index).error_union.val == .err_name) {
+            try sema.writer.writeAll("err_union_payload: operand carries an error, not a payload\n");
+            return error.AnalysisFail;
+        }
+    }
+    const child_ptr_ty = try ip.internPtrType(.{ .child = eu_key.error_union_type.payload_type, .sentinel = ptr_type.sentinel, .flags = ptr_type.flags });
+    return .{ .index = try ip.internPtr(.{
+        .ty = child_ptr_ty,
+        .base_addr = .{ .eu_payload = eu_ptr.index },
+        .byte_offset = 0,
+    }) };
+}
+
+/// `try operand` (`try x`): if `x` is a payload, yield it; if an error, run the
+/// error branch `body` (a `ret_node` that propagates the error out of the
+/// enclosing function). Mirrors `zirTry`: the operand is comptime-known, so the
+/// branch is chosen directly rather than emitted as runtime control flow.
+fn evalTry(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const ip = sema.intern_pool;
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.Try, pl_node.payload_index);
+    const body = sema.zir.bodySlice(extra.end, extra.data.body_len);
+    const err_union = try sema.resolveRef(extra.data.operand);
+    const key = ip.indexToKey(err_union.index);
+    if (key != .error_union) {
+        try sema.writer.writeAll("expected error union type\n");
+        return error.AnalysisFail;
+    }
+    return switch (key.error_union.val) {
+        .payload => |p| .{ .index = p },
+        // The body is noreturn (it returns the error); running it propagates
+        // `error.ComptimeReturn`/`ComptimeBreak` up to the call boundary.
+        .err_name => try sema.evalBody(body),
+    };
+}
+
+/// `try_ptr operand` (`try p.*` on an addressable error union): the pointer form
+/// of `try`. Load the union behind `operand` (`*E!T`); on a payload yield a `*T`
+/// (`eu_payload` projection), on an error run the error branch. Mirrors `zirTryPtr`.
+fn evalTryPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const ip = sema.intern_pool;
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.Try, pl_node.payload_index);
+    const body = sema.zir.bodySlice(extra.end, extra.data.body_len);
+    const operand = try sema.resolveRef(extra.data.operand);
+    const err_union = try sema.loadValue(operand);
+    const key = ip.indexToKey(err_union.index);
+    if (key != .error_union) {
+        try sema.writer.writeAll("expected error union type\n");
+        return error.AnalysisFail;
+    }
+    return switch (key.error_union.val) {
+        .payload => try sema.errUnionPayloadPtr(operand, false),
+        .err_name => try sema.evalBody(body),
+    };
+}
+
+/// `ensure_err_union_payload_void operand`: reject a discarded non-void error-union
+/// payload (`errfn();` without capturing the payload). Returns void. Mirrors
+/// `zirEnsureErrUnionPayloadVoid`; the operand may be the union or a pointer to it.
+fn evalEnsureErrUnionPayloadVoid(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const ip = sema.intern_pool;
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const operand = try sema.resolveRef(un_node.operand);
+    const operand_ty = operand.typeOf(ip);
+    const eu_ty = if (operand_ty.zigTypeTag(ip) == .pointer) operand_ty.childType(ip) else operand_ty;
+    if (eu_ty.zigTypeTag(ip) != .error_union) return null;
+    const payload_tag = eu_ty.errorUnionPayload(ip).zigTypeTag(ip);
+    if (payload_tag != .void and payload_tag != .noreturn) {
+        try sema.writer.writeAll("error union payload is ignored\n");
+        return error.AnalysisFail;
+    }
+    return null;
 }
 
 /// `err_union_payload_unsafe operand`: extract the payload from an
@@ -9184,17 +9341,38 @@ fn evalErrUnionPayloadUnsafe(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// `zirIsNonErr` (`src/Sema.zig:17225`).
 fn evalIsNonErr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     assert(un_node.operand != .none);
+    return try sema.isNonErrVal(try sema.resolveRef(un_node.operand));
+}
 
-    const operand_value = try sema.resolveRef(un_node.operand);
+/// `ret_is_non_err operand`: the same non-error predicate as `is_non_err`, emitted
+/// where a `return`-position `try`/`catch` needs it. Mirrors `zirRetIsNonErr`.
+fn evalRetIsNonErr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
+    return try sema.isNonErrVal(try sema.resolveRef(un_node.operand));
+}
+
+/// `is_non_err_ptr operand`: the non-error predicate on a pointer to an error
+/// union (`*E!T`) -- load it, then test. Mirrors `zirIsNonErrPtr`
+/// (`analyzeLoad` -> `analyzeIsNonErr`).
+fn evalIsNonErrPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    assert(un_node.operand != .none);
+    return try sema.isNonErrVal(try sema.loadValue(try sema.resolveRef(un_node.operand)));
+}
+
+/// The non-error predicate on an error-union value: `true` iff the variant is
+/// `.payload`. Mirrors `analyzeIsNonErr` (the operand is comptime-known here).
+fn isNonErrVal(sema: *Sema, operand_value: Value) Error!Value {
     const operand_key = sema.intern_pool.indexToKey(operand_value.index);
     if (operand_key != .error_union) {
         try sema.writer.print("is_non_err: operand is not an error union\n", .{});
         return error.AnalysisFail;
     }
-
     return switch (operand_key.error_union.val) {
         .payload => Value.bool_true,
         .err_name => Value.bool_false,

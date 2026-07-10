@@ -1089,13 +1089,25 @@ test "compliance: struct/union init through an optional result location" {
     // field active.
     try expectMatchesZig(testing.allocator, &.{"(struct { const S = struct { a: u8, b: u8 }; fn f() ?S { return .{ .a = 3, .b = 9 }; } }).f().?.b"});
     try expectMatchesZig(testing.allocator, &.{"(struct { const U = union(enum) { x: u8, y: u16 }; fn f() ?U { return .{ .x = 7 }; } }).f().?.x"});
-    // The value form (`@as(?T, .{...})`) peels the optional off the result type
-    // (optEuBaseType), builds the payload, and coerces it back -- for a struct, a
-    // union, and the empty `.{}` (fields defaulted). The error-union payload form
-    // is covered where `catch` unwraps it.
+    // The value form (`@as(?T, .{...})`) peels the optional/error-union off the
+    // result type (optEuBaseType), builds the payload, and coerces it back -- for a
+    // struct, a union, an error-union (unwrapped with `catch`), and the empty `.{}`.
     try expectMatchesZig(testing.allocator, &.{"@as(?struct { a: u8, b: u8 }, .{ .a = 3, .b = 9 }).?.b"});
     try expectMatchesZig(testing.allocator, &.{"@as(?union(enum) { x: u8, y: u16 }, .{ .x = 7 }).?.x"});
+    try expectMatchesZig(testing.allocator, &.{"(@as(anyerror!struct { a: u8 }, .{ .a = 5 }) catch unreachable).a"});
     try expectMatchesZig(testing.allocator, &.{"@as(?struct { a: u8 = 4 }, .{}).?.a"});
+}
+
+test "compliance: try and pointer-form catch unwrap error unions" {
+    // `try x` yields the payload or returns the error out of the enclosing fn;
+    // an addressable operand drives the pointer forms (is_non_err_ptr,
+    // err_union_payload_unsafe_ptr) through an `eu_payload` projection.
+    const G = "const g = struct { fn g(x: anyerror!u8) anyerror!u8 { return (try x) + 1; } }.g;";
+    try expectMatchesZig(testing.allocator, &.{ "blk: { " ++ G ++ " break :blk g(5) catch 0; }" }); // 6
+    try expectMatchesZig(testing.allocator, &.{ "blk: { " ++ G ++ " break :blk g(error.Bad) catch 99; }" }); // 99
+    try expectMatchesZig(testing.allocator, &.{"(@as(anyerror!struct { a: u8 }, .{ .a = 5 }) catch unreachable).a"}); // 5
+    // `if (p.*) |v|` reads the optional behind a pointer (is_non_null_ptr).
+    try expectMatchesZig(testing.allocator, &.{"blk: { var o: ?u8 = 4; const p = &o; break :blk p.* orelse 0; }"}); // 4
 }
 
 test "compliance: optional null test drives if-capture and orelse" {
