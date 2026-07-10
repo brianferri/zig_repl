@@ -1089,6 +1089,10 @@ test "compliance: struct/union init through an optional result location" {
     // field active.
     try expectMatchesZig(testing.allocator, &.{"(struct { const S = struct { a: u8, b: u8 }; fn f() ?S { return .{ .a = 3, .b = 9 }; } }).f().?.b"});
     try expectMatchesZig(testing.allocator, &.{"(struct { const U = union(enum) { x: u8, y: u16 }; fn f() ?U { return .{ .x = 7 }; } }).f().?.x"});
+    // The error-union result location projects the same way (opt_eu_base_ptr_init's
+    // error_union arm), so a `fn () E!T` returning `.{...}` initializes through `*T`.
+    try expectMatchesZig(testing.allocator, &.{"((struct { const S = struct { a: u8, b: u8 }; fn f() anyerror!S { return .{ .a = 3, .b = 9 }; } }).f() catch unreachable).b"});
+    try expectMatchesZig(testing.allocator, &.{"((struct { const U = union(enum) { x: u8, y: u16 }; fn f() anyerror!U { return .{ .x = 7 }; } }).f() catch unreachable).x"});
     // The value form (`@as(?T, .{...})`) peels the optional/error-union off the
     // result type (optEuBaseType), builds the payload, and coerces it back -- for a
     // struct, a union, an error-union (unwrapped with `catch`), and the empty `.{}`.

@@ -7814,18 +7814,20 @@ fn storePointee(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
 }
 
 /// `opt_eu_base_ptr_init`: project a result-location pointer down to the payload
-/// base it will initialize. A `*?T` (or nested `*??T`) becomes a `*T`, so the
-/// following `struct_init_field_ptr` sees the struct/union, not the wrapper.
+/// base it will initialize. A `*?T`/`*E!T` (or nested `*?E!T`) becomes a `*T`, so
+/// the following `struct_init_field_ptr` sees the struct/union, not the wrapper.
 /// Mirrors `optEuBasePtrInit`'s loop; a plain struct/array is already the base and
-/// falls straight out. The error-union arm is unmodeled (no result-init path forms
-/// one), so an `E!T` base falls through and fails at the field access downstream.
+/// falls straight out. Both projections initialize (skip the null/error check).
 fn evalOptEuBasePtrInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const ip = sema.intern_pool;
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     var base_ptr = try sema.resolveRef(un_node.operand);
-    while (ip.indexToKey(ip.indexToKey(base_ptr.typeOf(ip).toIndex()).ptr_type.child) == .opt_type)
-        base_ptr = try sema.optPayloadPtr(base_ptr, true);
+    while (true) switch (ip.indexToKey(ip.indexToKey(base_ptr.typeOf(ip).toIndex()).ptr_type.child)) {
+        .opt_type => base_ptr = try sema.optPayloadPtr(base_ptr, true),
+        .error_union_type => base_ptr = try sema.errUnionPayloadPtr(base_ptr, true),
+        else => break,
+    };
     return base_ptr;
 }
 
