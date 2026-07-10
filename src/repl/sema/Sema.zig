@@ -5543,16 +5543,43 @@ fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error
     // auto-numbered from 0 with no explicit values or tag type.
     if (et.generated_union != .none) return try sema.generatedTagScan(enum_ty, match);
 
+    const fields = try sema.resolveEnumFields(enum_ty);
+    for (fields.names, 0..) |field_name, pos| {
+        // An auto-numbered enum stores no values; the tag value is the field index.
+        const cur: i128 = if (fields.values.len == 0) @intCast(pos) else sema.intAsI128(fields.values[pos]).?;
+        if (try sema.matchEnumField(enum_ty, fields.int_tag_type, match, field_name, @intCast(pos), cur)) |m| return m;
+    }
+    return null;
+}
+
+/// Resolve a declared enum's fields from its ZIR into the InternPool once, then
+/// return the stored view. The tag type and each field's name and (auto or
+/// explicit) value are read in the enum's own ZIR frame; subsequent calls read the
+/// cache. Mirrors the compiler resolving `LoadedEnumType`'s fields lazily.
+fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.EnumFields {
+    const ip = sema.intern_pool;
+    if (ip.enumFields(enum_ty)) |f| return f;
+
+    const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
     const cf = try sema.enterContainer(enum_ty, "enum field");
     defer cf.restore(sema);
-
     const decl = sema.zir.getEnumDecl(cf.decl_inst);
-    const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
+    // The compiler stores field values only for an enum that needs them -- an
+    // explicit tag type or a non-exhaustive enum; an auto-numbered enum's value is
+    // its field index (see `enumValueFieldIndex`). Zig rejects explicit values
+    // without an explicit tag type, so `tag_type_body` captures every valued enum.
+    const have_values = decl.nonexhaustive or decl.tag_type_body != null;
+
+    var names: std.ArrayListUnmanaged(InternPool.NullTerminatedString) = .empty;
+    defer names.deinit(sema.gpa);
+    var values: std.ArrayListUnmanaged(InternPool.Index) = .empty;
+    defer values.deinit(sema.gpa);
 
     var it = decl.iterateFields();
     var next_auto: i128 = 0;
-    var pos: u32 = 0;
-    while (it.next()) |field| : (pos += 1) {
+    while (it.next()) |field| {
+        try names.append(sema.gpa, try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name)));
+        if (!have_values) continue;
         const cur: i128 = if (field.value_body) |body| blk: {
             const raw = try sema.resolveInlineBody(body, cf.decl_inst);
             break :blk sema.intAsI128(raw.index) orelse {
@@ -5561,10 +5588,10 @@ fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error
             };
         } else next_auto;
         next_auto = cur + 1;
-        const field_name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
-        if (try sema.matchEnumField(enum_ty, tag_ty, match, field_name, pos, cur)) |m| return m;
+        try values.append(sema.gpa, try sema.enumTagIntValue(tag_ty, cur));
     }
-    return null;
+    try ip.setEnumFields(enum_ty, tag_ty, names.items, values.items);
+    return ip.enumFields(enum_ty).?;
 }
 
 /// `enumFieldScan` for a union's generated tag enum: the fields are the union's,
@@ -5643,17 +5670,23 @@ fn matchEnumField(
         .index => |i| field_index == i,
     };
     if (!matched) return null;
-    const i64v = std.math.cast(i64, value) orelse {
-        try sema.writer.writeAll("enum: tag value out of supported range\n");
-        return error.AnalysisFail;
-    };
-    const raw = try ip.internInt(.{ .ty = .comptime_int_type, .storage = .{ .i64 = i64v } });
-    const int = (try sema.coerceValueToType(.{ .index = raw }, tag_ty, "enum tag")).index;
+    const int = try sema.enumTagIntValue(tag_ty, value);
     return .{
         .tag = .{ .index = try ip.internEnumTag(.{ .ty = enum_ty, .int = int }) },
         .name = field_name,
         .index = field_index,
     };
+}
+
+/// The interned integer value `value` as an enum's `tag_ty` -- the `int` an
+/// `enum_tag` holds. Shared by `matchEnumField` and `resolveEnumFields`.
+fn enumTagIntValue(sema: *Sema, tag_ty: InternPool.Index, value: i128) Error!InternPool.Index {
+    const i64v = std.math.cast(i64, value) orelse {
+        try sema.writer.writeAll("enum: tag value out of supported range\n");
+        return error.AnalysisFail;
+    };
+    const raw = try sema.intern_pool.internInt(.{ .ty = .comptime_int_type, .storage = .{ .i64 = i64v } });
+    return (try sema.coerceValueToType(.{ .index = raw }, tag_ty, "enum tag")).index;
 }
 
 /// The field index of `name`, or null if the enum has no such field. Mirrors the

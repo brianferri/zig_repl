@@ -1792,7 +1792,18 @@ const EnumTypeRepr = extern struct {
     name: u32,
     generated_union: u32,
     parent: u32,
+    /// Offset into `extra` of this enum's resolved field storage
+    /// (`[int_tag_type, names_len, values_len, names..., values...]`, `values`
+    /// empty for an auto enum), or `fields_unresolved`. Not part of the type's
+    /// identity -- filled after creation, so it is excluded from the dedup Key
+    /// (`enumTypeFromExtra` does not read it).
+    field_data: u32,
 };
+
+/// Sentinel `EnumTypeRepr.field_data` value meaning the enum's fields have not been
+/// resolved into storage yet (a declared enum resolves them lazily on first access;
+/// a reified enum sets them at creation).
+const fields_unresolved: u32 = std.math.maxInt(u32);
 
 /// Extra-arena payload for `Item.Tag.enum_tag`. Two u32 slots: the enum type and
 /// the integer tag value.
@@ -3285,10 +3296,65 @@ fn emitEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!void {
         .name = @intFromEnum(et.name),
         .generated_union = @intFromEnum(et.generated_union),
         .parent = @intFromEnum(et.parent),
+        .field_data = fields_unresolved,
     });
     try pool.extra.append(pool.gpa, @intCast(et.captures.len));
     try pool.extra.appendSlice(pool.gpa, @ptrCast(et.captures));
     pool.items.appendAssumeCapacity(.{ .tag = .type_enum, .data = extra_index });
+}
+
+/// The resolved fields of an enum type, borrowing into `extra`. Mirrors the
+/// compiler's `LoadedEnumType` field data (names + values + `int_tag_type`); the
+/// per-name/value lookup maps are omitted -- the REPL scans linearly. `values` is
+/// empty for an auto-numbered enum (tag value == field index), as the compiler
+/// leaves `field_values` empty (see `enumValueFieldIndex`).
+pub const EnumFields = struct {
+    int_tag_type: Index,
+    names: []const NullTerminatedString,
+    values: []const Index,
+};
+
+/// This enum's resolved fields, or null if not resolved yet. A generated-union tag
+/// enum never stores fields (its fields are the union's, read through the union).
+pub fn enumFields(pool: *const InternPool, enum_ty: Index) ?EnumFields {
+    const item = pool.items.get(@intFromEnum(enum_ty));
+    assert(item.tag == .type_enum);
+    const off = pool.extra.items[item.data + @offsetOf(EnumTypeRepr, "field_data") / 4];
+    if (off == fields_unresolved) return null;
+    const names_len = pool.extra.items[off + 1];
+    const values_len = pool.extra.items[off + 2];
+    return .{
+        .int_tag_type = @enumFromInt(pool.extra.items[off]),
+        .names = @ptrCast(pool.extra.items[off + 3 ..][0..names_len]),
+        .values = @ptrCast(pool.extra.items[off + 3 + names_len ..][0..values_len]),
+    };
+}
+
+/// Store this enum's resolved fields (idempotent -- a no-op once set). `values` is
+/// empty for an auto-numbered enum (each tag value is its field index, as
+/// `enumValueFieldIndex` computes); otherwise `values[i]` is `names[i]`'s interned
+/// `int_tag_type` value. The identity Key is unchanged; only the `field_data` slot
+/// is filled, in place.
+pub fn setEnumFields(
+    pool: *InternPool,
+    enum_ty: Index,
+    int_tag_type: Index,
+    names: []const NullTerminatedString,
+    values: []const Index,
+) Allocator.Error!void {
+    assert(values.len == 0 or values.len == names.len);
+    const item = pool.items.get(@intFromEnum(enum_ty));
+    assert(item.tag == .type_enum);
+    const slot = item.data + @offsetOf(EnumTypeRepr, "field_data") / 4;
+    if (pool.extra.items[slot] != fields_unresolved) return;
+    const off: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.ensureUnusedCapacity(pool.gpa, 3 + names.len + values.len);
+    pool.extra.appendAssumeCapacity(@intFromEnum(int_tag_type));
+    pool.extra.appendAssumeCapacity(@intCast(names.len));
+    pool.extra.appendAssumeCapacity(@intCast(values.len));
+    for (names) |n| pool.extra.appendAssumeCapacity(@intFromEnum(n));
+    for (values) |v| pool.extra.appendAssumeCapacity(@intFromEnum(v));
+    pool.extra.items[slot] = off;
 }
 
 /// Emit an `enum_tag` Item. Two u32 slots: `ty`, `int`.
