@@ -1697,10 +1697,53 @@ test "compliance: @memcpy copies a slice range" {
     // A sub-slice destination copies at the backing array's start offset, leaving
     // the untouched elements as they were.
     try expectMatchesZig(a, &.{"blk: { var dst = [_]u8{ 1, 2, 3, 4 }; const src = [_]u8{ 8, 9 }; @memcpy(dst[1..3], src[0..2]); break :blk dst[0] + dst[1] + dst[2] + dst[3]; }"}); // 22
+    // Pointer-to-array operands (`&arr`): the length comes from the array type, not
+    // a slice header.
+    try expectMatchesZig(a, &.{"blk: { var dst = [_]u8{ 0, 0, 0 }; const src = [_]u8{ 4, 5, 6 }; @memcpy(&dst, &src); break :blk dst[0] + dst[2]; }"}); // 10
     // Mismatched comptime lengths, and a copy to a const destination, are compile
     // errors on both sides.
     try expectBothReject(a, &.{"blk: { var dst = [_]u8{ 0, 0, 0, 0 }; const src = [_]u8{ 7, 8, 9 }; @memcpy(dst[1..3], src[0..3]); break :blk dst[1]; }"});
     try expectBothReject(a, &.{"blk: { const dst = [_]u8{ 0, 0, 0 }; const src = [_]u8{ 7, 8, 9 }; @memcpy(dst[0..3], src[0..3]); break :blk dst[1]; }"});
+    // Element types must be in-memory coercible (`coerceInMemoryAllowed`): differing
+    // int widths are rejected, as is copying overlapping (aliasing) ranges.
+    try expectBothReject(a, &.{"blk: { var dst = [_]u8{ 0, 0 }; const src = [_]u16{ 1, 2 }; @memcpy(dst[0..2], src[0..2]); break :blk dst[0]; }"});
+    try expectBothReject(a, &.{"blk: { var arr = [_]u8{ 1, 2, 3, 4 }; @memcpy(arr[0..3], arr[1..4]); break :blk arr[0]; }"});
+}
+
+test "compliance: @memcpy element-coercion diagnostic wording" {
+    // The REPL surfaces `coerceInMemoryAllowed`'s reason note (`int_not_coercible`)
+    // beneath its own "cannot coerce" line, mirroring the compiler's phrasing.
+    try expectReplDiagnostic(
+        testing.allocator,
+        &.{"blk: { var dst = [_]u8{ 0, 0 }; const src = [_]u16{ 1, 2 }; @memcpy(dst[0..2], src[0..2]); break :blk dst[0]; }"},
+        "cannot represent all possible",
+    );
+}
+
+// Ported from the compiler's `test/behavior/memcpy.zig` (the comptime-evaluable
+// cases -- the REPL evaluates everything at comptime).
+test "compliance: @memcpy ported behavior cases" {
+    const a = testing.allocator;
+    // Both operands single-pointer-to-array.
+    try expectMatchesZig(a, &.{"blk: { var foo = [_]u8{ 65, 66, 67 }; var bar: [3]u8 = undefined; @memcpy(&bar, &foo); break :blk bar[2]; }"}); // 67
+    // Slice destination formed by coercing `*[N]u8` to `[]u8`.
+    try expectMatchesZig(a, &.{"blk: { var buf: [5]u8 = undefined; const dst: []u8 = &buf; const src: []const u8 = \"hello\"; @memcpy(dst, src); break :blk @as(u16, buf[0]) + buf[4]; }"}); // 215
+    // Zero-bit element type with aliasing: the same slice on both sides is allowed
+    // because the copy touches zero bits of memory.
+    try expectMatchesZig(a, &.{"blk: { var buf: [3]void = undefined; const s: []void = &buf; @memcpy(s, s); break :blk @as(u8, 42); }"}); // 42
+}
+
+test "compliance: @memcpy comptime-only element type" {
+    // `@memcpy` of a `[N]type` is comptime-only, so `zig run` cannot be the oracle
+    // (`var out: [2]type` is illegal at runtime); assert the REPL evaluates it, as
+    // the compiler does in the `comptime` half of behavior/memcpy.zig.
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+    try expectReplValue(&session, "blk: { const in: [2]type = .{ u8, u16 }; var out: [2]type = undefined; @memcpy(&out, &in); break :blk out[0] == u8 and out[1] == u16; }", "true");
 }
 
 test "compliance: typed array initialization ([N]T = .{ ... })" {

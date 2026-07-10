@@ -8373,51 +8373,146 @@ fn aggregateElementByIndex(sema: *Sema, array_value: Value, index: u64) Error!Va
     return .{ .index = InternPool.aggregateElementAt(agg_key.aggregate, start_offset + index) };
 }
 
-/// `memcpy` (`@memcpy(dest, src)`): copy `src`'s elements into `dest`. Scoped to the
-/// slice operands the REPL reaches (`DynamicLinker.set`'s
-/// `@memcpy(dl.buffer[0..path.len], path)`); `*[N]T`/many-ptr operands, the
-/// element-coercion check, and the aliasing check are not yet modeled. The compiler
-/// stores the copied range as a single array through a `MutableValue`; lacking one,
-/// this evaluator reads `src` element-wise and rebuilds `dest`'s backing aggregate.
-/// Mirrors zirMemcpy's comptime path for the const-dest and matching-length checks;
-/// void.
+/// A `@memcpy` operand must be an indexable pointer -- a slice, many/C pointer, or
+/// pointer to an array. Mirrors `checkMemOperand`; returns the operand's type, or
+/// null (with no diagnostic) so the caller emits the "not an indexable pointer"
+/// error against the specific operand.
+fn memOperandType(sema: *Sema, value: Value) ?Type {
+    const ip = sema.intern_pool;
+    const ty = value.typeOf(ip);
+    switch (ip.indexToKey(ty.index)) {
+        .ptr_type => |ptr_type| switch (ptr_type.flags.size) {
+            .slice, .many, .c => return ty,
+            .one => if (ip.indexToKey(ptr_type.child) == .array_type) return ty,
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn failMemOperand(sema: *Sema, ty: Type) Error {
+    try sema.writer.writeAll("@memcpy: type '");
+    try Type.print(ty, sema.intern_pool, sema.writer);
+    try sema.writer.writeAll("' is not an indexable pointer; operand must be a slice, a many pointer or a pointer to an array\n");
+    return error.AnalysisFail;
+}
+
+/// The element count of a `@memcpy` operand, or null for many/C pointers (which
+/// carry no length). Mirrors `indexablePtrLenOrNone`: a slice's own `len`, or a
+/// pointer-to-array's array length.
+fn indexableMemLen(sema: *Sema, value: Value) Error!?u64 {
+    const ip = sema.intern_pool;
+    switch (ip.indexToKey(value.index)) {
+        .slice => |s| return try sema.resolveUsizeInt(.{ .index = s.len }, "@memcpy length"),
+        .ptr => |p| return switch (ip.indexToKey(ip.indexToKey(p.ty).ptr_type.child)) {
+            .array_type => |at| at.len,
+            else => null, // many / C pointer
+        },
+        else => return null,
+    }
+}
+
+/// The backing aggregate a `@memcpy` operand addresses, as `(pointer-to-backing,
+/// start index)`. A slice indexes `backing[start..]` via its many-pointer's
+/// `arr_elem` base; a pointer-to-array addresses the whole array at offset 0.
+fn memBacking(sema: *Sema, value: Value) struct { ptr: InternPool.Index, start: u64 } {
+    const ip = sema.intern_pool;
+    switch (ip.indexToKey(value.index)) {
+        .slice => |s| {
+            const many = ip.indexToKey(s.ptr).ptr;
+            return switch (many.base_addr) {
+                .arr_elem => |ae| .{ .ptr = ae.base, .start = ae.index },
+                else => .{ .ptr = s.ptr, .start = 0 },
+            };
+        },
+        .ptr => return .{ .ptr = value.index, .start = 0 },
+        else => unreachable,
+    }
+}
+
+/// Whether two `@memcpy` operands alias over `elem_count` elements. Mirrors
+/// `Value.doPointersOverlap`'s comptime-only branch -- compare the backing storage
+/// identity and the element-index distance. The compiler's other branch keys on
+/// byte offsets, which collapse to element indices in the REPL's no-layout model,
+/// so this single comparison covers both.
+fn doPointersOverlap(sema: *Sema, a: Value, b: Value, elem_count: u64) bool {
+    const a_back = sema.memBacking(a);
+    const b_back = sema.memBacking(b);
+    if (a_back.ptr != b_back.ptr) return false;
+    const diff = if (a_back.start >= b_back.start) a_back.start - b_back.start else b_back.start - a_back.start;
+    return diff < elem_count;
+}
+
+/// `memcpy` (`@memcpy(dest, src)`): copy `src`'s elements into `dest`. Mirrors
+/// zirMemcpy's comptime path -- indexable-operand + element-coercion + const-dest +
+/// matching-length + aliasing checks. The compiler stores the copied range as a
+/// single array through a `MutableValue`; lacking one, this evaluator reads `src`
+/// element-wise and rebuilds `dest`'s backing aggregate. Returns void.
 fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const bin = sema.binData(inst);
-    const dest = ip.indexToKey((try sema.resolveRef(bin.lhs)).index);
+    const dest = try sema.resolveRef(bin.lhs);
     const src = try sema.resolveRef(bin.rhs);
-    if (dest != .slice or ip.indexToKey(src.index) != .slice) {
-        try sema.writer.writeAll("@memcpy: only slice operands are supported\n");
-        return error.AnalysisFail;
-    }
-    if (ip.indexToKey(dest.slice.ty).ptr_type.flags.is_const) {
+
+    const dest_ty = sema.memOperandType(dest) orelse return sema.failMemOperand(dest.typeOf(ip));
+    const src_ty = sema.memOperandType(src) orelse return sema.failMemOperand(src.typeOf(ip));
+
+    if (dest_ty.isConstPtr(ip)) {
         try sema.writer.writeAll("@memcpy: cannot copy to constant pointer\n");
         return error.AnalysisFail;
     }
 
-    const len = try sema.resolveUsizeInt(.{ .index = dest.slice.len }, "@memcpy length");
-    const src_len = try sema.resolveUsizeInt(.{ .index = ip.indexToKey(src.index).slice.len }, "@memcpy length");
-    if (len != src_len) {
-        try sema.writer.print("@memcpy: non-matching copy lengths {d} and {d}\n", .{ len, src_len });
+    const dest_elem = dest_ty.indexableElem(ip);
+    const src_elem = src_ty.indexableElem(ip);
+    const imc = try sema.coerceInMemoryAllowed(dest_elem, src_elem, false, null);
+    if (imc != .ok) {
+        try sema.writer.writeAll("@memcpy: pointer element type '");
+        try Type.print(src_elem, ip, sema.writer);
+        try sema.writer.writeAll("' cannot coerce into element type '");
+        try Type.print(dest_elem, ip, sema.writer);
+        try sema.writer.writeAll("'\n");
+        try imc.report(sema);
         return error.AnalysisFail;
     }
+
+    const dest_len = try sema.indexableMemLen(dest);
+    const src_len = try sema.indexableMemLen(src);
+    if (dest_len == null and src_len == null) {
+        try sema.writer.writeAll("@memcpy: unknown copy length\n");
+        return error.AnalysisFail;
+    }
+    if (dest_len != null and src_len != null and dest_len.? != src_len.?) {
+        try sema.writer.print("@memcpy: non-matching copy lengths {d} and {d}\n", .{ dest_len.?, src_len.? });
+        return error.AnalysisFail;
+    }
+    const len = dest_len orelse src_len.?;
     if (len == 0) return null;
 
-    // `dest`'s many-pointer addresses `backing[start..]`; rebuild that backing
-    // aggregate with the copied elements and store it once through the base.
-    const dest_ptr = ip.indexToKey(dest.slice.ptr).ptr;
-    const backing_ptr: InternPool.Index, const start: u64 = switch (dest_ptr.base_addr) {
-        .arr_elem => |ae| .{ ae.base, ae.index },
-        else => .{ dest.slice.ptr, 0 },
-    };
-    const backing_ty = ip.indexToKey(ip.indexToKey(backing_ptr).ptr.ty).ptr_type.child;
-    var backing = try sema.loadValue(.{ .index = backing_ptr });
+    // A zero-bit element type (e.g. `void`, `u0`) copies nothing and cannot alias,
+    // so it is done here -- before the aliasing check, as zirMemcpy's `zero_bit`
+    // block returns early. A comptime-only element still copies. `abiSize == 0`
+    // stands in for the compiler's `hasRuntimeBits`.
+    if (!src_elem.comptimeOnly(ip) and (src_elem.abiSize(ip) orelse 0) == 0) return null;
+
+    if (sema.doPointersOverlap(dest, src, len)) {
+        try sema.writer.writeAll("@memcpy: arguments alias\n");
+        return error.AnalysisFail;
+    }
+
+    // Rebuild `dest`'s backing aggregate with the copied elements and store it once.
+    // Every slice/pointer operand's base addresses a backing array (slices are
+    // `.arr_elem` into it), so the base pointer's child is that array type. This is
+    // the REPL's element-wise stand-in for zirMemcpy's `[len]elem` array store
+    // through `storePtrVal`, which this evaluator's value model lacks.
+    const back = sema.memBacking(dest);
+    var backing = try sema.loadValue(.{ .index = back.ptr });
+    const backing_ty = ip.indexToKey(ip.indexToKey(back.ptr).ptr.ty).ptr_type.child;
     var i: u64 = 0;
     while (i < len) : (i += 1) {
         const elem = try sema.aggregateElementByIndex(src, i);
-        backing = try sema.setAggregateElement(backing, backing_ty, @intCast(start + i), elem);
+        backing = try sema.setAggregateElement(backing, backing_ty, @intCast(back.start + i), elem);
     }
-    try sema.storePointee(ip.indexToKey(backing_ptr).ptr, backing);
+    try sema.storePointee(ip.indexToKey(back.ptr).ptr, backing);
     return null;
 }
 
