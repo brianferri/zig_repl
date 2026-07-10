@@ -6574,7 +6574,21 @@ fn containerDeclByName(sema: *Sema, container_ty: InternPool.Index, name: Intern
         const saved_this = sema.this_type;
         sema.this_type = container_ty;
         defer sema.this_type = saved_this;
-        return try sema.resolveInlineBody(value_body, decl_inst);
+        // Resolve the type annotation (`const x: T = ...`) before the value and
+        // bind it to the declaration instruction, then coerce, exactly as
+        // `bindValueDecl` does: a result-located init -- a `decl_literal` like
+        // `.gnu`, whose `coerced_ty` AstGen sets to `decl_inst.toRef()` -- reads
+        // `%decl` for its type. Both bodies break to the declaration instruction.
+        const declared_type: ?InternPool.Index = if (unwrapped.type_body) |tb| blk: {
+            const t = (try sema.resolveInlineBody(tb, decl_inst)).index;
+            try sema.results.put(sema.gpa, decl_inst, .{ .index = t });
+            break :blk t;
+        } else null;
+        const raw_value = try sema.resolveInlineBody(value_body, decl_inst);
+        return if (declared_type) |dest_ty|
+            try sema.coerceValueToType(raw_value, dest_ty, "decl")
+        else
+            raw_value;
     }
     return null;
 }
