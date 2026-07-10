@@ -3418,14 +3418,16 @@ fn evalReifyPointerSentinelTy(sema: *Sema, extended: Zir.Inst.Extended.InstData)
 
 /// `reify_slice_arg_ty`: the array-pointer type a reification slice argument
 /// coerces to -- `*const [len]out`, `len` from the operand slice's length. Mirrors
-/// zirReifySliceArgTy. Only the `@Fn` parameter-attributes mapping (sized by the
-/// parameter-types slice) is needed until the nominal container constructors land.
+/// zirReifySliceArgTy. The `@Fn` parameter-attributes and `@Struct` field-type /
+/// field-attributes mappings are modelled; `@Union`'s land with `reify_union`.
 fn evalReifySliceArgTy(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
     const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.UnNode, extended.operand).data;
     const info: Zir.Inst.ReifySliceArgInfo = @enumFromInt(extended.small);
     const in_scalar_ty: InternPool.Index, const out_scalar_ty: InternPool.Index = switch (info) {
         .type_to_fn_param_attrs => .{ .type_type, try sema.getStdLangType(.@"Type.Fn.ParamAttributes") },
+        .string_to_struct_field_type => .{ try sema.sliceConstU8Ty(), .type_type },
+        .string_to_struct_field_attrs => .{ try sema.sliceConstU8Ty(), try sema.getStdLangType(.@"Type.Struct.FieldAttributes") },
         else => {
             try sema.writer.print("reify: slice argument mapping '{s}' is not supported\n", .{@tagName(info)});
             return error.AnalysisFail;
@@ -3513,9 +3515,13 @@ fn evalReifyFn(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
 /// reserves it as a well-known index; the REPL interns it on demand. The element is
 /// `[]const u8` with no sentinel, matching the primitive AstGen coerces against.
 fn sliceOfStringTy(sema: *Sema) Error!InternPool.Index {
-    const ip = sema.intern_pool;
-    const slice_const_u8 = try ip.internPtrType(.{ .child = .u8_type, .flags = .{ .size = .slice, .is_const = true } });
-    return try ip.internPtrType(.{ .child = slice_const_u8, .flags = .{ .size = .slice, .is_const = true } });
+    return try sema.intern_pool.internPtrType(.{ .child = try sema.sliceConstU8Ty(), .flags = .{ .size = .slice, .is_const = true } });
+}
+
+/// The `[]const u8` slice type -- a reification string element (a field name), and
+/// the `in_scalar_ty` of the string-to-field reify slice-argument mappings.
+fn sliceConstU8Ty(sema: *Sema) Error!InternPool.Index {
+    return try sema.intern_pool.internPtrType(.{ .child = .u8_type, .flags = .{ .size = .slice, .is_const = true } });
 }
 
 /// Read a comptime `[]const u8` slice value into an interned name handle. Mirrors
@@ -3626,6 +3632,158 @@ fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.In
     });
     try ip.setEnumFields(enum_ty, tag_ty, nonexhaustive, names, values);
     return .{ .index = enum_ty };
+}
+
+/// `@Struct(layout, backing_ty, field_names, field_types, field_attrs)`
+/// (`reify_struct`): reify a struct type from its layout, optional packed backing
+/// integer, field names/types, and per-field attributes (comptime, alignment,
+/// default). Mirrors zirReifyStruct. Fields are stored eagerly from the arguments:
+/// a reified struct cannot be self-referential (its field types are already-interned
+/// values), so no lazy resolution is needed. The runtime layout (offsets, size) is
+/// not modelled.
+fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const name_strategy: Zir.Inst.NameStrategy = @enumFromInt(extended.small);
+    const extra = sema.zir.extraData(Zir.Inst.ReifyStruct, extended.operand).data;
+
+    const layout_ty = try sema.getStdLangType(.@"Type.ContainerLayout");
+    const layout_val = try sema.coerceValueToType(try sema.resolveRef(extra.layout), layout_ty, "struct layout");
+    const layout = try sema.interpretStdLangEnum(std.lang.Type.ContainerLayout, layout_ty, layout_val, "struct layout");
+
+    // backing_ty is `?type`: null unless a packed struct declares a backing integer.
+    const backing_val = try sema.coerceValueToType(try sema.resolveRef(extra.backing_ty), try ip.internOptionalType(.type_type), "struct backing integer type");
+    if (ip.indexToKey(backing_val.index) == .undef) {
+        try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
+        return error.AnalysisFail;
+    }
+    const backing_int = ip.indexToKey(backing_val.index).opt.val;
+    if (backing_int != .none and layout != .@"packed") {
+        try sema.writer.writeAll("non-packed struct does not support backing integer type\n");
+        return error.AnalysisFail;
+    }
+
+    const names_slice = try sema.coerceValueToType(try sema.resolveRef(extra.field_names), try sema.sliceOfStringTy(), "struct field names");
+    const names_agg = ip.indexToKey((try sema.derefSliceAsArray(names_slice)).index).aggregate;
+    const fields_len: u32 = @intCast(ip.indexToKey(names_agg.ty).array_type.len);
+
+    const field_types_ty = try ip.internPtrType(.{
+        .child = try ip.internArrayType(.{ .len = fields_len, .child = .type_type }),
+        .flags = .{ .size = .one, .is_const = true },
+    });
+    const types_arr = try sema.derefSliceAsArray(try sema.coerceValueToType(try sema.resolveRef(extra.field_types), field_types_ty, "struct field types"));
+    const types_agg = ip.indexToKey(types_arr.index).aggregate;
+
+    const attrs_scalar_ty = try sema.getStdLangType(.@"Type.Struct.FieldAttributes");
+    const field_attrs_ty = try ip.internPtrType(.{
+        .child = try ip.internArrayType(.{ .len = fields_len, .child = attrs_scalar_ty }),
+        .flags = .{ .size = .one, .is_const = true },
+    });
+    const attrs_agg = ip.indexToKey((try sema.derefSliceAsArray(try sema.coerceValueToType(try sema.resolveRef(extra.field_attrs), field_attrs_ty, "struct field attributes"))).index).aggregate;
+
+    const names = try sema.gpa.alloc(InternPool.NullTerminatedString, fields_len);
+    defer sema.gpa.free(names);
+    const types = try sema.gpa.alloc(InternPool.Index, fields_len);
+    defer sema.gpa.free(types);
+    const defaults = try sema.gpa.alloc(InternPool.Index, fields_len);
+    defer sema.gpa.free(defaults);
+    @memset(defaults, .none);
+    const aligns = try sema.gpa.alloc(InternPool.Index, fields_len);
+    defer sema.gpa.free(aligns);
+    @memset(aligns, .none);
+    const comptime_words = try sema.gpa.alloc(u32, (fields_len + 31) / 32);
+    defer sema.gpa.free(comptime_words);
+    @memset(comptime_words, 0);
+    var any_defaults = false;
+    var any_aligns = false;
+    var any_comptime = false;
+
+    // The dedup hash mirrors the compiler's: layout, the backing-int value, the
+    // (dedup-stable) field-type array, then per-field name/attributes.
+    var hasher = std.hash.Wyhash.init(0);
+    std.hash.autoHash(&hasher, layout);
+    std.hash.autoHash(&hasher, backing_val.index);
+    std.hash.autoHash(&hasher, types_arr.index);
+
+    for (names, types, 0..) |*name_out, *type_out, i| {
+        name_out.* = try sema.sliceToIpString(.{ .index = InternPool.aggregateElementAt(names_agg, i) });
+        type_out.* = InternPool.aggregateElementAt(types_agg, i);
+        if (ip.indexToKey(type_out.*) == .undef) {
+            try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
+            return error.AnalysisFail;
+        }
+        // Field attributes are `.{ comptime: bool, align: ?usize, default_value_ptr:
+        // ?*const anyopaque }` (the order `@typeInfo`'s struct arm emits).
+        const attr_elem = InternPool.aggregateElementAt(attrs_agg, i);
+        if (ip.indexToKey(attr_elem) == .undef) {
+            try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
+            return error.AnalysisFail;
+        }
+        const attr = ip.indexToKey(attr_elem).aggregate;
+        const comptime_elem = InternPool.aggregateElementAt(attr, 0);
+        const align_elem = InternPool.aggregateElementAt(attr, 1);
+        const align_opt = ip.indexToKey(align_elem).opt.val;
+        const default_ptr = ip.indexToKey(InternPool.aggregateElementAt(attr, 2)).opt.val;
+
+        const field_default: InternPool.Index = if (default_ptr == .none) .none else (try sema.loadValue(.{ .index = default_ptr })).index;
+        if (field_default != .none) {
+            defaults[i] = field_default;
+            any_defaults = true;
+        }
+
+        if (comptime_elem == .bool_true) {
+            if (field_default == .none) {
+                try sema.writer.writeAll("comptime field without default initialization value\n");
+                return error.AnalysisFail;
+            }
+            if (layout != .auto) {
+                try sema.writer.writeAll("non-auto struct fields cannot be marked comptime\n");
+                return error.AnalysisFail;
+            }
+            comptime_words[i / 32] |= @as(u32, 1) << @intCast(i % 32);
+            any_comptime = true;
+        }
+
+        if (align_opt != .none) {
+            if (layout == .@"packed") {
+                try sema.writer.writeAll("packed struct fields cannot be aligned\n");
+                return error.AnalysisFail;
+            }
+            aligns[i] = align_opt;
+            any_aligns = true;
+        }
+
+        std.hash.autoHash(&hasher, name_out.*);
+        std.hash.autoHash(&hasher, comptime_elem);
+        std.hash.autoHash(&hasher, align_elem);
+        std.hash.autoHash(&hasher, field_default);
+    }
+
+    const name = switch (name_strategy) {
+        .parent => sema.type_name_ctx,
+        .anon, .func, .dbg_var => blk: {
+            const ctx = ip.stringSlice(sema.type_name_ctx);
+            const text = try std.fmt.allocPrint(sema.gpa, "{s}__struct_{d}", .{ ctx, @intFromEnum(inst) });
+            defer sema.gpa.free(text);
+            break :blk try ip.getOrPutString(sema.gpa, text);
+        },
+    };
+
+    const struct_ty = try ip.internStructType(.{
+        .name = name,
+        .id = .{ .reified = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst, .type_hash = hasher.final() } },
+        .parent = sema.this_type,
+    });
+    try ip.setStructFields(
+        struct_ty,
+        layout,
+        backing_int,
+        names,
+        types,
+        if (any_defaults) defaults else &.{},
+        if (any_aligns) aligns else &.{},
+        if (any_comptime) comptime_words else &.{},
+    );
+    return .{ .index = struct_ty };
 }
 
 /// `array_type lhs, rhs`: `lhs` is the length operand, `rhs` the
@@ -6205,7 +6363,11 @@ fn containerParent(sema: *Sema, container_ty: InternPool.Index) InternPool.Index
 const ContainerNamespace = struct { source_zir_id: u32, decl_inst: Zir.Inst.Index };
 fn containerNamespace(sema: *Sema, container_ty: InternPool.Index) ?ContainerNamespace {
     return switch (sema.intern_pool.indexToKey(container_ty)) {
-        .struct_type => |st| .{ .source_zir_id = st.id.sourceZirId(), .decl_inst = st.id.declInst() },
+        // A reified struct has an empty namespace (no source decls).
+        .struct_type => |st| switch (st.id) {
+            .declared => |d| .{ .source_zir_id = d.source_zir_id, .decl_inst = d.decl_inst },
+            else => null,
+        },
         .union_type => |ut| .{ .source_zir_id = ut.id.sourceZirId(), .decl_inst = ut.id.declInst() },
         // A generated tag enum resolves through the owner union's namespace; a
         // reified enum has an empty namespace (no source decls).
@@ -9099,6 +9261,7 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .reify_fn => return sema.evalReifyFn(extended),
         .reify_enum_value_slice_ty => return sema.evalReifyEnumValueSliceTy(extended),
         .reify_enum => return sema.evalReifyEnum(extended, inst),
+        .reify_struct => return sema.evalReifyStruct(extended, inst),
         .tuple_decl => return sema.evalTupleDecl(extended),
         .enum_decl => return sema.evalEnumDecl(inst),
         .union_decl => return sema.evalUnionDecl(inst),

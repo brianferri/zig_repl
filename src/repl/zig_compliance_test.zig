@@ -2422,6 +2422,13 @@ test "@import(std) broad access probes" {
         .{ .src = "@typeInfo(@Enum(u8, .exhaustive, &.{ \"a\", \"b\" }, &.{ 0, 1 })).@\"enum\".field_names.len == 2", .want = "true" },
         .{ .src = "@typeInfo(@Enum(u8, .exhaustive, &.{ \"a\", \"b\" }, &.{ 0, 1 })).@\"enum\".field_values[1] == 1", .want = "true" },
         .{ .src = "@typeInfo(@Enum(u16, .nonexhaustive, &.{\"x\"}, &.{5})).@\"enum\".mode == .nonexhaustive", .want = "true" },
+        // @Struct reifies a struct type from a layout, optional packed backing
+        // integer, field names, field types, and per-field attributes. Its fields
+        // are stored at creation; field access and @typeInfo read them back.
+        .{ .src = "@typeInfo(@Struct(.auto, null, &.{ \"a\", \"b\" }, &.{ u8, u16 }, &.{ .{}, .{} })).@\"struct\".field_types.len == 2", .want = "true" },
+        .{ .src = "@typeInfo(@Struct(.auto, null, &.{ \"a\", \"b\" }, &.{ u8, u16 }, &.{ .{}, .{} })).@\"struct\".field_types[1] == u16", .want = "true" },
+        .{ .src = "@typeInfo(@Struct(.auto, null, &.{\"x\"}, &.{u8}, &.{.{}})).@\"struct\".is_tuple", .want = "false" },
+        .{ .src = "(@Struct(.auto, null, &.{\"x\"}, &.{u8}, &.{.{}}){ .x = 5 }).x == 5", .want = "true" },
         // A struct field's `= .auto` decl-literal default resolves against the
         // field type (CallingConvention), not the enclosing container -- the
         // field-default decl_inst binding. `.{}` fills the field from its default.
