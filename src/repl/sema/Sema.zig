@@ -6574,6 +6574,16 @@ fn containerDeclByName(sema: *Sema, container_ty: InternPool.Index, name: Intern
         const saved_this = sema.this_type;
         sema.this_type = container_ty;
         defer sema.this_type = saved_this;
+        // A member function collects its parameters into `block.params`, which
+        // the enclosing evaluation may itself be filling (a parameter type that
+        // calls another function, `fn use(b: dep(u8))`). Give this member a fresh
+        // list so its `func` drains only its own params; restore the caller's.
+        const saved_params = sema.block.params;
+        sema.block.params = .empty;
+        defer {
+            sema.block.params.deinit(sema.gpa);
+            sema.block.params = saved_params;
+        }
         // Resolve the type annotation (`const x: T = ...`) before the value and
         // bind it to the declaration instruction, then coerce, exactly as
         // `bindValueDecl` does: a result-located init -- a `decl_literal` like
