@@ -481,6 +481,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .align_of => sema.evalAlignOf(inst),
         .size_of => sema.evalSizeOf(inst),
         .bit_size_of => sema.evalBitSizeOf(inst),
+        .clz => sema.evalClz(inst),
         .int_from_ptr => sema.evalIntFromPtr(inst),
         .int_from_enum => sema.evalIntFromEnum(inst),
         .tag_name => sema.evalTagName(inst),
@@ -2567,6 +2568,37 @@ fn evalBitSizeOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .ty = .comptime_int_type,
         .storage = .{ .u64 = bits },
     });
+    return .{ .index = idx };
+}
+
+/// `clz` (`@clz(x)`): count the leading zero bits of a fixed-width integer.
+/// Mirrors zirBitCount's int arm -- the result is `smallestUnsignedInt(bits)`,
+/// the narrowest unsigned type holding the maximum count. A non-negative value
+/// has `bits - bitCountAbs` leading zeros; a negative one's two's-complement top
+/// bit is set, so none.
+fn evalClz(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const ip = sema.intern_pool;
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const operand = try sema.resolveRef(un_node.operand);
+    const operand_ty = operand.typeOf(ip).toIndex();
+    if (ip.indexToKey(operand_ty) != .int_type) {
+        try sema.writer.writeAll("@clz: expected a fixed-width integer\n");
+        return error.AnalysisFail;
+    }
+    const bits = ip.indexToKey(operand_ty).int_type.bits;
+    const val_key = ip.indexToKey(operand.index);
+    if (val_key != .int) {
+        try sema.writer.writeAll("@clz: expected a comptime-known integer\n");
+        return error.AnalysisFail;
+    }
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const big = val_key.int.storage.toBigInt(&space);
+    const used: u64 = @intCast(big.bitCountAbs());
+    const count: u64 = if (!big.positive and used != 0) 0 else @as(u64, bits) - used;
+    const result_bits: u16 = if (bits == 0) 0 else std.math.log2_int(u16, bits) + 1;
+    const result_ty = try ip.internIntType(.unsigned, result_bits);
+    const idx = try ip.internInt(.{ .ty = result_ty, .storage = .{ .u64 = count } });
     return .{ .index = idx };
 }
 
