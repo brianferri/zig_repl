@@ -3508,6 +3508,126 @@ fn evalReifyFn(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
     }) };
 }
 
+/// The `[]const []const u8` slice type an `@Enum`/`@Struct`/`@Union` field-name
+/// argument coerces to (AstGen's `.slice_const_slice_const_u8_type`). The compiler
+/// reserves it as a well-known index; the REPL interns it on demand. The element is
+/// `[]const u8` with no sentinel, matching the primitive AstGen coerces against.
+fn sliceOfStringTy(sema: *Sema) Error!InternPool.Index {
+    const ip = sema.intern_pool;
+    const slice_const_u8 = try ip.internPtrType(.{ .child = .u8_type, .flags = .{ .size = .slice, .is_const = true } });
+    return try ip.internPtrType(.{ .child = slice_const_u8, .flags = .{ .size = .slice, .is_const = true } });
+}
+
+/// Read a comptime `[]const u8` slice value into an interned name handle. Mirrors
+/// the compiler's `sliceToIpString`: the slice's backing `[N:0]u8` array holds one
+/// interned `u8` per byte, which are collected and interned as a string.
+fn sliceToIpString(sema: *Sema, slice_val: Value) Error!InternPool.NullTerminatedString {
+    const ip = sema.intern_pool;
+    const arr = try sema.derefSliceAsArray(slice_val);
+    const agg = ip.indexToKey(arr.index).aggregate;
+    const len: usize = @intCast(ip.indexToKey(agg.ty).array_type.len);
+    const buf = try sema.gpa.alloc(u8, len);
+    defer sema.gpa.free(buf);
+    // The compiler's `Value.toIpString` reads `bytes` aggregate storage directly;
+    // this evaluator has only `elems` storage (one `u8` per slot, as
+    // `internStringLiteral` builds), so the bytes are read back one slot at a time.
+    // An undef byte is rejected here, as the compiler's `toIpString` checks.
+    for (buf, 0..) |*b, i| b.* = @intCast(sema.intAsI128(InternPool.aggregateElementAt(agg, i)) orelse {
+        try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
+        return error.AnalysisFail;
+    });
+    return try ip.getOrPutString(sema.gpa, buf);
+}
+
+/// `reify_enum_value_slice_ty`: the array-pointer type `@Enum`'s field-values
+/// argument coerces to -- `*const [len]tag_ty`, `len` from the field-names slice's
+/// length. Mirrors zirReifyEnumValueSliceTy.
+fn evalReifyEnumValueSliceTy(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
+    const ip = sema.intern_pool;
+    const extra = sema.zir.extraData(Zir.Inst.BinNode, extended.operand).data;
+    const int_tag_ty = try sema.resolveDestType(extra.lhs, "enum tag type");
+    const names_slice = try sema.coerceValueToType(try sema.resolveRef(extra.rhs), try sema.sliceOfStringTy(), "enum field names");
+    const len = try sema.resolveUsizeInt(.{ .index = ip.indexToKey(names_slice.index).slice.len }, "enum field names length");
+    const arr_ty = try ip.internArrayType(.{ .len = len, .child = int_tag_ty });
+    return .{ .index = try ip.internPtrType(.{ .child = arr_ty, .flags = .{ .size = .one, .is_const = true } }) };
+}
+
+/// `@Enum(tag_ty, mode, field_names, field_values)` (`reify_enum`): reify an enum
+/// type from its integer tag type, exhaustive/non-exhaustive mode, field names, and
+/// per-field values. Mirrors zirReifyEnum: a reified enum's identity is its reify
+/// instruction plus a `type_hash` over its inputs (dedup-stable), and it gets an
+/// empty namespace. Field storage is filled eagerly from the arguments (there is no
+/// ZIR to resolve lazily).
+fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const name_strategy: Zir.Inst.NameStrategy = @enumFromInt(extended.small);
+    const extra = sema.zir.extraData(Zir.Inst.ReifyEnum, extended.operand).data;
+
+    const tag_ty = try sema.resolveDestType(extra.tag_ty, "enum tag type");
+
+    const enum_mode_ty = try sema.getStdLangType(.@"Type.Enum.Mode");
+    const mode_val = try sema.coerceValueToType(try sema.resolveRef(extra.mode), enum_mode_ty, "enum mode");
+    const nonexhaustive = switch (try sema.interpretStdLangEnum(std.lang.Type.Enum.Mode, enum_mode_ty, mode_val, "enum mode")) {
+        .exhaustive => false,
+        .nonexhaustive => true,
+    };
+
+    const names_slice = try sema.coerceValueToType(try sema.resolveRef(extra.field_names), try sema.sliceOfStringTy(), "enum field names");
+    const names_agg = ip.indexToKey((try sema.derefSliceAsArray(names_slice)).index).aggregate;
+    const fields_len: u32 = @intCast(ip.indexToKey(names_agg.ty).array_type.len);
+
+    const values_ty = try ip.internPtrType(.{
+        .child = try ip.internArrayType(.{ .len = fields_len, .child = tag_ty }),
+        .flags = .{ .size = .one, .is_const = true },
+    });
+    const values_slice = try sema.coerceValueToType(try sema.resolveRef(extra.field_values), values_ty, "enum field values");
+    const values_arr = try sema.derefSliceAsArray(values_slice);
+    const values_agg = ip.indexToKey(values_arr.index).aggregate;
+
+    const names = try sema.gpa.alloc(InternPool.NullTerminatedString, fields_len);
+    defer sema.gpa.free(names);
+    for (names, 0..) |*n, i| n.* = try sema.sliceToIpString(.{ .index = InternPool.aggregateElementAt(names_agg, i) });
+    const values = try sema.gpa.alloc(InternPool.Index, fields_len);
+    defer sema.gpa.free(values);
+    for (values, 0..) |*v, i| {
+        v.* = InternPool.aggregateElementAt(values_agg, i);
+        // Reject undefined field values, as the compiler's `anyUndef` check does;
+        // field names are checked in `sliceToIpString`.
+        if (ip.indexToKey(v.*) == .undef) {
+            try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
+            return error.AnalysisFail;
+        }
+    }
+
+    // The dedup key is the reify instruction plus a hash over the inputs (Sema
+    // computes it so the InternPool Key stays simple). Field names are hashed
+    // individually because distinct slice values can intern to the same string.
+    var hasher = std.hash.Wyhash.init(0);
+    std.hash.autoHash(&hasher, tag_ty);
+    std.hash.autoHash(&hasher, nonexhaustive);
+    std.hash.autoHash(&hasher, fields_len);
+    std.hash.autoHash(&hasher, values_arr.index); // dedup-stable interned aggregate
+    for (names) |n| std.hash.autoHash(&hasher, n);
+
+    const name = switch (name_strategy) {
+        .parent => sema.type_name_ctx,
+        .anon, .func, .dbg_var => blk: {
+            const ctx = ip.stringSlice(sema.type_name_ctx);
+            const text = try std.fmt.allocPrint(sema.gpa, "{s}__enum_{d}", .{ ctx, @intFromEnum(inst) });
+            defer sema.gpa.free(text);
+            break :blk try ip.getOrPutString(sema.gpa, text);
+        },
+    };
+
+    const enum_ty = try ip.internEnumType(.{
+        .name = name,
+        .id = .{ .reified = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst, .type_hash = hasher.final() } },
+        .parent = sema.this_type,
+    });
+    try ip.setEnumFields(enum_ty, tag_ty, nonexhaustive, names, values);
+    return .{ .index = enum_ty };
+}
+
 /// `array_type lhs, rhs`: `lhs` is the length operand, `rhs` the
 /// element type. Builds `[len]child` with no sentinel (the
 /// sentinel form is `array_type_sentinel`, a separate tag). Returns
@@ -6048,12 +6168,13 @@ fn containerNamespace(sema: *Sema, container_ty: InternPool.Index) ?ContainerNam
     return switch (sema.intern_pool.indexToKey(container_ty)) {
         .struct_type => |st| .{ .source_zir_id = st.id.sourceZirId(), .decl_inst = st.id.declInst() },
         .union_type => |ut| .{ .source_zir_id = ut.id.sourceZirId(), .decl_inst = ut.id.declInst() },
-        // A generated tag enum has no source of its own; it resolves through the
-        // owner union's namespace.
-        .enum_type => |et| if (et.id.generatedUnion() != .none)
-            sema.containerNamespace(et.id.generatedUnion())
-        else
-            .{ .source_zir_id = et.id.sourceZirId(), .decl_inst = et.id.declInst() },
+        // A generated tag enum resolves through the owner union's namespace; a
+        // reified enum has an empty namespace (no source decls).
+        .enum_type => |et| switch (et.id) {
+            .declared => |d| .{ .source_zir_id = d.source_zir_id, .decl_inst = d.decl_inst },
+            .generated_union_tag => |owner| sema.containerNamespace(owner),
+            .reified => null,
+        },
         else => null,
     };
 }
@@ -7208,6 +7329,9 @@ fn internTypedWellKnownRef(sema: *Sema, ref: Zir.Inst.Ref) Error!?Value {
     // `[]const type` -- the type the reification builtins coerce their type-list
     // argument to (e.g. `@Tuple`). Interned on demand like the other slice types.
     if (ref == .slice_const_type_type) return .{ .index = try sema.sliceConstTypeTy() };
+    // `[]const []const u8` -- the type `@Enum`/`@Struct`/`@Union` coerce their
+    // field-names argument to.
+    if (ref == .slice_const_slice_const_u8_type) return .{ .index = try sema.sliceOfStringTy() };
     return null;
 }
 
@@ -8934,6 +9058,8 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .reify_pointer_sentinel_ty => return sema.evalReifyPointerSentinelTy(extended),
         .reify_slice_arg_ty => return sema.evalReifySliceArgTy(extended),
         .reify_fn => return sema.evalReifyFn(extended),
+        .reify_enum_value_slice_ty => return sema.evalReifyEnumValueSliceTy(extended),
+        .reify_enum => return sema.evalReifyEnum(extended, inst),
         .tuple_decl => return sema.evalTupleDecl(extended),
         .enum_decl => return sema.evalEnumDecl(inst),
         .union_decl => return sema.evalUnionDecl(inst),

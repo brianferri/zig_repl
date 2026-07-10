@@ -2415,6 +2415,13 @@ test "@import(std) broad access probes" {
         .{ .src = "@Fn(&.{u8}, &.{.{}}, u8, .{}) == fn (u8) u8", .want = "true" },
         .{ .src = "@Fn(&.{ u8, bool }, &.{ .{}, .{} }, void, .{}) == fn (u8, bool) void", .want = "true" },
         .{ .src = "@Fn(&.{*u8}, &.{.{ .@\"noalias\" = true }}, void, .{}) == fn (noalias *u8) void", .want = "true" },
+        // @Enum reifies an enum type from a tag type, mode, field names, and
+        // per-field values (the values slice is typed *const [N]tag_type). Its
+        // fields are stored at creation and read back through @typeInfo.
+        .{ .src = "@typeInfo(@Enum(u8, .exhaustive, &.{ \"a\", \"b\" }, &.{ 0, 1 })).@\"enum\".tag_type == u8", .want = "true" },
+        .{ .src = "@typeInfo(@Enum(u8, .exhaustive, &.{ \"a\", \"b\" }, &.{ 0, 1 })).@\"enum\".field_names.len == 2", .want = "true" },
+        .{ .src = "@typeInfo(@Enum(u8, .exhaustive, &.{ \"a\", \"b\" }, &.{ 0, 1 })).@\"enum\".field_values[1] == 1", .want = "true" },
+        .{ .src = "@typeInfo(@Enum(u16, .nonexhaustive, &.{\"x\"}, &.{5})).@\"enum\".mode == .nonexhaustive", .want = "true" },
         // A struct field's `= .auto` decl-literal default resolves against the
         // field type (CallingConvention), not the enclosing container -- the
         // field-default decl_inst binding. `.{}` fills the field from its default.
