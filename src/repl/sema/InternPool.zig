@@ -3390,23 +3390,27 @@ fn emitEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!void {
 /// leaves `field_values` empty (see `enumValueFieldIndex`).
 pub const EnumFields = struct {
     int_tag_type: Index,
+    nonexhaustive: bool,
     names: []const NullTerminatedString,
     values: []const Index,
 };
 
 /// This enum's resolved fields, or null if not resolved yet. A generated-union tag
 /// enum never stores fields (its fields are the union's, read through the union).
+/// Storage block layout: `[int_tag_type, nonexhaustive, names_len, values_len,
+/// names..., values...]`.
 pub fn enumFields(pool: *const InternPool, enum_ty: Index) ?EnumFields {
     const item = pool.items.get(@intFromEnum(enum_ty));
     assert(item.tag == .type_enum);
     const off = pool.extra.items[item.data + @offsetOf(EnumTypeRepr, "field_data") / 4];
     if (off == fields_unresolved) return null;
-    const names_len = pool.extra.items[off + 1];
-    const values_len = pool.extra.items[off + 2];
+    const names_len = pool.extra.items[off + 2];
+    const values_len = pool.extra.items[off + 3];
     return .{
         .int_tag_type = @enumFromInt(pool.extra.items[off]),
-        .names = @ptrCast(pool.extra.items[off + 3 ..][0..names_len]),
-        .values = @ptrCast(pool.extra.items[off + 3 + names_len ..][0..values_len]),
+        .nonexhaustive = pool.extra.items[off + 1] != 0,
+        .names = @ptrCast(pool.extra.items[off + 4 ..][0..names_len]),
+        .values = @ptrCast(pool.extra.items[off + 4 + names_len ..][0..values_len]),
     };
 }
 
@@ -3419,6 +3423,7 @@ pub fn setEnumFields(
     pool: *InternPool,
     enum_ty: Index,
     int_tag_type: Index,
+    nonexhaustive: bool,
     names: []const NullTerminatedString,
     values: []const Index,
 ) Allocator.Error!void {
@@ -3428,8 +3433,9 @@ pub fn setEnumFields(
     const slot = item.data + @offsetOf(EnumTypeRepr, "field_data") / 4;
     if (pool.extra.items[slot] != fields_unresolved) return;
     const off: u32 = @intCast(pool.extra.items.len);
-    try pool.extra.ensureUnusedCapacity(pool.gpa, 3 + names.len + values.len);
+    try pool.extra.ensureUnusedCapacity(pool.gpa, 4 + names.len + values.len);
     pool.extra.appendAssumeCapacity(@intFromEnum(int_tag_type));
+    pool.extra.appendAssumeCapacity(@intFromBool(nonexhaustive));
     pool.extra.appendAssumeCapacity(@intCast(names.len));
     pool.extra.appendAssumeCapacity(@intCast(values.len));
     for (names) |n| pool.extra.appendAssumeCapacity(@intFromEnum(n));

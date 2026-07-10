@@ -5502,6 +5502,8 @@ fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPool.In
 fn enumFieldCount(sema: *Sema, enum_ty: InternPool.Index) Error!u32 {
     const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
     if (et.id.generatedUnion() != .none) return try sema.unionFieldCount(et.id.generatedUnion());
+    // A reified enum has no ZIR; its field count comes from stored fields.
+    if (sema.intern_pool.enumFields(enum_ty)) |f| return @intCast(f.names.len);
     const cf = try sema.enterContainer(enum_ty, "enum field count");
     defer cf.restore(sema);
     return @intCast(sema.zir.getEnumDecl(cf.decl_inst).field_names.len);
@@ -5589,7 +5591,7 @@ fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.En
         next_auto = cur + 1;
         try values.append(sema.gpa, try sema.enumTagIntValue(tag_ty, cur));
     }
-    try ip.setEnumFields(enum_ty, tag_ty, names.items, values.items);
+    try ip.setEnumFields(enum_ty, tag_ty, decl.nonexhaustive, names.items, values.items);
     return ip.enumFields(enum_ty).?;
 }
 
@@ -5621,6 +5623,9 @@ fn generatedTagScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Er
 /// source `enumFieldScan`/`generatedTagScan` draw the tag type from for coercion.
 fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Index {
     const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
+    // A reified enum has no ZIR; its tag type is stored. (A declared enum's fields
+    // are not yet resolved when this is called during resolution, so it reads ZIR.)
+    if (sema.intern_pool.enumFields(enum_ty)) |f| return f.int_tag_type;
     const cf = try sema.enterContainer(enum_ty, "enum tag type");
     defer cf.restore(sema);
     // A generated tag enum reads its explicit `T` from the owner union's decl;
@@ -5644,6 +5649,8 @@ fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Ind
 fn enumNonexhaustive(sema: *Sema, enum_ty: InternPool.Index) Error!bool {
     const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
     if (et.id.generatedUnion() != .none) return false;
+    // A reified enum has no ZIR; its mode is stored.
+    if (sema.intern_pool.enumFields(enum_ty)) |f| return f.nonexhaustive;
     const cf = try sema.enterContainer(enum_ty, "enum mode");
     defer cf.restore(sema);
     return sema.zir.getEnumDecl(cf.decl_inst).nonexhaustive;
