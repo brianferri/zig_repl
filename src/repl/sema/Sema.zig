@@ -3899,12 +3899,19 @@ fn coerceToSlice(sema: *Sema, value: Value, dest_ty: InternPool.Index) Error!?Va
     const array = ip.indexToKey(child).array_type;
 
     // The slice's ptr field type is a many-ptr (`[*]T`) carrying the slice's
-    // constness; re-tag the array pointer to it (same base address).
+    // constness. `&arr` coerced to `[]T` is `arr[0..arr.len]`, so its many-pointer
+    // addresses `arr[0]` -- an `.arr_elem` base into the array pointer, exactly the
+    // shape `slice_end` produces for `arr[0..]`. Keeping the two forms identical
+    // lets element access and `@memcpy` treat every slice uniformly.
     const many_ptr_ty = try ip.internPtrType(.{
         .child = array.child,
         .flags = .{ .size = .many, .is_const = ip.indexToKey(dest_ty).ptr_type.flags.is_const },
     });
-    const many_ptr = try ip.internPtr(.{ .ty = many_ptr_ty, .base_addr = array_ptr.base_addr, .byte_offset = array_ptr.byte_offset });
+    const many_ptr = try ip.internPtr(.{
+        .ty = many_ptr_ty,
+        .base_addr = .{ .arr_elem = .{ .base = value.index, .index = 0 } },
+        .byte_offset = 0,
+    });
     const len_val = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = array.len } });
     return .{ .index = try ip.get(.{ .slice = .{ .ty = dest_ty, .ptr = many_ptr, .len = len_val } }) };
 }
@@ -4079,10 +4086,10 @@ fn evalReifyTuple(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Valu
 /// Dereference a comptime slice (or a pointer to an array) to its backing array
 /// value. The compiler's `derefSliceAsArray` re-types the slice pointer as a
 /// single pointer to the array and `pointerDeref`s it (and passes a pointer-to-
-/// array straight through); a `&.{ ... }` literal -- every reification argument --
-/// backs its pointer with an anonymous-constant to the whole array, which
-/// `loadValue` (our `pointerDeref`) resolves directly. Offset (element-pointer)
-/// slices do not arise here.
+/// array straight through). A `&.{ ... }` literal -- every reification argument --
+/// is `arr[0..arr.len]`, so its many-pointer is an `.arr_elem` into the array
+/// pointer (the uniform slice shape); the backing array is behind that base. A
+/// direct pointer-to-array (`.uav`/`.nav`) resolves straight through `loadValue`.
 fn derefSliceAsArray(sema: *Sema, val: Value) Error!Value {
     const ip = sema.intern_pool;
     const array_ptr: InternPool.Index = switch (ip.indexToKey(val.index)) {
@@ -4095,11 +4102,12 @@ fn derefSliceAsArray(sema: *Sema, val: Value) Error!Value {
     };
     switch (ip.indexToKey(array_ptr).ptr.base_addr) {
         .uav, .nav => return try sema.loadValue(.{ .index = array_ptr }),
-        else => {
-            try sema.writer.writeAll("reify: expected a comptime array-backed slice\n");
-            return error.AnalysisFail;
-        },
+        // A whole-array slice: `arr_elem{ array_ptr, 0 }`. Load the array behind it.
+        .arr_elem => |ae| if (ae.index == 0) return try sema.loadValue(.{ .index = ae.base }),
+        else => {},
     }
+    try sema.writer.writeAll("reify: expected a comptime array-backed slice\n");
+    return error.AnalysisFail;
 }
 
 /// Reject a tuple field type that cannot be embedded, as the compiler's
