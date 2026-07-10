@@ -1681,6 +1681,19 @@ test "compliance: slicing a slice and a string literal" {
     try expectBothReject(a, &.{"blk: { const s: []const u8 = \"hi\"; const t = s[0..5]; break :blk t[0]; }"});
 }
 
+test "compliance: @memcpy copies a slice range" {
+    const a = testing.allocator;
+    // `var` dest so zig accepts the mutation; the copy rebuilds the backing array.
+    try expectMatchesZig(a, &.{"blk: { var dst = [_]u8{ 0, 0, 0 }; const src = [_]u8{ 7, 8, 9 }; @memcpy(dst[0..3], src[0..3]); break :blk dst[0] + dst[2]; }"}); // 16
+    // A sub-slice destination copies at the backing array's start offset, leaving
+    // the untouched elements as they were.
+    try expectMatchesZig(a, &.{"blk: { var dst = [_]u8{ 1, 2, 3, 4 }; const src = [_]u8{ 8, 9 }; @memcpy(dst[1..3], src[0..2]); break :blk dst[0] + dst[1] + dst[2] + dst[3]; }"}); // 22
+    // Mismatched comptime lengths, and a copy to a const destination, are compile
+    // errors on both sides.
+    try expectBothReject(a, &.{"blk: { var dst = [_]u8{ 0, 0, 0, 0 }; const src = [_]u8{ 7, 8, 9 }; @memcpy(dst[1..3], src[0..3]); break :blk dst[1]; }"});
+    try expectBothReject(a, &.{"blk: { const dst = [_]u8{ 0, 0, 0 }; const src = [_]u8{ 7, 8, 9 }; @memcpy(dst[0..3], src[0..3]); break :blk dst[1]; }"});
+}
+
 test "compliance: typed array initialization ([N]T = .{ ... })" {
     const a = testing.allocator;
     // The result-location form (array_init_elem_ptr / validate_ptr_array_init).

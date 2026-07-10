@@ -588,6 +588,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         // they share a handler (the compiler differs only in a diagnostic).
         .elem_ptr, .elem_ptr_node => sema.evalElemPtrNode(inst),
         .elem_val => sema.evalElemVal(inst),
+        .memcpy => sema.evalMemcpy(inst),
         .slice_end => sema.evalSliceEnd(inst),
         .array_init_elem_ptr => sema.evalArrayInitElemPtr(inst),
         .validate_ptr_array_init => sema.evalValidatePtrArrayInit(inst),
@@ -7538,6 +7539,11 @@ fn evalElemVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// Read element `index_ref` of an aggregate value, with a bounds check.
 /// Shared by `elem_ptr_load` and `elem_val`.
 fn aggregateElement(sema: *Sema, array_value: Value, index_ref: Zir.Inst.Ref) Error!Value {
+    return sema.aggregateElementByIndex(array_value, try sema.resolveArrayLen(index_ref, "elem access"));
+}
+
+/// Read element `index` of an aggregate or slice value, with a bounds check.
+fn aggregateElementByIndex(sema: *Sema, array_value: Value, index: u64) Error!Value {
     const ip = sema.intern_pool;
     // A slice indexes through its `ptr` into the array; its own `len` bounds it
     // (the array behind `ptr` may be longer). Unwrap to the array pointer first. A
@@ -7567,13 +7573,60 @@ fn aggregateElement(sema: *Sema, array_value: Value, index_ref: Zir.Inst.Ref) Er
         try sema.writer.writeAll("elem access: operand is not an indexable aggregate\n");
         return error.AnalysisFail;
     }
-    const index = try sema.resolveArrayLen(index_ref, "elem access");
     const count = slice_len orelse ip.aggregateElementCount(agg_key.aggregate.ty);
     if (index >= count) {
         try sema.writer.print("index {d} outside array of length {d}\n", .{ index, count });
         return error.AnalysisFail;
     }
     return .{ .index = InternPool.aggregateElementAt(agg_key.aggregate, start_offset + index) };
+}
+
+/// `memcpy` (`@memcpy(dest, src)`): copy `src`'s elements into `dest`. Scoped to the
+/// slice operands the REPL reaches (`DynamicLinker.set`'s
+/// `@memcpy(dl.buffer[0..path.len], path)`); `*[N]T`/many-ptr operands, the
+/// element-coercion check, and the aliasing check are not yet modeled. The compiler
+/// stores the copied range as a single array through a `MutableValue`; lacking one,
+/// this evaluator reads `src` element-wise and rebuilds `dest`'s backing aggregate.
+/// Mirrors zirMemcpy's comptime path for the const-dest and matching-length checks;
+/// void.
+fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const bin = sema.binData(inst);
+    const dest = ip.indexToKey((try sema.resolveRef(bin.lhs)).index);
+    const src = try sema.resolveRef(bin.rhs);
+    if (dest != .slice or ip.indexToKey(src.index) != .slice) {
+        try sema.writer.writeAll("@memcpy: only slice operands are supported\n");
+        return error.AnalysisFail;
+    }
+    if (ip.indexToKey(dest.slice.ty).ptr_type.flags.is_const) {
+        try sema.writer.writeAll("@memcpy: cannot copy to constant pointer\n");
+        return error.AnalysisFail;
+    }
+
+    const len = try sema.resolveUsizeInt(.{ .index = dest.slice.len }, "@memcpy length");
+    const src_len = try sema.resolveUsizeInt(.{ .index = ip.indexToKey(src.index).slice.len }, "@memcpy length");
+    if (len != src_len) {
+        try sema.writer.print("@memcpy: non-matching copy lengths {d} and {d}\n", .{ len, src_len });
+        return error.AnalysisFail;
+    }
+    if (len == 0) return null;
+
+    // `dest`'s many-pointer addresses `backing[start..]`; rebuild that backing
+    // aggregate with the copied elements and store it once through the base.
+    const dest_ptr = ip.indexToKey(dest.slice.ptr).ptr;
+    const backing_ptr: InternPool.Index, const start: u64 = switch (dest_ptr.base_addr) {
+        .arr_elem => |ae| .{ ae.base, ae.index },
+        else => .{ dest.slice.ptr, 0 },
+    };
+    const backing_ty = ip.indexToKey(ip.indexToKey(backing_ptr).ptr.ty).ptr_type.child;
+    var backing = try sema.loadValue(.{ .index = backing_ptr });
+    var i: u64 = 0;
+    while (i < len) : (i += 1) {
+        const elem = try sema.aggregateElementByIndex(src, i);
+        backing = try sema.setAggregateElement(backing, backing_ty, @intCast(start + i), elem);
+    }
+    try sema.storePointee(ip.indexToKey(backing_ptr).ptr, backing);
+    return null;
 }
 
 /// Resolve a ZIR ref to a `u64` array length or element index:
