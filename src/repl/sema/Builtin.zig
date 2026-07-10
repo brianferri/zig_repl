@@ -27,6 +27,14 @@ pub fn generate(gpa: Allocator) Allocator.Error![:0]u8 {
     @setEvalBranchQuota(4000);
     try buffer.print(
         \\const std = @import("std");
+        \\pub const zig_version = std.SemanticVersion.parse(zig_version_string) catch unreachable;
+        \\pub const zig_version_string = "{s}";
+        \\pub const zig_backend = std.lang.CompilerBackend.{f};
+        \\pub const output_mode: std.lang.OutputMode = .{f};
+        \\pub const link_mode: std.lang.LinkMode = .{f};
+        \\pub const unwind_tables: std.lang.UnwindTables = .{f};
+        \\pub const is_test = {};
+        \\pub const single_threaded = {};
         \\pub const abi: std.Target.Abi = .{f};
         \\pub const cpu: std.Target.Cpu = .{{
         \\    .arch = .{f},
@@ -34,6 +42,13 @@ pub fn generate(gpa: Allocator) Allocator.Error![:0]u8 {
         \\    .features = std.Target.{f}.featureSet(&.{{
         \\
     , .{
+        native.zig_version_string,
+        std.zig.fmtIdPU(@tagName(native.zig_backend)),
+        std.zig.fmtIdPU(@tagName(native.output_mode)),
+        std.zig.fmtIdPU(@tagName(native.link_mode)),
+        std.zig.fmtIdPU(@tagName(native.unwind_tables)),
+        native.is_test,
+        native.single_threaded,
         std.zig.fmtIdPU(@tagName(target.abi)),
         std.zig.fmtIdPU(@tagName(target.cpu.arch)),
         std.zig.fmtIdPU(arch_family_name),
@@ -102,22 +117,57 @@ pub fn generate(gpa: Allocator) Allocator.Error![:0]u8 {
             \\
         , .{ windows.min, windows.max }),
     }
-    try buffer.print(
-        \\}};
-        \\pub const object_format: std.Target.ObjectFormat = .{f};
-        \\pub const target: std.Target = .{{
+    try buffer.appendSlice(
+        \\};
+        \\pub const target: std.Target = .{
         \\    .cpu = cpu,
         \\    .os = os,
         \\    .abi = abi,
         \\    .ofmt = object_format,
         \\
-    , .{std.zig.fmtIdPU(@tagName(target.ofmt))});
+    );
 
     if (target.dynamic_linker.get()) |dl| {
         try buffer.print("    .dynamic_linker = .init(\"{s}\"),\n}};\n", .{dl});
     } else {
         try buffer.appendSlice("    .dynamic_linker = .none,\n};\n");
     }
+
+    // The build-configuration declarations. The REPL has no `Compilation`, so it
+    // reflects its own build config (`native.*`) -- coherent, and (being a Debug
+    // exe) matching `zig run` defaults. `wasi_exec_model`/`test_functions`, which
+    // the compiler emits only for wasi / test builds, do not apply to the native
+    // REPL target and are omitted.
+    try buffer.print(
+        \\pub const object_format: std.Target.ObjectFormat = .{f};
+        \\pub const mode: std.lang.OptimizeMode = .{f};
+        \\pub const link_libc = {};
+        \\pub const link_libcpp = {};
+        \\pub const have_error_return_tracing = {};
+        \\pub const valgrind_support = {};
+        \\pub const sanitize_thread = {};
+        \\pub const fuzz = {};
+        \\pub const position_independent_code = {};
+        \\pub const position_independent_executable = {};
+        \\pub const strip_debug_info = {};
+        \\pub const code_model: std.lang.CodeModel = .{f};
+        \\pub const omit_frame_pointer = {};
+        \\
+    , .{
+        std.zig.fmtIdPU(@tagName(target.ofmt)),
+        std.zig.fmtIdPU(@tagName(native.mode)),
+        native.link_libc,
+        native.link_libcpp,
+        native.have_error_return_tracing,
+        native.valgrind_support,
+        native.sanitize_thread,
+        native.fuzz,
+        native.position_independent_code,
+        native.position_independent_executable,
+        native.strip_debug_info,
+        std.zig.fmtIdPU(@tagName(native.code_model)),
+        native.omit_frame_pointer,
+    });
 
     return buffer.toOwnedSliceSentinel(0);
 }

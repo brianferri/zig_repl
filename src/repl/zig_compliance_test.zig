@@ -4,7 +4,54 @@
 //! the expressions we list here at the test-runner level.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
+
+/// A bool as the string `render` prints it, for comptime-derived `.want` values.
+fn comptimeBool(comptime b: bool) []const u8 {
+    return if (b) "true" else "false";
+}
+
+/// One compliance probe: an expression and the string `render` should print.
+const Probe = struct { src: []const u8, want: []const u8 };
+
+/// A probe for every scalar `builtin` declaration, derived from the evaluating
+/// binary's own `@import("builtin")` so the expected values follow the host.
+/// `generate()` emits exactly the bool and enum decls; the struct/string/slice
+/// decls (target, cpu, zig_version_string, test_functions) are reached through
+/// their own probes. An enum tag is compared with an escaped literal so keyword
+/// tags (e.g. unwind_tables `.@"async"`) parse. A new emitted enum/bool decl is
+/// covered automatically; a decl the compiler adds that `generate()` omits
+/// surfaces here as a resolution failure.
+fn builtinDeclProbes() []const Probe {
+    var list: []const Probe = &.{};
+    // `@TypeOf` classifies the decl without resolving its value -- the struct and
+    // slice decls (target, test_functions) hold runtime-addressed values that are
+    // not comptime-resolvable, so their value is only read inside the scalar arms.
+    inline for (comptime std.meta.declarations(builtin)) |name| {
+        switch (@typeInfo(@TypeOf(@field(builtin, name)))) {
+            .bool => list = list ++ &[_]Probe{.{
+                .src = "@import(\"builtin\")." ++ name,
+                .want = comptimeBool(@field(builtin, name)),
+            }},
+            .@"enum" => list = list ++ &[_]Probe{.{
+                .src = "@import(\"builtin\")." ++ name ++ " == .@\"" ++ @tagName(@field(builtin, name)) ++ "\"",
+                .want = "true",
+            }},
+            else => {},
+        }
+    }
+    return list;
+}
+
+/// Run one probe against `session`, printing and counting a mismatch rather than
+/// aborting so every gap in a probe set surfaces in a single run.
+fn runProbe(session: *Session, p: Probe, failures: *usize) void {
+    expectReplValue(session, p.src, p.want) catch |err| {
+        std.debug.print("PROBE FAILED ({s}): {s}\n", .{ @errorName(err), p.src });
+        failures.* += 1;
+    };
+}
 const Io = std.Io;
 
 const eval = @import("eval.zig");
@@ -2324,7 +2371,6 @@ test "@import(std) broad access probes" {
 
     // A spread of access shapes against real std, run in one session so each gap
     // surfaces independently rather than the first aborting the rest.
-    const Probe = struct { src: []const u8, want: []const u8 };
     const probes = [_]Probe{
         // Top-level std decls (name scan; submodules not analysed yet).
         .{ .src = "@hasDecl(@import(\"std\"), \"mem\")", .want = "true" },
@@ -2525,15 +2571,17 @@ test "@import(std) broad access probes" {
         // The assertions are target-agnostic: the concrete arch/CC vary by host.
         .{ .src = "@TypeOf(@import(\"builtin\").target) == @import(\"std\").Target", .want = "true" },
         .{ .src = "@TypeOf(@import(\"builtin\").target.cCallingConvention().?) == @import(\"std\").builtin.CallingConvention", .want = "true" },
+        // The scalar builtin decls are asserted by VALUE below via
+        // `builtinDeclProbes()`, comptime-derived from the host. `arch` and
+        // `os.tag` live under `target`, not at the top level, so they are probed
+        // here explicitly -- the nested access also exercises struct-field reads.
+        .{ .src = "@import(\"builtin\").target.cpu.arch == .@\"" ++ @tagName(builtin.target.cpu.arch) ++ "\"", .want = "true" },
+        .{ .src = "@import(\"builtin\").target.os.tag == .@\"" ++ @tagName(builtin.target.os.tag) ++ "\"", .want = "true" },
     };
 
     var failures: usize = 0;
-    for (probes) |p| {
-        expectReplValue(&session, p.src, p.want) catch |err| {
-            std.debug.print("PROBE FAILED ({s}): {s}\n", .{ @errorName(err), p.src });
-            failures += 1;
-        };
-    }
+    for (&probes) |p| runProbe(&session, p, &failures);
+    for (comptime builtinDeclProbes()) |p| runProbe(&session, p, &failures);
     try testing.expectEqual(@as(usize, 0), failures);
 }
 
