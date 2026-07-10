@@ -4282,16 +4282,19 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const struct_std_ty = try sema.getStdLangType(.@"Type.Struct");
             const attrs_ty = try sema.getStdLangType(.@"Type.Struct.FieldAttributes");
             const layout_ty = try sema.getStdLangType(.@"Type.ContainerLayout");
-            const tuple: ?InternPool.Key.TupleType = switch (ip.indexToKey(ty)) {
-                .tuple_type => |tt| tt,
+            // A tuple's element-type list borrows `pool.extra`; interning in the
+            // loop below can grow and reallocate it, so take a stable copy.
+            const tuple_types: ?[]const InternPool.Index = switch (ip.indexToKey(ty)) {
+                .tuple_type => |tt| try sema.gpa.dupe(InternPool.Index, tt.types),
                 else => null,
             };
+            defer if (tuple_types) |t| sema.gpa.free(t);
 
             // Struct fields resolve by position/name through the field accessors;
             // a tuple's come straight off its element-type list. The REPL's tuple
             // type carries no comptime field values, so every tuple field is
             // runtime (no default, not comptime).
-            const count = if (tuple) |tt| @as(u32, @intCast(tt.types.len)) else try sema.structFieldCount(ty);
+            const count = if (tuple_types) |t| @as(u32, @intCast(t.len)) else try sema.structFieldCount(ty);
             const names = try sema.gpa.alloc(InternPool.NullTerminatedString, count);
             defer sema.gpa.free(names);
             const types = try sema.gpa.alloc(InternPool.Index, count);
@@ -4302,10 +4305,10 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
                 var is_comptime = false;
                 var align_bytes: ?u64 = null;
                 var default: InternPool.Index = .none;
-                if (tuple) |tt| {
+                if (tuple_types) |t| {
                     var buf: [16]u8 = undefined;
                     name.* = try ip.getOrPutString(sema.gpa, std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable);
-                    field_ty.* = tt.types[i];
+                    field_ty.* = t[i];
                 } else {
                     name.* = (try sema.structFieldNameAt(ty, @intCast(i))).?;
                     const f = (try sema.structFieldByName(ty, name.*)).?;
@@ -4324,32 +4327,36 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const field_names_val = try sema.internStringSlice(names);
             const field_types_val = try sema.internConstSlice(.type_type, types);
             const field_attrs_val = try sema.internConstSlice(attrs_ty, attrs);
-            const decl_names_val = if (tuple != null) try sema.internStringSlice(&.{}) else try sema.typeInfoDecls(ty);
+            const decl_names_val = if (tuple_types != null) try sema.internStringSlice(&.{}) else try sema.typeInfoDecls(ty);
 
             // No layout model, so the reported layout is always `.auto` and the
             // packed backing integer is null.
             const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(std.lang.Type.ContainerLayout.auto))).?;
             const backing_integer_val = try sema.optTypeValue(.none);
 
-            var elems = [_]InternPool.Index{ if (tuple != null) .bool_true else .bool_false, layout_val.index, backing_integer_val, field_names_val, field_types_val, field_attrs_val, decl_names_val };
+            var elems = [_]InternPool.Index{ if (tuple_types != null) .bool_true else .bool_false, layout_val.index, backing_integer_val, field_names_val, field_types_val, field_attrs_val, decl_names_val };
             return try sema.typeInfoUnion(type_info_ty, tag_enum, "struct", try ip.internAggregate(.{ .ty = struct_std_ty, .storage = .{ .elems = &elems } }));
         },
         // `Type.Fn{ attrs: Attributes{ callconv, varargs }, is_generic,
         // return_type: ?type, param_types: []const ?type, param_attrs }`. A generic
         // parameter/return is `generic_poison_type`, exposed as a null element.
         .func_type => |ft| {
+            // `ft.param_types` borrows `extra`; the interning below can grow and
+            // reallocate it, so take a stable copy before touching the pool.
+            const param_types = try sema.gpa.dupe(InternPool.Index, ft.param_types);
+            defer sema.gpa.free(param_types);
             const fn_std_ty = try sema.getStdLangType(.@"Type.Fn");
             const param_attrs_ty = try sema.getStdLangType(.@"Type.Fn.ParamAttributes");
             const fn_attr_ty = try sema.getStdLangType(.@"Type.Fn.Attributes");
             const opt_type_child = try ip.internOptionalType(.type_type);
 
             var func_is_generic = ft.return_type == .generic_poison_type;
-            const param_type_vals = try sema.gpa.alloc(InternPool.Index, ft.param_types.len);
+            const param_type_vals = try sema.gpa.alloc(InternPool.Index, param_types.len);
             defer sema.gpa.free(param_type_vals);
-            const param_attr_vals = try sema.gpa.alloc(InternPool.Index, ft.param_types.len);
+            const param_attr_vals = try sema.gpa.alloc(InternPool.Index, param_types.len);
             defer sema.gpa.free(param_attr_vals);
             for (param_type_vals, param_attr_vals, 0..) |*pt_val, *pa_val, i| {
-                const param_ty = ft.param_types[i];
+                const param_ty = param_types[i];
                 const is_generic = param_ty == .generic_poison_type;
                 // Per-parameter flag masks cap at 32 params (the compiler's `u5`).
                 const narrow = std.math.cast(u5, i);
