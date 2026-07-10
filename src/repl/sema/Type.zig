@@ -48,7 +48,7 @@ pub fn abiAlignment(ty: Type, pool: *const InternPool) ?InternPool.Alignment {
         .array_type => |at| abiAlignment(fromIndex(at.child), pool),
         .simple_type => |t| switch (t) {
             .bool, .void, .noreturn, .anyopaque, .type, .comptime_int, .comptime_float, .null, .undefined, .enum_literal => .@"1",
-            .anyerror => null, // error-set ABI not modelled yet
+            .anyerror, .adhoc_inferred_error_set => null, // error-set ABI not modelled yet
             .usize, .isize => .fromByteUnits(std.zig.target.intAlignment(target, target.ptrBitWidth())),
             .c_char => cTypeAlign(.char),
             .c_short => cTypeAlign(.short),
@@ -90,7 +90,7 @@ pub fn abiSize(ty: Type, pool: *const InternPool) ?u64 {
         },
         .simple_type => |t| switch (t) {
             .void, .noreturn, .anyopaque, .type, .comptime_int, .comptime_float, .null, .undefined, .enum_literal => 0,
-            .anyerror => null,
+            .anyerror, .adhoc_inferred_error_set => null,
             .bool => 1,
             .usize, .isize => ptrByteSize(),
             .c_char => target.cTypeByteSize(.char),
@@ -268,7 +268,7 @@ pub fn isSelfComparable(ty: Type, pool: *const InternPool, is_equality_cmp: bool
             .usize, .isize, .c_char, .c_short, .c_ushort, .c_int, .c_uint, .c_long, .c_ulong, .c_longlong, .c_ulonglong, .comptime_int, // .int / .comptime_int
             .f16, .f32, .f64, .f80, .f128, .c_longdouble, .comptime_float, // .float / .comptime_float
             => true,
-            .bool, .type, .void, .anyerror, .enum_literal, .anyopaque => is_equality_cmp,
+            .bool, .type, .void, .anyerror, .adhoc_inferred_error_set, .enum_literal, .anyopaque => is_equality_cmp,
             .noreturn, .undefined, .null, .generic_poison => false,
         },
         .vector_type => |vt| fromIndex(vt.child).isSelfComparable(pool, is_equality_cmp),

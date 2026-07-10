@@ -79,6 +79,76 @@ pub const Index = enum(u32) {
     null_type,
     undefined_type,
     enum_literal_type,
+
+    // Pointer/slice specializations (Key.ptr_type).
+    ptr_usize_type,
+    ptr_const_comptime_int_type,
+    manyptr_u8_type,
+    manyptr_const_u8_type,
+    manyptr_const_u8_sentinel_0_type,
+    slice_const_u8_type,
+    slice_const_u8_sentinel_0_type,
+
+    manyptr_const_slice_const_u8_type,
+    slice_const_slice_const_u8_type,
+
+    optional_type_type,
+    manyptr_const_type_type,
+    slice_const_type_type,
+
+    // Vector specializations (Key.vector_type).
+    vector_8_i8_type,
+    vector_16_i8_type,
+    vector_32_i8_type,
+    vector_64_i8_type,
+    vector_1_u8_type,
+    vector_2_u8_type,
+    vector_4_u8_type,
+    vector_8_u8_type,
+    vector_16_u8_type,
+    vector_32_u8_type,
+    vector_64_u8_type,
+    vector_2_i16_type,
+    vector_4_i16_type,
+    vector_8_i16_type,
+    vector_16_i16_type,
+    vector_32_i16_type,
+    vector_4_u16_type,
+    vector_8_u16_type,
+    vector_16_u16_type,
+    vector_32_u16_type,
+    vector_2_i32_type,
+    vector_4_i32_type,
+    vector_8_i32_type,
+    vector_16_i32_type,
+    vector_4_u32_type,
+    vector_8_u32_type,
+    vector_16_u32_type,
+    vector_2_i64_type,
+    vector_4_i64_type,
+    vector_8_i64_type,
+    vector_2_u64_type,
+    vector_4_u64_type,
+    vector_8_u64_type,
+    vector_1_u128_type,
+    vector_2_u128_type,
+    vector_1_u256_type,
+    vector_4_f16_type,
+    vector_8_f16_type,
+    vector_16_f16_type,
+    vector_32_f16_type,
+    vector_2_f32_type,
+    vector_4_f32_type,
+    vector_8_f32_type,
+    vector_16_f32_type,
+    vector_2_f64_type,
+    vector_4_f64_type,
+    vector_8_f64_type,
+
+    optional_noreturn_type,
+    anyerror_void_error_union_type,
+    /// Used for the inferred error set of inline/comptime function calls.
+    adhoc_inferred_error_set_type,
     /// A type that is unknown until a generic function is instantiated:
     /// the declared type of a generic parameter or return whose value
     /// depends on a comptime argument. `evalFunc` stores it as a func's
@@ -91,10 +161,30 @@ pub const Index = enum(u32) {
     // Values.
     /// `undefined` (untyped)
     undef,
+    /// `@as(bool, undefined)`
+    undef_bool,
+    /// `@as(usize, undefined)`
+    undef_usize,
+    /// `@as(u1, undefined)`
+    undef_u1,
     /// `0` (comptime_int)
     zero,
+    /// `@as(usize, 0)`
+    zero_usize,
+    /// `@as(u1, 0)`
+    zero_u1,
+    /// `@as(u8, 0)`
+    zero_u8,
     /// `1` (comptime_int)
     one,
+    /// `@as(usize, 1)`
+    one_usize,
+    /// `@as(u1, 1)`
+    one_u1,
+    /// `@as(u8, 1)`
+    one_u8,
+    /// `@as(u8, 4)`
+    four_u8,
     /// `-1` (comptime_int)
     negative_one,
     /// `{}`
@@ -500,6 +590,7 @@ pub const SimpleType = enum(u32) {
     null = @intFromEnum(Index.null_type),
     undefined = @intFromEnum(Index.undefined_type),
     enum_literal = @intFromEnum(Index.enum_literal_type),
+    adhoc_inferred_error_set = @intFromEnum(Index.adhoc_inferred_error_set_type),
     generic_poison = @intFromEnum(Index.generic_poison_type),
 };
 
@@ -2533,13 +2624,104 @@ const static_keys: [first_dynamic_index]Key = .{
     .{ .simple_type = .null },
     .{ .simple_type = .undefined },
     .{ .simple_type = .enum_literal },
+
+    // *usize
+    .{ .ptr_type = .{ .child = .usize_type, .flags = .{} } },
+    // *const comptime_int
+    .{ .ptr_type = .{ .child = .comptime_int_type, .flags = .{ .is_const = true } } },
+    // [*]u8
+    .{ .ptr_type = .{ .child = .u8_type, .flags = .{ .size = .many } } },
+    // [*]const u8
+    .{ .ptr_type = .{ .child = .u8_type, .flags = .{ .size = .many, .is_const = true } } },
+    // [*:0]const u8
+    .{ .ptr_type = .{ .child = .u8_type, .sentinel = .zero_u8, .flags = .{ .size = .many, .is_const = true } } },
+    // []const u8
+    .{ .ptr_type = .{ .child = .u8_type, .flags = .{ .size = .slice, .is_const = true } } },
+    // [:0]const u8
+    .{ .ptr_type = .{ .child = .u8_type, .sentinel = .zero_u8, .flags = .{ .size = .slice, .is_const = true } } },
+
+    // [*]const []const u8
+    .{ .ptr_type = .{ .child = .slice_const_u8_type, .flags = .{ .size = .many, .is_const = true } } },
+    // []const []const u8
+    .{ .ptr_type = .{ .child = .slice_const_u8_type, .flags = .{ .size = .slice, .is_const = true } } },
+
+    // ?type
+    .{ .opt_type = .type_type },
+    // [*]const type
+    .{ .ptr_type = .{ .child = .type_type, .flags = .{ .size = .many, .is_const = true } } },
+    // []const type
+    .{ .ptr_type = .{ .child = .type_type, .flags = .{ .size = .slice, .is_const = true } } },
+
+    .{ .vector_type = .{ .len = 8, .child = .i8_type } },
+    .{ .vector_type = .{ .len = 16, .child = .i8_type } },
+    .{ .vector_type = .{ .len = 32, .child = .i8_type } },
+    .{ .vector_type = .{ .len = 64, .child = .i8_type } },
+    .{ .vector_type = .{ .len = 1, .child = .u8_type } },
+    .{ .vector_type = .{ .len = 2, .child = .u8_type } },
+    .{ .vector_type = .{ .len = 4, .child = .u8_type } },
+    .{ .vector_type = .{ .len = 8, .child = .u8_type } },
+    .{ .vector_type = .{ .len = 16, .child = .u8_type } },
+    .{ .vector_type = .{ .len = 32, .child = .u8_type } },
+    .{ .vector_type = .{ .len = 64, .child = .u8_type } },
+    .{ .vector_type = .{ .len = 2, .child = .i16_type } },
+    .{ .vector_type = .{ .len = 4, .child = .i16_type } },
+    .{ .vector_type = .{ .len = 8, .child = .i16_type } },
+    .{ .vector_type = .{ .len = 16, .child = .i16_type } },
+    .{ .vector_type = .{ .len = 32, .child = .i16_type } },
+    .{ .vector_type = .{ .len = 4, .child = .u16_type } },
+    .{ .vector_type = .{ .len = 8, .child = .u16_type } },
+    .{ .vector_type = .{ .len = 16, .child = .u16_type } },
+    .{ .vector_type = .{ .len = 32, .child = .u16_type } },
+    .{ .vector_type = .{ .len = 2, .child = .i32_type } },
+    .{ .vector_type = .{ .len = 4, .child = .i32_type } },
+    .{ .vector_type = .{ .len = 8, .child = .i32_type } },
+    .{ .vector_type = .{ .len = 16, .child = .i32_type } },
+    .{ .vector_type = .{ .len = 4, .child = .u32_type } },
+    .{ .vector_type = .{ .len = 8, .child = .u32_type } },
+    .{ .vector_type = .{ .len = 16, .child = .u32_type } },
+    .{ .vector_type = .{ .len = 2, .child = .i64_type } },
+    .{ .vector_type = .{ .len = 4, .child = .i64_type } },
+    .{ .vector_type = .{ .len = 8, .child = .i64_type } },
+    .{ .vector_type = .{ .len = 2, .child = .u64_type } },
+    .{ .vector_type = .{ .len = 4, .child = .u64_type } },
+    .{ .vector_type = .{ .len = 8, .child = .u64_type } },
+    .{ .vector_type = .{ .len = 1, .child = .u128_type } },
+    .{ .vector_type = .{ .len = 2, .child = .u128_type } },
+    .{ .vector_type = .{ .len = 1, .child = .u256_type } },
+    .{ .vector_type = .{ .len = 4, .child = .f16_type } },
+    .{ .vector_type = .{ .len = 8, .child = .f16_type } },
+    .{ .vector_type = .{ .len = 16, .child = .f16_type } },
+    .{ .vector_type = .{ .len = 32, .child = .f16_type } },
+    .{ .vector_type = .{ .len = 2, .child = .f32_type } },
+    .{ .vector_type = .{ .len = 4, .child = .f32_type } },
+    .{ .vector_type = .{ .len = 8, .child = .f32_type } },
+    .{ .vector_type = .{ .len = 16, .child = .f32_type } },
+    .{ .vector_type = .{ .len = 2, .child = .f64_type } },
+    .{ .vector_type = .{ .len = 4, .child = .f64_type } },
+    .{ .vector_type = .{ .len = 8, .child = .f64_type } },
+
+    // ?noreturn
+    .{ .opt_type = .noreturn_type },
+    // anyerror!void
+    .{ .error_union_type = .{ .error_set_type = .anyerror_type, .payload_type = .void_type } },
+    .{ .simple_type = .adhoc_inferred_error_set },
     .{ .simple_type = .generic_poison },
+    // empty_tuple_type -- the REPL's TupleType has no `values` field.
     .{ .tuple_type = .{ .types = &.{} } },
 
-    // Untyped `undefined` -- same shape as the compiler.
     .{ .undef = .undefined_type },
+    .{ .undef = .bool_type },
+    .{ .undef = .usize_type },
+    .{ .undef = .u1_type },
     .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 0 } } },
+    .{ .int = .{ .ty = .usize_type, .storage = .{ .u64 = 0 } } },
+    .{ .int = .{ .ty = .u1_type, .storage = .{ .u64 = 0 } } },
+    .{ .int = .{ .ty = .u8_type, .storage = .{ .u64 = 0 } } },
     .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .u64 = 1 } } },
+    .{ .int = .{ .ty = .usize_type, .storage = .{ .u64 = 1 } } },
+    .{ .int = .{ .ty = .u1_type, .storage = .{ .u64 = 1 } } },
+    .{ .int = .{ .ty = .u8_type, .storage = .{ .u64 = 1 } } },
+    .{ .int = .{ .ty = .u8_type, .storage = .{ .u64 = 4 } } },
     .{ .int = .{ .ty = .comptime_int_type, .storage = .{ .i64 = -1 } } },
     .{ .simple_value = .void },
     .{ .simple_value = .@"unreachable" },

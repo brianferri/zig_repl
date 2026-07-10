@@ -7884,55 +7884,8 @@ fn resolveRef(sema: *Sema, ref: Zir.Inst.Ref) Error!Value {
     }
 
     if (wellKnownRefToValue(ref)) |value| return value;
-    if (try sema.internTypedWellKnownRef(ref)) |value| return value;
     try sema.writer.print("unsupported ZIR ref: {s}\n", .{@tagName(ref)});
     return error.AnalysisFail;
-}
-
-/// Refs the compiler hands out as pre-typed constants --
-/// `zero_u8` / `one_u8` / `one_usize` / `undef_bool` / etc. We intern
-/// them on demand rather than reserving well-known slots, since they
-/// fold into the pool's normal int / undef storage with no special
-/// shape. Mirrors the compiler's well-known table layout in
-/// `src/InternPool.zig`.
-fn internTypedWellKnownRef(sema: *Sema, ref: Zir.Inst.Ref) Error!?Value {
-    const TypedInt = struct { ty: InternPool.Index, value: u64 };
-    const typed_int: ?TypedInt = switch (ref) {
-        .zero_usize => .{ .ty = .usize_type, .value = 0 },
-        .zero_u1 => .{ .ty = .u1_type, .value = 0 },
-        .zero_u8 => .{ .ty = .u8_type, .value = 0 },
-        .one_usize => .{ .ty = .usize_type, .value = 1 },
-        .one_u1 => .{ .ty = .u1_type, .value = 1 },
-        .one_u8 => .{ .ty = .u8_type, .value = 1 },
-        .four_u8 => .{ .ty = .u8_type, .value = 4 },
-        else => null,
-    };
-    if (typed_int) |t| {
-        const idx = try sema.intern_pool.internInt(.{
-            .ty = t.ty,
-            .storage = .{ .u64 = t.value },
-        });
-        return .{ .index = idx };
-    }
-
-    const undef_ty: ?InternPool.Index = switch (ref) {
-        .undef_bool => .bool_type,
-        .undef_usize => .usize_type,
-        .undef_u1 => .u1_type,
-        else => null,
-    };
-    if (undef_ty) |ty| {
-        const idx = try sema.intern_pool.get(.{ .undef = ty });
-        return .{ .index = idx };
-    }
-
-    // `[]const type` -- the type the reification builtins coerce their type-list
-    // argument to (e.g. `@Tuple`). Interned on demand like the other slice types.
-    if (ref == .slice_const_type_type) return .{ .index = try sema.sliceConstTypeTy() };
-    // `[]const []const u8` -- the type `@Enum`/`@Struct`/`@Union` coerce their
-    // field-names argument to.
-    if (ref == .slice_const_slice_const_u8_type) return .{ .index = try sema.sliceOfStringTy() };
-    return null;
 }
 
 /// Maps a static ZIR `Ref` to the corresponding interned Value.
@@ -7943,34 +7896,12 @@ fn internTypedWellKnownRef(sema: *Sema, ref: Zir.Inst.Ref) Error!?Value {
 ///
 /// because its `Zir.Inst.Ref` and `InternPool.Index` are kept in
 /// lock-step. A non-instruction Ref *is* the matching InternPool index,
-/// by construction. Pure integer identity, no lookup.
-///
-/// Our parity is partial -- the type-prefix of `Index` through
-/// `enum_literal_type` mirrors the compiler's
-/// `Index` enum exactly, so we use the compiler's identity pattern
-/// directly for that range. Positions beyond it diverge until further
-/// compliance steps add the ptr/slice/vector wells and the typed
-/// undef/int values; the reflection bridge below covers them by name.
-/// Once the gap is closed, the reflection block disappears and only
-/// the identity line remains.
+/// by construction. Pure integer identity, no lookup. The REPL's
+/// well-known `Index` set mirrors the compiler's `static_keys` in the
+/// same order, so every static ref's integer value is its `Index`.
 fn wellKnownRefToValue(ref: Zir.Inst.Ref) ?Value {
-    if (ref == .none) return null;
-    if (ref.toIndex() != null) return null; // dynamic instruction ref
-
-    const ref_int = @intFromEnum(ref);
-    const identity_boundary = @intFromEnum(InternPool.Index.enum_literal_type);
-    if (ref_int <= identity_boundary) {
-        return Value{ .index = @enumFromInt(ref_int) };
-    }
-
-    const ref_info = @typeInfo(Zir.Inst.Ref).@"enum";
-    inline for (ref_info.field_names, ref_info.field_values) |name, value| {
-        if (comptime std.mem.eql(u8, name, "none")) continue;
-        if (comptime !@hasField(InternPool.Index, name)) continue;
-        if (comptime value <= @intFromEnum(InternPool.Index.enum_literal_type)) continue;
-        if (ref_int == value) {
-            return Value{ .index = @field(InternPool.Index, name) };
-        }
+    if (ref != .none and ref.toIndex() == null) {
+        return .{ .index = @enumFromInt(@intFromEnum(ref)) };
     }
     return null;
 }
