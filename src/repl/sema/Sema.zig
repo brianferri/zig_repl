@@ -517,7 +517,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .has_decl => sema.evalHasDecl(inst),
         .opt_eu_base_ptr_init => sema.evalOptEuBasePtrInit(inst),
         .validate_ptr_struct_init => sema.evalValidatePtrStructInit(inst),
-        .validate_struct_init_ty, .validate_struct_init_result_ty => sema.evalValidateStructInitTy(inst),
+        .validate_struct_init_ty => sema.evalValidateStructInitTy(inst, false),
+        .validate_struct_init_result_ty => sema.evalValidateStructInitTy(inst, true),
         .struct_init_field_type => sema.evalStructInitFieldType(inst),
         .struct_init => sema.evalStructInit(inst, false),
         .struct_init_ref => sema.evalStructInit(inst, true),
@@ -7843,11 +7844,13 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// `validate_struct_init_ty` / `validate_struct_init_result_ty`: check that the
 /// named type accepts `T{ ... }` init syntax; the following `struct_init` builds
 /// the value. Returns void. Mirrors zirValidateStructInitTy -- a struct or union
-/// passes (the same ZIR drives `T{ .a = x }` for both).
-fn evalValidateStructInitTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+/// passes (the same ZIR drives `T{ .a = x }` for both). The result-ty form peels
+/// optional/error-union wrappers first, so `@as(?S, .{...})` validates against `S`.
+fn evalValidateStructInitTy(sema: *Sema, inst: Zir.Inst.Index, comptime is_result_ty: bool) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const ty = (try sema.resolveRef(un_node.operand)).index;
-    switch (sema.intern_pool.indexToKey(ty)) {
+    const struct_ty = if (is_result_ty) Type.fromIndex(ty).optEuBaseType(sema.intern_pool).index else ty;
+    switch (sema.intern_pool.indexToKey(struct_ty)) {
         .struct_type, .union_type => return null,
         else => {
             try sema.writer.writeAll("struct init: type does not support struct initialization syntax\n");
@@ -7858,11 +7861,12 @@ fn evalValidateStructInitTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// `struct_init_field_type`: the type of `container_type`'s field `name`, used
 /// to coerce that field's init expression. Mirrors zirStructInitFieldType, which
-/// resolves the field against a struct or a union.
+/// peels optional/error-union wrappers off `container_type` before resolving the
+/// field against the payload struct or union.
 fn evalStructInitFieldType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const datas = sema.zir.instructions.items(.data);
     const ft = sema.zir.extraData(Zir.Inst.FieldType, datas[@intFromEnum(inst)].pl_node.payload_index).data;
-    const container_ty = (try sema.resolveRef(ft.container_type)).index;
+    const container_ty = Type.fromIndex((try sema.resolveRef(ft.container_type)).index).optEuBaseType(sema.intern_pool).index;
     const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(ft.name_start));
     const field_ty = switch (sema.intern_pool.indexToKey(container_ty)) {
         .struct_type => ((try sema.structFieldByName(container_ty, name)) orelse
@@ -7893,10 +7897,13 @@ fn evalStructInit(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Erro
 
     const first = sema.zir.extraData(Zir.Inst.StructInit.Item, extra.end).data;
     const first_ft = sema.zir.extraData(Zir.Inst.FieldType, datas[@intFromEnum(first.field_type)].pl_node.payload_index).data;
-    const struct_ty = (try sema.resolveRef(first_ft.container_type)).index;
+    // The result type may wrap the container in `?`/`E!` (from `@as(?S, .{...})`);
+    // build against the peeled base and coerce the finished value back at the end.
+    const result_ty = (try sema.resolveRef(first_ft.container_type)).index;
+    const struct_ty = Type.fromIndex(result_ty).optEuBaseType(ip).index;
     switch (ip.indexToKey(struct_ty)) {
         .struct_type => {},
-        .union_type => return try sema.evalUnionInit(struct_ty, inst, is_ref),
+        .union_type => return try sema.evalUnionInit(struct_ty, result_ty, inst, is_ref),
         else => {
             try sema.writer.writeAll("struct init: initializer type is not a struct or union\n");
             return error.AnalysisFail;
@@ -7923,7 +7930,7 @@ fn evalStructInit(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Erro
         elems[field.index] = (try sema.coerceValueToType(raw, field.ty, "struct field")).index;
     }
 
-    return try sema.finishStructInit(struct_ty, elems, is_ref);
+    return try sema.finishStructInit(struct_ty, result_ty, elems, is_ref);
 }
 
 /// `struct_init`'s union arm: `U{ .a = x }` builds a union value. A union init
@@ -7931,7 +7938,7 @@ fn evalStructInit(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Erro
 /// enum (looked up by name, so a `union(E)` uses `E`'s value for the field), the
 /// payload the coerced init. Mirrors zirStructInit's union branch: unionFieldIndex
 /// -> enumValueFieldIndex tag -> internUnion.
-fn evalUnionInit(sema: *Sema, union_ty: InternPool.Index, inst: Zir.Inst.Index, comptime is_ref: bool) Error!Value {
+fn evalUnionInit(sema: *Sema, union_ty: InternPool.Index, result_ty: InternPool.Index, inst: Zir.Inst.Index, comptime is_ref: bool) Error!Value {
     const ip = sema.intern_pool;
     const datas = sema.zir.instructions.items(.data);
     const extra = sema.zir.extraData(Zir.Inst.StructInit, datas[@intFromEnum(inst)].pl_node.payload_index);
@@ -7965,7 +7972,8 @@ fn evalUnionInit(sema: *Sema, union_ty: InternPool.Index, inst: Zir.Inst.Index, 
     }
     const tag = (try sema.enumValueFieldIndex(tag_enum, tag_index)).?;
     const value: Value = .{ .index = try ip.internUnion(.{ .ty = union_ty, .tag = tag.index, .val = val }) };
-    return if (is_ref) try sema.materializeConstPtr(value) else value;
+    const final = if (result_ty == union_ty) value else try sema.coerceValueToType(value, result_ty, "union init");
+    return if (is_ref) try sema.materializeConstPtr(final) else final;
 }
 
 /// `struct_init_empty`: `T{}` -- every field takes its default. Just the
@@ -7990,22 +7998,26 @@ fn structInitEmpty(sema: *Sema, struct_ty: InternPool.Index) Error!Value {
     const elems = try sema.gpa.alloc(InternPool.Index, count);
     defer sema.gpa.free(elems);
     @memset(elems, .none);
-    return try sema.finishStructInit(struct_ty, elems, false);
+    return try sema.finishStructInit(struct_ty, struct_ty, elems, false);
 }
 
 /// `struct_init_empty_result` / `struct_init_empty_ref_result`: `.{}` whose type
 /// comes from the surrounding result type. An untyped (generic-poison) operand --
 /// `.{}` bound to an `anytype` parameter -- is the empty tuple; a concrete struct
-/// fills its defaults. Mirrors zirStructInitEmptyResult; the `is_ref` variant
-/// returns a `*const` to the value.
+/// fills its defaults. The result type may wrap the container in `?`/`E!` (from
+/// `@as(?S, .{})`), so build against the peeled base and coerce back. Mirrors
+/// zirStructInitEmptyResult; the `is_ref` variant returns a `*const` to the value.
 fn evalStructInitEmptyResult(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
-    const ty = try sema.resolveDestType(un_node.operand, "struct init");
-    const value: Value = if (ty == .generic_poison_type)
-        .{ .index = .empty_tuple }
-    else switch (sema.intern_pool.indexToKey(ty)) {
-        .struct_type, .tuple_type => try sema.structInitEmpty(ty),
-        .array_type, .vector_type => try sema.arrayInitEmpty(ty),
+    const init_ty = try sema.resolveDestType(un_node.operand, "struct init");
+    if (init_ty == .generic_poison_type) {
+        const empty: Value = .{ .index = .empty_tuple };
+        return if (is_ref) try sema.materializeConstPtr(empty) else empty;
+    }
+    const obj_ty = Type.fromIndex(init_ty).optEuBaseType(sema.intern_pool).index;
+    const base: Value = switch (sema.intern_pool.indexToKey(obj_ty)) {
+        .struct_type, .tuple_type => try sema.structInitEmpty(obj_ty),
+        .array_type, .vector_type => try sema.arrayInitEmpty(obj_ty),
         .union_type => {
             try sema.writer.writeAll("union initializer must initialize one field\n");
             return error.AnalysisFail;
@@ -8015,6 +8027,7 @@ fn evalStructInitEmptyResult(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref:
             return error.AnalysisFail;
         },
     };
+    const value = if (init_ty == obj_ty) base else try sema.coerceValueToType(base, init_ty, "struct init");
     return if (is_ref) try sema.materializeConstPtr(value) else value;
 }
 
@@ -8036,10 +8049,12 @@ fn arrayInitEmpty(sema: *Sema, obj_ty: InternPool.Index) Error!Value {
 
 /// Complete a struct init: fill each unwritten field (`elems[i] == .none`) from
 /// its declared default -- evaluated in the struct's source ZIR -- or report a
-/// missing-field error, then intern the aggregate. `is_ref` returns a `*const`
-/// pointer to the fresh value. The finishStructInit analog shared by both the
-/// explicit-field and empty forms.
-fn finishStructInit(sema: *Sema, struct_ty: InternPool.Index, elems: []InternPool.Index, comptime is_ref: bool) Error!Value {
+/// missing-field error, then intern the aggregate. The value is built at the
+/// peeled `struct_ty` and coerced to `result_ty` -- identical unless the result
+/// type wraps the struct in `?`/`E!`, where the coercion re-wraps it. `is_ref`
+/// returns a `*const` pointer to the finished (wrapped) value. The
+/// finishStructInit analog shared by both the explicit-field and empty forms.
+fn finishStructInit(sema: *Sema, struct_ty: InternPool.Index, result_ty: InternPool.Index, elems: []InternPool.Index, comptime is_ref: bool) Error!Value {
     const ip = sema.intern_pool;
     // Each unwritten field takes its declared default, resolved by the same pass
     // `@typeInfo` uses (`structFieldDefault`), kept off the field-access path.
@@ -8055,7 +8070,8 @@ fn finishStructInit(sema: *Sema, struct_ty: InternPool.Index, elems: []InternPoo
     }
 
     const value: Value = .{ .index = try ip.internAggregate(.{ .ty = struct_ty, .storage = .{ .elems = elems } }) };
-    return if (is_ref) try sema.materializeConstPtr(value) else value;
+    const final = if (result_ty == struct_ty) value else try sema.coerceValueToType(value, result_ty, "struct init");
+    return if (is_ref) try sema.materializeConstPtr(final) else final;
 }
 
 /// `ref operand`: materialise `operand`'s value into a fresh const

@@ -320,6 +320,19 @@ pub fn errorUnionSet(ty: Type, pool: *const InternPool) Type {
     return .fromIndex(pool.indexToKey(ty.index).error_union_type.error_set_type);
 }
 
+/// Peel optional and error-union wrappers to the innermost payload; `?T`, `E!T`,
+/// and `?E!T` all yield `T`. A result-location type carries these wrappers (from
+/// `@as(?S, .{...})`), but the init syntax binds against the payload container.
+/// Mirrors `Type.optEuBaseType`.
+pub fn optEuBaseType(ty: Type, pool: *const InternPool) Type {
+    var cur = ty;
+    while (true) switch (cur.zigTypeTag(pool)) {
+        .optional => cur = cur.optionalChild(pool),
+        .error_union => cur = cur.errorUnionPayload(pool),
+        else => return cur,
+    };
+}
+
 /// A tuple type. Mirrors `Type.isTuple`.
 pub fn isTuple(ty: Type, pool: *const InternPool) bool {
     return pool.indexToKey(ty.index) == .tuple_type;
