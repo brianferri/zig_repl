@@ -160,6 +160,27 @@ pub fn bitSize(ty: Type, pool: *const InternPool) ?u64 {
     };
 }
 
+/// `{signedness, bits}` of a fixed-width int, else null. Mirrors `Type.intInfo`.
+pub fn intInfo(ty: Type, pool: *const InternPool) ?std.lang.Type.Int {
+    return switch (ty.index) {
+        .usize_type => .{ .signedness = .unsigned, .bits = target.ptrBitWidth() },
+        .isize_type => .{ .signedness = .signed, .bits = target.ptrBitWidth() },
+        .c_char_type => .{ .signedness = target.cCharSignedness(), .bits = target.cTypeBitSize(.char) },
+        .c_short_type => .{ .signedness = .signed, .bits = target.cTypeBitSize(.short) },
+        .c_ushort_type => .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ushort) },
+        .c_int_type => .{ .signedness = .signed, .bits = target.cTypeBitSize(.int) },
+        .c_uint_type => .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.uint) },
+        .c_long_type => .{ .signedness = .signed, .bits = target.cTypeBitSize(.long) },
+        .c_ulong_type => .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ulong) },
+        .c_longlong_type => .{ .signedness = .signed, .bits = target.cTypeBitSize(.longlong) },
+        .c_ulonglong_type => .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ulonglong) },
+        else => switch (pool.indexToKey(ty.index)) {
+            .int_type => |it| it,
+            else => null,
+        },
+    };
+}
+
 /// `Alignment.fromByteUnits(target.cTypeAlignment(c))` -- the compiler's
 /// `cTypeAlign` helper, inlined for the two `abi*` switches.
 fn cTypeAlign(c: std.Target.CType) InternPool.Alignment {

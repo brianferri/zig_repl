@@ -1458,10 +1458,8 @@ fn failLog2NonInt(sema: *Sema) Error {
 /// `int_ty` is not an int. Mirrors the compiler's `log2IntType`.
 fn log2IntType(sema: *Sema, int_ty: InternPool.Index) Error!?InternPool.Index {
     if (int_ty == .comptime_int_type) return .comptime_int_type;
-    const key = sema.intern_pool.indexToKey(int_ty);
-    if (key != .int_type) return null;
-    const bits = key.int_type.bits;
-    const log2_bits: u16 = if (bits == 0) 0 else std.math.log2_int_ceil(u16, bits);
+    const info = Type.fromIndex(int_ty).intInfo(sema.intern_pool) orelse return null;
+    const log2_bits: u16 = if (info.bits == 0) 0 else std.math.log2_int_ceil(u16, info.bits);
     return try sema.intern_pool.internIntType(.unsigned, log2_bits);
 }
 
@@ -2582,11 +2580,10 @@ fn evalClz(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const operand = try sema.resolveRef(un_node.operand);
     const operand_ty = operand.typeOf(ip).toIndex();
-    if (ip.indexToKey(operand_ty) != .int_type) {
+    const bits = (Type.fromIndex(operand_ty).intInfo(ip) orelse {
         try sema.writer.writeAll("@clz: expected a fixed-width integer\n");
         return error.AnalysisFail;
-    }
-    const bits = ip.indexToKey(operand_ty).int_type.bits;
+    }).bits;
     const val_key = ip.indexToKey(operand.index);
     if (val_key != .int) {
         try sema.writer.writeAll("@clz: expected a comptime-known integer\n");
@@ -4546,17 +4543,18 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const type_info_ty = try sema.getStdLangType(.@"Type");
     const tag_enum = try sema.unionTagEnumType(type_info_ty);
 
+    if (Type.fromIndex(ty).intInfo(ip)) |it| {
+        const int_info_ty = try sema.getStdLangType(.@"Type.Int");
+        const signedness_ty = try sema.getStdLangType(.@"Signedness");
+        const sign_idx = (try sema.enumFieldIndex(signedness_ty, try ip.getOrPutString(sema.gpa, @tagName(it.signedness)))).?;
+        const sign_val = (try sema.enumValueFieldIndex(signedness_ty, sign_idx)).?;
+        const bits_val = try ip.internInt(.{ .ty = .u16_type, .storage = .{ .u64 = it.bits } });
+        var elems = [_]InternPool.Index{ sign_val.index, bits_val };
+        const payload = try ip.internAggregate(.{ .ty = int_info_ty, .storage = .{ .elems = &elems } });
+        return try sema.typeInfoUnion(type_info_ty, tag_enum, "int", payload);
+    }
+
     switch (ip.indexToKey(ty)) {
-        .int_type => |it| {
-            const int_info_ty = try sema.getStdLangType(.@"Type.Int");
-            const signedness_ty = try sema.getStdLangType(.@"Signedness");
-            const sign_idx = (try sema.enumFieldIndex(signedness_ty, try ip.getOrPutString(sema.gpa, @tagName(it.signedness)))).?;
-            const sign_val = (try sema.enumValueFieldIndex(signedness_ty, sign_idx)).?;
-            const bits_val = try ip.internInt(.{ .ty = .u16_type, .storage = .{ .u64 = it.bits } });
-            var elems = [_]InternPool.Index{ sign_val.index, bits_val };
-            const payload = try ip.internAggregate(.{ .ty = int_info_ty, .storage = .{ .elems = &elems } });
-            return try sema.typeInfoUnion(type_info_ty, tag_enum, "int", payload);
-        },
         .simple_type => |s| switch (s) {
             // `Type.Float{ bits }`, like the int arm but a single field.
             .f16, .f32, .f64, .f80, .f128 => {
