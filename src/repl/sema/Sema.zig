@@ -6656,6 +6656,15 @@ fn containerDeclByName(sema: *Sema, container_ty: InternPool.Index, name: Intern
             sema.block.params.deinit(sema.gpa);
             sema.block.params = saved_params;
         }
+        // `results` is keyed by bare instruction index, so a decl body in another
+        // file collides with the caller's in-flight instructions at the same index.
+        // Evaluate it against a fresh map, as `evalCall` does for a function body.
+        const saved_results = sema.results;
+        sema.results = .empty;
+        defer {
+            sema.results.deinit(sema.gpa);
+            sema.results = saved_results;
+        }
         // Resolve the type annotation (`const x: T = ...`) before the value and
         // bind it to the declaration instruction, then coerce, exactly as
         // `bindValueDecl` does: a result-located init -- a `decl_literal` like
