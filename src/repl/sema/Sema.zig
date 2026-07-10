@@ -5305,6 +5305,20 @@ const FieldInfo = struct {
     align_bytes: ?u64 = null,
 };
 
+/// Field `i`'s `comptime` bit from a reified struct's stored `comptime_bits`
+/// (empty when no field is comptime, LSB-first within each u32).
+fn structFieldIsComptime(f: InternPool.StructFields, i: usize) bool {
+    if (f.comptime_bits.len == 0) return false;
+    return f.comptime_bits[i / 32] >> @intCast(i % 32) & 1 != 0;
+}
+
+/// Field `i`'s explicit alignment (bytes) from a reified struct's stored `aligns`,
+/// or null for the natural alignment (no `aligns` slice, or a `.none` entry).
+fn structFieldAlign(sema: *Sema, f: InternPool.StructFields, i: usize) ?u64 {
+    if (f.aligns.len == 0 or f.aligns[i] == .none) return null;
+    return @intCast(sema.intAsI128(f.aligns[i]).?);
+}
+
 /// Resolve a struct field by name to its index and type. Iterates the struct
 /// decl's fields via the stdlib `iterateFields`, matching name bytes; the field
 /// type is its type body evaluated in the struct's source ZIR (swapped in for a
@@ -5318,6 +5332,19 @@ fn structFieldByName(
     name: InternPool.NullTerminatedString,
 ) Error!?FieldInfo {
     const ip = sema.intern_pool;
+    // A reified struct has no ZIR; its fields are read from storage.
+    if (ip.structFields(struct_ty)) |f| {
+        for (f.names, 0..) |n, i| {
+            if (n != name) continue;
+            return .{
+                .index = @intCast(i),
+                .ty = f.types[i],
+                .is_comptime = structFieldIsComptime(f, i),
+                .align_bytes = structFieldAlign(sema, f, i),
+            };
+        }
+        return null;
+    }
     // Intern each ZIR field name as we scan and compare interned handles against
     // the (already interned) query -- the compiler resolves struct fields lazily
     // too (`resolveStructFieldTypes` interns each ZIR name), and `getOrPutString`
@@ -5356,6 +5383,14 @@ fn structFieldDefault(
     name: InternPool.NullTerminatedString,
 ) Error!InternPool.Index {
     const ip = sema.intern_pool;
+    // A reified struct has no ZIR; its defaults are stored (`.none` if none).
+    if (ip.structFields(struct_ty)) |f| {
+        for (f.names, 0..) |n, i| {
+            if (n != name) continue;
+            return if (f.defaults.len == 0) .none else f.defaults[i];
+        }
+        return .none;
+    }
     const cf = try sema.enterContainer(struct_ty, "struct field default");
     defer cf.restore(sema);
     if (sema.zir.instructions.items(.tag)[@intFromEnum(cf.decl_inst)] == .struct_init_anon) return .none;
@@ -5479,6 +5514,8 @@ fn callConvValue(sema: *Sema, cc: std.lang.CallingConvention) Error!InternPool.I
 /// supplies each field's type and attributes.
 fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
     const ip = sema.intern_pool;
+    // A reified struct has no ZIR; its field names are stored.
+    if (ip.structFields(struct_ty)) |f| return if (index < f.names.len) f.names[index] else null;
     const cf = try sema.enterContainer(struct_ty, "struct field name");
     defer cf.restore(sema);
     var it = sema.zir.getStructDecl(cf.decl_inst).iterateFields();
@@ -6033,6 +6070,8 @@ fn unionIsTagged(sema: *Sema, union_ty: InternPool.Index) Error!bool {
 /// A struct type's declared field count (read straight from its source ZIR's
 /// `field_names`; no field bodies are evaluated).
 fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
+    // A reified struct has no ZIR; its field count comes from stored fields.
+    if (sema.intern_pool.structFields(struct_ty)) |f| return @intCast(f.names.len);
     const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
     const decl_inst = st.id.declInst();
     const frame = try sema.enterSourceZir(st.id.sourceZirId(), "struct field count");

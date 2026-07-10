@@ -1885,6 +1885,11 @@ fn readContainerId(pool: *const InternPool, captures_len: u32, off: u32) Key.Con
 const StructTypeRepr = extern struct {
     name: u32,
     parent: u32,
+    /// Offset into `extra` of this struct's resolved field storage (see
+    /// `structFields`), or `fields_unresolved`. A reified struct fills it at
+    /// creation; a declared struct reads its fields from ZIR, so this stays unset.
+    /// Not part of identity, like `EnumTypeRepr.field_data`.
+    field_data: u32,
     captures_len: u32,
 };
 
@@ -3364,6 +3369,7 @@ fn emitStructType(pool: *InternPool, st: Key.StructType) Allocator.Error!void {
     const extra_index = try pool.addExtra(StructTypeRepr{
         .name = @intFromEnum(st.name),
         .parent = @intFromEnum(st.parent),
+        .field_data = fields_unresolved,
         .captures_len = containerCapturesLen(st.id),
     });
     try pool.appendContainerId(st.id);
@@ -3440,6 +3446,92 @@ pub fn setEnumFields(
     pool.extra.appendAssumeCapacity(@intCast(values.len));
     for (names) |n| pool.extra.appendAssumeCapacity(@intFromEnum(n));
     for (values) |v| pool.extra.appendAssumeCapacity(@intFromEnum(v));
+    pool.extra.items[slot] = off;
+}
+
+/// The resolved fields of a reified struct, borrowing into `extra`. Mirrors the
+/// comptime-relevant part of `LoadedStructType` (the runtime layout fields -- size,
+/// offsets, class -- are not modelled). `defaults`/`aligns` are empty when no field
+/// has one; `comptime_bits` (one bit per field, LSB-first within each u32) is empty
+/// when no field is comptime. Storage block layout: `[layout, backing_int,
+/// fields_len, defaults_len, aligns_len, comptime_len, names..., types...,
+/// defaults..., aligns..., comptime_bits...]`.
+pub const StructFields = struct {
+    layout: std.lang.Type.ContainerLayout,
+    backing_int: Index,
+    names: []const NullTerminatedString,
+    types: []const Index,
+    defaults: []const Index,
+    aligns: []const Index,
+    comptime_bits: []const u32,
+};
+
+/// This struct's resolved fields, or null if it stores none (a declared struct,
+/// which reads its fields from ZIR).
+pub fn structFields(pool: *const InternPool, struct_ty: Index) ?StructFields {
+    const item = pool.items.get(@intFromEnum(struct_ty));
+    assert(item.tag == .type_struct);
+    const off = pool.extra.items[item.data + @offsetOf(StructTypeRepr, "field_data") / 4];
+    if (off == fields_unresolved) return null;
+    const fields_len = pool.extra.items[off + 2];
+    const defaults_len = pool.extra.items[off + 3];
+    const aligns_len = pool.extra.items[off + 4];
+    const comptime_len = pool.extra.items[off + 5];
+    var base = off + 6;
+    const names: []const NullTerminatedString = @ptrCast(pool.extra.items[base..][0..fields_len]);
+    base += fields_len;
+    const types: []const Index = @ptrCast(pool.extra.items[base..][0..fields_len]);
+    base += fields_len;
+    const defaults: []const Index = @ptrCast(pool.extra.items[base..][0..defaults_len]);
+    base += defaults_len;
+    const aligns: []const Index = @ptrCast(pool.extra.items[base..][0..aligns_len]);
+    base += aligns_len;
+    return .{
+        .layout = @enumFromInt(pool.extra.items[off]),
+        .backing_int = @enumFromInt(pool.extra.items[off + 1]),
+        .names = names,
+        .types = types,
+        .defaults = defaults,
+        .aligns = aligns,
+        .comptime_bits = pool.extra.items[base..][0..comptime_len],
+    };
+}
+
+/// Store a reified struct's resolved fields (idempotent -- a no-op once set). Each
+/// `defaults[i]`/`aligns[i]` is `.none` for a field without that attribute; the
+/// slice is empty when no field has one. The identity Key is unchanged; only the
+/// `field_data` slot is filled, in place.
+pub fn setStructFields(
+    pool: *InternPool,
+    struct_ty: Index,
+    layout: std.lang.Type.ContainerLayout,
+    backing_int: Index,
+    names: []const NullTerminatedString,
+    types: []const Index,
+    defaults: []const Index,
+    aligns: []const Index,
+    comptime_bits: []const u32,
+) Allocator.Error!void {
+    assert(types.len == names.len);
+    assert(defaults.len == 0 or defaults.len == names.len);
+    assert(aligns.len == 0 or aligns.len == names.len);
+    const item = pool.items.get(@intFromEnum(struct_ty));
+    assert(item.tag == .type_struct);
+    const slot = item.data + @offsetOf(StructTypeRepr, "field_data") / 4;
+    if (pool.extra.items[slot] != fields_unresolved) return;
+    const off: u32 = @intCast(pool.extra.items.len);
+    try pool.extra.ensureUnusedCapacity(pool.gpa, 6 + names.len + types.len + defaults.len + aligns.len + comptime_bits.len);
+    pool.extra.appendAssumeCapacity(@intFromEnum(layout));
+    pool.extra.appendAssumeCapacity(@intFromEnum(backing_int));
+    pool.extra.appendAssumeCapacity(@intCast(names.len));
+    pool.extra.appendAssumeCapacity(@intCast(defaults.len));
+    pool.extra.appendAssumeCapacity(@intCast(aligns.len));
+    pool.extra.appendAssumeCapacity(@intCast(comptime_bits.len));
+    for (names) |n| pool.extra.appendAssumeCapacity(@intFromEnum(n));
+    for (types) |t| pool.extra.appendAssumeCapacity(@intFromEnum(t));
+    for (defaults) |d| pool.extra.appendAssumeCapacity(@intFromEnum(d));
+    for (aligns) |a| pool.extra.appendAssumeCapacity(@intFromEnum(a));
+    for (comptime_bits) |b| pool.extra.appendAssumeCapacity(b);
     pool.extra.items[slot] = off;
 }
 
