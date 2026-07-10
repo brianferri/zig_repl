@@ -114,6 +114,52 @@ pub fn abiSize(ty: Type, pool: *const InternPool) ?u64 {
     };
 }
 
+/// The type's meaningful bit width (`@bitSizeOf`). Mirrors the compiler's
+/// `Type.bitSize`: `bool` = 1, a float's bit width, a pointer = the host pointer
+/// width, an array/vector = length times the element bit size, an integer its bit
+/// count. `null` for a type the comptime-only model cannot measure (a struct,
+/// union, or enum, whose layout is unresolved) -- the compiler's `else` arm reads
+/// `intInfo(zcu).bits`, which the scalar cases below cover directly.
+pub fn bitSize(ty: Type, pool: *const InternPool) ?u64 {
+    return switch (pool.indexToKey(ty.index)) {
+        .int_type => |it| it.bits,
+        .ptr_type => |pt| switch (pt.flags.size) {
+            .slice => target.ptrBitWidth() * 2,
+            .one, .many, .c => target.ptrBitWidth(),
+        },
+        .array_type => |at| blk: {
+            const child = bitSize(fromIndex(at.child), pool) orelse break :blk null;
+            break :blk at.lenIncludingSentinel() * child;
+        },
+        .vector_type => |vt| blk: {
+            const child = bitSize(fromIndex(vt.child), pool) orelse break :blk null;
+            break :blk vt.len * child;
+        },
+        .simple_type => |t| switch (t) {
+            .void => 0,
+            .bool => 1,
+            .usize, .isize => target.ptrBitWidth(),
+            .c_char => target.cTypeBitSize(.char),
+            .c_short => target.cTypeBitSize(.short),
+            .c_ushort => target.cTypeBitSize(.ushort),
+            .c_int => target.cTypeBitSize(.int),
+            .c_uint => target.cTypeBitSize(.uint),
+            .c_long => target.cTypeBitSize(.long),
+            .c_ulong => target.cTypeBitSize(.ulong),
+            .c_longlong => target.cTypeBitSize(.longlong),
+            .c_ulonglong => target.cTypeBitSize(.ulonglong),
+            .c_longdouble => target.cTypeBitSize(.longdouble),
+            .f16 => 16,
+            .f32 => 32,
+            .f64 => 64,
+            .f80 => 80,
+            .f128 => 128,
+            else => null,
+        },
+        else => null,
+    };
+}
+
 /// `Alignment.fromByteUnits(target.cTypeAlignment(c))` -- the compiler's
 /// `cTypeAlign` helper, inlined for the two `abi*` switches.
 fn cTypeAlign(c: std.Target.CType) InternPool.Alignment {

@@ -480,6 +480,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .ptr_type => sema.evalPtrType(inst),
         .align_of => sema.evalAlignOf(inst),
         .size_of => sema.evalSizeOf(inst),
+        .bit_size_of => sema.evalBitSizeOf(inst),
         .int_from_ptr => sema.evalIntFromPtr(inst),
         .int_from_enum => sema.evalIntFromEnum(inst),
         .tag_name => sema.evalTagName(inst),
@@ -2545,6 +2546,26 @@ fn evalSizeOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const idx = try sema.intern_pool.internInt(.{
         .ty = .comptime_int_type,
         .storage = .{ .u64 = size },
+    });
+    return .{ .index = idx };
+}
+
+/// `bit_size_of` (`@bitSizeOf(T)`): the type's bit width as a `comptime_int`.
+/// Mirrors zirBitSizeOf -- resolve the operand type, reject one with no bit
+/// representation, then measure via `Type.bitSize`.
+fn evalBitSizeOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const ty = try sema.resolveDestType(un_node.operand, "@bitSizeOf");
+    const bits = Type.fromIndex(ty).bitSize(sema.intern_pool) orelse {
+        try sema.writer.writeAll("@bitSizeOf: no bit size available for type '");
+        try Type.print(.fromIndex(ty), sema.intern_pool, sema.writer);
+        try sema.writer.writeAll("'\n");
+        return error.AnalysisFail;
+    };
+    const idx = try sema.intern_pool.internInt(.{
+        .ty = .comptime_int_type,
+        .storage = .{ .u64 = bits },
     });
     return .{ .index = idx };
 }
