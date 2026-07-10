@@ -9053,6 +9053,10 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .ty = fn_ty,
         .uncoerced_ty = fn_ty,
         .zir_body_inst = inst,
+        // The container being analysed when the function is declared is where
+        // its body resolves bare sibling names; a call restores it (see the
+        // body-eval `this_type` below).
+        .parent = sema.this_type,
     });
     return Value{ .index = func_idx };
 }
@@ -9157,9 +9161,13 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     // The callee's body sees its container as `@This()` and resolves bare
     // sibling-declaration names (`fn total() { return sum2(...); }`) against it.
     // Args above were evaluated in the caller's scope, so this is set only now.
-    // `.none` for a direct call whose namespace the call site does not name.
+    // Prefer the function's own definition container over the call site: a
+    // function reached through a re-export (`std.Target.x86.featureSet`) resolves
+    // its body's names where it was declared, not where it was named. Falls back
+    // to the call-site container for a function with no stored parent (a REPL
+    // top-level `fn`, whose siblings resolve through the session namespace).
     const saved_this = sema.this_type;
-    sema.this_type = enclosing_ty;
+    sema.this_type = if (func.parent != .none) func.parent else enclosing_ty;
     defer sema.this_type = saved_this;
 
     // View the func's source-ZIR snapshot for the body eval, crossing a REPL line

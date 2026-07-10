@@ -1095,6 +1095,22 @@ pub const Key = union(enum) {
         /// incremental compilation lands -- same deferred-vestigial
         /// story as `Nav.analysis.zir_index`.
         zir_body_inst: std.zig.Zir.Inst.Index,
+        /// The container type whose namespace declared this function -- where
+        /// its body resolves bare sibling names (a type `Set` referenced
+        /// unqualified). `.none` for a function with no enclosing container (a
+        /// REPL top-level `fn`, whose siblings resolve through the session
+        /// namespace). Named like the `parent` a container type stores.
+        ///
+        /// The compiler reaches the same information through `owner_nav ->
+        /// Nav.analysis.namespace -> owner_type`, but the REPL builds a `Nav`
+        /// only for a session-level declaration, not for a container member
+        /// resolved lazily from ZIR by `containerDeclByName` -- so a function
+        /// pulled out of `std` has no `owner_nav` to follow. Capturing the
+        /// definition-site container here is the stand-in. Storing `owner_nav`
+        /// verbatim would require eagerly building a `Nav` (and namespace) for
+        /// every container member, i.e. the whole-program `Zcu`/Nav graph the
+        /// lazy model deliberately avoids.
+        parent: Index = .none,
         /// `.none` unless this is a generic-fn instantiation. When
         /// set, points at the `func_decl` this instance was spawned
         /// from. Mirrors `Key.Func.generic_owner`.
@@ -1255,6 +1271,7 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, f.ty);
                 std.hash.autoHash(&hasher, f.uncoerced_ty);
                 std.hash.autoHash(&hasher, f.zir_body_inst);
+                std.hash.autoHash(&hasher, f.parent);
                 std.hash.autoHash(&hasher, f.generic_owner);
                 for (f.comptime_args) |arg| std.hash.autoHash(&hasher, arg);
             },
@@ -1416,6 +1433,7 @@ pub const Key = union(enum) {
                 if (x.ty != y.ty) break :blk false;
                 if (x.uncoerced_ty != y.uncoerced_ty) break :blk false;
                 if (x.zir_body_inst != y.zir_body_inst) break :blk false;
+                if (x.parent != y.parent) break :blk false;
                 if (x.generic_owner != y.generic_owner) break :blk false;
                 break :blk std.mem.eql(Index, x.comptime_args, y.comptime_args);
             },
@@ -1748,6 +1766,7 @@ const FuncDeclRepr = extern struct {
     source_zir_id: u32,
     ty: u32,
     zir_body_inst: u32,
+    parent: u32,
 };
 
 /// Extra-arena header for `Item.Tag.func_instance`. Four u32
@@ -4020,6 +4039,7 @@ fn emitFunc(pool: *InternPool, f: Key.Func) Allocator.Error!void {
             .ty = f.uncoerced_ty,
             .uncoerced_ty = f.uncoerced_ty,
             .zir_body_inst = f.zir_body_inst,
+            .parent = f.parent,
         });
         const coerced_extra: u32 = @intCast(pool.extra.items.len);
         try pool.extra.appendSlice(pool.gpa, &.{
@@ -4033,6 +4053,7 @@ fn emitFunc(pool: *InternPool, f: Key.Func) Allocator.Error!void {
         f.source_zir_id,
         @intFromEnum(f.ty),
         @intFromEnum(f.zir_body_inst),
+        @intFromEnum(f.parent),
     });
     pool.items.appendAssumeCapacity(.{ .tag = .func_decl, .data = extra_index });
 }
@@ -4081,7 +4102,7 @@ fn funcTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
 }
 
 fn funcDeclFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    assert(extra_index + 3 <= pool.extra.items.len);
+    assert(extra_index + 4 <= pool.extra.items.len);
     const source_zir_id = pool.extra.items[extra_index];
     const ty: Index = @enumFromInt(pool.extra.items[extra_index + 1]);
     return .{ .func = .{
@@ -4089,6 +4110,7 @@ fn funcDeclFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .ty = ty,
         .uncoerced_ty = ty,
         .zir_body_inst = @enumFromInt(pool.extra.items[extra_index + 2]),
+        .parent = @enumFromInt(pool.extra.items[extra_index + 3]),
     } };
 }
 
@@ -4132,6 +4154,7 @@ fn funcCoercedFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .ty = ty,
         .uncoerced_ty = inner_key.uncoerced_ty,
         .zir_body_inst = inner_key.zir_body_inst,
+        .parent = inner_key.parent,
         .generic_owner = inner_key.generic_owner,
         .comptime_args = inner_key.comptime_args,
     } };
