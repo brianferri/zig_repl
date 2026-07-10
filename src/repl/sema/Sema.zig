@@ -3428,10 +3428,8 @@ fn evalReifySliceArgTy(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!
         .type_to_fn_param_attrs => .{ .type_type, try sema.getStdLangType(.@"Type.Fn.ParamAttributes") },
         .string_to_struct_field_type => .{ try sema.sliceConstU8Ty(), .type_type },
         .string_to_struct_field_attrs => .{ try sema.sliceConstU8Ty(), try sema.getStdLangType(.@"Type.Struct.FieldAttributes") },
-        else => {
-            try sema.writer.print("reify: slice argument mapping '{s}' is not supported\n", .{@tagName(info)});
-            return error.AnalysisFail;
-        },
+        .string_to_union_field_type => .{ try sema.sliceConstU8Ty(), .type_type },
+        .string_to_union_field_attrs => .{ try sema.sliceConstU8Ty(), try sema.getStdLangType(.@"Type.Union.FieldAttributes") },
     };
     const operand_ty = try ip.internPtrType(.{ .child = in_scalar_ty, .flags = .{ .size = .slice, .is_const = true } });
     const operand_val = try sema.coerceValueToType(try sema.resolveRef(extra.operand), operand_ty, "reify slice argument");
@@ -3784,6 +3782,125 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
         if (any_comptime) comptime_words else &.{},
     );
     return .{ .index = struct_ty };
+}
+
+/// `@Union(layout, arg_ty, field_names, field_types, field_attrs)` (`reify_union`):
+/// reify a union type from its layout, optional tag/backing type, field names/types,
+/// and per-field attributes (alignment only). Mirrors zirReifyUnion. Fields are
+/// stored eagerly from the arguments (like `@Struct`). `arg_ty` is the explicit tag
+/// enum for an `.auto` union; for a `.packed` union it is a backing integer (not a
+/// tag), and for `.extern` it is rejected. The runtime layout is not modelled.
+fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const name_strategy: Zir.Inst.NameStrategy = @enumFromInt(extended.small);
+    const extra = sema.zir.extraData(Zir.Inst.ReifyUnion, extended.operand).data;
+
+    const layout_ty = try sema.getStdLangType(.@"Type.ContainerLayout");
+    const layout_val = try sema.coerceValueToType(try sema.resolveRef(extra.layout), layout_ty, "union layout");
+    const layout = try sema.interpretStdLangEnum(std.lang.Type.ContainerLayout, layout_ty, layout_val, "union layout");
+
+    // arg_ty is `?type`: for `.auto` it is the explicit tag enum; for `.packed` a
+    // backing integer (not modelled as a tag); for `.extern` it is not allowed.
+    const arg_val = try sema.coerceValueToType(try sema.resolveRef(extra.arg_ty), try ip.internOptionalType(.type_type), "union tag/backing type");
+    if (ip.indexToKey(arg_val.index) == .undef) {
+        try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
+        return error.AnalysisFail;
+    }
+    // `arg_ty` is the tag enum for an `.auto` union and the backing integer for a
+    // `.packed` one, matching how `zirReifyUnion` splits `explicit_tag_ty` from
+    // `explicit_packed_backing_type`.
+    const arg_ty = ip.indexToKey(arg_val.index).opt.val;
+    var tag_type: InternPool.Index = .none;
+    var backing_int: InternPool.Index = .none;
+    if (arg_ty != .none) switch (layout) {
+        .@"extern" => {
+            try sema.writer.writeAll("extern union does not support enum tag type\n");
+            return error.AnalysisFail;
+        },
+        .@"packed" => backing_int = arg_ty,
+        .auto => tag_type = arg_ty,
+    };
+
+    const names_slice = try sema.coerceValueToType(try sema.resolveRef(extra.field_names), try sema.sliceOfStringTy(), "union field names");
+    const names_agg = ip.indexToKey((try sema.derefSliceAsArray(names_slice)).index).aggregate;
+    const fields_len: u32 = @intCast(ip.indexToKey(names_agg.ty).array_type.len);
+
+    const field_types_ty = try ip.internPtrType(.{
+        .child = try ip.internArrayType(.{ .len = fields_len, .child = .type_type }),
+        .flags = .{ .size = .one, .is_const = true },
+    });
+    const types_arr = try sema.derefSliceAsArray(try sema.coerceValueToType(try sema.resolveRef(extra.field_types), field_types_ty, "union field types"));
+    const types_agg = ip.indexToKey(types_arr.index).aggregate;
+
+    const attrs_scalar_ty = try sema.getStdLangType(.@"Type.Union.FieldAttributes");
+    const field_attrs_ty = try ip.internPtrType(.{
+        .child = try ip.internArrayType(.{ .len = fields_len, .child = attrs_scalar_ty }),
+        .flags = .{ .size = .one, .is_const = true },
+    });
+    const attrs_arr = try sema.derefSliceAsArray(try sema.coerceValueToType(try sema.resolveRef(extra.field_attrs), field_attrs_ty, "union field attributes"));
+    const attrs_agg = ip.indexToKey(attrs_arr.index).aggregate;
+
+    const names = try sema.gpa.alloc(InternPool.NullTerminatedString, fields_len);
+    defer sema.gpa.free(names);
+    const types = try sema.gpa.alloc(InternPool.Index, fields_len);
+    defer sema.gpa.free(types);
+    const aligns = try sema.gpa.alloc(InternPool.Index, fields_len);
+    defer sema.gpa.free(aligns);
+    @memset(aligns, .none);
+    var any_aligns = false;
+
+    // The dedup hash mirrors the compiler's: layout, the arg-type value, the
+    // (dedup-stable) field-type and field-attribute arrays, then per-field name.
+    // Field attributes hash wholesale -- a union field's only attribute is its
+    // alignment, a value the InternPool already deduplicated.
+    var hasher = std.hash.Wyhash.init(0);
+    std.hash.autoHash(&hasher, layout);
+    std.hash.autoHash(&hasher, arg_val.index);
+    std.hash.autoHash(&hasher, types_arr.index);
+    std.hash.autoHash(&hasher, attrs_arr.index);
+
+    for (names, types, 0..) |*name_out, *type_out, i| {
+        name_out.* = try sema.sliceToIpString(.{ .index = InternPool.aggregateElementAt(names_agg, i) });
+        type_out.* = InternPool.aggregateElementAt(types_agg, i);
+        if (ip.indexToKey(type_out.*) == .undef) {
+            try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
+            return error.AnalysisFail;
+        }
+        // A union field's attributes are `.{ align: ?usize }`.
+        const attr_elem = InternPool.aggregateElementAt(attrs_agg, i);
+        if (ip.indexToKey(attr_elem) == .undef) {
+            try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
+            return error.AnalysisFail;
+        }
+        const align_opt = ip.indexToKey(InternPool.aggregateElementAt(ip.indexToKey(attr_elem).aggregate, 0)).opt.val;
+        if (align_opt != .none) {
+            if (layout == .@"packed") {
+                try sema.writer.writeAll("packed union fields cannot be aligned\n");
+                return error.AnalysisFail;
+            }
+            aligns[i] = align_opt;
+            any_aligns = true;
+        }
+        std.hash.autoHash(&hasher, name_out.*);
+    }
+
+    const name = switch (name_strategy) {
+        .parent => sema.type_name_ctx,
+        .anon, .func, .dbg_var => blk: {
+            const ctx = ip.stringSlice(sema.type_name_ctx);
+            const text = try std.fmt.allocPrint(sema.gpa, "{s}__union_{d}", .{ ctx, @intFromEnum(inst) });
+            defer sema.gpa.free(text);
+            break :blk try ip.getOrPutString(sema.gpa, text);
+        },
+    };
+
+    const union_ty = try ip.internUnionType(.{
+        .name = name,
+        .id = .{ .reified = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst, .type_hash = hasher.final() } },
+        .parent = sema.this_type,
+    });
+    try ip.setUnionFields(union_ty, layout, tag_type, backing_int, names, types, if (any_aligns) aligns else &.{});
+    return .{ .index = union_ty };
 }
 
 /// `array_type lhs, rhs`: `lhs` is the length operand, `rhs` the
@@ -9308,6 +9425,7 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .reify_enum_value_slice_ty => return sema.evalReifyEnumValueSliceTy(extended),
         .reify_enum => return sema.evalReifyEnum(extended, inst),
         .reify_struct => return sema.evalReifyStruct(extended, inst),
+        .reify_union => return sema.evalReifyUnion(extended, inst),
         .tuple_decl => return sema.evalTupleDecl(extended),
         .enum_decl => return sema.evalEnumDecl(inst),
         .union_decl => return sema.evalUnionDecl(inst),

@@ -2429,6 +2429,13 @@ test "@import(std) broad access probes" {
         .{ .src = "@typeInfo(@Struct(.auto, null, &.{ \"a\", \"b\" }, &.{ u8, u16 }, &.{ .{}, .{} })).@\"struct\".field_types[1] == u16", .want = "true" },
         .{ .src = "@typeInfo(@Struct(.auto, null, &.{\"x\"}, &.{u8}, &.{.{}})).@\"struct\".is_tuple", .want = "false" },
         .{ .src = "(@Struct(.auto, null, &.{\"x\"}, &.{u8}, &.{.{}}){ .x = 5 }).x == 5", .want = "true" },
+        // @Union reifies a union type from a layout, optional tag/backing type,
+        // field names, field types, and per-field attributes (alignment only). An
+        // `.auto` union with a `null` arg is untagged; an explicit enum tags it.
+        .{ .src = "@typeInfo(@Union(.auto, null, &.{ \"a\", \"b\" }, &.{ u8, u16 }, &.{ .{}, .{} })).@\"union\".field_types.len == 2", .want = "true" },
+        .{ .src = "@typeInfo(@Union(.auto, null, &.{ \"a\", \"b\" }, &.{ u8, u16 }, &.{ .{}, .{} })).@\"union\".field_types[1] == u16", .want = "true" },
+        .{ .src = "@typeInfo(@Union(.auto, null, &.{\"x\"}, &.{u8}, &.{.{}})).@\"union\".tag_type == null", .want = "true" },
+        .{ .src = "@typeInfo(@Union(.auto, @Enum(u8, .exhaustive, &.{\"x\"}, &.{0}), &.{\"x\"}, &.{u8}, &.{.{}})).@\"union\".tag_type != null", .want = "true" },
         // A struct field's `= .auto` decl-literal default resolves against the
         // field type (CallingConvention), not the enclosing container -- the
         // field-default decl_inst binding. `.{}` fills the field from its default.
