@@ -6496,14 +6496,24 @@ fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index, comptime initializing: bool) 
 fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedString, comptime initializing: bool) Error!?Value {
     const ip = sema.intern_pool;
     const parent_ty = ip.indexToKey(object_ptr.index).ptr.ty;
-    const container_ty = ip.indexToKey(parent_ty).ptr_type.child;
+    const object_ty = ip.indexToKey(parent_ty).ptr_type.child;
+    // Zig dereferences a single pointer during field lookup: `p.field` where `p`
+    // is a `*T` (so the operand is `*const *T`) reads the field on `T`. Mirrors
+    // `fieldPtr`'s `is_pointer_to` / `inner_ty` -- load the operand to the inner
+    // pointer and use that as the field-pointer base; a non-pointer container is
+    // unchanged (`inner_ty == object_ty`, `base_ptr == object_ptr`).
+    const is_pointer_to = ip.indexToKey(object_ty) == .ptr_type and
+        ip.indexToKey(object_ty).ptr_type.flags.size == .one;
+    const container_ty = if (is_pointer_to) ip.indexToKey(object_ty).ptr_type.child else object_ty;
+    const base_ptr = if (is_pointer_to) try sema.loadValue(object_ptr) else object_ptr;
+    const attr_ptr_ty = if (is_pointer_to) object_ty else parent_ty;
 
     // Namespace decl access on a type (`&S.decl`, e.g. the intermediate `S.A` in
     // `S.A.y`): the operand points at a type value. Resolve the decl in that type's
     // namespace and return a pointer to it. Mirrors fieldPtr's `.type` arm, whose
     // `namespaceLookupRef` yields a `decl_ref`.
     if (container_ty == .type_type) {
-        const container = try sema.loadValue(object_ptr);
+        const container = try sema.loadValue(base_ptr);
         if (try sema.containerDeclByName(container.index, name)) |decl_val|
             return try sema.materializeConstPtr(decl_val);
         return sema.failBadMemberAccess(container.index, name);
@@ -6519,7 +6529,7 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
             return sema.failNoMember(container_ty, name);
         },
         .ptr_type => |ptr_ty| if (ptr_ty.flags.size == .slice) {
-            const s = ip.indexToKey((try sema.loadValue(object_ptr)).index).slice;
+            const s = ip.indexToKey((try sema.loadValue(base_ptr)).index).slice;
             if (name.eqlSlice("len", ip)) return try sema.materializeConstPtr(.{ .index = s.len });
             if (name.eqlSlice("ptr", ip)) return try sema.materializeConstPtr(.{ .index = s.ptr });
             return sema.failNoMember(container_ty, name);
@@ -6534,7 +6544,7 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
             // Reading a pointer to an inactive union field is illegal; the
             // compiler checks the active tag at the pointer op unless the field
             // is being initialized. The union value is comptime-known here.
-            if (!initializing) _ = try sema.loadUnionField((try sema.loadValue(object_ptr)).index, f.index);
+            if (!initializing) _ = try sema.loadUnionField((try sema.loadValue(base_ptr)).index, f.index);
             break :blk f;
         },
         .struct_type => (try sema.structFieldByName(container_ty, name)) orelse
@@ -6551,16 +6561,16 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
     // An anonymous struct's field carries no ZIR-resolvable type (`.none`); read
     // it from the stored aggregate element instead.
     const field_ty = if (fld.ty != .none) fld.ty else blk: {
-        const agg = ip.indexToKey((try sema.loadValue(object_ptr)).index).aggregate;
+        const agg = ip.indexToKey((try sema.loadValue(base_ptr)).index).aggregate;
         break :blk Value.typeOf(.{ .index = InternPool.aggregateElementAt(agg, fld.index) }, ip).index;
     };
     const field_ptr_ty = try ip.internPtrType(.{
         .child = field_ty,
-        .flags = .{ .size = .one, .is_const = ip.indexToKey(parent_ty).ptr_type.flags.is_const },
+        .flags = .{ .size = .one, .is_const = ip.indexToKey(attr_ptr_ty).ptr_type.flags.is_const },
     });
     return .{ .index = try ip.internPtr(.{
         .ty = field_ptr_ty,
-        .base_addr = .{ .field = .{ .base = object_ptr.index, .index = fld.index } },
+        .base_addr = .{ .field = .{ .base = base_ptr.index, .index = fld.index } },
         .byte_offset = 0,
     }) };
 }
