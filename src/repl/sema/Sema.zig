@@ -533,6 +533,9 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .error_set_decl => sema.evalErrorSetDecl(inst),
         .error_value => sema.evalErrorValue(inst),
         .error_union_type => sema.evalErrorUnionType(inst),
+        // Async never landed in the self-hosted compiler; every frame/async form
+        // resolves to the same diagnostic (`failWithUseOfAsync`).
+        .anyframe_type, .frame_type, .suspend_block, .@"resume" => sema.failUseOfAsync(),
         .err_union_code => sema.evalErrUnionCode(inst),
         .err_union_code_ptr => sema.evalErrUnionCodePtr(inst),
         .err_union_payload_unsafe => sema.evalErrUnionPayloadUnsafe(inst),
@@ -10669,6 +10672,9 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
         .std_lang_value => return sema.evalStdLangValue(extended),
 
+        // `@frame()` -- another async form, rejected like the frame ZIR tags.
+        .frame => return sema.failUseOfAsync(),
+
         inline else => |op| {
             try sema.writer.print("unsupported extended ZIR opcode: {s}\n", .{@tagName(op)});
             return error.AnalysisFail;
@@ -10678,5 +10684,15 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 fn reportUnsupportedTag(sema: *Sema, comptime tag: Zir.Inst.Tag) Error {
     try sema.writer.print("unsupported ZIR instruction: {s}\n", .{@tagName(tag)});
+    return error.AnalysisFail;
+}
+
+/// Reject an async/frame operation (`anyframe`, `anyframe->T`, `@Frame`, `suspend`,
+/// `resume`, `@frame`) with the self-hosted compiler's own diagnostic. Async was
+/// never implemented in the self-hosted compiler; each of these ZIR forms resolves
+/// to `failWithUseOfAsync`, so the REPL mirrors that rather than the type build the
+/// dead code past `if (true)` in `zirAnyframeType` would suggest.
+fn failUseOfAsync(sema: *Sema) Error!?Value {
+    try sema.writer.writeAll("async has not been implemented in the self-hosted compiler yet\n");
     return error.AnalysisFail;
 }

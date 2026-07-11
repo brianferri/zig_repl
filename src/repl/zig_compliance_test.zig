@@ -2275,6 +2275,16 @@ test "compliance: switch operand and exhaustiveness are validated" {
     try expectBothReject(a, &.{ "const E = error{ A, B };", "const x: E!u8 = error.A;", "x catch |e| switch (e) { error.A => 1 }" });
 }
 
+test "compliance: async and frame forms are rejected like the compiler" {
+    // Async was never implemented in the self-hosted compiler; anyframe, anyframe->T,
+    // and @Frame all resolve to the same diagnostic, which the REPL emits verbatim.
+    const a = testing.allocator;
+    try expectBothReject(a, &.{"anyframe"});
+    try expectBothReject(a, &.{"anyframe->u8"});
+    try expectBothReject(a, &.{"blk: { const f = struct { fn g() void {} }.g; break :blk @Frame(f); }"});
+    try expectReplDiagnostic(a, &.{"anyframe->u8"}, "async has not been implemented in the self-hosted compiler yet");
+}
+
 test "sad paths: enums are rejected" {
     const a = testing.allocator;
     try expectBothReject(a, &.{"blk: { const E = enum { a, b }; break :blk E.z; }"});
