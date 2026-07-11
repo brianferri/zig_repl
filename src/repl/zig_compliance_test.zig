@@ -500,6 +500,24 @@ test "compliance: @compileError fails on both sides" {
     try expectBothReject(testing.allocator, &.{"blk: { @compileError(\"boom\"); break :blk 1; }"});
 }
 
+test "compliance: @unionInit builds the union with the named field active" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"@unionInit(union { a: u8, b: bool }, \"a\", @as(u8, 5)).a"});
+    try expectMatchesZig(a, &.{"@unionInit(union { a: u8, b: bool }, \"b\", true).b"});
+    // A field name the union does not have is rejected.
+    try expectBothReject(a, &.{"@unionInit(union { a: u8 }, \"z\", @as(u8, 1)).a"});
+}
+
+test "compliance: `||` merges error sets" {
+    // Probe via a name lookup rather than the set's type name: merged names are
+    // ordered by intern order, not declaration order, so the type name is not stable.
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"blk: { const E = error{A} || error{B}; const e: E = error.B; break :blk @errorName(e)[0]; }"});
+    try expectMatchesZig(a, &.{"blk: { const E = error{A} || error{ A, C }; const e: E = error.C; break :blk @errorName(e)[0]; }"});
+    // Two bool operands are the `||`-vs-`or` mistake.
+    try expectBothReject(a, &.{"blk: { const x = true || false; break :blk x; }"});
+}
+
 test "compliance: overflow-arithmetic builtins return .{ wrapped, overflow }" {
     // Index the 2-tuple result: [0] is the wrapped value, [1] the u1 overflow bit.
     const a = testing.allocator;

@@ -637,6 +637,9 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .set_runtime_safety => sema.evalSetRuntimeSafety(inst),
         .type_name => sema.evalTypeName(inst),
         .error_name => sema.evalErrorName(inst),
+        .union_init => sema.evalUnionInit(inst),
+        .field_type_ref => sema.evalFieldTypeRef(inst),
+        .merge_error_sets => sema.evalMergeErrorSets(inst),
         .slice_start => sema.evalSliceStart(inst),
         .slice_end => sema.evalSliceEnd(inst),
         .slice_sentinel => sema.evalSliceSentinel(inst),
@@ -851,6 +854,15 @@ fn intFittingRange(sema: *Sema, min: Value, max: Value) Error!Type {
     const min_val_bits = sema.intBitsForValue(min, sign);
     const max_val_bits = sema.intBitsForValue(max, sign);
     return .fromIndex(try pool.internIntType(if (sign) .signed else .unsigned, @max(min_val_bits, max_val_bits)));
+}
+
+/// Write a formatted diagnostic (with a trailing newline) and fail. The REPL's
+/// analogue of the compiler's `sema.fail(block, src, format, args)` -- there is no
+/// `block`/`src`, and a `Type.fmt(ip)` argument supplies the `{f}` type name.
+/// Variadic `args`, like the compiler's `fail`, forwards to `writer.print`.
+fn fail(sema: *Sema, comptime format: []const u8, args: anytype) Error {
+    try sema.writer.print(format ++ "\n", args);
+    return error.AnalysisFail;
 }
 
 pub fn failWithUseOfUndef(sema: *Sema) Error {
@@ -8036,6 +8048,105 @@ fn evalErrorName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return try sema.internStringLiteral(ip.stringSlice(name));
 }
 
+/// `@unionInit(U, "field", init)`: build the union value with `field` active.
+/// Mirrors zirUnionInit's comptime path: resolve the field's tag value, coerce the
+/// payload to the field type, and intern the union. A packed union bitcasts the
+/// payload to its backing integer -- the comptime-only evaluator has no bit layout
+/// to do that, so a (reified) packed union is rejected rather than mis-built as a
+/// tagged value; a declared union is modeled as `.auto`.
+fn evalUnionInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.UnionInit, pl_node.payload_index).data;
+    const union_ty = try sema.resolveDestType(extra.union_type, "@unionInit");
+    if (ip.indexToKey(union_ty) != .union_type) {
+        return sema.fail("@unionInit: expected union type, found '{f}'", .{Type.fromIndex(union_ty).fmt(ip)});
+    }
+    const field_name = try sema.resolveConstStringIntern(extra.field_name);
+    const field = (try sema.unionFieldByName(union_ty, field_name)) orelse
+        return sema.failBadUnionFieldAccess(union_ty, field_name);
+    const payload = try sema.coerceValueToType(try sema.resolveRef(extra.init), field.ty, "@unionInit");
+    if (ip.unionFields(union_ty)) |uf| if (uf.layout == .@"packed") {
+        return sema.fail("@unionInit of a packed union is not supported", .{});
+    };
+    const tag_enum = try sema.unionTagEnumType(union_ty);
+    const tag_val = (try sema.enumValueFieldIndex(tag_enum, field.index)).?;
+    return .{ .index = try ip.internUnion(.{ .ty = union_ty, .tag = tag_val.index, .val = payload.index }) };
+}
+
+/// `field_type_ref`: the type of `container`'s field named `field_name`, as a type
+/// value. AstGen emits it to type the `init` argument of `@unionInit` (and struct
+/// field inits) against the field's declared type. Mirrors zirFieldTypeRef.
+fn evalFieldTypeRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.FieldTypeRef, pl_node.payload_index).data;
+    // `fieldType` looks through optional / error-union wrappers to the container.
+    const aggregate_ty = sema.optEuBaseType(try sema.resolveDestType(extra.container_type, "field type"));
+    const field_name = try sema.resolveConstStringIntern(extra.field_name);
+    const field_ty: InternPool.Index = switch (ip.indexToKey(aggregate_ty)) {
+        .struct_type => ((try sema.structFieldByName(aggregate_ty, field_name)) orelse
+            return sema.failBadMemberAccess(aggregate_ty, field_name)).ty,
+        // A tuple's fields are named by their numeric index.
+        .tuple_type => |tuple| ty: {
+            const idx = std.fmt.parseInt(u32, ip.stringSlice(field_name), 10) catch
+                return sema.failBadMemberAccess(aggregate_ty, field_name);
+            if (idx >= tuple.types.len) return sema.failBadMemberAccess(aggregate_ty, field_name);
+            break :ty tuple.types[idx];
+        },
+        .union_type => ((try sema.unionFieldByName(aggregate_ty, field_name)) orelse
+            return sema.failBadUnionFieldAccess(aggregate_ty, field_name)).ty,
+        else => return sema.fail("expected struct or union; found '{f}'", .{Type.fromIndex(aggregate_ty).fmt(ip)}),
+    };
+    return .{ .index = field_ty };
+}
+
+/// `E1 || E2`: the error set that is the union of two error sets. Mirrors
+/// zirMergeErrorSets: two `bool` operands are the "`||` vs `or`" mistake; each
+/// operand must resolve to an error-set type; either side being `anyerror` yields
+/// `anyerror`; otherwise merge the name lists. The compiler's
+/// `inferred_error_set_type` arms have no analog -- this evaluator mints no
+/// inferred error sets (see [[no_inferred_error_sets]]), so both resolved operands
+/// are always `error_set_type`.
+fn evalMergeErrorSets(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const bin = sema.binData(inst);
+    const lhs = try sema.resolveRef(bin.lhs);
+    const rhs = try sema.resolveRef(bin.rhs);
+    if (Value.typeOf(lhs, ip).index == .bool_type and Value.typeOf(rhs, ip).index == .bool_type) {
+        return sema.fail("expected error set type, found 'bool' ('||' merges error sets; 'or' performs boolean OR)", .{});
+    }
+    // `resolveDestType` is the REPL's `analyzeAsType`: it validates each operand is
+    // a type before the error-set-tag check reads it.
+    const lhs_ty = try sema.resolveDestType(bin.lhs, "error set merge");
+    const rhs_ty = try sema.resolveDestType(bin.rhs, "error set merge");
+    inline for (.{ lhs_ty, rhs_ty }) |ty| {
+        if (Type.fromIndex(ty).zigTypeTag(ip) != .error_set) {
+            return sema.fail("expected error set type, found '{f}'", .{Type.fromIndex(ty).fmt(ip)});
+        }
+    }
+    if (lhs_ty == .anyerror_type or rhs_ty == .anyerror_type) return .{ .index = .anyerror_type };
+    return .{ .index = (try sema.errorSetMerge(lhs_ty, rhs_ty)).index };
+}
+
+/// Union two `error_set_type`s into one, dropping duplicate names. Mirrors
+/// `errorSetMerge`.
+fn errorSetMerge(sema: *Sema, lhs_ty: InternPool.Index, rhs_ty: InternPool.Index) Error!Type {
+    const ip = sema.intern_pool;
+    const lhs_names = ip.indexToKey(lhs_ty).error_set_type.names;
+    const rhs_names = ip.indexToKey(rhs_ty).error_set_type.names;
+    const buf = try sema.arena.alloc(InternPool.NullTerminatedString, lhs_names.len + rhs_names.len);
+    @memcpy(buf[0..lhs_names.len], lhs_names);
+    var n = lhs_names.len;
+    for (rhs_names) |name| {
+        if (std.mem.indexOfScalar(InternPool.NullTerminatedString, buf[0..n], name) == null) {
+            buf[n] = name;
+            n += 1;
+        }
+    }
+    return .fromIndex(try ip.internErrorSetType(buf[0..n]));
+}
+
 /// `has_field` (`@hasField(T, "name")`): whether type `T` has a field named
 /// `name`. Mirrors zirHasField's type-tag switch: struct/union/enum by field or
 /// tag name, tuple by numeric index, array `len`, slice `ptr`/`len`. A type that
@@ -8365,7 +8476,7 @@ fn evalStructInit(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Erro
     const struct_ty = Type.fromIndex(result_ty).optEuBaseType(ip).index;
     switch (ip.indexToKey(struct_ty)) {
         .struct_type => {},
-        .union_type => return try sema.evalUnionInit(struct_ty, result_ty, inst, is_ref),
+        .union_type => return try sema.evalStructInitUnion(struct_ty, result_ty, inst, is_ref),
         else => {
             try sema.writer.writeAll("struct init: initializer type is not a struct or union\n");
             return error.AnalysisFail;
@@ -8400,7 +8511,7 @@ fn evalStructInit(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Erro
 /// enum (looked up by name, so a `union(E)` uses `E`'s value for the field), the
 /// payload the coerced init. Mirrors zirStructInit's union branch: unionFieldIndex
 /// -> enumValueFieldIndex tag -> internUnion.
-fn evalUnionInit(sema: *Sema, union_ty: InternPool.Index, result_ty: InternPool.Index, inst: Zir.Inst.Index, comptime is_ref: bool) Error!Value {
+fn evalStructInitUnion(sema: *Sema, union_ty: InternPool.Index, result_ty: InternPool.Index, inst: Zir.Inst.Index, comptime is_ref: bool) Error!Value {
     const ip = sema.intern_pool;
     const datas = sema.zir.instructions.items(.data);
     const extra = sema.zir.extraData(Zir.Inst.StructInit, datas[@intFromEnum(inst)].pl_node.payload_index);

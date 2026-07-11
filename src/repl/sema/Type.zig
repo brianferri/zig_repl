@@ -635,6 +635,26 @@ fn ptrByteSize() u64 {
 /// sort needs (it dupes the names slice to order them alphabetically).
 pub const PrintError = std.Io.Writer.Error || std.mem.Allocator.Error;
 
+/// A `{f}`-formattable wrapper carrying the `InternPool` `print` needs (a plain
+/// `format(self, writer)` method cannot take one). Mirrors the compiler's
+/// `Type.Formatter` / `ty.fmt(pt)`, letting diagnostics write `"found '{f}'"` with
+/// `ty.fmt(ip)`. OOM while sorting error-set names degrades to `<type>` rather than
+/// propagating (a diagnostic is best-effort and `format` yields only `Writer.Error`).
+pub const Formatter = struct {
+    ty: Type,
+    pool: *const InternPool,
+    pub fn format(self: Formatter, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        self.ty.print(self.pool, writer) catch |err| switch (err) {
+            error.WriteFailed => return error.WriteFailed,
+            else => try writer.writeAll("<type>"),
+        };
+    }
+};
+
+pub fn fmt(ty: Type, pool: *const InternPool) Formatter {
+    return .{ .ty = ty, .pool = pool };
+}
+
 /// Write `ty`'s Zig surface-syntax name with no trailing newline (`*const u8`,
 /// `error{A,B}!u32`, `fn (u8) void`), recursing on container children. The
 /// single type-name printer, the analogue of the compiler's `Type.print`
