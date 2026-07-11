@@ -487,6 +487,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .cmp_neq => sema.evalComparison(inst, .neq),
         .negate, .negate_wrap => sema.evalNegate(inst, tag),
         .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .floor, .ceil, .round, .trunc => sema.evalUnaryMath(inst, tag),
+        .mul_add => sema.evalMulAdd(inst),
+        .abs => sema.evalAbs(inst),
         .bit_not => sema.evalBitNot(inst),
         .ptr_type => sema.evalPtrType(inst),
         .align_of => sema.evalAlignOf(inst),
@@ -2426,6 +2428,89 @@ fn scalarUnaryMath(sema: *Sema, tag: Zir.Inst.Tag, operand_key: InternPool.Key, 
             };
             const out_storage = @unionInit(InternPool.Key.Float.Storage, @tagName(storage_tag), result);
             return .{ .index = try ip.internFloat(.{ .ty = float.ty, .storage = out_storage }) };
+        },
+    }
+}
+
+/// `mul_add` (`@mulAdd(T, a, b, c)`): the fused multiply-add `a * b + c` at `T`'s
+/// precision. Ports zirMulAdd: the result type is the addend's type and the
+/// mulends coerce to it; reject a non-float scalar, pass undef through, then fold
+/// via `Value.mulAdd`.
+fn evalMulAdd(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const extra = sema.zir.extraData(Zir.Inst.MulAdd, sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node.payload_index).data;
+    const addend = try sema.resolveRef(extra.addend);
+    const ty = addend.typeOf(ip);
+    const mulend1 = try sema.coerceValueToType(try sema.resolveRef(extra.mulend1), ty.toIndex(), "@mulAdd");
+    const mulend2 = try sema.coerceValueToType(try sema.resolveRef(extra.mulend2), ty.toIndex(), "@mulAdd");
+
+    switch (ty.scalarType(ip).zigTypeTag(ip)) {
+        .comptime_float, .float => {},
+        else => {
+            try sema.writer.writeAll("expected vector of floats or float type, found '");
+            try Type.print(ty, ip, sema.writer);
+            try sema.writer.writeAll("'\n");
+            return error.AnalysisFail;
+        },
+    }
+
+    if (ip.indexToKey(mulend1.index) == .undef or ip.indexToKey(mulend2.index) == .undef or ip.indexToKey(addend.index) == .undef)
+        return .{ .index = try ip.get(.{ .undef = ty.toIndex() }) };
+    return try Value.mulAdd(ty, mulend1, mulend2, addend, sema.arena, ip);
+}
+
+/// `abs` (`@abs(x)`). Ports zirAbs: a signed int narrows to the same-width
+/// unsigned type (`toUnsigned`), an unsigned int is returned unchanged, and
+/// float/comptime keep the operand type; then fold via `maybeConstantUnaryMath`
+/// with `Value.abs`.
+fn evalAbs(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const operand = try sema.resolveRef(un_node.operand);
+    const operand_ty = operand.typeOf(ip);
+    const scalar_ty = operand_ty.scalarType(ip);
+
+    const result_ty: Type = switch (scalar_ty.zigTypeTag(ip)) {
+        .comptime_float, .float, .comptime_int => operand_ty,
+        .int => if (scalar_ty.intInfo(ip).?.signedness == .signed) try operand_ty.toUnsigned(ip) else return operand,
+        else => {
+            try sema.writer.writeAll("expected integer, float, or vector of either integers or floats, found '");
+            try Type.print(operand_ty, ip, sema.writer);
+            try sema.writer.writeAll("'\n");
+            return error.AnalysisFail;
+        },
+    };
+
+    return try sema.maybeConstantUnaryMath(operand, result_ty, Value.abs);
+}
+
+/// Fold a unary math builtin over a comptime-known operand: a scalar directly, a
+/// vector elementwise, and undef to undef of the result type. Ports
+/// `maybeConstantUnaryMath` (the operand is always comptime-known here, so the
+/// runtime `null` return collapses to always folding).
+fn maybeConstantUnaryMath(
+    sema: *Sema,
+    operand: Value,
+    result_ty: Type,
+    comptime eval: fn (Value, Type, std.mem.Allocator, *InternPool) std.mem.Allocator.Error!Value,
+) Error!Value {
+    const ip = sema.intern_pool;
+    switch (result_ty.zigTypeTag(ip)) {
+        .vector => {
+            const scalar_ty = result_ty.scalarType(ip);
+            const vec_len = result_ty.vectorLen(ip);
+            if (ip.indexToKey(operand.index) == .undef)
+                return .{ .index = try ip.get(.{ .undef = result_ty.toIndex() }) };
+            const elems = try sema.arena.alloc(InternPool.Index, vec_len);
+            for (elems, 0..) |*elem, i| {
+                elem.* = (try eval(try operand.elemValue(ip, i), scalar_ty, sema.arena, ip)).index;
+            }
+            return .{ .index = try ip.internAggregate(.{ .ty = result_ty.toIndex(), .storage = .{ .elems = elems } }) };
+        },
+        else => {
+            if (ip.indexToKey(operand.index) == .undef)
+                return .{ .index = try ip.get(.{ .undef = result_ty.toIndex() }) };
+            return try eval(operand, result_ty, sema.arena, ip);
         },
     }
 }

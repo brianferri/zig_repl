@@ -191,6 +191,28 @@ pub fn intInfo(starting_ty: Type, pool: *const InternPool) ?std.lang.Type.Int {
     };
 }
 
+/// The unsigned integer type with the same width as `ty` (a signed int, or a
+/// vector thereof). `usize`/`isize` map to `usize` and each `c_*` pair to its
+/// unsigned member; `c_char` (absent from those pairs) falls to a plain unsigned
+/// int of its width, as in the compiler. Ports `Type.toUnsigned`.
+pub fn toUnsigned(ty: Type, pool: *InternPool) std.mem.Allocator.Error!Type {
+    return switch (ty.index) {
+        .usize_type, .isize_type => .fromIndex(.usize_type),
+        .c_ushort_type, .c_short_type => .fromIndex(.c_ushort_type),
+        .c_uint_type, .c_int_type => .fromIndex(.c_uint_type),
+        .c_ulong_type, .c_long_type => .fromIndex(.c_ulong_type),
+        .c_ulonglong_type, .c_longlong_type => .fromIndex(.c_ulonglong_type),
+        else => switch (ty.zigTypeTag(pool)) {
+            .int => .fromIndex(try pool.internIntType(.unsigned, ty.intInfo(pool).?.bits)),
+            .vector => .fromIndex(try pool.internVectorType(.{
+                .len = ty.vectorLen(pool),
+                .child = (try ty.childType(pool).toUnsigned(pool)).index,
+            })),
+            else => unreachable,
+        },
+    };
+}
+
 /// The `std.lang.TypeId` of `ty`. Mirrors `Type.zigTypeTag`.
 pub fn zigTypeTag(ty: Type, pool: *const InternPool) std.lang.TypeId {
     return pool.zigTypeTag(ty.index);

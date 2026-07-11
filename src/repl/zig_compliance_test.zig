@@ -433,6 +433,27 @@ test "compliance: unary float builtins fold at comptime" {
     try expectMatchesZig(a, &.{"@TypeOf(@sqrt(@as(f64, undefined))) == f64"});
 }
 
+test "compliance: @mulAdd fuses multiply-add" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"@mulAdd(f64, 2.0, 3.0, 4.0)"}); // 10
+    try expectMatchesZig(a, &.{"@mulAdd(f32, 1.5, 2.0, 0.5)"}); // 3.5
+    try expectMatchesZig(a, &.{"@mulAdd(@Vector(2, f32), .{ 2.0, 3.0 }, .{ 4.0, 5.0 }, .{ 1.0, 1.0 })[1]"}); // 16
+    try expectMatchesZig(a, &.{"@TypeOf(@mulAdd(f64, undefined, 3.0, 4.0)) == f64"});
+    try expectBothReject(a, &.{"@mulAdd(u8, 2, 3, 4)"});
+}
+
+test "compliance: @abs narrows a signed int to unsigned" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"@abs(@as(i8, -5))"}); // 5
+    try expectMatchesZig(a, &.{"@abs(@as(i8, -128))"}); // 128 (fits u8)
+    try expectMatchesZig(a, &.{"@TypeOf(@abs(@as(i8, -5))) == u8"});
+    try expectMatchesZig(a, &.{"@abs(@as(u8, 5))"}); // 5 (unsigned unchanged)
+    try expectMatchesZig(a, &.{"@abs(@as(f64, -3.5))"}); // 3.5
+    try expectMatchesZig(a, &.{"@abs(-7)"}); // 7 (comptime_int)
+    try expectMatchesZig(a, &.{"@abs(@as(@Vector(2, i8), .{ -3, 4 }))[0]"}); // 3
+    try expectBothReject(a, &.{"@abs(true)"});
+}
+
 test "compliance: integer bit-count and bit/byte reversal builtins" {
     const a = testing.allocator;
     // @clz/@ctz/@popCount fold to smallestUnsignedInt(bits) via the same big.int
