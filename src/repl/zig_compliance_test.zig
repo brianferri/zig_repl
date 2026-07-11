@@ -411,6 +411,52 @@ test "compliance: @reduce folds a vector to a scalar" {
     try expectReplValue(&session, "@reduce(.Xor, @as(@Vector(3, u8), .{ 255, 15, 0 }))", "240");
 }
 
+test "compliance: slicing an array pointer yields a pointer-to-array" {
+    // A comptime-known length makes the result `*[len]T`, not a slice; deref with
+    // `.*` to compare the array contents. Each form exercises a distinct ZIR tag:
+    // `[start..]` -> slice_start, `[start..end]` -> slice_end,
+    // `[start..end :s]` -> slice_sentinel, `[start..][0..len]` -> slice_length.
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"(&[_]i32{ 1, 2, 3, 4, 5 })[2..].*"});
+    try expectMatchesZig(a, &.{"(&[_]i32{ 1, 2, 3, 4, 5 })[0..].*"});
+    try expectMatchesZig(a, &.{"(&[_]i32{ 1, 2, 3, 4, 5 })[1..3].*"});
+    try expectMatchesZig(a, &.{"(&[_]i32{ 1, 2, 3, 4, 5 })[1..3 :4].*"});
+    try expectMatchesZig(a, &.{"(&[_]i32{ 1, 2, 3, 4, 5 })[1..][0..2].*"});
+    // A string literal is a `*const [N:0]u8`; slicing then deref yields `[M]u8`.
+    try expectMatchesZig(a, &.{"\"hello\"[1..4].*"});
+    // Slicing a slice with comptime bounds is also a pointer-to-array, not a slice.
+    try expectMatchesZig(a, &.{"blk: { const s: []const i32 = &.{ 1, 2, 3, 4 }; break :blk s[1..3].*; }"});
+    // Indexing the pointer-to-array result reaches the underlying element.
+    try expectMatchesZig(a, &.{"(&[_]i32{ 1, 2, 3, 4, 5 })[1..4][1]"});
+    // Slicing to the end of a sentinel-terminated array inherits the sentinel.
+    try expectMatchesZig(a, &.{"(&[_:0]i32{ 1, 2, 3 })[1..].*"});
+    // The result type is a single pointer to an array of the sliced length.
+    try expectMatchesZig(a, &.{"@TypeOf((&[_]i32{ 1, 2, 3 })[0..2])"});
+}
+
+test "compliance: storing through a pointer-to-array writes the sub-array range" {
+    // `p.* = arr` where `p` is a sliced pointer-to-array exercises the sub-array
+    // store (the counterpart of the sub-array load), writing only `p`'s range.
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"blk: { var d = [_]u8{ 1, 2, 3, 4 }; d[1..3].* = .{ 8, 9 }; break :blk d[0] + d[1] + d[2] + d[3]; }"}); // 22
+    // A wrong-length store through the pointer-to-array is rejected on both sides.
+    try expectBothReject(a, &.{"blk: { var d = [_]u8{ 1, 2, 3, 4 }; d[1..3].* = .{ 8, 9, 10 }; break :blk d[1]; }"});
+}
+
+test "compliance: out-of-bounds and mismatched-sentinel slices are rejected" {
+    const a = testing.allocator;
+    try expectBothReject(a, &.{"(&[_]i32{ 1, 2, 3 })[1..5].*"});
+    try expectBothReject(a, &.{"(&[_]i32{ 1, 2, 3 })[2..1].*"});
+    try expectBothReject(a, &.{"(&[_]i32{ 1, 2, 3, 4, 5 })[1..3 :9].*"});
+    // slice_start past the end.
+    try expectBothReject(a, &.{"(&[_]i32{ 1, 2, 3 })[5..].*"});
+    // slice_length whose start+len overruns the array.
+    try expectBothReject(a, &.{"(&[_]i32{ 1, 2, 3 })[1..][0..5].*"});
+    // A sentinel on a single-item pointer (not a pointer-to-array) is rejected in
+    // `slice_sentinel_ty`, before the slice itself.
+    try expectBothReject(a, &.{"blk: { var x: i32 = 5; _ = &x; const p: *i32 = &x; break :blk p[0..1 :0]; }"});
+}
+
 test "compliance: @intCast widen" {
     try expectMatchesZig(testing.allocator, &.{"@as(u32, @intCast(@as(u8, 200)))"});
 }
@@ -1911,6 +1957,10 @@ test "compliance: @memcpy copies a slice range" {
     // Pointer-to-array operands (`&arr`): the length comes from the array type, not
     // a slice header.
     try expectMatchesZig(a, &.{"blk: { var dst = [_]u8{ 0, 0, 0 }; const src = [_]u8{ 4, 5, 6 }; @memcpy(&dst, &src); break :blk dst[0] + dst[2]; }"}); // 10
+    // Mixed operand kinds: a whole-array-pointer dest with a slice src, and a slice
+    // dest with a whole-array-pointer src, resolve their lengths independently.
+    try expectMatchesZig(a, &.{"blk: { var dst = [_]u8{ 0, 0, 0 }; const src = [_]u8{ 7, 8, 9 }; @memcpy(&dst, src[0..3]); break :blk dst[0] + dst[2]; }"}); // 16
+    try expectMatchesZig(a, &.{"blk: { var dst = [_]u8{ 0, 0, 0, 0 }; const src = [_]u8{ 1, 2 }; @memcpy(dst[1..3], &src); break :blk dst[1] + dst[2]; }"}); // 3
     // Mismatched comptime lengths, and a copy to a const destination, are compile
     // errors on both sides.
     try expectBothReject(a, &.{"blk: { var dst = [_]u8{ 0, 0, 0, 0 }; const src = [_]u8{ 7, 8, 9 }; @memcpy(dst[1..3], src[0..3]); break :blk dst[1]; }"});
@@ -1919,6 +1969,10 @@ test "compliance: @memcpy copies a slice range" {
     // int widths are rejected, as is copying overlapping (aliasing) ranges.
     try expectBothReject(a, &.{"blk: { var dst = [_]u8{ 0, 0 }; const src = [_]u16{ 1, 2 }; @memcpy(dst[0..2], src[0..2]); break :blk dst[0]; }"});
     try expectBothReject(a, &.{"blk: { var arr = [_]u8{ 1, 2, 3, 4 }; @memcpy(arr[0..3], arr[1..4]); break :blk arr[0]; }"});
+    // Aliasing in the other direction, and a length mismatch between two
+    // whole-array-pointer operands, are also rejected.
+    try expectBothReject(a, &.{"blk: { var arr = [_]u8{ 1, 2, 3, 4 }; @memcpy(arr[1..4], arr[0..3]); break :blk arr[1]; }"});
+    try expectBothReject(a, &.{"blk: { var dst = [_]u8{ 0, 0, 0 }; const src = [_]u8{ 1, 2 }; @memcpy(&dst, &src); break :blk dst[0]; }"});
 }
 
 test "compliance: @memcpy element-coercion diagnostic wording" {

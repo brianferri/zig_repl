@@ -632,7 +632,11 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .elem_ptr, .elem_ptr_node => sema.evalElemPtrNode(inst),
         .elem_val => sema.evalElemVal(inst),
         .memcpy => sema.evalMemcpy(inst),
+        .slice_start => sema.evalSliceStart(inst),
         .slice_end => sema.evalSliceEnd(inst),
+        .slice_sentinel => sema.evalSliceSentinel(inst),
+        .slice_sentinel_ty => sema.evalSliceSentinelTy(inst),
+        .slice_length => sema.evalSliceLength(inst),
         .array_init_elem_ptr => sema.evalArrayInitElemPtr(inst),
         .validate_ptr_array_init => sema.evalValidatePtrArrayInit(inst),
         inline else => |unhandled| return sema.reportUnsupportedTag(unhandled),
@@ -3232,12 +3236,36 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
         // pointer, so recurse.
         .field, .arr_elem => |f| {
             const parent = try sema.loadValue(.{ .index = f.base });
-            return switch (ip.indexToKey(parent.index)) {
-                // A not-yet-initialised parent (mid array/struct init) projects to
-                // `undef`. Mirrors the compiler's `loadComptimePtrInner`, whose
-                // every level returns `.undef` when the value it projects from is
-                // `undef` (src/Sema/comptime_ptr_access.zig).
-                .undef => .{ .index = .undef },
+            const parent_key = ip.indexToKey(parent.index);
+            // A not-yet-initialised parent (mid array/struct init) projects to
+            // `undef`. Mirrors the compiler's `loadComptimePtrInner`, whose every
+            // level returns `.undef` when the value it projects from is `undef`
+            // (src/Sema/comptime_ptr_access.zig).
+            if (parent_key == .undef) return .{ .index = .undef };
+            // A pointer whose pointee is itself an array reads that many consecutive
+            // elements into a sub-array, not a single element -- the shape
+            // `analyzeSlice` produces for `a[start..end]`. The compiler's `.arr_elem`
+            // load gates this on the load type's element base matching the array's
+            // (`load_one_ty == base_ty`), so `matrix[i]` (row element type differs)
+            // still projects one row.
+            if (ptr_key.ptr.base_addr == .arr_elem) sub_array: {
+                const child_ty = ip.indexToKey(ptr_key.ptr.ty).ptr_type.child;
+                const sub = indexableInfo(ip, child_ty) orelse break :sub_array;
+                const agg = switch (parent_key) {
+                    .aggregate => |agg| agg,
+                    else => break :sub_array,
+                };
+                const parent_info = indexableInfo(ip, agg.ty) orelse break :sub_array;
+                if (parent_info.child != sub.child) break :sub_array;
+                // Aggregate storage includes the sentinel slot (`elems.len ==
+                // lenIncludingSentinel`), so read that many -- the last element is
+                // the sentinel, read from index `f.index + len` of the parent.
+                const count = ip.aggregateElementCount(child_ty);
+                const elems = try sema.arena.alloc(InternPool.Index, @intCast(count));
+                for (elems, 0..) |*e, i| e.* = InternPool.aggregateElementAt(agg, f.index + @as(u64, @intCast(i)));
+                return try sema.aggregateValue(Type.fromIndex(child_ty), elems);
+            }
+            return switch (parent_key) {
                 // A union stores only the active field's payload, not a positional
                 // slot per field; reading a field pointer checks the active tag,
                 // mirroring `unionFieldPtr`'s comptime load.
@@ -6067,7 +6095,13 @@ fn buildArrayAggregate(sema: *Sema, inst: Zir.Inst.Index) Error!InternPool.Index
     const array_key = ip.indexToKey(array_ty);
 
     const elems = operands[1..];
-    const buf = try sema.gpa.alloc(InternPool.Index, elems.len);
+    // A sentinel-terminated array stores the sentinel as its final element:
+    // `elems.len == lenIncludingSentinel` and `elems[len] == sentinel`.
+    const sentinel: InternPool.Index = switch (array_key) {
+        .array_type => |at| at.sentinel,
+        else => .none,
+    };
+    const buf = try sema.gpa.alloc(InternPool.Index, elems.len + @intFromBool(sentinel != .none));
     defer sema.gpa.free(buf);
     for (elems, 0..) |elem_ref, i| {
         const elem = try sema.resolveRef(elem_ref);
@@ -6078,6 +6112,7 @@ fn buildArrayAggregate(sema: *Sema, inst: Zir.Inst.Index) Error!InternPool.Index
         const coerced = try sema.coerceValueToType(elem, elem_ty, "array_init");
         buf[i] = coerced.index;
     }
+    if (sentinel != .none) buf[elems.len] = sentinel;
 
     return try ip.internAggregate(.{ .ty = array_ty, .storage = .{ .elems = buf } });
 }
@@ -8013,6 +8048,25 @@ fn storeElement(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
         try sema.storePointee(base_ptr, new_union);
         return;
     }
+    // A store through a pointer-to-array writes the value's consecutive elements as
+    // a sub-array of the parent -- the counterpart of `loadValue`'s sub-array read,
+    // and the REPL analog of storing a `[len]T` through `storePtrVal`. The same
+    // `load_one_ty == base_ty` gate keeps a `*T` element pointer a single-slot write.
+    if (ptr.base_addr == .arr_elem) sub_array: {
+        const child_ty = ip.indexToKey(ptr.ty).ptr_type.child;
+        const sub = indexableInfo(ip, child_ty) orelse break :sub_array;
+        const parent_info = indexableInfo(ip, agg_ty) orelse break :sub_array;
+        if (parent_info.child != sub.child) break :sub_array;
+        var parent = try sema.loadValue(.{ .index = f.base });
+        const count = ip.aggregateElementCount(child_ty);
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            const elem = try sema.aggregateElementByIndex(value, i);
+            parent = try sema.setAggregateElement(parent, agg_ty, @intCast(f.index + i), elem);
+        }
+        try sema.storePointee(base_ptr, parent);
+        return;
+    }
     const parent = try sema.loadValue(.{ .index = f.base });
     const new_parent = try sema.setAggregateElement(parent, agg_ty, @intCast(f.index), value);
     try sema.storePointee(base_ptr, new_parent);
@@ -8521,95 +8575,200 @@ fn evalValidatePtrArrayInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return null;
 }
 
-/// `slice_end`: `a[start..end]` -- a slice of a pointer-to-array. The result
-/// slice's `ptr` is a many-pointer to `a[start]` (an `.arr_elem` base carrying the
-/// start offset, the compiler's byte-offset-to-`a[start]` in this no-layout model)
-/// and its `len` is `end - start`. Mirrors zirSliceEnd -> analyzeSlice for the
-/// comptime array-pointer case.
-fn evalSliceEnd(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+/// The comptime slice handler all four `slice_*` ZIR tags feed. Ports
+/// `analyzeSlice` (`src/Sema.zig`): `ptr_ptr` is the (double) pointer AstGen
+/// produces -- a `*[N]T`, or a pointer to a slice/many-ptr loaded first. `end` is
+/// null for `a[start..]` (slice to the operand's length); `by_length` means the
+/// second operand is a length, so the end is `start + it`. Every operand is
+/// comptime-known, so the runtime ptr-arithmetic and safety-check machinery drops.
+fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel_opt: ?Value, by_length: bool) Error!?Value {
     const ip = sema.intern_pool;
+    const ptr_ptr_child = ip.indexToKey(ip.indexToKey(ptr_ptr.index).ptr.ty).ptr_type.child;
+
+    // Resolve the operand to a backing pointer + start offset + length + element type.
+    var backing: InternPool.Index = undefined;
+    var base_offset: u64 = undefined;
+    var len: u64 = undefined;
+    var elem_ty: InternPool.Index = undefined;
+    var is_const: bool = undefined;
+    var ptr_sentinel: InternPool.Index = .none;
+    // The out-of-bounds message names the operand as an array or a slice, matching
+    // the compiler's two `analyzeSlice` diagnostics.
+    var operand_is_slice = false;
+    switch (ip.indexToKey(ptr_ptr_child)) {
+        // `*[N]T`: slice the array directly.
+        .array_type => |arr| {
+            backing = ptr_ptr.index;
+            base_offset = 0;
+            len = arr.len;
+            elem_ty = arr.child;
+            is_const = ip.indexToKey(ip.indexToKey(ptr_ptr.index).ptr.ty).ptr_type.flags.is_const;
+            ptr_sentinel = arr.sentinel;
+        },
+        .ptr_type => |inner| switch (inner.flags.size) {
+            // `&*[N]T` (a string literal, `&[_]T{...}`): load to the `*[N]T`, slice that.
+            .one => {
+                const arr = ip.indexToKey(inner.child).array_type;
+                backing = (try sema.loadValue(ptr_ptr)).index;
+                base_offset = 0;
+                len = arr.len;
+                elem_ty = arr.child;
+                is_const = inner.flags.is_const;
+                ptr_sentinel = arr.sentinel;
+            },
+            // `&[]T`: load the slice and re-slice into the same backing.
+            .slice => {
+                operand_is_slice = true;
+                const s = ip.indexToKey((try sema.loadValue(ptr_ptr)).index).slice;
+                len = try sema.resolveUsizeInt(.{ .index = s.len }, "slice len");
+                const sptr = ip.indexToKey(s.ptr).ptr;
+                if (sptr.base_addr == .arr_elem) {
+                    backing = sptr.base_addr.arr_elem.base;
+                    base_offset = sptr.base_addr.arr_elem.index;
+                } else {
+                    backing = s.ptr;
+                    base_offset = 0;
+                }
+                const s_ptr_ty = ip.indexToKey(s.ty).ptr_type;
+                elem_ty = s_ptr_ty.child;
+                is_const = s_ptr_ty.flags.is_const;
+                ptr_sentinel = s_ptr_ty.sentinel;
+            },
+            else => return sema.failSliceNotArrayPtr(),
+        },
+        else => return sema.failSliceNotArrayPtr(),
+    }
+
+    // `a[start..]` slices to the length; `a[start..][0..n]` (by_length) ends at start+n.
+    const end: u64 = if (end_opt) |e| (if (by_length) start + e else e) else len;
+    // end_is_len (without the sentinel) makes a slice to the end inherit the sentinel.
+    const end_is_len = end == len;
+
+    if (start > end) {
+        try sema.writer.print("start index {d} is larger than end index {d}\n", .{ start, end });
+        return error.AnalysisFail;
+    }
+    if (end > len + @intFromBool(ptr_sentinel != .none)) {
+        // The printed length excludes the sentinel; a `" +1 (sentinel)"` suffix
+        // notes it is admissible as the end index when the operand is terminated.
+        const sentinel_label: []const u8 = if (ptr_sentinel != .none) " +1 (sentinel)" else "";
+        const kind: []const u8 = if (operand_is_slice) "slice" else "array";
+        try sema.writer.print("end index {d} out of bounds for {s} of length {d}{s}\n", .{ end, kind, len, sentinel_label });
+        return error.AnalysisFail;
+    }
+
+    // Result sentinel: an explicit `:S`, else inherited when slicing to the end of a
+    // sentinel-terminated operand.
+    const sentinel: InternPool.Index = s: {
+        if (sentinel_opt) |provided| {
+            try sema.checkSentinelType(elem_ty);
+            const casted = try sema.coerceValueToType(provided, elem_ty, "slice sentinel");
+            // The sentinel sits at index `end` of the backing; verify it matches.
+            const actual = try sema.aggregateElementByIndex(try sema.loadValue(.{ .index = backing }), base_offset + end);
+            if (actual.index != casted.index) {
+                try sema.writer.writeAll("value in memory does not match slice sentinel\n");
+                return error.AnalysisFail;
+            }
+            break :s casted.index;
+        }
+        break :s if (end_is_len) ptr_sentinel else .none;
+    };
+
+    // The new length is comptime-known (always, here), so the result is a pointer
+    // to an array of that length -- `*[end-start]T` -- rather than a slice. This is
+    // the `opt_new_len_val` branch of the compiler's `analyzeSlice`: it coerces the
+    // advanced pointer to `*[new_len]elem_ty` and returns that.
+    const result_array_ty = try ip.internArrayType(.{ .len = end - start, .child = elem_ty, .sentinel = sentinel });
+    const result_ptr_ty = try ip.internPtrType(.{ .child = result_array_ty, .flags = .{ .size = .one, .is_const = is_const } });
+    return .{ .index = try ip.internPtr(.{
+        .ty = result_ptr_ty,
+        .base_addr = .{ .arr_elem = .{ .base = backing, .index = base_offset + start } },
+        .byte_offset = 0,
+    }) };
+}
+
+fn failSliceNotArrayPtr(sema: *Sema) Error {
+    try sema.writer.writeAll("slice: operand is not an array pointer\n");
+    return error.AnalysisFail;
+}
+
+fn evalSliceStart(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const datas = sema.zir.instructions.items(.data);
+    const extra = sema.zir.extraData(Zir.Inst.SliceStart, datas[@intFromEnum(inst)].pl_node.payload_index).data;
+    const operand = try sema.resolveRef(extra.lhs);
+    const start = try sema.resolveArrayLen(extra.start, "slice start");
+    return sema.analyzeSlice(operand, start, null, null, false);
+}
+
+fn evalSliceEnd(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const datas = sema.zir.instructions.items(.data);
     const extra = sema.zir.extraData(Zir.Inst.SliceEnd, datas[@intFromEnum(inst)].pl_node.payload_index).data;
     const operand = try sema.resolveRef(extra.lhs);
     const start = try sema.resolveArrayLen(extra.start, "slice start");
     const end = try sema.resolveArrayLen(extra.end, "slice end");
-    if (start > end) {
-        try sema.writer.print("start index {d} is larger than end index {d}\n", .{ start, end });
-        return error.AnalysisFail;
-    }
+    return sema.analyzeSlice(operand, start, end, null, false);
+}
 
-    // Dispatch on what the operand pointer addresses (mirrors analyzeSlice's
-    // `ptr_ptr_child_ty` switch): a `*[N]T` slices directly; a pointer to another
-    // pointer/slice (`&str`, `&some_slice`) is loaded first, then sliced.
-    const child_ty = ip.indexToKey(ip.indexToKey(operand.index).ptr.ty).ptr_type.child;
-    switch (ip.indexToKey(child_ty)) {
-        .array_type => return try sema.sliceArrayPtr(operand, start, end),
-        .ptr_type => |inner| switch (inner.flags.size) {
-            // `&ptr_to_array` (a string literal, `&[_]T{...}`): load to the
-            // pointer-to-array, then slice it.
-            .one => return try sema.sliceArrayPtr(try sema.loadValue(operand), start, end),
-            // `&slice`: load the slice, then re-slice it.
-            .slice => return try sema.sliceSliceValue(try sema.loadValue(operand), start, end),
-            else => {},
+fn evalSliceSentinel(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const datas = sema.zir.instructions.items(.data);
+    const extra = sema.zir.extraData(Zir.Inst.SliceSentinel, datas[@intFromEnum(inst)].pl_node.payload_index).data;
+    const operand = try sema.resolveRef(extra.lhs);
+    const start = try sema.resolveArrayLen(extra.start, "slice start");
+    // `a[start.. :s]` carries no end (slices to the length); `a[start..end :s]` does.
+    const end = if (extra.end == .none) null else try sema.resolveArrayLen(extra.end, "slice end");
+    const sentinel = try sema.resolveRef(extra.sentinel);
+    return sema.analyzeSlice(operand, start, end, sentinel, false);
+}
+
+fn evalSliceLength(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const datas = sema.zir.instructions.items(.data);
+    const extra = sema.zir.extraData(Zir.Inst.SliceLength, datas[@intFromEnum(inst)].pl_node.payload_index).data;
+    const operand = try sema.resolveRef(extra.lhs);
+    const start = try sema.resolveArrayLen(extra.start, "slice start");
+    const length = try sema.resolveArrayLen(extra.len, "slice length");
+    const sentinel = if (extra.sentinel == .none) null else try sema.resolveRef(extra.sentinel);
+    return sema.analyzeSlice(operand, start, length, sentinel, true);
+}
+
+/// `slice_sentinel_ty operand`: the element type a `a[start..end :s]` sentinel is
+/// coerced to -- AstGen emits it as the `coerced_ty` result type of the sentinel
+/// expression. The operand is the lvalue (a double pointer if it was already a
+/// pointer), so peel one pointer, then take the element type per operand kind.
+/// Mirrors zirSliceSentinelTy.
+fn evalSliceSentinelTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const datas = sema.zir.instructions.items(.data);
+    const operand = try sema.resolveRef(datas[@intFromEnum(inst)].un_node.operand);
+    const lhs_ptr_ty = operand.typeOf(ip);
+    const lhs_ty = switch (ip.indexToKey(lhs_ptr_ty.index)) {
+        .ptr_type => |pt| pt.child,
+        else => {
+            try sema.writer.writeAll("expected pointer, found '");
+            try Type.print(lhs_ptr_ty, ip, sema.writer);
+            try sema.writer.writeAll("'\n");
+            return error.AnalysisFail;
         },
-        else => {},
-    }
-    try sema.writer.writeAll("slice: operand is not an array pointer\n");
-    return error.AnalysisFail;
-}
-
-/// Slice a pointer-to-array (`*[N]T`) to `[start..end]`: a slice whose many-ptr
-/// carries the start offset (`.arr_elem`) and whose `len` is `end - start`.
-fn sliceArrayPtr(sema: *Sema, array_ptr: Value, start: u64, end: u64) Error!?Value {
-    const ip = sema.intern_pool;
-    const parent_ty = ip.indexToKey(array_ptr.index).ptr.ty;
-    const child_ty = ip.indexToKey(parent_ty).ptr_type.child;
-    if (ip.indexToKey(child_ty) != .array_type) {
-        try sema.writer.writeAll("slice: operand is not an array pointer\n");
-        return error.AnalysisFail;
-    }
-    const array = ip.indexToKey(child_ty).array_type;
-    if (end > array.len) {
-        try sema.writer.print("end index {d} out of bounds for array of length {d}\n", .{ end, array.len });
-        return error.AnalysisFail;
-    }
-
-    const is_const = ip.indexToKey(parent_ty).ptr_type.flags.is_const;
-    const many_ptr = try ip.internPtr(.{
-        .ty = try ip.internPtrType(.{ .child = array.child, .flags = .{ .size = .many, .is_const = is_const } }),
-        .base_addr = .{ .arr_elem = .{ .base = array_ptr.index, .index = @intCast(start) } },
-        .byte_offset = 0,
-    });
-    const slice_ty = try ip.internPtrType(.{ .child = array.child, .flags = .{ .size = .slice, .is_const = is_const } });
-    const len_val = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = end - start } });
-    return .{ .index = try ip.get(.{ .slice = .{ .ty = slice_ty, .ptr = many_ptr, .len = len_val } }) };
-}
-
-/// Re-slice a slice value (`s[start..end]`): a slice into the same backing, its
-/// many-ptr advanced by `start` past `s`'s own start offset and its `len` set to
-/// `end - start`. Bounds check against `s.len`.
-fn sliceSliceValue(sema: *Sema, s_val: Value, start: u64, end: u64) Error!?Value {
-    const ip = sema.intern_pool;
-    const s = ip.indexToKey(s_val.index).slice;
-    const backing_len = try sema.resolveUsizeInt(.{ .index = s.len }, "slice len");
-    if (end > backing_len) {
-        try sema.writer.print("end index {d} out of bounds for slice of length {d}\n", .{ end, backing_len });
-        return error.AnalysisFail;
-    }
-    // `s.ptr` is a many-ptr into the backing, possibly already carrying a start
-    // offset in its `.arr_elem` base; add `start` to it.
-    const sptr = ip.indexToKey(s.ptr).ptr;
-    const backing: InternPool.Index, const base_offset: u64 = if (sptr.base_addr == .arr_elem)
-        .{ sptr.base_addr.arr_elem.base, sptr.base_addr.arr_elem.index }
-    else
-        .{ s.ptr, 0 };
-    const many_ptr = try ip.internPtr(.{
-        .ty = sptr.ty, // reuse `s.ptr`'s many-pointer type
-        .base_addr = .{ .arr_elem = .{ .base = backing, .index = base_offset + start } },
-        .byte_offset = 0,
-    });
-    const len_val = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = end - start } });
-    return .{ .index = try ip.get(.{ .slice = .{ .ty = s.ty, .ptr = many_ptr, .len = len_val } }) };
+    };
+    const sentinel_ty: InternPool.Index = switch (ip.indexToKey(lhs_ty)) {
+        .array_type => |at| at.child,
+        .ptr_type => |pt| switch (pt.flags.size) {
+            .many, .c, .slice => pt.child,
+            .one => switch (ip.indexToKey(pt.child)) {
+                .array_type => |at| at.child,
+                else => {
+                    try sema.writer.writeAll("slice of single-item pointer cannot have sentinel\n");
+                    return error.AnalysisFail;
+                },
+            },
+        },
+        else => {
+            try sema.writer.writeAll("slice of non-array type '");
+            try Type.print(Type.fromIndex(lhs_ty), ip, sema.writer);
+            try sema.writer.writeAll("'\n");
+            return error.AnalysisFail;
+        },
+    };
+    return .{ .index = sentinel_ty };
 }
 
 /// `elem_val`: `indexable[index]` by value (the `for (a) |x|` capture and
@@ -8715,7 +8874,8 @@ fn indexableMemLen(sema: *Sema, value: Value) Error!?u64 {
 
 /// The backing aggregate a `@memcpy` operand addresses, as `(pointer-to-backing,
 /// start index)`. A slice indexes `backing[start..]` via its many-pointer's
-/// `arr_elem` base; a pointer-to-array addresses the whole array at offset 0.
+/// `arr_elem` base; a sub-range pointer-to-array (`a[start..end]`) carries the same
+/// `arr_elem` base directly; a whole-array pointer (`&a`) addresses it at offset 0.
 fn memBacking(sema: *Sema, value: Value) struct { ptr: InternPool.Index, start: u64 } {
     const ip = sema.intern_pool;
     switch (ip.indexToKey(value.index)) {
@@ -8726,7 +8886,10 @@ fn memBacking(sema: *Sema, value: Value) struct { ptr: InternPool.Index, start: 
                 else => .{ .ptr = s.ptr, .start = 0 },
             };
         },
-        .ptr => return .{ .ptr = value.index, .start = 0 },
+        .ptr => |p| return switch (p.base_addr) {
+            .arr_elem => |ae| .{ .ptr = ae.base, .start = ae.index },
+            else => .{ .ptr = value.index, .start = 0 },
+        },
         else => unreachable,
     }
 }
@@ -8746,9 +8909,8 @@ fn doPointersOverlap(sema: *Sema, a: Value, b: Value, elem_count: u64) bool {
 
 /// `memcpy` (`@memcpy(dest, src)`): copy `src`'s elements into `dest`. Mirrors
 /// zirMemcpy's comptime path -- indexable-operand + element-coercion + const-dest +
-/// matching-length + aliasing checks. The compiler stores the copied range as a
-/// single array through a `MutableValue`; lacking one, this evaluator reads `src`
-/// element-wise and rebuilds `dest`'s backing aggregate. Returns void.
+/// matching-length + aliasing checks, then the single `[len]elem` array load/store
+/// (`pointerDeref` + `storePtrVal`). Returns void.
 fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const bin = sema.binData(inst);
@@ -8800,20 +8962,30 @@ fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return error.AnalysisFail;
     }
 
-    // Rebuild `dest`'s backing aggregate with the copied elements and store it once.
-    // Every slice/pointer operand's base addresses a backing array (slices are
-    // `.arr_elem` into it), so the base pointer's child is that array type. This is
-    // the REPL's element-wise stand-in for zirMemcpy's `[len]elem` array store
-    // through `storePtrVal`, which this evaluator's value model lacks.
-    const back = sema.memBacking(dest);
-    var backing = try sema.loadValue(.{ .index = back.ptr });
-    const backing_ty = ip.indexToKey(ip.indexToKey(back.ptr).ptr.ty).ptr_type.child;
-    var i: u64 = 0;
-    while (i < len) : (i += 1) {
-        const elem = try sema.aggregateElementByIndex(src, i);
-        backing = try sema.setAggregateElement(backing, backing_ty, @intCast(back.start + i), elem);
-    }
-    try sema.storePointee(ip.indexToKey(back.ptr).ptr, backing);
+    // Copy as one array load and one array store, as zirMemcpy does: upgrade each
+    // operand's backing pointer to `*[len]elem` and move the `[len]elem` value
+    // whole. `loadValue`/`storePointee` handle the pointer-to-array projection --
+    // `pointerDeref` and `storePtrVal` in the compiler.
+    const src_back = sema.memBacking(src);
+    const dest_back = sema.memBacking(dest);
+    const src_arr_ptr = try ip.internPtr(.{
+        .ty = try ip.internPtrType(.{
+            .child = try ip.internArrayType(.{ .len = len, .child = src_elem.index }),
+            .flags = .{ .size = .one, .is_const = true },
+        }),
+        .base_addr = .{ .arr_elem = .{ .base = src_back.ptr, .index = src_back.start } },
+        .byte_offset = 0,
+    });
+    const array_val = try sema.loadValue(.{ .index = src_arr_ptr });
+    const dest_arr_ptr: InternPool.Key.Ptr = .{
+        .ty = try ip.internPtrType(.{
+            .child = try ip.internArrayType(.{ .len = len, .child = dest_elem.index }),
+            .flags = .{ .size = .one, .is_const = false },
+        }),
+        .base_addr = .{ .arr_elem = .{ .base = dest_back.ptr, .index = dest_back.start } },
+        .byte_offset = 0,
+    };
+    try sema.storePointee(dest_arr_ptr, array_val);
     return null;
 }
 
