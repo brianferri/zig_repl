@@ -763,42 +763,174 @@ fn evalPassthroughUnNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///
 /// Compiler reference: src/Sema.zig:zirArithmetic ->
 /// src/Sema/arith.zig:{add,sub,mul,divTrunc,divFloor,mod,rem}.
+pub fn intValue_big(sema: *Sema, ty: Type, x: std.math.big.int.Const) Error!Value {
+    return .fromIndex(try sema.intern_pool.internIntValue(ty.index, x));
+}
+
+pub fn intValue_u64(sema: *Sema, ty: Type, x: u64) Error!Value {
+    return .fromIndex(try sema.intern_pool.internInt(.{ .ty = ty.index, .storage = .{ .u64 = x } }));
+}
+
+pub fn intValue_i64(sema: *Sema, ty: Type, x: i64) Error!Value {
+    return .fromIndex(try sema.intern_pool.internInt(.{ .ty = ty.index, .storage = .{ .i64 = x } }));
+}
+
+pub fn undefValue(sema: *Sema, ty: Type) Error!Value {
+    return .fromIndex(try sema.intern_pool.get(.{ .undef = ty.index }));
+}
+
+pub fn aggregateSplatValue(sema: *Sema, ty: Type, repeated_elem: Value) Error!Value {
+    if (repeated_elem.isUndef(sema.intern_pool)) return sema.undefValue(ty);
+    return .fromIndex(try sema.intern_pool.internAggregate(.{ .ty = ty.index, .storage = .{ .repeated_elem = repeated_elem.index } }));
+}
+
+pub fn aggregateValue(sema: *Sema, ty: Type, elems: []const InternPool.Index) Error!Value {
+    return .fromIndex(try sema.intern_pool.internAggregate(.{ .ty = ty.index, .storage = .{ .elems = elems } }));
+}
+
+pub fn vectorType(sema: *Sema, info: InternPool.Key.VectorType) Error!Type {
+    return .fromIndex(try sema.intern_pool.internVectorType(info));
+}
+
+pub fn failWithUseOfUndef(sema: *Sema) Error {
+    try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
+    return error.AnalysisFail;
+}
+
+pub fn failWithDivideByZero(sema: *Sema) Error {
+    try sema.writer.writeAll("division by zero here causes illegal behavior\n");
+    return error.AnalysisFail;
+}
+
+pub fn failWithIntegerOverflow(sema: *Sema, ty: Type, val: Value) Error {
+    try sema.writer.writeAll("overflow of integer type '");
+    try Type.print(ty, sema.intern_pool, sema.writer);
+    try sema.writer.writeAll("' with value '");
+    try render_value.render(val, sema.intern_pool, sema.writer);
+    try sema.writer.writeAll("'\n");
+    return error.AnalysisFail;
+}
+
+pub fn failWithNegativeShiftAmount(sema: *Sema, shift_amt: Value) Error {
+    try sema.writer.writeAll("shift by negative amount '");
+    try render_value.render(shift_amt, sema.intern_pool, sema.writer);
+    try sema.writer.writeAll("'\n");
+    return error.AnalysisFail;
+}
+
+pub fn failWithTooLargeShiftAmount(sema: *Sema, ty: Type, shift_amt: Value) Error {
+    try sema.writer.writeAll("shift amount '");
+    try render_value.render(shift_amt, sema.intern_pool, sema.writer);
+    try sema.writer.writeAll("' is too large for operand type '");
+    try Type.print(ty, sema.intern_pool, sema.writer);
+    try sema.writer.writeAll("'\n");
+    return error.AnalysisFail;
+}
+
+pub fn failWithUnsupportedComptimeShiftAmount(sema: *Sema) Error {
+    try sema.writer.writeAll("this implementation only supports comptime shift amounts of up to 2^64 - 1 bits\n");
+    return error.AnalysisFail;
+}
+
 fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     const bin = sema.binData(inst);
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
     const op_name: []const u8 = @tagName(tag);
-    assert(op_name.len > 0);
+    const lhs_val = try sema.resolveRef(bin.lhs);
+    const rhs_val = try sema.resolveRef(bin.rhs);
 
-    const ip = sema.intern_pool;
-    const lv = try sema.resolveRef(bin.lhs);
-    const rv = try sema.resolveRef(bin.rhs);
+    const resolved_type = try sema.resolveArithPeerType(lhs_val, rhs_val, op_name);
+    const lhs = try sema.coerceValueToType(lhs_val, resolved_type.index, op_name);
+    const rhs = try sema.coerceValueToType(rhs_val, resolved_type.index, op_name);
 
-    // Vector operands: apply the op lane-wise and build a result vector, mirroring
-    // the compiler's element-wise arithmetic on `@Vector(N, T)`.
-    if (ip.indexToKey(Value.typeOf(lv, ip).index) == .vector_type)
-        return try sema.evalVectorBinaryTag(tag, lv, rv, op_name, scalarArith);
-
-    return sema.scalarArith(tag, ip.indexToKey(lv.index), ip.indexToKey(rv.index), op_name);
+    return switch (tag) {
+        .add, .add_unsafe => try arith.add(sema, resolved_type, lhs, rhs),
+        .addwrap => try arith.addWrap(sema, resolved_type, lhs, rhs),
+        .add_sat => try arith.addSat(sema, resolved_type, lhs, rhs),
+        .sub => try arith.sub(sema, resolved_type, lhs, rhs),
+        .subwrap => try arith.subWrap(sema, resolved_type, lhs, rhs),
+        .sub_sat => try arith.subSat(sema, resolved_type, lhs, rhs),
+        .mul => try arith.mul(sema, resolved_type, lhs, rhs),
+        .mulwrap => try arith.mulWrap(sema, resolved_type, lhs, rhs),
+        .mul_sat => try arith.mulSat(sema, resolved_type, lhs, rhs),
+        .div => try arith.div(sema, resolved_type, lhs, rhs, .div),
+        .div_trunc => try arith.div(sema, resolved_type, lhs, rhs, .div_trunc),
+        .div_floor => try arith.div(sema, resolved_type, lhs, rhs, .div_floor),
+        .div_exact => try arith.div(sema, resolved_type, lhs, rhs, .div_exact),
+        .mod => try arith.modRem(sema, resolved_type, lhs, rhs, .mod),
+        .rem => try arith.modRem(sema, resolved_type, lhs, rhs, .rem),
+        .mod_rem => try sema.evalModRem(resolved_type, lhs_val, rhs_val, lhs, rhs),
+        else => unreachable,
+    };
 }
 
-/// The scalar (non-vector) arithmetic dispatch shared by `evalBinaryArith` and
-/// each lane of `evalVectorArith`: int-pair, then float-pair, else a typed error.
-fn scalarArith(sema: *Sema, tag: Zir.Inst.Tag, lhs_key: InternPool.Key, rhs_key: InternPool.Key, op_name: []const u8) Error!?Value {
-    if (resolveNumericPairToInt(sema.intern_pool, lhs_key, rhs_key)) |triple| {
-        return sema.evalBinaryArithInt(tag, triple.lhs, triple.rhs, triple.ty);
+/// `%` (`mod_rem`): `@rem`, but rejected when an operand may be negative and the
+/// remainder is nonzero -- the mod/rem ambiguity. Mirrors `zirModRem`; the
+/// negativity check keys on each operand's *original* scalar type + value.
+fn evalModRem(sema: *Sema, resolved_type: Type, lhs_orig: Value, rhs_orig: Value, lhs: Value, rhs: Value) Error!Value {
+    const ip = sema.intern_pool;
+    const lhs_ty = Value.typeOf(lhs_orig, ip);
+    const rhs_ty = Value.typeOf(rhs_orig, ip);
+    const lhs_maybe_negative = !isUnsignedIntType(lhs_ty.scalarType(ip), ip) and !lhs.compareAllWithZero(.gte, ip);
+    const rhs_maybe_negative = !isUnsignedIntType(rhs_ty.scalarType(ip), ip) and !rhs.compareAllWithZero(.gte, ip);
+    const result = try arith.modRem(sema, resolved_type, lhs, rhs, .rem);
+    if (lhs_maybe_negative or rhs_maybe_negative) {
+        if (!result.compareAllWithZero(.eq, ip)) {
+            try sema.writer.writeAll("remainder division with '");
+            try Type.print(lhs_ty, ip, sema.writer);
+            try sema.writer.writeAll("' and '");
+            try Type.print(rhs_ty, ip, sema.writer);
+            try sema.writer.writeAll("': signed integers and floats must use @rem or @mod\n");
+            return error.AnalysisFail;
+        }
     }
-    if (coerceNumericPairToFloat(lhs_key, rhs_key)) |pair| {
-        return sema.evalBinaryArithFloat(tag, pair[0], pair[1]);
+    return result;
+}
+
+fn isUnsignedIntType(ty: Type, pool: *const InternPool) bool {
+    return ty.zigTypeTag(pool) == .int and ty.intInfo(pool).?.signedness == .unsigned;
+}
+
+/// Peer-type resolution for a binary numeric op, producing the result type the
+/// mid-layer operates on. Vectors resolve element-wise into a vector of the
+/// element peer; scalars fall to `resolveScalarNumericPeer`.
+fn resolveArithPeerType(sema: *Sema, lhs: Value, rhs: Value, op_name: []const u8) Error!Type {
+    const ip = sema.intern_pool;
+    const lt_key = ip.indexToKey(Value.typeOf(lhs, ip).index);
+    const rt_key = ip.indexToKey(Value.typeOf(rhs, ip).index);
+    if (lt_key == .vector_type or rt_key == .vector_type) {
+        if (lt_key != .vector_type or rt_key != .vector_type) {
+            try sema.writer.print("{s}: mixed scalar and vector operands\n", .{op_name});
+            return error.AnalysisFail;
+        }
+        if (lt_key.vector_type.len != rt_key.vector_type.len) {
+            try sema.writer.print("{s}: vector length mismatch\n", .{op_name});
+            return error.AnalysisFail;
+        }
+        const lhs_agg = ip.indexToKey(lhs.index).aggregate;
+        const rhs_agg = ip.indexToKey(rhs.index).aggregate;
+        const elem_ty = try sema.resolveScalarNumericPeer(
+            ip.indexToKey(InternPool.aggregateElementAt(lhs_agg, 0)),
+            ip.indexToKey(InternPool.aggregateElementAt(rhs_agg, 0)),
+            op_name,
+        );
+        return sema.vectorType(.{ .len = lt_key.vector_type.len, .child = elem_ty.index });
     }
+    return sema.resolveScalarNumericPeer(ip.indexToKey(lhs.index), ip.indexToKey(rhs.index), op_name);
+}
+
+fn resolveScalarNumericPeer(sema: *Sema, lhs_key: InternPool.Key, rhs_key: InternPool.Key, op_name: []const u8) Error!Type {
+    if (resolveNumericPairToInt(sema.intern_pool, lhs_key, rhs_key)) |triple| return .fromIndex(triple.ty);
+    if (coerceNumericPairToFloat(lhs_key, rhs_key)) |pair| return .fromIndex(pair[0].ty);
     return sema.failNumericOperands(op_name, lhs_key, rhs_key);
 }
 
-/// The "not a workable numeric pair" error shared by scalar arithmetic
-/// (`scalarArith`) and comparison (`evalComparison`): two numeric operands with
-/// no common type are "incompatible"; a non-numeric operand is "non-numeric or
-/// mismatched".
+/// The "not a workable numeric pair" error shared by numeric peer resolution
+/// (`resolveScalarNumericPeer`) and comparison (`evalComparison`): two numeric
+/// operands with no common type are "incompatible"; a non-numeric operand is
+/// "non-numeric or mismatched".
 fn failNumericOperands(sema: *Sema, op_name: []const u8, lhs_key: InternPool.Key, rhs_key: InternPool.Key) Error {
     if ((lhs_key == .int or lhs_key == .float) and (rhs_key == .int or rhs_key == .float)) {
         sema.writer.print("{s}: incompatible numeric operands\n", .{op_name}) catch |e| return e;
@@ -808,10 +940,10 @@ fn failNumericOperands(sema: *Sema, op_name: []const u8, lhs_key: InternPool.Key
     return error.AnalysisFail;
 }
 
-/// Validate two operands for a binary lane-wise op: both must be vectors of the
-/// same length -- the compiler requires an explicit `@splat` to combine a scalar,
-/// so a scalar operand is "mixed scalar and vector operands" and a differing
-/// length is a "vector length mismatch". Returns the lane count + both aggregates.
+/// Validate two operands for a lane-wise comparison: both must be vectors of the
+/// same length -- a scalar operand is "mixed scalar and vector operands" and a
+/// differing length is a "vector length mismatch". Returns the lane count + both
+/// aggregates.
 const VectorPair = struct { len: usize, lhs: InternPool.Key.Aggregate, rhs: InternPool.Key.Aggregate };
 fn vectorBinaryOperands(sema: *Sema, lhs: Value, rhs: Value, op_name: []const u8) Error!VectorPair {
     const ip = sema.intern_pool;
@@ -826,32 +958,6 @@ fn vectorBinaryOperands(sema: *Sema, lhs: Value, rhs: Value, op_name: []const u8
         return error.AnalysisFail;
     }
     return .{ .len = @intCast(lhs_vt.len), .lhs = ip.indexToKey(lhs.index).aggregate, .rhs = ip.indexToKey(rhs.index).aggregate };
-}
-
-/// Apply a tag-dispatched scalar kernel (`scalarArith` / `scalarBitwise` /
-/// `scalarShift`) to each `(lhs[i], rhs[i])` lane and intern the result vector.
-/// The result lane type follows the scalar op's result (identity for same-type
-/// lanes). Shared by every binary lane-wise op whose kernel keys on the ZIR tag.
-fn evalVectorBinaryTag(
-    sema: *Sema,
-    tag: Zir.Inst.Tag,
-    lhs: Value,
-    rhs: Value,
-    op_name: []const u8,
-    comptime lane: fn (*Sema, Zir.Inst.Tag, InternPool.Key, InternPool.Key, []const u8) Error!?Value,
-) Error!?Value {
-    const ip = sema.intern_pool;
-    const vp = try sema.vectorBinaryOperands(lhs, rhs, op_name);
-    const elems = try sema.gpa.alloc(InternPool.Index, vp.len);
-    defer sema.gpa.free(elems);
-    for (elems, 0..) |*e, i| {
-        const l = ip.indexToKey(InternPool.aggregateElementAt(vp.lhs, i));
-        const r = ip.indexToKey(InternPool.aggregateElementAt(vp.rhs, i));
-        e.* = (try lane(sema, tag, l, r, op_name) orelse return null).index;
-    }
-    const child = Value.typeOf(.{ .index = elems[0] }, ip).index;
-    const vec_ty = try ip.internVectorType(.{ .len = @intCast(vp.len), .child = child });
-    return .{ .index = try ip.internAggregate(.{ .ty = vec_ty, .storage = .{ .elems = elems } }) };
 }
 
 /// Peer-type resolution for two int operands. Returns the common int
@@ -1056,140 +1162,6 @@ fn coerceNumericToFloat(
     return .{ .ty = target_ty, .storage = narrowF128ToFloatStorage(widened, target_ty) };
 }
 
-/// Int binary arith. The bignum kernel computes an exact comptime_int
-/// result; if `dest_ty` is a fixed-width int, we then range-check via
-/// `fitsInTwosComp` (matching the compiler's comptime overflow error)
-/// and re-intern at the destination type.
-fn evalBinaryArithInt(
-    sema: *Sema,
-    tag: Zir.Inst.Tag,
-    lhs_int: InternPool.Key.Int,
-    rhs_int: InternPool.Key.Int,
-    dest_ty: InternPool.Index,
-) Error!?Value {
-    var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const lhs = lhs_int.storage.toBigInt(&lhs_space);
-    const rhs = rhs_int.storage.toBigInt(&rhs_space);
-
-    const ip = sema.intern_pool;
-    const gpa = sema.gpa;
-
-    // Wrap / sat tags carry destination-width semantics in stdlib's
-    // `BigIntMutable.addWrap` family. For comptime_int destinations the
-    // wrap/sat tags fall back to regular arith (matches `zig run`:
-    // `200 +% 100` on two comptime_int operands is 300, not 44).
-    const dest_info = intTypeInfo(ip, dest_ty);
-    if (dest_info) |info| {
-        if (wrapSatKernel(tag)) |kind| {
-            return try sema.runIntWrapSat(kind, lhs, rhs, dest_ty, info);
-        }
-    }
-
-    const tmp_idx = switch (tag) {
-        .add, .add_unsafe => try arith.internAdd(gpa, ip, lhs, rhs),
-        .sub => try arith.internSub(gpa, ip, lhs, rhs),
-        .mul => try arith.internMul(gpa, ip, lhs, rhs),
-        .addwrap, .add_sat => try arith.internAdd(gpa, ip, lhs, rhs),
-        .subwrap, .sub_sat => try arith.internSub(gpa, ip, lhs, rhs),
-        .mulwrap, .mul_sat => try arith.internMul(gpa, ip, lhs, rhs),
-        .div, .div_trunc => try sema.unwrapDivResult(arith.internDivTrunc(gpa, ip, lhs, rhs), "/"),
-        .div_exact => try sema.unwrapDivResult(arith.internDivExact(gpa, ip, lhs, rhs), "@divExact"),
-        .div_floor => try sema.unwrapDivResult(arith.internDivFloor(gpa, ip, lhs, rhs), "@divFloor"),
-        .mod => try sema.unwrapDivResult(arith.internMod(gpa, ip, lhs, rhs), "@mod"),
-        .rem => try sema.unwrapDivResult(arith.internRem(gpa, ip, lhs, rhs), "@rem"),
-        // `%` is `@rem`, but Zig rejects it only when an operand is negative
-        // AND the remainder is nonzero (mod/rem ambiguity); a negative operand
-        // with a zero remainder is fine. Mirrors zirModRem. `.positive` is true
-        // for zero, so `!positive` means strictly negative.
-        .mod_rem => blk: {
-            const rem_idx = try sema.unwrapDivResult(arith.internRem(gpa, ip, lhs, rhs), "%");
-            if (!lhs.positive or !rhs.positive) {
-                var rem_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-                const rem_nonzero = !ip.indexToKey(rem_idx).int.storage.toBigInt(&rem_space).eqlZero();
-                if (rem_nonzero) {
-                    try sema.writer.writeAll("remainder division with '");
-                    try Type.print(.fromIndex(lhs_int.ty), ip, sema.writer);
-                    try sema.writer.writeAll("' and '");
-                    try Type.print(.fromIndex(rhs_int.ty), ip, sema.writer);
-                    try sema.writer.writeAll("': signed integers and floats must use @rem or @mod\n");
-                    return error.AnalysisFail;
-                }
-            }
-            break :blk rem_idx;
-        },
-        else => unreachable,
-    };
-
-    if (dest_ty == .comptime_int_type) return .{ .index = tmp_idx };
-    return try sema.refitIntToFixedWidth(tmp_idx, dest_ty, @tagName(tag));
-}
-
-const WrapSatKind = enum {
-    add_wrap,
-    sub_wrap,
-    mul_wrap,
-    add_sat,
-    sub_sat,
-    mul_sat,
-};
-
-fn wrapSatKernel(tag: Zir.Inst.Tag) ?WrapSatKind {
-    return switch (tag) {
-        .addwrap => .add_wrap,
-        .subwrap => .sub_wrap,
-        .mulwrap => .mul_wrap,
-        .add_sat => .add_sat,
-        .sub_sat => .sub_sat,
-        .mul_sat => .mul_sat,
-        else => null,
-    };
-}
-
-/// Run a wrap or saturating int kernel via stdlib's
-/// `BigIntMutable.{addWrap, addSat, subWrap, subSat, mulWrap, mulSat}`.
-/// The `mul_sat` case has no direct stdlib helper, so we mul first and
-/// then `saturate` to the destination range.
-fn runIntWrapSat(
-    sema: *Sema,
-    kind: WrapSatKind,
-    lhs: std.math.big.int.Const,
-    rhs: std.math.big.int.Const,
-    dest_ty: InternPool.Index,
-    dest_info: std.lang.Type.Int,
-) Error!?Value {
-    // Worst-case `mul` output is `lhs.limbs.len + rhs.limbs.len`; add /
-    // sub need `max + 1`. One worst-case buffer fits everything plus
-    // one cushion limb for `saturate` to write its sentinel.
-    const max_op_limbs = @max(lhs.limbs.len + rhs.limbs.len, @max(lhs.limbs.len, rhs.limbs.len) + 1);
-    const dest_limbs = std.math.big.int.calcTwosCompLimbCount(dest_info.bits) + 1;
-    const workspace = try sema.gpa.alloc(std.math.big.Limb, @max(max_op_limbs, dest_limbs));
-    defer sema.gpa.free(workspace);
-
-    var mutable: std.math.big.int.Mutable = .{
-        .limbs = workspace,
-        .len = undefined,
-        .positive = undefined,
-    };
-    switch (kind) {
-        .add_wrap => _ = mutable.addWrap(lhs, rhs, dest_info.signedness, dest_info.bits),
-        .sub_wrap => _ = mutable.subWrap(lhs, rhs, dest_info.signedness, dest_info.bits),
-        // Workspace is gpa-allocated; lhs/rhs live in the pool's arena,
-        // so mulWrapNoAlias's no-alias precondition holds and the
-        // separate temp buffer mulWrap would need is unnecessary.
-        .mul_wrap => mutable.mulWrapNoAlias(lhs, rhs, dest_info.signedness, dest_info.bits, sema.gpa),
-        .add_sat => mutable.addSat(lhs, rhs, dest_info.signedness, dest_info.bits),
-        .sub_sat => mutable.subSat(lhs, rhs, dest_info.signedness, dest_info.bits),
-        .mul_sat => {
-            mutable.mulNoAlias(lhs, rhs, sema.gpa);
-            const product = mutable.toConst();
-            mutable.saturate(product, dest_info.signedness, dest_info.bits);
-        },
-    }
-    const idx = try sema.intern_pool.internIntValue(dest_ty, mutable.toConst());
-    return .{ .index = idx };
-}
-
 /// Re-intern a comptime_int result at the given fixed-width int type,
 /// erroring if the value doesn't fit. Used by every fixed-width int
 /// path (binary arith and the matching coercion in `@as`).
@@ -1233,121 +1205,6 @@ fn intCoercible(src: std.lang.Type.Int, dst: std.lang.Type.Int) bool {
         },
     };
 }
-
-/// Float binary arith for any width. The `inline else` switch on storage
-/// instantiates the math in the operand's native float type (f16 .. f128),
-/// so the same body covers comptime_float (always f128) and all the
-/// fixed-width variants. Storage variants are guaranteed to match because
-/// `ty` matches and the pool stores each ty as its corresponding variant.
-fn evalBinaryArithFloat(
-    sema: *Sema,
-    tag: Zir.Inst.Tag,
-    lhs_float: InternPool.Key.Float,
-    rhs_float: InternPool.Key.Float,
-) Error!?Value {
-    assert(lhs_float.ty == rhs_float.ty);
-
-    const StorageTag = @typeInfo(InternPool.Key.Float.Storage).@"union".tag_type.?;
-    assert(@as(StorageTag, lhs_float.storage) == @as(StorageTag, rhs_float.storage));
-
-    const ip = sema.intern_pool;
-    switch (lhs_float.storage) {
-        inline else => |lhs_v, storage_tag| {
-            const FloatT = @TypeOf(lhs_v);
-            const rhs_v = @field(rhs_float.storage, @tagName(storage_tag));
-            const result: FloatT = try sema.computeFloatBin(FloatT, tag, lhs_v, rhs_v);
-            const out_storage = @unionInit(InternPool.Key.Float.Storage, @tagName(storage_tag), result);
-            const idx = try ip.internFloat(.{ .ty = lhs_float.ty, .storage = out_storage });
-            return .{ .index = idx };
-        },
-    }
-}
-
-/// Compute the float result for a binary arith tag at a specific width.
-/// Division-family ops share a single zero-check; `@divExact` adds a
-/// remainder check. Diagnostics are written directly so the caller can
-/// just propagate `AnalysisFail` via `try`.
-fn computeFloatBin(
-    sema: *Sema,
-    comptime FloatT: type,
-    tag: Zir.Inst.Tag,
-    lhs: FloatT,
-    rhs: FloatT,
-) Error!FloatT {
-    switch (tag) {
-        .add => return lhs + rhs,
-        .sub => return lhs - rhs,
-        .mul => return lhs * rhs,
-        else => {},
-    }
-    if (rhs == 0) {
-        try sema.writer.writeAll("division by zero here causes illegal behavior\n");
-        return error.AnalysisFail;
-    }
-    return switch (tag) {
-        .div => lhs / rhs,
-        .div_trunc => @divTrunc(lhs, rhs),
-        .div_floor => @divFloor(lhs, rhs),
-        .div_exact => blk: {
-            if (@rem(lhs, rhs) != 0) {
-                try sema.writer.print("error: @divExact: remainder is non-zero\n", .{});
-                return error.AnalysisFail;
-            }
-            break :blk lhs / rhs;
-        },
-        .mod => @mod(lhs, rhs),
-        .rem => @rem(lhs, rhs),
-        // `%` is `@rem`, rejected only when an operand is negative AND the
-        // remainder is nonzero -- the same mod/rem ambiguity rule the int
-        // kernel applies (zirModRem governs both).
-        .mod_rem => blk: {
-            const r = @rem(lhs, rhs);
-            if ((lhs < 0 or rhs < 0) and r != 0) {
-                // `@typeName(FloatT)` is the concrete float type (exact for a
-                // fixed-width float; a comptime_float operand widened to f128 here
-                // reads as f128 rather than comptime_float).
-                try sema.writer.print(
-                    "remainder division with '{s}' and '{s}': signed integers and floats must use @rem or @mod\n",
-                    .{ @typeName(FloatT), @typeName(FloatT) },
-                );
-                return error.AnalysisFail;
-            }
-            break :blk r;
-        },
-        else => unreachable,
-    };
-}
-
-/// Translate an arith.DivError into either a successful Index or a written
-/// runtime-style diagnostic + AnalysisFail.
-fn unwrapDivResult(
-    sema: *Sema,
-    result: arith.DivError!InternPool.Index,
-    op_name: []const u8,
-) Error!InternPool.Index {
-    assert(op_name.len > 0);
-
-    const idx = result catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.DivisionByZero => {
-            try sema.writer.writeAll("division by zero here causes illegal behavior\n");
-            return error.AnalysisFail;
-        },
-        error.DivisionNotExact => {
-            try sema.writer.print("error: {s}: remainder is non-zero\n", .{op_name});
-            return error.AnalysisFail;
-        },
-    };
-    assert(idx != .none);
-    return idx;
-}
-
-const ShiftKernel = *const fn (
-    std.mem.Allocator,
-    *InternPool,
-    std.math.big.int.Const,
-    std.math.big.int.Const,
-) arith.ShiftError!InternPool.Index;
 
 /// `block` / `block_inline`: evaluate an inner ZIR body and yield the value
 /// it breaks with. Sema's existing `evalBody` already does this -- `block`
@@ -2000,137 +1857,20 @@ fn evalShift(
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
-    const op_name: []const u8 = @tagName(tag);
     const ip = sema.intern_pool;
     const lhs_value = try sema.resolveRef(bin.lhs);
     const rhs_value = try sema.resolveRef(bin.rhs);
+    const lhs_ty = Value.typeOf(lhs_value, ip);
+    const rhs_ty = Value.typeOf(rhs_value, ip);
 
-    // Vector operands shift lane-wise (each lane by its own shift amount).
-    if (ip.indexToKey(Value.typeOf(lhs_value, ip).index) == .vector_type)
-        return try sema.evalVectorBinaryTag(tag, lhs_value, rhs_value, op_name, scalarShift);
-
-    return sema.scalarShift(tag, ip.indexToKey(lhs_value.index), ip.indexToKey(rhs_value.index), op_name);
-}
-
-/// The scalar shift kernel (`shl / shr / shl_exact / shr_exact / shl_sat`),
-/// shared by `evalShift` and each lane of a vector shift.
-fn scalarShift(sema: *Sema, tag: Zir.Inst.Tag, lhs_key: InternPool.Key, rhs_key: InternPool.Key, op_name: []const u8) Error!?Value {
-    const ip = sema.intern_pool;
-    if (lhs_key != .int or rhs_key != .int) {
-        try sema.writer.print("{s}: non-int operand\n", .{op_name});
-        return error.AnalysisFail;
-    }
-
-    var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const lhs = lhs_key.int.storage.toBigInt(&lhs_space);
-    const rhs = rhs_key.int.storage.toBigInt(&rhs_space);
-    const dest_ty = lhs_key.int.ty;
-
-    // shl_sat needs the destination signedness / bit count up front;
-    // the bignum kernel handles the rest.
-    if (tag == .shl_sat) {
-        const dest_info = intTypeInfo(ip, dest_ty) orelse {
-            try sema.writer.print("{s}: saturating shift requires a fixed-width int operand\n", .{op_name});
-            return error.AnalysisFail;
-        };
-        const idx = try sema.runShlSat(lhs, rhs, dest_ty, dest_info, op_name);
-        return .{ .index = idx };
-    }
-
-    const kernel: ShiftKernel = switch (tag) {
-        .shl, .shl_exact => arith.internShl,
-        .shr, .shr_exact => arith.internShr,
+    return switch (tag) {
+        .shl => try arith.shl(sema, lhs_ty, lhs_value, rhs_value, .shl),
+        .shl_exact => try arith.shl(sema, lhs_ty, lhs_value, rhs_value, .shl_exact),
+        .shl_sat => try arith.shl(sema, lhs_ty, lhs_value, rhs_value, .shl_sat),
+        .shr => try arith.shr(sema, lhs_ty, rhs_ty, lhs_value, rhs_value, .shr),
+        .shr_exact => try arith.shr(sema, lhs_ty, rhs_ty, lhs_value, rhs_value, .shr_exact),
         else => unreachable,
     };
-    const tmp_idx = kernel(sema.gpa, ip, lhs, rhs) catch |err|
-        return sema.reportShiftAmountError(err, op_name);
-
-    // `_exact`: confirm the inverse shift round-trips, i.e. no bits
-    // were lost. Compares lhs against (result <<-> shift_amount).
-    if (tag == .shl_exact or tag == .shr_exact) {
-        try sema.checkShiftExact(tag, lhs, rhs, tmp_idx, op_name);
-    }
-
-    if (dest_ty == .comptime_int_type) return .{ .index = tmp_idx };
-    return try sema.refitIntToFixedWidth(tmp_idx, dest_ty, op_name);
-}
-
-fn reportShiftAmountError(sema: *Sema, err: arith.ShiftError, op_name: []const u8) Error {
-    switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.NegativeIntoUnsigned => {
-            try sema.writer.print("error: {s}: shift amount is negative\n", .{op_name});
-            return error.AnalysisFail;
-        },
-        error.TargetTooSmall => {
-            try sema.writer.print("error: {s}: shift amount exceeds usize\n", .{op_name});
-            return error.AnalysisFail;
-        },
-        error.ShiftAmountTooLarge => {
-            try sema.writer.print(
-                "error: {s}: shift amount exceeds {d} bits\n",
-                .{ op_name, arith.max_shift_bits },
-            );
-            return error.AnalysisFail;
-        },
-    }
-}
-
-/// `_exact` shift safety: re-shift the result the opposite direction
-/// and confirm it matches the original LHS bit-for-bit. Mirrors the
-/// compiler's `zirShlExact` / `zirShrExact` post-checks.
-fn checkShiftExact(
-    sema: *Sema,
-    tag: Zir.Inst.Tag,
-    lhs: std.math.big.int.Const,
-    rhs: std.math.big.int.Const,
-    result_idx: InternPool.Index,
-    op_name: []const u8,
-) Error!void {
-    assert(tag == .shl_exact or tag == .shr_exact);
-    const ip = sema.intern_pool;
-    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const result = ip.indexToKey(result_idx).int.storage.toBigInt(&space);
-
-    const inverse_kernel: ShiftKernel = if (tag == .shl_exact) arith.internShr else arith.internShl;
-    const round_trip = inverse_kernel(sema.gpa, ip, result, rhs) catch |err|
-        return sema.reportShiftAmountError(err, op_name);
-
-    var rt_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const round_trip_big = ip.indexToKey(round_trip).int.storage.toBigInt(&rt_space);
-    if (!round_trip_big.eql(lhs)) {
-        try sema.writer.print("error: {s}: exact shift lost bits\n", .{op_name});
-        return error.AnalysisFail;
-    }
-}
-
-/// `shl_sat`: shift left and saturate to the destination width's
-/// `[minInt, maxInt]` range via stdlib's `shiftLeftSat`. Buffer
-/// sized for the worst-case bit-shift output, matching the compiler
-/// in `Sema/arith.zig:shlSat`.
-fn runShlSat(
-    sema: *Sema,
-    lhs: std.math.big.int.Const,
-    rhs: std.math.big.int.Const,
-    dest_ty: InternPool.Index,
-    dest_info: std.lang.Type.Int,
-    op_name: []const u8,
-) Error!InternPool.Index {
-    const shift_amount = arith.shiftAmount(rhs) catch |err|
-        return sema.reportShiftAmountError(err, op_name);
-
-    const max_limbs: usize = std.math.big.int.calcTwosCompLimbCount(dest_info.bits) + 1;
-    const workspace = try sema.gpa.alloc(std.math.big.Limb, max_limbs);
-    defer sema.gpa.free(workspace);
-
-    var mutable: std.math.big.int.Mutable = .{
-        .limbs = workspace,
-        .len = undefined,
-        .positive = undefined,
-    };
-    mutable.shiftLeftSat(lhs, shift_amount, dest_info.signedness, dest_info.bits);
-    return try sema.intern_pool.internIntValue(dest_ty, mutable.toConst());
 }
 
 /// `bit_and / bit_or / xor`. Uses the same `resolveNumericPairToInt`
@@ -2145,41 +1885,19 @@ fn evalBitwise(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Valu
     assert(bin.rhs != .none);
 
     const op_name: []const u8 = @tagName(tag);
-    const ip = sema.intern_pool;
     const lhs_value = try sema.resolveRef(bin.lhs);
     const rhs_value = try sema.resolveRef(bin.rhs);
 
-    // Vector operands apply the bitwise op lane-wise.
-    if (ip.indexToKey(Value.typeOf(lhs_value, ip).index) == .vector_type)
-        return try sema.evalVectorBinaryTag(tag, lhs_value, rhs_value, op_name, scalarBitwise);
+    const resolved_type = try sema.resolveArithPeerType(lhs_value, rhs_value, op_name);
+    const lhs = try sema.coerceValueToType(lhs_value, resolved_type.index, op_name);
+    const rhs = try sema.coerceValueToType(rhs_value, resolved_type.index, op_name);
 
-    return sema.scalarBitwise(tag, ip.indexToKey(lhs_value.index), ip.indexToKey(rhs_value.index), op_name);
-}
-
-/// The scalar `bit_and / bit_or / xor` kernel, shared by `evalBitwise` and each
-/// lane of a vector bitwise op: peer-resolve to a common int type, apply the
-/// bignum kernel, then re-fit into the destination width.
-fn scalarBitwise(sema: *Sema, tag: Zir.Inst.Tag, lhs_key: InternPool.Key, rhs_key: InternPool.Key, op_name: []const u8) Error!?Value {
-    const ip = sema.intern_pool;
-    const triple = resolveNumericPairToInt(ip, lhs_key, rhs_key) orelse {
-        try sema.writer.print("{s}: non-int or incompatible operands\n", .{op_name});
-        return error.AnalysisFail;
-    };
-
-    var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const lhs = triple.lhs.storage.toBigInt(&lhs_space);
-    const rhs = triple.rhs.storage.toBigInt(&rhs_space);
-
-    const gpa = sema.gpa;
-    const tmp_idx = switch (tag) {
-        .bit_and => try arith.internBitAnd(gpa, ip, lhs, rhs),
-        .bit_or => try arith.internBitOr(gpa, ip, lhs, rhs),
-        .xor => try arith.internXor(gpa, ip, lhs, rhs),
+    return switch (tag) {
+        .bit_and => try arith.bitwiseBin(sema, resolved_type, lhs, rhs, .@"and"),
+        .bit_or => try arith.bitwiseBin(sema, resolved_type, lhs, rhs, .@"or"),
+        .xor => try arith.bitwiseBin(sema, resolved_type, lhs, rhs, .xor),
         else => unreachable,
     };
-    if (triple.ty == .comptime_int_type) return .{ .index = tmp_idx };
-    return try sema.refitIntToFixedWidth(tmp_idx, triple.ty, op_name);
 }
 
 /// A `bool` result as an interned Value -- the two well-known bool indices.
@@ -2315,22 +2033,20 @@ fn evalComparison(
         }
     }
 
-    return sema.scalarCompare(op, lhs_key, rhs_key, op_name);
+    return sema.scalarCompare(op, lhs_value, rhs_value, op_name);
 }
 
 /// Compare two numeric scalars to a `bool`, shared by `evalComparison` and each
-/// lane of `evalVectorComparison`: a common int type compares the bignums exactly
-/// (no re-fit needed), a float pair compares by storage, else a typed error.
-fn scalarCompare(sema: *Sema, op: std.math.CompareOperator, lhs_key: InternPool.Key, rhs_key: InternPool.Key, op_name: []const u8) Error!?Value {
-    if (resolveNumericPairToInt(sema.intern_pool, lhs_key, rhs_key)) |triple| {
-        var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-        var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-        const lhs = triple.lhs.storage.toBigInt(&lhs_space);
-        const rhs = triple.rhs.storage.toBigInt(&rhs_space);
-        return .{ .index = if (arith.compareInt(lhs, rhs, op)) .bool_true else .bool_false };
-    }
-    if (coerceNumericPairToFloat(lhs_key, rhs_key)) |pair| {
-        return .{ .index = if (compareFloatStorage(pair[0].storage, pair[1].storage, op)) .bool_true else .bool_false };
+/// lane of `evalVectorComparison`. Any int/float pair compares by value through
+/// `Value.compareHetero` -- ints order exactly, a float pair (or a mixed int/float
+/// pair) orders as `f128`, and NaN is unordered. A non-numeric operand is a typed
+/// error. Mirrors `cmpNumeric`'s comptime path (`src/Sema.zig`).
+fn scalarCompare(sema: *Sema, op: std.math.CompareOperator, lhs: Value, rhs: Value, op_name: []const u8) Error!?Value {
+    const ip = sema.intern_pool;
+    const lhs_key = ip.indexToKey(lhs.index);
+    const rhs_key = ip.indexToKey(rhs.index);
+    if ((lhs_key == .int or lhs_key == .float) and (rhs_key == .int or rhs_key == .float)) {
+        return boolValue(Value.compareHetero(lhs, op, rhs, ip));
     }
     return sema.failNumericOperands(op_name, lhs_key, rhs_key);
 }
@@ -2345,39 +2061,13 @@ fn evalVectorComparison(sema: *Sema, op: std.math.CompareOperator, lhs: Value, r
     const elems = try sema.gpa.alloc(InternPool.Index, vp.len);
     defer sema.gpa.free(elems);
     for (elems, 0..) |*e, i| {
-        const l = ip.indexToKey(InternPool.aggregateElementAt(vp.lhs, i));
-        const r = ip.indexToKey(InternPool.aggregateElementAt(vp.rhs, i));
+        const l: Value = .{ .index = InternPool.aggregateElementAt(vp.lhs, i) };
+        const r: Value = .{ .index = InternPool.aggregateElementAt(vp.rhs, i) };
         e.* = (try sema.scalarCompare(op, l, r, op_name) orelse return null).index;
     }
     // A comparison mask is always `@Vector(N, bool)`, whatever the operand type.
     const vec_ty = try ip.internVectorType(.{ .len = @intCast(vp.len), .child = .bool_type });
     return .{ .index = try ip.internAggregate(.{ .ty = vec_ty, .storage = .{ .elems = elems } }) };
-}
-
-/// Compare two float storages of the same width. NaN comparisons follow
-/// IEEE: any comparison with a NaN is false except `.neq`, which is true.
-/// `std.math.order` doesn't totalise NaN, so the language operators are
-/// used directly via an inline switch over the storage variant.
-fn compareFloatStorage(
-    lhs: InternPool.Key.Float.Storage,
-    rhs: InternPool.Key.Float.Storage,
-    op: std.math.CompareOperator,
-) bool {
-    const StorageTag = @typeInfo(InternPool.Key.Float.Storage).@"union".tag_type.?;
-    assert(@as(StorageTag, lhs) == @as(StorageTag, rhs));
-    switch (lhs) {
-        inline else => |lhs_v, storage_tag| {
-            const rhs_v = @field(rhs, @tagName(storage_tag));
-            return switch (op) {
-                .lt => lhs_v < rhs_v,
-                .lte => lhs_v <= rhs_v,
-                .eq => lhs_v == rhs_v,
-                .gte => lhs_v >= rhs_v,
-                .gt => lhs_v > rhs_v,
-                .neq => lhs_v != rhs_v,
-            };
-        },
-    }
 }
 
 /// `negate` / `negate_wrap`. AstGen lowers `-x` as `negate(x)`; constant-
@@ -2508,87 +2198,33 @@ fn evalNegate(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value
     assert(un_node.operand != .none);
 
     const ip = sema.intern_pool;
-    const operand_value = try sema.resolveRef(un_node.operand);
-    const op_name: []const u8 = @tagName(tag);
+    const operand = try sema.resolveRef(un_node.operand);
+    const ty = Value.typeOf(operand, ip);
+    const scalar_ty = ty.scalarType(ip);
+    const scalar_tag = scalar_ty.zigTypeTag(ip);
 
-    // A vector negates lane-wise.
-    if (ip.indexToKey(Value.typeOf(operand_value, ip).index) == .vector_type)
-        return try sema.evalVectorUnary(tag, operand_value, op_name, scalarNegate);
-
-    return sema.scalarNegate(tag, ip.indexToKey(operand_value.index), op_name);
-}
-
-/// Apply a unary lane kernel (`scalarNegate`) to each lane of a vector operand
-/// and intern the result vector. The lane loop for unary lane-wise ops, the
-/// unary analogue of `evalVectorBinaryTag`.
-fn evalVectorUnary(
-    sema: *Sema,
-    tag: Zir.Inst.Tag,
-    operand: Value,
-    op_name: []const u8,
-    comptime lane: fn (*Sema, Zir.Inst.Tag, InternPool.Key, []const u8) Error!?Value,
-) Error!?Value {
-    const ip = sema.intern_pool;
-    const vt = ip.indexToKey(Value.typeOf(operand, ip).index).vector_type;
-    const agg = ip.indexToKey(operand.index).aggregate;
-    const elems = try sema.gpa.alloc(InternPool.Index, vt.len);
-    defer sema.gpa.free(elems);
-    for (elems, 0..) |*e, i| {
-        e.* = (try lane(sema, tag, ip.indexToKey(InternPool.aggregateElementAt(agg, i)), op_name) orelse return null).index;
-    }
-    const child = Value.typeOf(.{ .index = elems[0] }, ip).index;
-    const vec_ty = try ip.internVectorType(.{ .len = vt.len, .child = child });
-    return .{ .index = try ip.internAggregate(.{ .ty = vec_ty, .storage = .{ .elems = elems } }) };
-}
-
-/// The scalar `negate` / `negate_wrap` kernel, shared by `evalNegate` and each
-/// lane of a vector negation.
-fn scalarNegate(sema: *Sema, tag: Zir.Inst.Tag, operand_key: InternPool.Key, op_name: []const u8) Error!?Value {
-    const ip = sema.intern_pool;
-    if (operand_key == .float) {
-        if (tag == .negate_wrap) {
-            try sema.writer.writeAll("negate_wrap: not valid on float operand\n");
-            return error.AnalysisFail;
-        }
-        if (operand_key.float.ty != .comptime_float_type and !isFixedWidthFloatType(operand_key.float.ty)) {
-            try sema.writer.writeAll("negate: float type not yet supported\n");
-            return error.AnalysisFail;
-        }
-        const out_storage = switch (operand_key.float.storage) {
-            inline else => |v, storage_tag| @unionInit(
-                InternPool.Key.Float.Storage,
-                @tagName(storage_tag),
-                -v,
-            ),
-        };
-        const idx = try ip.internFloat(.{ .ty = operand_key.float.ty, .storage = out_storage });
-        return .{ .index = idx };
+    const numeric = switch (scalar_tag) {
+        .int, .comptime_int, .float, .comptime_float => true,
+        else => false,
+    };
+    if (!numeric or (tag == .negate and isUnsignedIntType(scalar_ty, ip))) {
+        try sema.writer.writeAll("negation of type '");
+        try Type.print(ty, ip, sema.writer);
+        try sema.writer.writeAll("'\n");
+        return error.AnalysisFail;
     }
 
-    if (operand_key == .int) {
-        if (operand_key.int.ty == .comptime_int_type) {
-            // Wrap is meaningless at infinite precision: both forms reduce
-            // to a plain negate of a comptime_int.
-            var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-            const operand = operand_key.int.storage.toBigInt(&space);
-            const idx = try arith.internNegate(sema.gpa, ip, operand);
-            return .{ .index = idx };
-        }
-        const dest_info = intTypeInfo(ip, operand_key.int.ty) orelse {
-            try sema.writer.print("{s}: int type not yet supported\n", .{op_name});
-            return error.AnalysisFail;
-        };
-        if (tag == .negate_wrap) {
-            return try sema.runIntNegateWrap(operand_key.int, operand_key.int.ty, dest_info);
-        }
-        var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-        const operand = operand_key.int.storage.toBigInt(&space);
-        const tmp_idx = try arith.internNegate(sema.gpa, ip, operand);
-        return try sema.refitIntToFixedWidth(tmp_idx, operand_key.int.ty, op_name);
+    if (scalar_tag == .float or scalar_tag == .comptime_float) {
+        return try arith.negateFloat(sema, ty, operand);
     }
 
-    try sema.writer.print("{s}: non-numeric operand\n", .{op_name});
-    return error.AnalysisFail;
+    const zero_scalar = try sema.intValue_u64(scalar_ty, 0);
+    const zero = if (ty.zigTypeTag(ip) == .vector) try sema.aggregateSplatValue(ty, zero_scalar) else zero_scalar;
+    return switch (tag) {
+        .negate => try arith.sub(sema, ty, zero, operand),
+        .negate_wrap => try arith.subWrap(sema, ty, zero, operand),
+        else => unreachable,
+    };
 }
 
 /// `ptr_type`: evaluate a `*T` / `*const T` / `[*]T` / `[]T` / `[*c]T`
@@ -3798,7 +3434,10 @@ fn coerceInMemoryAllowed(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_mut: 
                 .ty = dest_info.elem_type,
             } };
         }
-        return .{ .ok = switch (child_strat) { .bit_cast => .bit_cast, else => .none } };
+        return .{ .ok = switch (child_strat) {
+            .bit_cast => .bit_cast,
+            else => .none,
+        } };
     }
 
     // Vectors.
@@ -4472,7 +4111,7 @@ fn evalReifyPointer(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Va
     const align_opt = ip.indexToKey(InternPool.aggregateElementAt(attrs, 4)).opt.val;
 
     const address_space: std.lang.AddressSpace = if (addrspace_opt != .none)
-        try sema.interpretStdLangEnum(std.lang.AddressSpace, try sema.getStdLangType(.@"AddressSpace"), .{ .index = addrspace_opt }, "address space")
+        try sema.interpretStdLangEnum(std.lang.AddressSpace, try sema.getStdLangType(.AddressSpace), .{ .index = addrspace_opt }, "address space")
     else
         .generic;
     const alignment: InternPool.Alignment = if (align_opt != .none)
@@ -5627,7 +5266,7 @@ fn evalStdLangValue(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Va
         // Values are handled here: `.c` is a target-dependent declaration,
         // `.@"inline"` a payload-free tag -- resolved directly, not as types.
         .calling_convention_c => {
-            const cc_ty = try sema.getStdLangType(.@"CallingConvention");
+            const cc_ty = try sema.getStdLangType(.CallingConvention);
             const name = try sema.intern_pool.getOrPutString(sema.gpa, "c");
             return (try sema.containerDeclByName(cc_ty, name)) orelse {
                 try sema.writer.print("std.lang is corrupt: CallingConvention.c\n", .{});
@@ -5648,13 +5287,13 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const ty = (try sema.resolveRef(un_node.operand)).index;
 
-    const type_info_ty = try sema.getStdLangType(.@"Type");
+    const type_info_ty = try sema.getStdLangType(.Type);
     const tag_enum = try sema.unionTagEnumType(type_info_ty);
 
     if (Type.fromIndex(ty).zigTypeTag(ip) == .int) {
         const it = Type.fromIndex(ty).intInfo(ip).?;
         const int_info_ty = try sema.getStdLangType(.@"Type.Int");
-        const signedness_ty = try sema.getStdLangType(.@"Signedness");
+        const signedness_ty = try sema.getStdLangType(.Signedness);
         const sign_idx = (try sema.enumFieldIndex(signedness_ty, try ip.getOrPutString(sema.gpa, @tagName(it.signedness)))).?;
         const sign_val = (try sema.enumValueFieldIndex(signedness_ty, sign_idx)).?;
         const bits_val = try ip.internInt(.{ .ty = .u16_type, .storage = .{ .u64 = it.bits } });
@@ -5720,7 +5359,7 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const pointer_ty = try sema.getStdLangType(.@"Type.Pointer");
             const size_ty = try sema.getStdLangType(.@"Type.Pointer.Size");
             const attrs_ty = try sema.getStdLangType(.@"Type.Pointer.Attributes");
-            const addrspace_ty = try sema.getStdLangType(.@"AddressSpace");
+            const addrspace_ty = try sema.getStdLangType(.AddressSpace);
 
             const opt_addrspace = try ip.internOpt(.{
                 .ty = try ip.internOptionalType(addrspace_ty),
@@ -6039,7 +5678,7 @@ fn typeInfoDecls(sema: *Sema, container_ty: InternPool.Index) Error!InternPool.I
 /// concern; a comptime evaluator has the resolved set in hand.
 fn typeInfoErrorSet(sema: *Sema, err_ty: ?InternPool.Index) Error!?Value {
     const ip = sema.intern_pool;
-    const type_info_ty = try sema.getStdLangType(.@"Type");
+    const type_info_ty = try sema.getStdLangType(.Type);
     const tag_enum = try sema.unionTagEnumType(type_info_ty);
     const error_set_ty = try sema.getStdLangType(.@"Type.ErrorSet");
 
@@ -6955,7 +6594,7 @@ fn optTypeValue(sema: *Sema, val: InternPool.Index) Error!InternPool.Index {
 /// general `Value.uninterpret(cc, ...)`.
 fn callConvValue(sema: *Sema, cc: std.lang.CallingConvention) Error!InternPool.Index {
     const ip = sema.intern_pool;
-    const cc_ty = try sema.getStdLangType(.@"CallingConvention");
+    const cc_ty = try sema.getStdLangType(.CallingConvention);
     const tag_enum = try sema.unionTagEnumType(cc_ty);
     switch (cc) {
         inline else => |payload, tag| {
@@ -9016,32 +8655,6 @@ fn runFixedWidthBitNot(
         .positive = undefined,
     };
     mutable.bitNotWrap(operand_big, dest_info.signedness, dest_info.bits);
-    const idx = try sema.intern_pool.internIntValue(dest_ty, mutable.toConst());
-    return .{ .index = idx };
-}
-
-/// Compute `-%x` on a fixed-width int via stdlib's `subWrap(0, x, ...)`.
-/// Wrap semantics: `-%@as(i8, -128)` is `-128` (overflow wraps).
-fn runIntNegateWrap(
-    sema: *Sema,
-    operand_int: InternPool.Key.Int,
-    dest_ty: InternPool.Index,
-    dest_info: std.lang.Type.Int,
-) Error!Value {
-    var op_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const operand_big = operand_int.storage.toBigInt(&op_space);
-
-    const workspace_limbs: usize = std.math.big.int.calcTwosCompLimbCount(dest_info.bits) + 1;
-    const workspace = try sema.gpa.alloc(std.math.big.Limb, workspace_limbs);
-    defer sema.gpa.free(workspace);
-
-    var mutable: std.math.big.int.Mutable = .{
-        .limbs = workspace,
-        .len = undefined,
-        .positive = undefined,
-    };
-    const zero: std.math.big.int.Const = .{ .limbs = &.{0}, .positive = true };
-    _ = mutable.subWrap(zero, operand_big, dest_info.signedness, dest_info.bits);
     const idx = try sema.intern_pool.internIntValue(dest_ty, mutable.toConst());
     return .{ .index = idx };
 }

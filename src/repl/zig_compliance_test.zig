@@ -363,6 +363,17 @@ test "compliance: bitwise on fixed-width" {
     try expectMatchesZig(testing.allocator, &.{"@as(u16, 1000) & @as(u16, 0xff)"});
 }
 
+test "compliance: vector arithmetic is lane-wise" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"@as(@Vector(4, i32), .{ 1, 2, 3, 4 }) + @as(@Vector(4, i32), .{ 10, 20, 30, 40 })"});
+    try expectMatchesZig(a, &.{"@as(@Vector(4, i32), .{ 10, 20, 30, 40 }) - @as(@Vector(4, i32), .{ 1, 2, 3, 4 })"});
+    try expectMatchesZig(a, &.{"@as(@Vector(4, i32), .{ 1, 2, 3, 4 }) * @as(@Vector(4, i32), .{ 2, 3, 4, 5 })"});
+    try expectMatchesZig(a, &.{"@as(@Vector(4, u8), .{ 12, 10, 255, 15 }) & @as(@Vector(4, u8), .{ 10, 6, 15, 255 })"});
+    try expectMatchesZig(a, &.{"@as(@Vector(4, u8), .{ 100, 200, 50, 25 }) ^ @as(@Vector(4, u8), .{ 1, 2, 3, 4 })"});
+    try expectMatchesZig(a, &.{"@as(@Vector(4, u8), .{ 1, 2, 4, 8 }) << @as(@Vector(4, u3), .{ 1, 2, 3, 0 })"});
+    try expectMatchesZig(a, &.{"-@as(@Vector(2, i32), .{ 1, -2 })"});
+}
+
 test "compliance: @intCast widen" {
     try expectMatchesZig(testing.allocator, &.{"@as(u32, @intCast(@as(u8, 200)))"});
 }
@@ -1195,8 +1206,8 @@ test "compliance: try and pointer-form catch unwrap error unions" {
     // an addressable operand drives the pointer forms (is_non_err_ptr,
     // err_union_payload_unsafe_ptr) through an `eu_payload` projection.
     const G = "const g = struct { fn g(x: anyerror!u8) anyerror!u8 { return (try x) + 1; } }.g;";
-    try expectMatchesZig(testing.allocator, &.{ "blk: { " ++ G ++ " break :blk g(5) catch 0; }" }); // 6
-    try expectMatchesZig(testing.allocator, &.{ "blk: { " ++ G ++ " break :blk g(error.Bad) catch 99; }" }); // 99
+    try expectMatchesZig(testing.allocator, &.{"blk: { " ++ G ++ " break :blk g(5) catch 0; }"}); // 6
+    try expectMatchesZig(testing.allocator, &.{"blk: { " ++ G ++ " break :blk g(error.Bad) catch 99; }"}); // 99
     try expectMatchesZig(testing.allocator, &.{"(@as(anyerror!struct { a: u8 }, .{ .a = 5 }) catch unreachable).a"}); // 5
     // `if (p.*) |v|` reads the optional behind a pointer (is_non_null_ptr).
     try expectMatchesZig(testing.allocator, &.{"blk: { var o: ?u8 = 4; const p = &o; break :blk p.* orelse 0; }"}); // 4
@@ -2767,5 +2778,3 @@ test "reify constructors: value paths and rejected inputs" {
         }
     }
 }
-
-

@@ -3677,7 +3677,6 @@ fn emitFloat(pool: *InternPool, float: Key.Float) Allocator.Error!void {
     }
 }
 
-
 /// Intern a float value with any storage form.
 pub fn internFloat(pool: *InternPool, float: Key.Float) Allocator.Error!Index {
     return pool.get(.{ .float = float });

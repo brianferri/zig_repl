@@ -521,7 +521,7 @@ test "float division errors surface at Sema" {
     defer pool.deinit();
 
     try expectEvalFails(gpa, &pool, "1.5 / 0.0", "division by zero");
-    try expectEvalFails(gpa, &pool, "@divExact(7.0, 2.0)", "remainder is non-zero");
+    try expectEvalFails(gpa, &pool, "@divExact(7.0, 2.0)", "exact division produced remainder");
 }
 
 test "float comparison yields the well-known bool indices" {
@@ -533,6 +533,10 @@ test "float comparison yields the well-known bool indices" {
     try expectEvalBool(gpa, &pool, "1.5 == 1.5", true);
     try expectEvalBool(gpa, &pool, "3.14 != 3.14", false);
     try expectEvalBool(gpa, &pool, "-1.5 > -2.5", true);
+    // A fixed-width int compares against a float by value (the compiler permits
+    // this even though the same pair is a type error for arithmetic).
+    try expectEvalBool(gpa, &pool, "@as(i32, 5) < 1.5", false);
+    try expectEvalBool(gpa, &pool, "@as(i32, 5) > @as(f32, 1.5)", true);
 }
 
 test "@as coerces comptime_float to fixed-width float and stores the type" {
@@ -796,10 +800,7 @@ test "fixed-width int + comptime_int range-checks via peer resolution" {
     try expectEvalTypedDecimal(gpa, &pool, "1 + @as(i32, 5)", .i32_type, "6");
     try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 100) + 50", .u8_type, "150");
 
-    // Overflow at the fixed width is a comptime error in real Zig
-    // ("overflow of integer type 'u8' with value '300'"); we surface
-    // the same condition via the post-arith range check.
-    try expectEvalFails(gpa, &pool, "@as(u8, 200) + @as(u8, 100)", "does not fit in u8");
+    try expectEvalFails(gpa, &pool, "@as(u8, 200) + @as(u8, 100)", "overflow of integer type 'u8' with value '300'");
 }
 
 test "fixed-width int peer resolution across widths and signedness" {
@@ -875,6 +876,18 @@ test "fixed-width shifts and shift variants" {
     // Saturating shl: 1 << 8 would overflow u8; sat clamps to 255.
     try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 1) <<| 8", .u8_type, "255");
     try expectEvalTypedDecimal(gpa, &pool, "@as(u8, 1) <<| 7", .u8_type, "128");
+}
+
+test "exactness and negation errors match the compiler" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+
+    try expectEvalFails(gpa, &pool, "@divExact(7, 2)", "exact division produced remainder");
+    try expectEvalFails(gpa, &pool, "@shrExact(@as(u8, 3), 1)", "exact shift shifted out 1 bits");
+    // `-` on an unsigned operand is rejected; `-%` (negate_wrap) is not.
+    try expectEvalFails(gpa, &pool, "-@as(u8, 5)", "negation of type 'u8'");
+    try expectEvalTypedDecimal(gpa, &pool, "-%@as(u8, 1)", .u8_type, "255");
 }
 
 test "target-conditioned int types participate in peer resolution" {
@@ -1311,9 +1324,7 @@ test "negate on fixed-width int now refits + overflows cleanly" {
     defer pool.deinit();
 
     try expectEvalTypedDecimal(gpa, &pool, "-@as(i32, 100)", .i32_type, "-100");
-    // -minInt(i8) = 128 which overflows i8 (matches the compiler's
-    // comptime overflow error).
-    try expectEvalFails(gpa, &pool, "-@as(i8, -128)", "value does not fit in i8");
+    try expectEvalFails(gpa, &pool, "-@as(i8, -128)", "overflow of integer type 'i8' with value '128'");
 }
 
 test "mixed comptime_int + comptime_float promotes via peer-type resolution" {

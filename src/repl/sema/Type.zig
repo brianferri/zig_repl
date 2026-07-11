@@ -7,10 +7,63 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 const InternPool = @import("InternPool.zig");
+const Sema = @import("Sema.zig");
+const Value = @import("Value.zig");
 
 const Type = @This();
 
 index: InternPool.Index,
+
+pub fn minInt(ty: Type, sema: *Sema, dest_ty: Type) !Value {
+    const pool = sema.intern_pool;
+    const scalar = try minIntScalar(ty.scalarType(pool), sema, dest_ty.scalarType(pool));
+    return if (ty.zigTypeTag(pool) == .vector) sema.aggregateSplatValue(dest_ty, scalar) else scalar;
+}
+
+pub fn minIntScalar(ty: Type, sema: *Sema, dest_ty: Type) !Value {
+    const info = ty.intInfo(sema.intern_pool).?;
+    if (info.signedness == .unsigned) return sema.intValue_u64(dest_ty, 0);
+    if (std.math.cast(u6, info.bits - 1)) |shift| {
+        const n = @as(i64, std.math.minInt(i64)) >> (63 - shift);
+        return sema.intValue_i64(dest_ty, n);
+    }
+    var res = try std.math.big.int.Managed.init(sema.gpa);
+    defer res.deinit();
+    try res.setTwosCompIntLimit(.min, info.signedness, info.bits);
+    return sema.intValue_big(dest_ty, res.toConst());
+}
+
+pub fn maxInt(ty: Type, sema: *Sema, dest_ty: Type) !Value {
+    const pool = sema.intern_pool;
+    const scalar = try maxIntScalar(ty.scalarType(pool), sema, dest_ty.scalarType(pool));
+    return if (ty.zigTypeTag(pool) == .vector) sema.aggregateSplatValue(dest_ty, scalar) else scalar;
+}
+
+pub fn maxIntScalar(ty: Type, sema: *Sema, dest_ty: Type) !Value {
+    const info = ty.intInfo(sema.intern_pool).?;
+    switch (info.bits) {
+        0 => return sema.intValue_u64(dest_ty, 0),
+        1 => return switch (info.signedness) {
+            .signed => sema.intValue_u64(dest_ty, 0),
+            .unsigned => sema.intValue_u64(dest_ty, 1),
+        },
+        else => {},
+    }
+    if (std.math.cast(u6, info.bits - 1)) |shift| switch (info.signedness) {
+        .signed => {
+            const n = @as(i64, std.math.maxInt(i64)) >> (63 - shift);
+            return sema.intValue_i64(dest_ty, n);
+        },
+        .unsigned => {
+            const n = @as(u64, std.math.maxInt(u64)) >> (63 - shift);
+            return sema.intValue_u64(dest_ty, n);
+        },
+    };
+    var res = try std.math.big.int.Managed.init(sema.gpa);
+    defer res.deinit();
+    try res.setTwosCompIntLimit(.max, info.signedness, info.bits);
+    return sema.intValue_big(dest_ty, res.toConst());
+}
 
 pub fn fromIndex(index: InternPool.Index) Type {
     assert(index != .none);
@@ -513,8 +566,25 @@ pub fn isSelfComparable(ty: Type, pool: *const InternPool, is_equality_cmp: bool
     return switch (pool.indexToKey(ty.index)) {
         .int_type => true,
         .simple_type => |s| switch (s) {
-            .usize, .isize, .c_char, .c_short, .c_ushort, .c_int, .c_uint, .c_long, .c_ulong, .c_longlong, .c_ulonglong, .comptime_int, // .int / .comptime_int
-            .f16, .f32, .f64, .f80, .f128, .c_longdouble, .comptime_float, // .float / .comptime_float
+            .usize,
+            .isize,
+            .c_char,
+            .c_short,
+            .c_ushort,
+            .c_int,
+            .c_uint,
+            .c_long,
+            .c_ulong,
+            .c_longlong,
+            .c_ulonglong,
+            .comptime_int, // .int / .comptime_int
+            .f16,
+            .f32,
+            .f64,
+            .f80,
+            .f128,
+            .c_longdouble,
+            .comptime_float, // .float / .comptime_float
             => true,
             .bool, .type, .void, .anyerror, .adhoc_inferred_error_set, .enum_literal, .anyopaque => is_equality_cmp,
             .noreturn, .undefined, .null, .generic_poison => false,
