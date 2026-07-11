@@ -433,6 +433,26 @@ test "compliance: unary float builtins fold at comptime" {
     try expectMatchesZig(a, &.{"@TypeOf(@sqrt(@as(f64, undefined))) == f64"});
 }
 
+test "compliance: integer bit-count and bit/byte reversal builtins" {
+    const a = testing.allocator;
+    // @clz/@ctz/@popCount fold to smallestUnsignedInt(bits) via the same big.int
+    // methods the compiler uses; @byteSwap/@bitReverse keep the operand type.
+    try expectMatchesZig(a, &.{"@clz(@as(u8, 1))"}); // 7
+    try expectMatchesZig(a, &.{"@ctz(@as(u8, 8))"}); // 3
+    try expectMatchesZig(a, &.{"@ctz(@as(u8, 0))"}); // 8
+    try expectMatchesZig(a, &.{"@popCount(@as(u8, 0xff))"}); // 8
+    try expectMatchesZig(a, &.{"@popCount(@as(i16, -1))"}); // 16 (two's complement)
+    try expectMatchesZig(a, &.{"@byteSwap(@as(u16, 0x1234))"}); // 0x3412
+    try expectMatchesZig(a, &.{"@byteSwap(@as(u32, 0x11223344))"});
+    try expectMatchesZig(a, &.{"@bitReverse(@as(u8, 0b10000000))"}); // 1
+    try expectMatchesZig(a, &.{"@bitReverse(@as(i8, 1))"}); // -128 (top bit set)
+    try expectMatchesZig(a, &.{"@clz(@as(@Vector(2, u8), .{ 1, 255 }))[0]"}); // 7
+    // A zero-length vector yields the right result type (explicit, not inferred).
+    try expectMatchesZig(a, &.{"@TypeOf(@clz(@as(@Vector(0, u8), .{}))) == @Vector(0, u4)"});
+    // @byteSwap needs a byte-multiple width.
+    try expectBothReject(a, &.{"@byteSwap(@as(u12, 1))"});
+}
+
 test "compliance: bit_not on fixed-width int" {
     try expectMatchesZig(testing.allocator, &.{"~@as(u8, 5)"});
 }

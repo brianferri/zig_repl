@@ -492,7 +492,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .align_of => sema.evalAlignOf(inst),
         .size_of => sema.evalSizeOf(inst),
         .bit_size_of => sema.evalBitSizeOf(inst),
-        .clz => sema.evalClz(inst),
+        .clz, .ctz, .pop_count => sema.evalBitCount(inst, tag),
+        .byte_swap, .bit_reverse => sema.evalByteBitReverse(inst, tag),
         .int_from_ptr => sema.evalIntFromPtr(inst),
         .int_from_enum => sema.evalIntFromEnum(inst),
         .tag_name => sema.evalTagName(inst),
@@ -2654,34 +2655,122 @@ fn evalBitSizeOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = idx };
 }
 
-/// `clz` (`@clz(x)`): count the leading zero bits of a fixed-width integer.
-/// Mirrors zirBitCount's int arm -- the result is `smallestUnsignedInt(bits)`,
-/// the narrowest unsigned type holding the maximum count. A non-negative value
-/// has `bits - bitCountAbs` leading zeros; a negative one's two's-complement top
-/// bit is set, so none.
-fn evalClz(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+/// `clz`/`ctz`/`pop_count` (`@clz`/`@ctz`/`@popCount`): count leading zeros,
+/// trailing zeros, or set bits of a fixed-width integer (or vector of them). The
+/// result scalar type is `smallestUnsignedInt(bits)` -- the narrowest unsigned
+/// type holding the maximum count. Ports zirBitCount, folding via the same
+/// `std.math.big.int.Const` methods `Value.clz`/`ctz`/`popCount` call; the REPL's
+/// scalar-only `intInfo` takes a `scalarType` first. An undef operand yields undef.
+fn evalBitCount(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const ip = sema.intern_pool;
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const operand = try sema.resolveRef(un_node.operand);
-    const operand_ty = operand.typeOf(ip).toIndex();
-    const bits = (Type.fromIndex(operand_ty).intInfo(ip) orelse {
-        try sema.writer.writeAll("@clz: expected a fixed-width integer\n");
+    const operand_ty = operand.typeOf(ip);
+    const bits = (operand_ty.scalarType(ip).intInfo(ip) orelse {
+        try sema.writer.writeAll("expected integer or vector of integers, found '");
+        try Type.print(operand_ty, ip, sema.writer);
+        try sema.writer.writeAll("'\n");
         return error.AnalysisFail;
     }).bits;
+    const result_scalar_ty = try ip.internIntType(.unsigned, Type.smallestUnsignedBits(bits));
     const val_key = ip.indexToKey(operand.index);
-    if (val_key != .int) {
-        try sema.writer.writeAll("@clz: expected a comptime-known integer\n");
+    switch (operand_ty.zigTypeTag(ip)) {
+        .vector => {
+            const vec_len = operand_ty.vectorLen(ip);
+            const result_ty = try ip.internVectorType(.{ .len = vec_len, .child = result_scalar_ty });
+            if (val_key == .undef) return .{ .index = try ip.get(.{ .undef = result_ty }) };
+            const elems = try sema.gpa.alloc(InternPool.Index, vec_len);
+            defer sema.gpa.free(elems);
+            for (elems, 0..) |*elem, i| {
+                const count = bitCountValue(tag, ip.indexToKey(InternPool.aggregateElementAt(val_key.aggregate, i)).int, bits);
+                elem.* = try ip.internInt(.{ .ty = result_scalar_ty, .storage = .{ .u64 = count } });
+            }
+            return .{ .index = try ip.internAggregate(.{ .ty = result_ty, .storage = .{ .elems = elems } }) };
+        },
+        .int => {
+            if (val_key == .undef) return .{ .index = try ip.get(.{ .undef = result_scalar_ty }) };
+            const count = bitCountValue(tag, val_key.int, bits);
+            return .{ .index = try ip.internInt(.{ .ty = result_scalar_ty, .storage = .{ .u64 = count } }) };
+        },
+        else => unreachable,
+    }
+}
+
+/// The bit count of one integer value at `bits` width, via the operand's own
+/// `std.math.big.int.Const` method -- the comptimeOp `zirBitCount` passes as
+/// `Value.clz`/`ctz`/`popCount`.
+fn bitCountValue(tag: Zir.Inst.Tag, int: InternPool.Key.Int, bits: u16) u64 {
+    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const big = int.storage.toBigInt(&space);
+    return switch (tag) {
+        .clz => big.clz(bits),
+        .ctz => big.ctz(bits),
+        .pop_count => big.popCount(bits),
+        else => unreachable,
+    };
+}
+
+/// `byte_swap`/`bit_reverse` (`@byteSwap`/`@bitReverse`): reverse the byte or bit
+/// order of a fixed-width integer (or vector of them), keeping the operand type.
+/// `@byteSwap` requires the width to be a multiple of 8. Mirrors zirByteSwap/
+/// zirBitReverse -> `arith.byteSwap`/`bitReverse`, folding via the same
+/// `std.math.big.int.Mutable` methods. An undef operand (or lane) stays undef.
+fn evalByteBitReverse(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const ip = sema.intern_pool;
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const operand = try sema.resolveRef(un_node.operand);
+    const operand_ty = operand.typeOf(ip);
+    const scalar_ty = operand_ty.scalarType(ip);
+    const info = scalar_ty.intInfo(ip) orelse {
+        try sema.writer.writeAll("expected integer or vector of integers, found '");
+        try Type.print(operand_ty, ip, sema.writer);
+        try sema.writer.writeAll("'\n");
+        return error.AnalysisFail;
+    };
+    // zirByteSwap's width check, before the fold.
+    if (tag == .byte_swap and info.bits % 8 != 0) {
+        try sema.writer.print("@byteSwap requires the number of bits to be evenly divisible by 8, but the operand has {d} bits\n", .{info.bits});
         return error.AnalysisFail;
     }
+    // arith.byteSwap/bitReverse: a whole-operand undef stays undef.
+    const val_key = ip.indexToKey(operand.index);
+    if (val_key == .undef) return operand;
+    switch (operand_ty.zigTypeTag(ip)) {
+        .int => return .{ .index = try sema.intByteBitReverse(tag, val_key.int, operand_ty.toIndex()) },
+        .vector => {
+            const len = operand_ty.vectorLen(ip);
+            const elems = try sema.gpa.alloc(InternPool.Index, len);
+            defer sema.gpa.free(elems);
+            for (elems, 0..) |*result_elem, i| {
+                const elem = InternPool.aggregateElementAt(val_key.aggregate, i);
+                const elem_key = ip.indexToKey(elem);
+                result_elem.* = if (elem_key == .undef) elem else try sema.intByteBitReverse(tag, elem_key.int, scalar_ty.toIndex());
+            }
+            return .{ .index = try ip.internAggregate(.{ .ty = operand_ty.toIndex(), .storage = .{ .elems = elems } }) };
+        },
+        else => unreachable,
+    }
+}
+
+/// Reverse one integer's byte or bit order into a two's-complement scratch sized
+/// for its width, then re-intern at `ty`. Ports `intByteSwap`/`intBitReverse`,
+/// folding via the same `std.math.big.int.Mutable` methods.
+fn intByteBitReverse(sema: *Sema, tag: Zir.Inst.Tag, int: InternPool.Key.Int, ty: InternPool.Index) Error!InternPool.Index {
+    const ip = sema.intern_pool;
+    const info = Type.fromIndex(ty).intInfo(ip).?;
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const big = val_key.int.storage.toBigInt(&space);
-    const used: u64 = @intCast(big.bitCountAbs());
-    const count: u64 = if (!big.positive and used != 0) 0 else @as(u64, bits) - used;
-    const result_bits: u16 = if (bits == 0) 0 else std.math.log2_int(u16, bits) + 1;
-    const result_ty = try ip.internIntType(.unsigned, result_bits);
-    const idx = try ip.internInt(.{ .ty = result_ty, .storage = .{ .u64 = count } });
-    return .{ .index = idx };
+    const big = int.storage.toBigInt(&space);
+    const limbs = try sema.gpa.alloc(std.math.big.Limb, std.math.big.int.calcTwosCompLimbCount(info.bits));
+    defer sema.gpa.free(limbs);
+    var result: BigIntMutable = .{ .limbs = limbs, .positive = undefined, .len = undefined };
+    switch (tag) {
+        .byte_swap => result.byteSwap(big, info.signedness, @divExact(info.bits, 8)),
+        .bit_reverse => result.bitReverse(big, info.signedness, info.bits),
+        else => unreachable,
+    }
+    return try ip.internIntValue(ty, result.toConst());
 }
 
 /// Reserve the next `size` bytes of the modeled address space at `align_bytes`

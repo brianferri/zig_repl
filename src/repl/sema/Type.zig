@@ -192,6 +192,15 @@ pub fn childType(ty: Type, pool: *const InternPool) Type {
     return .fromIndex(pool.childType(ty.index));
 }
 
+/// The number of bits an unsigned integer needs to hold `max`. Mirrors
+/// `Type.smallestUnsignedBits` (the width behind `smallestUnsignedInt`).
+pub fn smallestUnsignedBits(max: u64) u16 {
+    return switch (max) {
+        0 => 0,
+        else => @as(u16, 1) + std.math.log2_int(u64, max),
+    };
+}
+
 /// Bit width of a float type. Mirrors `Type.floatBits`; `c_longdouble` resolves
 /// against the host target, like the sibling `intInfo` c-type arms.
 pub fn floatBits(ty: Type) u16 {
