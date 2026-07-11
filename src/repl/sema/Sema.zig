@@ -632,6 +632,11 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .elem_ptr, .elem_ptr_node => sema.evalElemPtrNode(inst),
         .elem_val => sema.evalElemVal(inst),
         .memcpy => sema.evalMemcpy(inst),
+        .compile_error => sema.evalCompileError(inst),
+        .set_eval_branch_quota => sema.evalSetEvalBranchQuota(inst),
+        .set_runtime_safety => sema.evalSetRuntimeSafety(inst),
+        .type_name => sema.evalTypeName(inst),
+        .error_name => sema.evalErrorName(inst),
         .slice_start => sema.evalSliceStart(inst),
         .slice_end => sema.evalSliceEnd(inst),
         .slice_sentinel => sema.evalSliceSentinel(inst),
@@ -7935,6 +7940,55 @@ fn resolveConstStringIntern(sema: *Sema, ref: Zir.Inst.Ref) Error!InternPool.Nul
         b.* = @intCast(ip.indexToKey(elem).int.storage.u64);
     }
     return try ip.getOrPutString(sema.gpa, bytes);
+}
+
+/// `@compileError(msg)`: emit `msg` as a diagnostic and fail. Mirrors
+/// zirCompileError -> `resolveConstString` + `fail("{s}", msg)`.
+fn evalCompileError(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const msg = try sema.resolveConstStringIntern(un_node.operand);
+    try sema.writer.print("{s}\n", .{sema.intern_pool.stringSlice(msg)});
+    return error.AnalysisFail;
+}
+
+/// `@setEvalBranchQuota(n)`: raise the comptime branch-count ceiling. Mirrors
+/// zirSetEvalBranchQuota; the `allow_memoize` clear has no analog here, as this
+/// evaluator does not memoize comptime calls.
+fn evalSetEvalBranchQuota(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const quota = try sema.resolveInt(try sema.resolveRef(un_node.operand), .u32_type, "@setEvalBranchQuota");
+    sema.branch_quota = @max(sema.branch_quota, @as(u32, @intCast(quota)));
+    return null;
+}
+
+/// `@setRuntimeSafety(b)`: validate the bool operand, then no-op -- this
+/// comptime-only evaluator emits no runtime safety checks to toggle. Mirrors
+/// zirSetRuntimeSafety minus the `block.want_safety` write (no runtime block).
+fn evalSetRuntimeSafety(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    _ = try sema.coerceValueToType(try sema.resolveRef(un_node.operand), .bool_type, "@setRuntimeSafety");
+    return null;
+}
+
+/// `@typeName(T)`: the fully-qualified type name as a `*const [N:0]u8`. Mirrors
+/// zirTypeName -> `getOrPutStringFmt("{f}", ty.fmt)` -> `addNullTerminatedStrLit`.
+fn evalTypeName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const ty = try sema.resolveDestType(un_node.operand, "@typeName");
+    var name: std.Io.Writer.Allocating = .init(sema.gpa);
+    defer name.deinit();
+    try Type.print(Type.fromIndex(ty), sema.intern_pool, &name.writer);
+    return try sema.internStringLiteral(name.written());
+}
+
+/// `@errorName(e)`: the error's name as a `*const [N:0]u8`. Mirrors zirErrorName's
+/// comptime path: coerce to `anyerror`, read `err.name`, `addNullTerminatedStrLit`.
+fn evalErrorName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const operand = try sema.coerceValueToType(try sema.resolveRef(un_node.operand), .anyerror_type, "@errorName");
+    const name = ip.indexToKey(operand.index).err.name;
+    return try sema.internStringLiteral(ip.stringSlice(name));
 }
 
 /// `has_field` (`@hasField(T, "name")`): whether type `T` has a field named

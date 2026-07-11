@@ -465,6 +465,28 @@ test "compliance: an error value widens into a superset error type" {
     try expectMatchesZig(a, &.{"blk: { const S = error{ A, B }; const e: S = error.A; const w: anyerror = e; break :blk w; }"});
 }
 
+test "compliance: @typeName and @errorName produce string values" {
+    // The result is a `*const [N:0]u8`; deref or index to compare the bytes. Only
+    // primitive type names are canonical across contexts (an anonymous struct's
+    // qualified name depends on where it is declared).
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"@typeName(u32).*"});
+    try expectMatchesZig(a, &.{"@typeName(?u8).*"});
+    try expectMatchesZig(a, &.{"@typeName(u32)[1]"});
+    try expectMatchesZig(a, &.{"@errorName(error.Foo).*"});
+    try expectMatchesZig(a, &.{"@errorName(error.Boom)[0]"});
+}
+
+test "compliance: @setEvalBranchQuota and @setRuntimeSafety are accepted no-ops" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"blk: { @setEvalBranchQuota(5000); break :blk 2 + 2; }"});
+    try expectMatchesZig(a, &.{"blk: { @setRuntimeSafety(false); break :blk 7; }"});
+}
+
+test "compliance: @compileError fails on both sides" {
+    try expectBothReject(testing.allocator, &.{"blk: { @compileError(\"boom\"); break :blk 1; }"});
+}
+
 test "compliance: @intCast widen" {
     try expectMatchesZig(testing.allocator, &.{"@as(u32, @intCast(@as(u8, 200)))"});
 }
