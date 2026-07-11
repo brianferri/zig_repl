@@ -487,6 +487,23 @@ test "compliance: @compileError fails on both sides" {
     try expectBothReject(testing.allocator, &.{"blk: { @compileError(\"boom\"); break :blk 1; }"});
 }
 
+test "compliance: overflow-arithmetic builtins return .{ wrapped, overflow }" {
+    // Index the 2-tuple result: [0] is the wrapped value, [1] the u1 overflow bit.
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"@addWithOverflow(@as(u8, 200), @as(u8, 100))[0]"});
+    try expectMatchesZig(a, &.{"@addWithOverflow(@as(u8, 200), @as(u8, 100))[1]"});
+    try expectMatchesZig(a, &.{"@addWithOverflow(@as(u8, 5), @as(u8, 3))[1]"});
+    try expectMatchesZig(a, &.{"@subWithOverflow(@as(u8, 5), @as(u8, 10))[0]"});
+    try expectMatchesZig(a, &.{"@mulWithOverflow(@as(u8, 20), @as(u8, 20))[0]"});
+    try expectMatchesZig(a, &.{"@mulWithOverflow(@as(u8, 20), @as(u8, 20))[1]"});
+    try expectMatchesZig(a, &.{"@shlWithOverflow(@as(u8, 64), 2)[0]"});
+    try expectMatchesZig(a, &.{"@shlWithOverflow(@as(u8, 64), 2)[1]"});
+    // Element-wise for vectors.
+    try expectMatchesZig(a, &.{"@addWithOverflow(@as(@Vector(2, u8), .{ 200, 5 }), @as(@Vector(2, u8), .{ 100, 3 }))[0]"});
+    // A zero operand returns the other unchanged with no overflow.
+    try expectMatchesZig(a, &.{"@addWithOverflow(@as(u8, 0), @as(u8, 7))[0]"});
+}
+
 test "compliance: @intCast widen" {
     try expectMatchesZig(testing.allocator, &.{"@as(u32, @intCast(@as(u8, 200)))"});
 }

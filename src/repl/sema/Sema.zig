@@ -796,6 +796,24 @@ pub fn aggregateSplatValue(sema: *Sema, ty: Type, repeated_elem: Value) Error!Va
     return .fromIndex(try sema.intern_pool.internAggregate(.{ .ty = ty.index, .storage = .{ .repeated_elem = repeated_elem.index } }));
 }
 
+/// Broadcast `val` across `ty` when it is a vector; otherwise return `val`
+/// unchanged. Mirrors the compiler's `Sema.splat`.
+fn splat(sema: *Sema, ty: Type, val: Value) Error!Value {
+    if (ty.zigTypeTag(sema.intern_pool) != .vector) return val;
+    return sema.aggregateSplatValue(ty, val);
+}
+
+/// The `.{ ty, u1|@Vector(N,u1) }` result tuple the `@*WithOverflow` builtins
+/// produce. Mirrors `overflowArithmeticTupleType`.
+fn overflowArithmeticTupleType(sema: *Sema, ty: Type) Error!Type {
+    const ip = sema.intern_pool;
+    const ov_ty: Type = if (ty.zigTypeTag(ip) == .vector)
+        try sema.vectorType(.{ .len = ty.vectorLen(ip), .child = .u1_type })
+    else
+        .fromIndex(.u1_type);
+    return .fromIndex(try ip.internTupleType(&.{ ty.index, ov_ty.index }));
+}
+
 pub fn aggregateValue(sema: *Sema, ty: Type, elems: []const InternPool.Index) Error!Value {
     return .fromIndex(try sema.intern_pool.internAggregate(.{ .ty = ty.index, .storage = .{ .elems = elems } }));
 }
@@ -2532,7 +2550,7 @@ fn evalNegate(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value
     }
 
     const zero_scalar = try sema.intValue_u64(scalar_ty, 0);
-    const zero = if (ty.zigTypeTag(ip) == .vector) try sema.aggregateSplatValue(ty, zero_scalar) else zero_scalar;
+    const zero = try sema.splat(ty, zero_scalar);
     return switch (tag) {
         .negate => try arith.sub(sema, ty, zero, operand),
         .negate_wrap => try arith.subWrap(sema, ty, zero, operand),
@@ -11012,6 +11030,120 @@ fn evalClosureGet(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Valu
     return Value{ .index = captures[extended.small] };
 }
 
+/// `@addWithOverflow`/`@subWithOverflow`/`@mulWithOverflow`/`@shlWithOverflow`:
+/// return `.{ wrapped_result, overflow_bit }`, a 2-tuple of the peer type (or the
+/// lhs type for shl) and `u1`/`@Vector(N, u1)`. Mirrors zirOverflowArithmetic's
+/// comptime path. Every operand is a known value, so the runtime AIR branches and
+/// the `1 *` undef-preservation short-circuit drop; the shift amount's bounds are
+/// enforced by coercing the rhs to the lhs's `Log2Int` (a too-large or negative
+/// amount does not fit that type). `checkVectorizableBinaryOperands` is subsumed by
+/// the peer-type resolution / rhs coercion, which reject mismatched shapes.
+fn evalOverflowArithmetic(sema: *Sema, extended: Zir.Inst.Extended.InstData, opcode: Zir.Inst.Extended) Error!?Value {
+    const ip = sema.intern_pool;
+    const extra = sema.zir.extraData(Zir.Inst.BinNode, extended.operand).data;
+    const uncasted_lhs = try sema.resolveRef(extra.lhs);
+    const uncasted_rhs = try sema.resolveRef(extra.rhs);
+    const lhs_ty = Value.typeOf(uncasted_lhs, ip);
+
+    const op_name = switch (opcode) {
+        .add_with_overflow => "@addWithOverflow",
+        .sub_with_overflow => "@subWithOverflow",
+        .mul_with_overflow => "@mulWithOverflow",
+        .shl_with_overflow => "@shlWithOverflow",
+        else => unreachable,
+    };
+
+    const dest_ty = if (opcode == .shl_with_overflow)
+        lhs_ty
+    else
+        try sema.resolveArithPeerType(uncasted_lhs, uncasted_rhs, op_name);
+    const rhs_dest_ty: Type = if (opcode == .shl_with_overflow)
+        .fromIndex((try sema.log2IntType(lhs_ty.index)).?)
+    else
+        dest_ty;
+
+    const lhs = try sema.coerceValueToType(uncasted_lhs, dest_ty.index, op_name);
+    const rhs = try sema.coerceValueToType(uncasted_rhs, rhs_dest_ty.index, op_name);
+
+    if (dest_ty.scalarType(ip).zigTypeTag(ip) != .int) {
+        try sema.writer.print("{s}: expected vector of integers or integer tag type, found '", .{op_name});
+        try Type.print(dest_ty, ip, sema.writer);
+        try sema.writer.writeAll("'\n");
+        return error.AnalysisFail;
+    }
+
+    // The result is a `.{ dest_ty, u1|@Vector(N,u1) }` tuple; `overflow_ty` is its
+    // second field.
+    const tuple_ty = try sema.overflowArithmeticTupleType(dest_ty);
+    const overflow_ty: Type = .fromIndex(ip.indexToKey(tuple_ty.index).tuple_type.types[1]);
+    const zero_overflow = try sema.splat(overflow_ty, Value.zero_u1);
+    const undef: Value = .{ .index = .undef };
+
+    var wrapped: Value = undefined;
+    var overflow_bit: Value = undefined;
+    switch (opcode) {
+        // A zero operand returns the other unchanged (defined) with no overflow,
+        // even if that other operand is undef; otherwise an undef operand poisons
+        // both results.
+        .add_with_overflow => {
+            if (!lhs.isUndef(ip) and lhs.compareAllWithZero(.eq, ip)) {
+                wrapped = rhs;
+                overflow_bit = zero_overflow;
+            } else if (!rhs.isUndef(ip) and rhs.compareAllWithZero(.eq, ip)) {
+                wrapped = lhs;
+                overflow_bit = zero_overflow;
+            } else if (lhs.isUndef(ip) or rhs.isUndef(ip)) {
+                wrapped = undef;
+                overflow_bit = undef;
+            } else {
+                const r = try arith.addWithOverflow(sema, dest_ty, lhs, rhs);
+                wrapped = r.wrapped_result;
+                overflow_bit = r.overflow_bit;
+            }
+        },
+        .sub_with_overflow => {
+            if (rhs.isUndef(ip)) {
+                wrapped = undef;
+                overflow_bit = undef;
+            } else if (rhs.compareAllWithZero(.eq, ip)) {
+                wrapped = lhs;
+                overflow_bit = zero_overflow;
+            } else if (lhs.isUndef(ip)) {
+                wrapped = undef;
+                overflow_bit = undef;
+            } else {
+                const r = try arith.subWithOverflow(sema, dest_ty, lhs, rhs);
+                wrapped = r.wrapped_result;
+                overflow_bit = r.overflow_bit;
+            }
+        },
+        .mul_with_overflow => {
+            if (!lhs.isUndef(ip) and lhs.compareAllWithZero(.eq, ip)) {
+                wrapped = lhs;
+                overflow_bit = zero_overflow;
+            } else if (!rhs.isUndef(ip) and rhs.compareAllWithZero(.eq, ip)) {
+                wrapped = rhs;
+                overflow_bit = zero_overflow;
+            } else if (lhs.isUndef(ip) or rhs.isUndef(ip)) {
+                wrapped = undef;
+                overflow_bit = undef;
+            } else {
+                const r = try arith.mulWithOverflow(sema, dest_ty, lhs, rhs);
+                wrapped = r.wrapped_result;
+                overflow_bit = r.overflow_bit;
+            }
+        },
+        .shl_with_overflow => {
+            const r = try arith.shlWithOverflow(sema, lhs_ty, lhs, rhs);
+            wrapped = r.wrapped_result;
+            overflow_bit = r.overflow_bit;
+        },
+        else => unreachable,
+    }
+
+    return try sema.aggregateValue(tuple_ty, &.{ wrapped.index, overflow_bit.index });
+}
+
 fn evalTypeofPeer(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.TypeOfPeer, extended.operand);
@@ -11104,6 +11236,11 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .in_comptime => return Value.bool_false,
 
         .select => return sema.evalSelect(extended),
+        .add_with_overflow,
+        .sub_with_overflow,
+        .mul_with_overflow,
+        .shl_with_overflow,
+        => return sema.evalOverflowArithmetic(extended, extended.opcode),
         .reify_tuple => return sema.evalReifyTuple(extended),
         .reify_pointer => return sema.evalReifyPointer(extended),
         .reify_pointer_sentinel_ty => return sema.evalReifyPointerSentinelTy(extended),
