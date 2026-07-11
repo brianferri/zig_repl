@@ -183,6 +183,362 @@ pub fn absScalar(val: Value, ty: Type, pool: *InternPool, arena: std.mem.Allocat
     }
 }
 
+// The unary float builtins. Each pair ports the compiler's `Value.<op>` /
+// `<op>Scalar`: a vector folds elementwise into an arena buffer, a scalar folds
+// directly via the `floatBits` switch over `toFloat` at each width.
+
+pub fn sqrt(val: Value, float_type: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (float_type.zigTypeTag(pool) == .vector) {
+        const result_data = try arena.alloc(InternPool.Index, float_type.vectorLen(pool));
+        const scalar_ty = float_type.scalarType(pool);
+        for (result_data, 0..) |*scalar, i| {
+            const elem_val = try val.elemValue(pool, i);
+            scalar.* = (try sqrtScalar(elem_val, scalar_ty, pool)).index;
+        }
+        return .fromIndex(try pool.internAggregate(.{ .ty = float_type.index, .storage = .{ .elems = result_data } }));
+    }
+    return sqrtScalar(val, float_type, pool);
+}
+
+pub fn sqrtScalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (float_type.floatBits()) {
+        16 => .{ .f16 = @sqrt(val.toFloat(f16, pool)) },
+        32 => .{ .f32 = @sqrt(val.toFloat(f32, pool)) },
+        64 => .{ .f64 = @sqrt(val.toFloat(f64, pool)) },
+        80 => .{ .f80 = @sqrt(val.toFloat(f80, pool)) },
+        128 => .{ .f128 = @sqrt(val.toFloat(f128, pool)) },
+        else => unreachable,
+    };
+    return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
+}
+
+pub fn sin(val: Value, float_type: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (float_type.zigTypeTag(pool) == .vector) {
+        const result_data = try arena.alloc(InternPool.Index, float_type.vectorLen(pool));
+        const scalar_ty = float_type.scalarType(pool);
+        for (result_data, 0..) |*scalar, i| {
+            const elem_val = try val.elemValue(pool, i);
+            scalar.* = (try sinScalar(elem_val, scalar_ty, pool)).index;
+        }
+        return .fromIndex(try pool.internAggregate(.{ .ty = float_type.index, .storage = .{ .elems = result_data } }));
+    }
+    return sinScalar(val, float_type, pool);
+}
+
+pub fn sinScalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (float_type.floatBits()) {
+        16 => .{ .f16 = @sin(val.toFloat(f16, pool)) },
+        32 => .{ .f32 = @sin(val.toFloat(f32, pool)) },
+        64 => .{ .f64 = @sin(val.toFloat(f64, pool)) },
+        80 => .{ .f80 = @sin(val.toFloat(f80, pool)) },
+        128 => .{ .f128 = @sin(val.toFloat(f128, pool)) },
+        else => unreachable,
+    };
+    return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
+}
+
+pub fn cos(val: Value, float_type: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (float_type.zigTypeTag(pool) == .vector) {
+        const result_data = try arena.alloc(InternPool.Index, float_type.vectorLen(pool));
+        const scalar_ty = float_type.scalarType(pool);
+        for (result_data, 0..) |*scalar, i| {
+            const elem_val = try val.elemValue(pool, i);
+            scalar.* = (try cosScalar(elem_val, scalar_ty, pool)).index;
+        }
+        return .fromIndex(try pool.internAggregate(.{ .ty = float_type.index, .storage = .{ .elems = result_data } }));
+    }
+    return cosScalar(val, float_type, pool);
+}
+
+pub fn cosScalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (float_type.floatBits()) {
+        16 => .{ .f16 = @cos(val.toFloat(f16, pool)) },
+        32 => .{ .f32 = @cos(val.toFloat(f32, pool)) },
+        64 => .{ .f64 = @cos(val.toFloat(f64, pool)) },
+        80 => .{ .f80 = @cos(val.toFloat(f80, pool)) },
+        128 => .{ .f128 = @cos(val.toFloat(f128, pool)) },
+        else => unreachable,
+    };
+    return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
+}
+
+pub fn tan(val: Value, float_type: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (float_type.zigTypeTag(pool) == .vector) {
+        const result_data = try arena.alloc(InternPool.Index, float_type.vectorLen(pool));
+        const scalar_ty = float_type.scalarType(pool);
+        for (result_data, 0..) |*scalar, i| {
+            const elem_val = try val.elemValue(pool, i);
+            scalar.* = (try tanScalar(elem_val, scalar_ty, pool)).index;
+        }
+        return .fromIndex(try pool.internAggregate(.{ .ty = float_type.index, .storage = .{ .elems = result_data } }));
+    }
+    return tanScalar(val, float_type, pool);
+}
+
+pub fn tanScalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (float_type.floatBits()) {
+        16 => .{ .f16 = @tan(val.toFloat(f16, pool)) },
+        32 => .{ .f32 = @tan(val.toFloat(f32, pool)) },
+        64 => .{ .f64 = @tan(val.toFloat(f64, pool)) },
+        80 => .{ .f80 = @tan(val.toFloat(f80, pool)) },
+        128 => .{ .f128 = @tan(val.toFloat(f128, pool)) },
+        else => unreachable,
+    };
+    return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
+}
+
+pub fn exp(val: Value, float_type: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (float_type.zigTypeTag(pool) == .vector) {
+        const result_data = try arena.alloc(InternPool.Index, float_type.vectorLen(pool));
+        const scalar_ty = float_type.scalarType(pool);
+        for (result_data, 0..) |*scalar, i| {
+            const elem_val = try val.elemValue(pool, i);
+            scalar.* = (try expScalar(elem_val, scalar_ty, pool)).index;
+        }
+        return .fromIndex(try pool.internAggregate(.{ .ty = float_type.index, .storage = .{ .elems = result_data } }));
+    }
+    return expScalar(val, float_type, pool);
+}
+
+pub fn expScalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (float_type.floatBits()) {
+        16 => .{ .f16 = @exp(val.toFloat(f16, pool)) },
+        32 => .{ .f32 = @exp(val.toFloat(f32, pool)) },
+        64 => .{ .f64 = @exp(val.toFloat(f64, pool)) },
+        80 => .{ .f80 = @exp(val.toFloat(f80, pool)) },
+        128 => .{ .f128 = @exp(val.toFloat(f128, pool)) },
+        else => unreachable,
+    };
+    return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
+}
+
+pub fn exp2(val: Value, float_type: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (float_type.zigTypeTag(pool) == .vector) {
+        const result_data = try arena.alloc(InternPool.Index, float_type.vectorLen(pool));
+        const scalar_ty = float_type.scalarType(pool);
+        for (result_data, 0..) |*scalar, i| {
+            const elem_val = try val.elemValue(pool, i);
+            scalar.* = (try exp2Scalar(elem_val, scalar_ty, pool)).index;
+        }
+        return .fromIndex(try pool.internAggregate(.{ .ty = float_type.index, .storage = .{ .elems = result_data } }));
+    }
+    return exp2Scalar(val, float_type, pool);
+}
+
+pub fn exp2Scalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (float_type.floatBits()) {
+        16 => .{ .f16 = @exp2(val.toFloat(f16, pool)) },
+        32 => .{ .f32 = @exp2(val.toFloat(f32, pool)) },
+        64 => .{ .f64 = @exp2(val.toFloat(f64, pool)) },
+        80 => .{ .f80 = @exp2(val.toFloat(f80, pool)) },
+        128 => .{ .f128 = @exp2(val.toFloat(f128, pool)) },
+        else => unreachable,
+    };
+    return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
+}
+
+pub fn log(val: Value, float_type: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (float_type.zigTypeTag(pool) == .vector) {
+        const result_data = try arena.alloc(InternPool.Index, float_type.vectorLen(pool));
+        const scalar_ty = float_type.scalarType(pool);
+        for (result_data, 0..) |*scalar, i| {
+            const elem_val = try val.elemValue(pool, i);
+            scalar.* = (try logScalar(elem_val, scalar_ty, pool)).index;
+        }
+        return .fromIndex(try pool.internAggregate(.{ .ty = float_type.index, .storage = .{ .elems = result_data } }));
+    }
+    return logScalar(val, float_type, pool);
+}
+
+pub fn logScalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (float_type.floatBits()) {
+        16 => .{ .f16 = @log(val.toFloat(f16, pool)) },
+        32 => .{ .f32 = @log(val.toFloat(f32, pool)) },
+        64 => .{ .f64 = @log(val.toFloat(f64, pool)) },
+        80 => .{ .f80 = @log(val.toFloat(f80, pool)) },
+        128 => .{ .f128 = @log(val.toFloat(f128, pool)) },
+        else => unreachable,
+    };
+    return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
+}
+
+pub fn log2(val: Value, float_type: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (float_type.zigTypeTag(pool) == .vector) {
+        const result_data = try arena.alloc(InternPool.Index, float_type.vectorLen(pool));
+        const scalar_ty = float_type.scalarType(pool);
+        for (result_data, 0..) |*scalar, i| {
+            const elem_val = try val.elemValue(pool, i);
+            scalar.* = (try log2Scalar(elem_val, scalar_ty, pool)).index;
+        }
+        return .fromIndex(try pool.internAggregate(.{ .ty = float_type.index, .storage = .{ .elems = result_data } }));
+    }
+    return log2Scalar(val, float_type, pool);
+}
+
+pub fn log2Scalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (float_type.floatBits()) {
+        16 => .{ .f16 = @log2(val.toFloat(f16, pool)) },
+        32 => .{ .f32 = @log2(val.toFloat(f32, pool)) },
+        64 => .{ .f64 = @log2(val.toFloat(f64, pool)) },
+        80 => .{ .f80 = @log2(val.toFloat(f80, pool)) },
+        128 => .{ .f128 = @log2(val.toFloat(f128, pool)) },
+        else => unreachable,
+    };
+    return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
+}
+
+pub fn log10(val: Value, float_type: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (float_type.zigTypeTag(pool) == .vector) {
+        const result_data = try arena.alloc(InternPool.Index, float_type.vectorLen(pool));
+        const scalar_ty = float_type.scalarType(pool);
+        for (result_data, 0..) |*scalar, i| {
+            const elem_val = try val.elemValue(pool, i);
+            scalar.* = (try log10Scalar(elem_val, scalar_ty, pool)).index;
+        }
+        return .fromIndex(try pool.internAggregate(.{ .ty = float_type.index, .storage = .{ .elems = result_data } }));
+    }
+    return log10Scalar(val, float_type, pool);
+}
+
+pub fn log10Scalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (float_type.floatBits()) {
+        16 => .{ .f16 = @log10(val.toFloat(f16, pool)) },
+        32 => .{ .f32 = @log10(val.toFloat(f32, pool)) },
+        64 => .{ .f64 = @log10(val.toFloat(f64, pool)) },
+        80 => .{ .f80 = @log10(val.toFloat(f80, pool)) },
+        128 => .{ .f128 = @log10(val.toFloat(f128, pool)) },
+        else => unreachable,
+    };
+    return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
+}
+
+pub fn floor(val: Value, float_type: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (float_type.zigTypeTag(pool) == .vector) {
+        const result_data = try arena.alloc(InternPool.Index, float_type.vectorLen(pool));
+        const scalar_ty = float_type.scalarType(pool);
+        for (result_data, 0..) |*scalar, i| {
+            const elem_val = try val.elemValue(pool, i);
+            scalar.* = (try floorScalar(elem_val, scalar_ty, pool)).index;
+        }
+        return .fromIndex(try pool.internAggregate(.{ .ty = float_type.index, .storage = .{ .elems = result_data } }));
+    }
+    return floorScalar(val, float_type, pool);
+}
+
+pub fn floorScalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (float_type.floatBits()) {
+        16 => .{ .f16 = @floor(val.toFloat(f16, pool)) },
+        32 => .{ .f32 = @floor(val.toFloat(f32, pool)) },
+        64 => .{ .f64 = @floor(val.toFloat(f64, pool)) },
+        80 => .{ .f80 = @floor(val.toFloat(f80, pool)) },
+        128 => .{ .f128 = @floor(val.toFloat(f128, pool)) },
+        else => unreachable,
+    };
+    return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
+}
+
+pub fn ceil(val: Value, float_type: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (float_type.zigTypeTag(pool) == .vector) {
+        const result_data = try arena.alloc(InternPool.Index, float_type.vectorLen(pool));
+        const scalar_ty = float_type.scalarType(pool);
+        for (result_data, 0..) |*scalar, i| {
+            const elem_val = try val.elemValue(pool, i);
+            scalar.* = (try ceilScalar(elem_val, scalar_ty, pool)).index;
+        }
+        return .fromIndex(try pool.internAggregate(.{ .ty = float_type.index, .storage = .{ .elems = result_data } }));
+    }
+    return ceilScalar(val, float_type, pool);
+}
+
+pub fn ceilScalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (float_type.floatBits()) {
+        16 => .{ .f16 = @ceil(val.toFloat(f16, pool)) },
+        32 => .{ .f32 = @ceil(val.toFloat(f32, pool)) },
+        64 => .{ .f64 = @ceil(val.toFloat(f64, pool)) },
+        80 => .{ .f80 = @ceil(val.toFloat(f80, pool)) },
+        128 => .{ .f128 = @ceil(val.toFloat(f128, pool)) },
+        else => unreachable,
+    };
+    return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
+}
+
+pub fn round(val: Value, float_type: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (float_type.zigTypeTag(pool) == .vector) {
+        const result_data = try arena.alloc(InternPool.Index, float_type.vectorLen(pool));
+        const scalar_ty = float_type.scalarType(pool);
+        for (result_data, 0..) |*scalar, i| {
+            const elem_val = try val.elemValue(pool, i);
+            scalar.* = (try roundScalar(elem_val, scalar_ty, pool)).index;
+        }
+        return .fromIndex(try pool.internAggregate(.{ .ty = float_type.index, .storage = .{ .elems = result_data } }));
+    }
+    return roundScalar(val, float_type, pool);
+}
+
+pub fn roundScalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (float_type.floatBits()) {
+        16 => .{ .f16 = @round(val.toFloat(f16, pool)) },
+        32 => .{ .f32 = @round(val.toFloat(f32, pool)) },
+        64 => .{ .f64 = @round(val.toFloat(f64, pool)) },
+        80 => .{ .f80 = @round(val.toFloat(f80, pool)) },
+        128 => .{ .f128 = @round(val.toFloat(f128, pool)) },
+        else => unreachable,
+    };
+    return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
+}
+
+pub fn trunc(val: Value, float_type: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (float_type.zigTypeTag(pool) == .vector) {
+        const result_data = try arena.alloc(InternPool.Index, float_type.vectorLen(pool));
+        const scalar_ty = float_type.scalarType(pool);
+        for (result_data, 0..) |*scalar, i| {
+            const elem_val = try val.elemValue(pool, i);
+            scalar.* = (try truncScalar(elem_val, scalar_ty, pool)).index;
+        }
+        return .fromIndex(try pool.internAggregate(.{ .ty = float_type.index, .storage = .{ .elems = result_data } }));
+    }
+    return truncScalar(val, float_type, pool);
+}
+
+pub fn truncScalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (float_type.floatBits()) {
+        16 => .{ .f16 = @trunc(val.toFloat(f16, pool)) },
+        32 => .{ .f32 = @trunc(val.toFloat(f32, pool)) },
+        64 => .{ .f64 = @trunc(val.toFloat(f64, pool)) },
+        80 => .{ .f80 = @trunc(val.toFloat(f80, pool)) },
+        128 => .{ .f128 = @trunc(val.toFloat(f128, pool)) },
+        else => unreachable,
+    };
+    return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
+}
+
+/// The value as a `std.math.big.int.Const`, borrowing into `space` for the
+/// `.u64`/`.i64` storage forms. Ports `Value.toBigInt` (the REPL stores no lazy
+/// int, so it reads `int.storage.toBigInt` directly).
+pub fn toBigInt(val: Value, space: *InternPool.Key.Int.Storage.BigIntSpace, pool: *const InternPool) std.math.big.int.Const {
+    return pool.indexToKey(val.index).int.storage.toBigInt(space);
+}
+
+/// `@clz`/`@ctz`/`@popCount` of one integer value at `ty`'s width, via the same
+/// `std.math.big.int.Const` methods. Port `Value.clz`/`ctz`/`popCount`.
+pub fn clz(val: Value, ty: Type, pool: *const InternPool) u64 {
+    var bigint_buf: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const bigint = val.toBigInt(&bigint_buf, pool);
+    return bigint.clz(ty.intInfo(pool).?.bits);
+}
+
+pub fn ctz(val: Value, ty: Type, pool: *const InternPool) u64 {
+    var bigint_buf: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const bigint = val.toBigInt(&bigint_buf, pool);
+    return bigint.ctz(ty.intInfo(pool).?.bits);
+}
+
+pub fn popCount(val: Value, ty: Type, pool: *const InternPool) u64 {
+    var bigint_buf: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const bigint = val.toBigInt(&bigint_buf, pool);
+    return @intCast(bigint.popCount(ty.intInfo(pool).?.bits));
+}
+
 pub const void_value: Value = .{ .index = .void_value };
 pub const bool_true: Value = .{ .index = .bool_true };
 pub const bool_false: Value = .{ .index = .bool_false };
