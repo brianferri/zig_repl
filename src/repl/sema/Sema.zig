@@ -2188,18 +2188,34 @@ fn checkNumericType(sema: *Sema, ty: Type) Error!void {
     }
 }
 
-/// `@min`/`@max`: fold two numeric operands, refining the result type to the
-/// narrowest that holds it (`@max(u32, i64)` -> `u63`). Ports `analyzeMinMax`
-/// (`src/Sema.zig`); every operand is comptime-known here, so only the runtime
-/// path is dropped.
-fn evalMinMax(sema: *Sema, inst: Zir.Inst.Index, comptime op: enum { min, max }) Error!?Value {
-    const ip = sema.intern_pool;
+/// The `@min` / `@max` selector, shared across the tag, extended, and analysis
+/// entry points so the `comptime op` parameter is one type (a bare anonymous enum
+/// would mint a distinct type per signature and not cross function boundaries).
+const MinMax = enum { min, max };
+
+/// `min`/`max` (two-operand `@min`/`@max`): resolve both operands and fold.
+fn evalMinMax(sema: *Sema, inst: Zir.Inst.Index, comptime op: MinMax) Error!?Value {
     const bin = sema.binData(inst);
     const operands = [_]Value{ try sema.resolveRef(bin.lhs), try sema.resolveRef(bin.rhs) };
+    return try sema.analyzeMinMax(&operands, op);
+}
+
+/// Fold N numeric operands, refining the result type to the narrowest that holds it
+/// (`@max(u32, i64)` -> `u63`). Shared by the 2-operand `min`/`max` tags and the
+/// N-operand `min_multi`/`max_multi` extended opcodes. Ports `analyzeMinMax`
+/// (`src/Sema.zig`); every operand is comptime-known here, so only the runtime path
+/// is dropped.
+fn analyzeMinMax(sema: *Sema, operands: []const Value, comptime op: MinMax) Error!Value {
+    const ip = sema.intern_pool;
     const opFunc = switch (op) {
         .min => Value.numberMin,
         .max => Value.numberMax,
     };
+
+    if (operands.len == 1) {
+        try sema.checkNumericType(Value.typeOf(operands[0], ip));
+        return operands[0];
+    }
 
     const vector_len: ?u64 = vec_len: {
         const first_ty = Value.typeOf(operands[0], ip);
@@ -2375,6 +2391,17 @@ fn evalMinMax(sema: *Sema, inst: Zir.Inst.Index, comptime op: enum { min, max })
     }
     if (vector_len == null) return Value{ .index = elems[0] };
     return try sema.aggregateValue(result_ty, elems);
+}
+
+/// `@min`/`@max` with three or more operands. AstGen emits the 2-operand form as
+/// `min`/`max` and this variadic form as `min_multi`/`max_multi`. Mirrors
+/// zirMinMaxMulti -> analyzeMinMax.
+fn evalMinMaxMulti(sema: *Sema, extended: Zir.Inst.Extended.InstData, comptime op: MinMax) Error!?Value {
+    const extra = sema.zir.extraData(Zir.Inst.NodeMultiOp, extended.operand);
+    const operand_refs = sema.zir.refSlice(extra.end, extended.small);
+    const operands = try sema.arena.alloc(Value, operand_refs.len);
+    for (operand_refs, operands) |ref, *v| v.* = try sema.resolveRef(ref);
+    return try sema.analyzeMinMax(operands, op);
 }
 
 /// `@reduce(op, vec)`: fold a vector to a scalar with the `std.lang.ReduceOp`
@@ -11241,6 +11268,8 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .mul_with_overflow,
         .shl_with_overflow,
         => return sema.evalOverflowArithmetic(extended, extended.opcode),
+        .min_multi => return sema.evalMinMaxMulti(extended, .min),
+        .max_multi => return sema.evalMinMaxMulti(extended, .max),
         .reify_tuple => return sema.evalReifyTuple(extended),
         .reify_pointer => return sema.evalReifyPointer(extended),
         .reify_pointer_sentinel_ty => return sema.evalReifyPointerSentinelTy(extended),

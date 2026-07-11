@@ -385,6 +385,19 @@ test "compliance: @min/@max fold and refine the result type" {
     try expectMatchesZig(a, &.{"@min(@as(@Vector(3, i32), .{ 1, 5, 2 }), @as(@Vector(3, i32), .{ 4, 2, 3 }))"});
 }
 
+test "compliance: variadic @min/@max fold three or more operands" {
+    // The 2-operand form is `min`/`max`; three or more is `min_multi`/`max_multi`,
+    // routed through the same fold and result-type refinement.
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"@min(3, 7, 2)"});
+    try expectMatchesZig(a, &.{"@max(3, 7, 2)"});
+    try expectMatchesZig(a, &.{"@min(9, 4, 7, 1, 6)"});
+    try expectMatchesZig(a, &.{"@min(@as(u8, 200), @as(u8, 100), @as(u8, 50))"});
+    try expectMatchesZig(a, &.{"@max(@as(u32, 5), @as(i64, -3), @as(u16, 10))"});
+    try expectMatchesZig(a, &.{"@TypeOf(@min(@as(u8, 200), @as(u8, 100), @as(u8, 50)))"});
+    try expectMatchesZig(a, &.{"@min(@as(@Vector(2, i32), .{ 1, 5 }), @as(@Vector(2, i32), .{ 4, 2 }), @as(@Vector(2, i32), .{ 3, 9 }))"});
+}
+
 test "compliance: @reduce folds a vector to a scalar" {
     // `@reduce`'s op arg is a `std.lang.ReduceOp`, so it needs std loaded --
     // use a `module_source`-backed session rather than the `zig run` harness.
