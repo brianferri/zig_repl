@@ -15,6 +15,9 @@ const Type = @import("../sema/Type.zig");
 /// sort `error{...}` member names.
 pub const Error = std.Io.Writer.Error || std.mem.Allocator.Error;
 
+/// Writes a value to `writer` with no trailing newline -- the analog of the
+/// compiler's `print_value.print`. A REPL result line appends its own
+/// terminator at the print site; diagnostics embed the value mid-message.
 pub fn render(
     value: Value,
     pool: *const InternPool,
@@ -27,29 +30,26 @@ pub fn render(
         .int => |iv| {
             var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
             const big = iv.storage.toBigInt(&space);
-            return writer.print("{f}\n", .{big});
+            return writer.print("{f}", .{big});
         },
-        .float => |fv| {
-            try renderFloat(fv, writer);
-            try writer.writeByte('\n');
-        },
-        .simple_value => |sv| writer.print("{s}\n", .{simpleValueText(sv)}),
-        .undef => writer.writeAll("undefined\n"),
+        .float => |fv| renderFloat(fv, writer),
+        .simple_value => |sv| writer.writeAll(simpleValueText(sv)),
+        .undef => writer.writeAll("undefined"),
         .opt => |o| if (o.val == .none)
-            writer.writeAll("null\n")
+            writer.writeAll("null")
         else
             render(.{ .index = o.val }, pool, writer),
-        .ptr => |p| writer.print("ptr@{d}+{d}\n", .{ @intFromEnum(p.ty), p.byte_offset }),
+        .ptr => |p| writer.print("ptr@{d}+{d}", .{ @intFromEnum(p.ty), p.byte_offset }),
         // The elements live behind the slice's `ptr` in a Sema comptime alloc the
         // renderer cannot reach (like struct fields), so render just the length.
         .slice => |s| blk: {
             var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
             const len = pool.indexToKey(s.len).int.storage.toBigInt(&space);
-            break :blk writer.print("slice[{f}]\n", .{len});
+            break :blk writer.print("slice[{f}]", .{len});
         },
-        .err => |e| writer.print("error.{s}\n", .{pool.stringSlice(e.name)}),
+        .err => |e| writer.print("error.{s}", .{pool.stringSlice(e.name)}),
         .error_union => |eu| renderErrorUnion(eu, pool, writer),
-        .func => |f| writer.print("fn@{d}\n", .{@intFromEnum(f.zir_body_inst)}),
+        .func => |f| writer.print("fn@{d}", .{@intFromEnum(f.zir_body_inst)}),
         .aggregate => |agg| renderAggregate(agg, pool, writer),
         // The tag name lives in the enum's ZIR, which the renderer cannot reach
         // (same limit as struct field names). Render the underlying integer tag --
@@ -96,7 +96,7 @@ fn renderAggregate(
         };
         try renderElemInline(elem_idx, pool, writer);
     }
-    try writer.writeAll(" }\n");
+    try writer.writeAll(" }");
 }
 
 /// Inline-print a value: same as `render` but without the trailing
@@ -129,7 +129,7 @@ fn renderErrorUnion(
     writer: *std.Io.Writer,
 ) Error!void {
     switch (eu.val) {
-        .err_name => |name| try writer.print("error.{s}\n", .{pool.stringSlice(name)}),
+        .err_name => |name| try writer.print("error.{s}", .{pool.stringSlice(name)}),
         .payload => |idx| try render(.{ .index = idx }, pool, writer),
     }
 }
@@ -144,16 +144,14 @@ fn simpleValueText(sv: InternPool.SimpleValue) []const u8 {
     };
 }
 
-/// Render a type Index as its Zig surface-syntax name with a trailing newline
-/// (the REPL-line terminator). The name itself is produced by `Type.print`,
-/// the shared type-name printer.
+/// Render a type Index as its Zig surface-syntax name, via the shared
+/// type-name printer `Type.print`.
 fn renderTypeRef(
     type_index: InternPool.Index,
     pool: *const InternPool,
     writer: *std.Io.Writer,
 ) Error!void {
     try Type.print(Type.fromIndex(type_index), pool, writer);
-    try writer.writeAll("\n");
 }
 
 /// Print each float-storage variant in its native precision. f80 has no

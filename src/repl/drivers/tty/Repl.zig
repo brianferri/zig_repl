@@ -155,6 +155,7 @@ fn evaluate(repl: *Repl, input: []const u8, stdout: *std.Io.Writer) !void {
     assert(input.len <= input_buffer_bytes);
     if (try eval.report(repl.session, input, stdout)) |value| {
         try renderValue(value, repl.session.intern_pool, stdout);
+        try stdout.writeByte('\n');
     }
 }
 

@@ -81,6 +81,7 @@ fn dispatch(input: []const u8) !void {
 fn evaluate(input: []const u8, w: *std.Io.Writer) !void {
     if (try eval.report(&session, input, w)) |value| {
         try render_value.render(value, session.intern_pool, w);
+        try w.writeByte('\n');
     }
 }
 
