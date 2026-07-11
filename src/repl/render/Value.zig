@@ -15,6 +15,26 @@ const Type = @import("../sema/Type.zig");
 /// sort `error{...}` member names.
 pub const Error = std.Io.Writer.Error || std.mem.Allocator.Error;
 
+/// A `{f}`-formattable wrapper for a value, the `Value` analogue of
+/// `Type.Formatter`: `render` needs the `InternPool`, which a bare
+/// `format(self, writer)` cannot take. Lets diagnostics write `"value '{f}'"` with
+/// `value.fmt(ip)`. OOM while rendering degrades to `<value>` (a diagnostic is
+/// best-effort and `format` yields only `Writer.Error`).
+pub const Formatter = struct {
+    value: Value,
+    pool: *const InternPool,
+    pub fn format(self: Formatter, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        render(self.value, self.pool, writer) catch |err| switch (err) {
+            error.WriteFailed => return error.WriteFailed,
+            else => try writer.writeAll("<value>"),
+        };
+    }
+};
+
+pub fn fmt(value: Value, pool: *const InternPool) Formatter {
+    return .{ .value = value, .pool = pool };
+}
+
 /// Writes a value to `writer` with no trailing newline -- the analog of the
 /// compiler's `print_value.print`. A REPL result line appends its own
 /// terminator at the print site; diagnostics embed the value mid-message.
