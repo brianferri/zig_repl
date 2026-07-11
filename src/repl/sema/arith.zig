@@ -1500,6 +1500,7 @@ const Env = struct {
     arena_state: std.heap.ArenaAllocator,
     buf: [512]u8 = undefined,
     w: std.Io.Writer = undefined,
+    block: Sema.Block = .{},
     sema: Sema = undefined,
 
     fn setup(e: *Env, gpa: Allocator) !void {
@@ -1516,6 +1517,10 @@ const Env = struct {
             .comptime_allocs = .empty,
             .namespace = null,
         };
+        // A diagnostic here builds a `LazySrcLoc` from `block`; it is never resolved
+        // in these unit tests (no AST), so a default block is enough to avoid
+        // dereferencing an undefined `sema.block`.
+        e.sema.block = &e.block;
     }
     fn deinit(e: *Env) void {
         e.arena_state.deinit();

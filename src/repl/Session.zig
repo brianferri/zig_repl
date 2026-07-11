@@ -10,6 +10,8 @@ const assert = std.debug.assert;
 
 const InternPool = @import("sema/InternPool.zig");
 const ModuleSource = @import("ModuleSource.zig");
+const ErrorMsg = @import("sema/ErrorMsg.zig").ErrorMsg;
+const InputShape = @import("front/InputShape.zig");
 
 const Session = @This();
 
@@ -30,9 +32,16 @@ root_namespace: InternPool.NamespaceIndex,
 /// compiler's `Zcu.File` collection; `source_zir_id` (on a Func or a container
 /// type) is a `File.Index` into this list, so crossing into another file's ZIR
 /// is one indexed lookup, exactly as the compiler resolves a `TrackedInst`'s
-/// file. Persist for the session lifetime; the Ast and wrapped source the front
-/// end produced alongside each ZIR are released at commit.
+/// file. Persist for the session lifetime, together with each file's Ast and
+/// wrapped source -- a Sema diagnostic resolves its `LazySrcLoc` against the owning
+/// file's tree, so the tree must outlive analysis, as `Zcu.File` keeps `tree`/`source`.
 files: std.ArrayListUnmanaged(File) = .empty,
+/// The pending Sema failure, set by `Sema.failWithOwnedErrorMsg` when a session is
+/// present. The REPL's single-slot analog of the compiler's `Zcu.failed_analysis`
+/// (a map keyed by `AnalUnit`): one unit is analyzed per call, so at most one
+/// failure is pending at the analyze boundary. The driver, which holds the `Ast`,
+/// resolves the carried `LazySrcLoc` and renders a caret, then `destroy`s it. gpa-owned.
+failed_analysis: ?*ErrorMsg = null,
 /// Loaded on-disk files by canonical sub-path -> `File.Index`, so each is read
 /// and lowered once. The compiler's `Zcu.import_table`. REPL lines are not
 /// here: they have no path. Keys alias each `File.sub_file_path` (no separate
@@ -57,6 +66,15 @@ pub const File = struct {
     /// as a tombstone so later `File.Index` values stay stable, as the compiler
     /// retains a failed file (`status == astgen_failure`).
     zir: ?std.zig.Zir,
+    /// The Ast this file was lowered from, kept so a Sema diagnostic can resolve its
+    /// `LazySrcLoc` (base declaration node + offset) into a byte span. Mirrors
+    /// `Zcu.File.tree`; the compiler additionally makes it droppable and re-parses via
+    /// `getTree`, an optimization not yet needed here. `null` only before it is set.
+    tree: ?std.zig.Ast = null,
+    /// The wrapped source the Ast was parsed from, and the coordinates that map it
+    /// back to what the user typed. Mirrors `Zcu.File.source`; a diagnostic renderer
+    /// slices the caret's source line out of it. `null` for files with no wrap (none today).
+    wrapped: ?InputShape.Wrapped = null,
     /// Path relative to the source root, the base for this file's own relative
     /// imports (`Zcu.File.sub_file_path`). `null` for a REPL line, which has no
     /// on-disk path. Owned when non-null.
@@ -80,11 +98,14 @@ pub fn init(
 }
 
 pub fn deinit(session: *Session) void {
+    if (session.failed_analysis) |em| em.destroy(session.gpa);
     // Tear down `import_table` first: its keys alias the `sub_file_path` strings
     // freed just below.
     session.import_table.deinit(session.gpa);
     for (session.files.items) |*file| {
         if (file.zir) |*z| z.deinit(session.gpa);
+        if (file.tree) |*t| t.deinit(session.gpa);
+        if (file.wrapped) |*w| w.deinit(session.gpa);
         if (file.sub_file_path) |p| session.gpa.free(p);
     }
     session.files.deinit(session.gpa);

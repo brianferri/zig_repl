@@ -54,6 +54,11 @@ arena: Allocator,
 intern_pool: *InternPool,
 zir: Zir,
 writer: *std.Io.Writer,
+/// The structured error a failed analysis produced. Mirrors `sema.err`; also
+/// handed to the session (the REPL's `failed_analysis`) so the driver can resolve
+/// its source location and render a caret after this `Sema` is gone. Owned by
+/// `gpa` (see `ErrorMsg.create`), not the arena, so it outlives analysis.
+err: ?*ErrorMsg = null,
 /// Per-instruction Value results within the body currently being walked.
 /// Cleared between bodies; not shared across REPL inputs.
 results: std.AutoHashMapUnmanaged(Zir.Inst.Index, Value),
@@ -149,6 +154,9 @@ this_type: InternPool.Index = .none,
 
 pub const default_branch_quota: u32 = 1000;
 
+pub const LazySrcLoc = @import("ErrorMsg.zig").LazySrcLoc;
+pub const ErrorMsg = @import("ErrorMsg.zig").ErrorMsg;
+
 /// Mirrors the compiler's `Sema.Block` (src/Sema.zig). Today
 /// only `params` is populated -- the other compiler fields
 /// (label, instructions, runtime_*, namespace overrides,
@@ -158,9 +166,31 @@ pub const default_branch_quota: u32 = 1000;
 /// `evalFunc` when the matching `.func` instruction lands.
 pub const Block = struct {
     params: std.ArrayListUnmanaged(Param) = .empty,
+    /// The instruction the block's source-location offsets are measured against
+    /// (the enclosing declaration). Mirrors the compiler's `Block.src_base_inst`.
+    src_base_inst: Zir.Inst.Index = undefined,
 
     pub fn deinit(self: *Block, gpa: std.mem.Allocator) void {
         self.params.deinit(gpa);
+    }
+
+    /// Build a `LazySrcLoc` from an offset relative to this block's source base.
+    /// Mirrors the compiler's `Block.src`.
+    pub fn src(block: Block, offset: LazySrcLoc.Offset) LazySrcLoc {
+        return .{ .base_node_inst = block.src_base_inst, .offset = offset };
+    }
+
+    /// Mirrors the compiler's `Block.nodeOffset`.
+    pub fn nodeOffset(block: Block, node_offset: std.zig.Ast.Node.Offset) LazySrcLoc {
+        return block.src(LazySrcLoc.Offset.nodeOffset(node_offset));
+    }
+
+    /// Mirrors the compiler's `Block.builtinCallArgSrc`.
+    pub fn builtinCallArgSrc(block: Block, builtin_call_node: std.zig.Ast.Node.Offset, arg_index: u32) LazySrcLoc {
+        return block.src(.{ .node_offset_builtin_call_arg = .{
+            .builtin_call_node = builtin_call_node,
+            .arg_index = arg_index,
+        } });
     }
 
     /// Mirrors `Block.Param` in the compiler. `name` is omitted
@@ -249,6 +279,7 @@ pub fn analyze(session: *Session, file_index: Session.Index, writer: *std.Io.Wri
     sema.type_name_ctx = try intern_pool.namespaceName(gpa, namespace);
 
     if (findReplInputBody(zir)) |bound| {
+        top_block.src_base_inst = bound.decl_inst;
         return try sema.resolveInlineBody(bound.body, bound.decl_inst);
     }
     try sema.bindDecls();
@@ -856,53 +887,90 @@ fn intFittingRange(sema: *Sema, min: Value, max: Value) Error!Type {
     return .fromIndex(try pool.internIntType(if (sign) .signed else .unsigned, @max(min_val_bits, max_val_bits)));
 }
 
-/// Write a formatted diagnostic (with a trailing newline) and fail. The REPL's
-/// analogue of the compiler's `sema.fail(block, src, format, args)` -- there is no
-/// `block`/`src`, and a `Type.fmt(ip)` argument supplies the `{f}` type name.
-/// Variadic `args`, like the compiler's `fail`, forwards to `writer.print`.
-fn fail(sema: *Sema, comptime format: []const u8, args: anytype) Error {
-    try sema.writer.print(format ++ "\n", args);
+/// Mirrors the compiler's `Sema.errMsg`: allocate a gpa-owned `ErrorMsg` anchored
+/// at `src` with the formatted message. gpa (not the arena) so it survives into the
+/// session's `failed_analysis` for the driver to render after this `Sema` is gone.
+fn errMsg(sema: *Sema, src: LazySrcLoc, comptime format: []const u8, args: anytype) Allocator.Error!*ErrorMsg {
+    assert(src.offset != .unneeded);
+    return ErrorMsg.create(sema.gpa, src, format, args);
+}
+
+/// Mirrors the compiler's `Zcu.errNote` (reached via `Sema.errNote`): append a
+/// gpa-owned sub-note at `src` to `parent`.
+fn errNote(sema: *Sema, src: LazySrcLoc, parent: *ErrorMsg, comptime format: []const u8, args: anytype) Allocator.Error!void {
+    const msg = try std.fmt.allocPrint(sema.gpa, format, args);
+    errdefer sema.gpa.free(msg);
+    parent.notes = try sema.gpa.realloc(parent.notes, parent.notes.len + 1);
+    parent.notes[parent.notes.len - 1] = .{ .src_loc = src, .msg = msg };
+}
+
+/// Mirrors the compiler's `Sema.failWithOwnedErrorMsg`: record the error and abort.
+/// With a session, hand the (unresolved) error to `session.failed_analysis`, the
+/// REPL's single-unit analog of `Zcu.failed_analysis`, for the driver to resolve
+/// and render later. Without one (bare-Sema unit tests) there is no store, so the
+/// flat message goes to `writer`.
+fn failWithOwnedErrorMsg(sema: *Sema, block: ?*Block, em: *ErrorMsg) Error {
+    _ = block;
+    sema.err = em;
+    if (sema.session) |session| {
+        if (session.failed_analysis) |old| old.destroy(sema.gpa);
+        session.failed_analysis = em;
+    } else {
+        sema.writer.print("{s}\n", .{em.msg}) catch {};
+        em.destroy(sema.gpa);
+    }
     return error.AnalysisFail;
+}
+
+/// Mirrors the compiler's `Sema.fail`: build the message at `src` and fail with it.
+/// `block` is carried for signature parity (the compiler attaches inlining-chain
+/// and `Type.Formatter` "declared here" notes through it); the REPL uses neither.
+fn fail(sema: *Sema, block: *Block, src: LazySrcLoc, comptime format: []const u8, args: anytype) Error {
+    return sema.failWithOwnedErrorMsg(block, try sema.errMsg(src, format, args));
+}
+
+/// The relative `Ast.Node.Offset` of instruction `inst` -- its `inst_data.src_node`.
+/// The compiler reads that field inline in each handler, which already has its data
+/// destructured to the right shape; the REPL's handlers abstract data access
+/// (`binData`/`unData`) and often lack it at the fail site, so this reads it
+/// uniformly via `Zir.Inst.Tag.data_tags` -- the compiler's own tag->data-field
+/// table (`directEnumArray`), the same lookup `Zcu` uses to recover an instruction's
+/// active data field. Token-only instructions carry no node, resolving to `.zero`
+/// (the enclosing declaration). Paired with `block.nodeOffset`, this is exactly the
+/// `block.nodeOffset(inst_data.src_node)` the compiler's handlers build.
+fn srcNodeOffset(sema: *Sema, inst: Zir.Inst.Index) std.zig.Ast.Node.Offset {
+    const tag = sema.zir.instructions.items(.tag)[@intFromEnum(inst)];
+    const data = sema.zir.instructions.items(.data)[@intFromEnum(inst)];
+    return switch (Zir.Inst.Tag.data_tags[@intFromEnum(tag)]) {
+        .pl_node => data.pl_node.src_node,
+        .un_node => data.un_node.src_node,
+        .node => data.node,
+        else => .zero,
+    };
 }
 
 pub fn failWithUseOfUndef(sema: *Sema) Error {
-    try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "use of undefined value here causes illegal behavior", .{});
 }
 
 pub fn failWithDivideByZero(sema: *Sema) Error {
-    try sema.writer.writeAll("division by zero here causes illegal behavior\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "division by zero here causes illegal behavior", .{});
 }
 
 pub fn failWithIntegerOverflow(sema: *Sema, ty: Type, val: Value) Error {
-    try sema.writer.writeAll("overflow of integer type '");
-    try Type.print(ty, sema.intern_pool, sema.writer);
-    try sema.writer.writeAll("' with value '");
-    try render_value.render(val, sema.intern_pool, sema.writer);
-    try sema.writer.writeAll("'\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "overflow of integer type '{f}' with value '{f}'", .{ ty.fmt(sema.intern_pool), render_value.fmt(val, sema.intern_pool) });
 }
 
 pub fn failWithNegativeShiftAmount(sema: *Sema, shift_amt: Value) Error {
-    try sema.writer.writeAll("shift by negative amount '");
-    try render_value.render(shift_amt, sema.intern_pool, sema.writer);
-    try sema.writer.writeAll("'\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "shift by negative amount '{f}'", .{render_value.fmt(shift_amt, sema.intern_pool)});
 }
 
 pub fn failWithTooLargeShiftAmount(sema: *Sema, ty: Type, shift_amt: Value) Error {
-    try sema.writer.writeAll("shift amount '");
-    try render_value.render(shift_amt, sema.intern_pool, sema.writer);
-    try sema.writer.writeAll("' is too large for operand type '");
-    try Type.print(ty, sema.intern_pool, sema.writer);
-    try sema.writer.writeAll("'\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "shift amount '{f}' is too large for operand type '{f}'", .{ render_value.fmt(shift_amt, sema.intern_pool), ty.fmt(sema.intern_pool) });
 }
 
 pub fn failWithUnsupportedComptimeShiftAmount(sema: *Sema) Error {
-    try sema.writer.writeAll("this implementation only supports comptime shift amounts of up to 2^64 - 1 bits\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "this implementation only supports comptime shift amounts of up to 2^64 - 1 bits", .{});
 }
 
 fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
@@ -951,12 +1019,7 @@ fn evalModRem(sema: *Sema, resolved_type: Type, lhs_orig: Value, rhs_orig: Value
     const result = try arith.modRem(sema, resolved_type, lhs, rhs, .rem);
     if (lhs_maybe_negative or rhs_maybe_negative) {
         if (!result.compareAllWithZero(.eq, ip)) {
-            try sema.writer.writeAll("remainder division with '");
-            try Type.print(lhs_ty, ip, sema.writer);
-            try sema.writer.writeAll("' and '");
-            try Type.print(rhs_ty, ip, sema.writer);
-            try sema.writer.writeAll("': signed integers and floats must use @rem or @mod\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "remainder division with '{f}' and '{f}': signed integers and floats must use @rem or @mod", .{ lhs_ty.fmt(ip), rhs_ty.fmt(ip) });
         }
     }
     return result;
@@ -975,12 +1038,10 @@ fn resolveArithPeerType(sema: *Sema, lhs: Value, rhs: Value, op_name: []const u8
     const rt_key = ip.indexToKey(Value.typeOf(rhs, ip).index);
     if (lt_key == .vector_type or rt_key == .vector_type) {
         if (lt_key != .vector_type or rt_key != .vector_type) {
-            try sema.writer.print("{s}: mixed scalar and vector operands\n", .{op_name});
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: mixed scalar and vector operands", .{op_name});
         }
         if (lt_key.vector_type.len != rt_key.vector_type.len) {
-            try sema.writer.print("{s}: vector length mismatch\n", .{op_name});
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: vector length mismatch", .{op_name});
         }
         const lhs_agg = ip.indexToKey(lhs.index).aggregate;
         const rhs_agg = ip.indexToKey(rhs.index).aggregate;
@@ -1023,12 +1084,10 @@ fn vectorBinaryOperands(sema: *Sema, lhs: Value, rhs: Value, op_name: []const u8
     const lhs_vt = ip.indexToKey(Value.typeOf(lhs, ip).index).vector_type;
     const rhs_ty_key = ip.indexToKey(Value.typeOf(rhs, ip).index);
     if (rhs_ty_key != .vector_type) {
-        try sema.writer.print("{s}: mixed scalar and vector operands\n", .{op_name});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: mixed scalar and vector operands", .{op_name});
     }
     if (rhs_ty_key.vector_type.len != lhs_vt.len) {
-        try sema.writer.print("{s}: vector length mismatch\n", .{op_name});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: vector length mismatch", .{op_name});
     }
     return .{ .len = @intCast(lhs_vt.len), .lhs = ip.indexToKey(lhs.index).aggregate, .rhs = ip.indexToKey(rhs.index).aggregate };
 }
@@ -1245,8 +1304,7 @@ fn refitIntToFixedWidth(
     op_name: []const u8,
 ) Error!Value {
     const dest_info = intTypeInfo(sema.intern_pool, dest_ty) orelse {
-        try sema.writer.print("{s}: destination is not a supported int type\n", .{op_name});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: destination is not a supported int type", .{op_name});
     };
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const result_big = sema.intern_pool.indexToKey(comptime_int_idx).int.storage.toBigInt(&space);
@@ -1320,8 +1378,7 @@ fn evalCondbr(sema: *Sema, inst: Zir.Inst.Index) Error!Value {
         .bool_true => true,
         .bool_false => false,
         else => {
-            try sema.writer.writeAll("condbr: condition is not a bool\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "condbr: condition is not a bool", .{});
         },
     };
 
@@ -1349,8 +1406,7 @@ fn evalBoolNot(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .bool_true => .{ .index = .bool_false },
         .bool_false => .{ .index = .bool_true },
         else => {
-            try sema.writer.writeAll("bool_not: operand is not a bool\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "bool_not: operand is not a bool", .{});
         },
     };
 }
@@ -1377,8 +1433,7 @@ fn evalBoolBr(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value
         .bool_true => true,
         .bool_false => false,
         else => {
-            try sema.writer.writeAll("bool_br: lhs is not a bool\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "bool_br: lhs is not a bool", .{});
         },
     };
 
@@ -1494,8 +1549,7 @@ fn resolveDestType(
     // from `isType` keeps this in lockstep with that single type/value
     // partition rather than a hand-maintained accept-list.
     if (key.isType()) return dest_value.index;
-    try sema.writer.print("{s}: destination is not a type\n", .{op_name});
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: destination is not a type", .{op_name});
 }
 
 /// Decode the `Zir.Inst.Bin` payload (the `lhs` / `rhs` operand refs) of a
@@ -1519,15 +1573,13 @@ fn evalFloatCast(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const dest_type_index = try sema.resolveDestType(bin.lhs, "@floatCast");
     if (!isFloatTypeIndex(dest_type_index)) {
-        try sema.writer.writeAll("@floatCast: destination is not a float type\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@floatCast: destination is not a float type", .{});
     }
 
     const operand_value = try sema.resolveRef(bin.rhs);
     const operand_key = sema.intern_pool.indexToKey(operand_value.index);
     if (operand_key != .float) {
-        try sema.writer.writeAll("@floatCast: operand is not a float\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@floatCast: operand is not a float", .{});
     }
     const coerced = coerceNumericToFloat(operand_key, dest_type_index);
     const idx = try sema.intern_pool.internFloat(coerced);
@@ -1550,17 +1602,14 @@ fn evalIntFromFloat(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand_value = try sema.resolveRef(bin.rhs);
     const operand_key = sema.intern_pool.indexToKey(operand_value.index);
     if (operand_key != .float) {
-        try sema.writer.writeAll("@intFromFloat: operand is not a float\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@intFromFloat: operand is not a float", .{});
     }
     const operand_f128: f128 = floatToF128(operand_key.float);
     if (std.math.isNan(operand_f128)) {
-        try sema.writer.writeAll("@intFromFloat: operand is NaN\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@intFromFloat: operand is NaN", .{});
     }
     if (!std.math.isFinite(operand_f128)) {
-        try sema.writer.writeAll("@intFromFloat: operand is infinite\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@intFromFloat: operand is infinite", .{});
     }
 
     return try sema.materialiseIntFromFloat(operand_f128, dest_type_index);
@@ -1611,8 +1660,7 @@ fn materialiseIntFromFloat(
         return .{ .index = idx };
     }
 
-    try sema.writer.writeAll("@intFromFloat: destination is not an int type\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@intFromFloat: destination is not an int type", .{});
 }
 
 /// `@floatFromInt(DestType, x)`: integer-to-float conversion. The int is
@@ -1629,15 +1677,13 @@ fn evalFloatFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const dest_type_index = try sema.resolveDestType(bin.lhs, "@floatFromInt");
     if (!isFloatTypeIndex(dest_type_index)) {
-        try sema.writer.writeAll("@floatFromInt: destination is not a float type\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@floatFromInt: destination is not a float type", .{});
     }
 
     const operand_value = try sema.resolveRef(bin.rhs);
     const operand_key = sema.intern_pool.indexToKey(operand_value.index);
     if (operand_key != .int) {
-        try sema.writer.writeAll("@floatFromInt: operand is not an int\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@floatFromInt: operand is not an int", .{});
     }
     // `coerceNumericToFloat` accepts any int via the same widen+narrow
     // pipeline (rounding is f128 nearest-even, IEEE-754 default).
@@ -1658,8 +1704,7 @@ fn evalIntCast(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand_value = try sema.resolveRef(bin.rhs);
     const operand_key = sema.intern_pool.indexToKey(operand_value.index);
     if (operand_key != .int) {
-        try sema.writer.writeAll("@intCast: operand is not an int\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@intCast: operand is not an int", .{});
     }
     // comptime_int destination is identity at comptime.
     if (dest_type_index == .comptime_int_type) return operand_value;
@@ -1677,15 +1722,13 @@ fn evalTruncate(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const dest_type_index = try sema.resolveDestType(bin.lhs, "@truncate");
     const dest_info = intTypeInfo(sema.intern_pool, dest_type_index) orelse {
-        try sema.writer.writeAll("@truncate: destination is not a fixed-width int\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@truncate: destination is not a fixed-width int", .{});
     };
 
     const operand_value = try sema.resolveRef(bin.rhs);
     const operand_key = sema.intern_pool.indexToKey(operand_value.index);
     if (operand_key != .int) {
-        try sema.writer.writeAll("@truncate: operand is not an int\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@truncate: operand is not an int", .{});
     }
 
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
@@ -1722,8 +1765,7 @@ fn evalBitCast(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand_bits = numericBitSize(sema.intern_pool, operand_type.index);
     const dest_bits = numericBitSize(sema.intern_pool, dest_type_index);
     if (operand_bits == null or dest_bits == null) {
-        try sema.writer.writeAll("@bitCast: operands must be fixed-width numeric types\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@bitCast: operands must be fixed-width numeric types", .{});
     }
     if (operand_bits.? != dest_bits.?) {
         try sema.writer.print(
@@ -1795,8 +1837,7 @@ fn reinterpretBitCast(
             return try sema.internBitsAsFloat(bits_u128, dest_ty);
         },
         else => {
-            try sema.writer.writeAll("@bitCast: operand kind not supported\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@bitCast: operand kind not supported", .{});
         },
     }
 }
@@ -2031,8 +2072,7 @@ fn evalComparison(
         const rhs_is_opt = ip.indexToKey(rhs_ty) == .opt_type;
         if (lhs_null_lit or rhs_null_lit or lhs_is_opt or rhs_is_opt) {
             if (op != .eq and op != .neq) {
-                try sema.writer.print("operator {s} not allowed for optional type\n", .{op_name});
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "operator {s} not allowed for optional type", .{op_name});
             }
             if (lhs_null_lit and rhs_null_lit) return boolValue(op == .eq);
             if (lhs_null_lit or rhs_null_lit) {
@@ -2042,10 +2082,7 @@ fn evalComparison(
                 const nullable = other_key == .opt_type or
                     (other_key == .ptr_type and other_key.ptr_type.flags.size == .c);
                 if (!nullable) {
-                    try sema.writer.writeAll("comparison of '");
-                    try Type.print(.fromIndex(other_ty), ip, sema.writer);
-                    try sema.writer.writeAll("' with null\n");
-                    return error.AnalysisFail;
+                    return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "comparison of '{f}' with null", .{Type.fromIndex(other_ty).fmt(ip)});
                 }
                 const ov_key = ip.indexToKey(other_val.index);
                 const is_null = ov_key == .opt and ov_key.opt.val == .none;
@@ -2091,16 +2128,14 @@ fn evalComparison(
             null;
         if (kind) |kind_name| {
             if (lhs_key == .enum_tag and lhs_key.enum_tag.ty != rhs_key.enum_tag.ty) {
-                try sema.writer.print("{s}: enum operands have different types\n", .{op_name});
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "{s}: enum operands have different types", .{op_name});
             }
             const equal = lhs_value.index == rhs_value.index;
             return switch (op) {
                 .eq => .{ .index = if (equal) .bool_true else .bool_false },
                 .neq => .{ .index = if (equal) .bool_false else .bool_true },
                 else => {
-                    try sema.writer.print("{s}: operator not allowed for {s} operands\n", .{ op_name, kind_name });
-                    return error.AnalysisFail;
+                    return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "{s}: operator not allowed for {s} operands", .{ op_name, kind_name });
                 },
             };
         }
@@ -2171,10 +2206,7 @@ fn evalUnaryMath(
     switch (operand_ty.scalarType(ip).zigTypeTag(ip)) {
         .comptime_float, .float => {},
         else => {
-            try sema.writer.writeAll("expected vector of floats or float type, found '");
-            try Type.print(operand_ty, ip, sema.writer);
-            try sema.writer.writeAll("'\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected vector of floats or float type, found '{f}'", .{operand_ty.fmt(ip)});
         },
     }
     return try sema.maybeConstantUnaryMath(operand, operand_ty, eval);
@@ -2187,15 +2219,11 @@ fn checkNumericType(sema: *Sema, ty: Type) Error!void {
         .vector => switch (ty.childType(ip).zigTypeTag(ip)) {
             .comptime_float, .float, .comptime_int, .int => {},
             else => |t| {
-                try sema.writer.print("expected number, found '{t}'\n", .{t});
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected number, found '{t}'", .{t});
             },
         },
         else => {
-            try sema.writer.writeAll("expected number, found '");
-            try Type.print(ty, ip, sema.writer);
-            try sema.writer.writeAll("'\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected number, found '{f}'", .{ty.fmt(ip)});
         },
     }
 }
@@ -2238,16 +2266,10 @@ fn analyzeMinMax(sema: *Sema, operands: []const Value, comptime op: MinMax) Erro
                 const operand_ty = Value.typeOf(operand, ip);
                 try sema.checkNumericType(operand_ty);
                 if (operand_ty.zigTypeTag(ip) != .vector) {
-                    try sema.writer.writeAll("expected vector, found '");
-                    try Type.print(operand_ty, ip, sema.writer);
-                    try sema.writer.writeAll("'\n");
-                    return error.AnalysisFail;
+                    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected vector, found '{f}'", .{operand_ty.fmt(ip)});
                 }
                 if (operand_ty.vectorLen(ip) != vec_len) {
-                    try sema.writer.print("expected vector of length '{d}', found '", .{vec_len});
-                    try Type.print(operand_ty, ip, sema.writer);
-                    try sema.writer.writeAll("'\n");
-                    return error.AnalysisFail;
+                    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected vector of length '{d}', found '{f}'", .{ vec_len, operand_ty.fmt(ip) });
                 }
             }
             break :vec_len vec_len;
@@ -2256,10 +2278,7 @@ fn analyzeMinMax(sema: *Sema, operands: []const Value, comptime op: MinMax) Erro
                 const operand_ty = Value.typeOf(operand, ip);
                 try sema.checkNumericType(operand_ty);
                 if (operand_ty.zigTypeTag(ip) == .vector) {
-                    try sema.writer.writeAll("expected vector, found '");
-                    try Type.print(first_ty, ip, sema.writer);
-                    try sema.writer.writeAll("'\n");
-                    return error.AnalysisFail;
+                    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected vector, found '{f}'", .{first_ty.fmt(ip)});
                 }
             }
             break :vec_len null;
@@ -2427,10 +2446,7 @@ fn evalReduce(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand_ty = operand.typeOf(ip);
 
     if (operand_ty.zigTypeTag(ip) != .vector) {
-        try sema.writer.writeAll("expected vector, found '");
-        try Type.print(operand_ty, ip, sema.writer);
-        try sema.writer.writeAll("'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected vector, found '{f}'", .{operand_ty.fmt(ip)});
     }
 
     const scalar_ty = operand_ty.childType(ip);
@@ -2447,8 +2463,7 @@ fn evalReduce(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const vec_len = operand_ty.vectorLen(ip);
     if (vec_len == 0) {
-        try sema.writer.writeAll("@reduce operation requires a vector with nonzero length\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@reduce operation requires a vector with nonzero length", .{});
     }
 
     if (ip.indexToKey(operand.index) == .undef) return try sema.undefValue(scalar_ty);
@@ -2471,10 +2486,7 @@ fn evalReduce(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 fn failReduceOperand(sema: *Sema, operation: std.lang.ReduceOp, operand_ty: Type, want: []const u8) Error {
-    try sema.writer.print("@reduce operation '{s}' requires {s} operand; found '", .{ @tagName(operation), want });
-    try Type.print(operand_ty, sema.intern_pool, sema.writer);
-    try sema.writer.writeAll("'\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@reduce operation '{s}' requires {s} operand; found '{f}'", .{ @tagName(operation), want, operand_ty.fmt(sema.intern_pool) });
 }
 
 /// `mul_add` (`@mulAdd(T, a, b, c)`): the fused multiply-add `a * b + c` at `T`'s
@@ -2492,10 +2504,7 @@ fn evalMulAdd(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     switch (ty.scalarType(ip).zigTypeTag(ip)) {
         .comptime_float, .float => {},
         else => {
-            try sema.writer.writeAll("expected vector of floats or float type, found '");
-            try Type.print(ty, ip, sema.writer);
-            try sema.writer.writeAll("'\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected vector of floats or float type, found '{f}'", .{ty.fmt(ip)});
         },
     }
 
@@ -2519,10 +2528,7 @@ fn evalAbs(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .comptime_float, .float, .comptime_int => operand_ty,
         .int => if (scalar_ty.intInfo(ip).?.signedness == .signed) try operand_ty.toUnsigned(ip) else return operand,
         else => {
-            try sema.writer.writeAll("expected integer, float, or vector of either integers or floats, found '");
-            try Type.print(operand_ty, ip, sema.writer);
-            try sema.writer.writeAll("'\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected integer, float, or vector of either integers or floats, found '{f}'", .{operand_ty.fmt(ip)});
         },
     };
 
@@ -2578,10 +2584,7 @@ fn evalNegate(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value
         else => false,
     };
     if (!numeric or (tag == .negate and isUnsignedIntType(scalar_ty, ip))) {
-        try sema.writer.writeAll("negation of type '");
-        try Type.print(ty, ip, sema.writer);
-        try sema.writer.writeAll("'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "negation of type '{f}'", .{ty.fmt(ip)});
     }
 
     if (scalar_tag == .float or scalar_tag == .comptime_float) {
@@ -2608,8 +2611,7 @@ fn evalPtrType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const inst_data = sema.zir.instructions.items(.data)[@intFromEnum(inst)].ptr_type;
     if (inst_data.flags.has_addrspace or inst_data.flags.has_bit_range) {
-        try sema.writer.writeAll("ptr_type: address_space / bit_range not yet supported\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "ptr_type: address_space / bit_range not yet supported", .{});
     }
 
     const extra = sema.zir.extraData(Zir.Inst.PtrType, inst_data.payload_index);
@@ -2662,8 +2664,7 @@ fn evalPtrType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 fn alignmentFromValue(sema: *Sema, value: Value, op_name: []const u8) Error!InternPool.Alignment {
     const bytes = try sema.resolveUsizeInt(value, op_name);
     if (bytes == 0 or !std.math.isPowerOfTwo(bytes)) {
-        try sema.writer.print("{s}: alignment '{d}' is not a power of two\n", .{ op_name, bytes });
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: alignment '{d}' is not a power of two", .{ op_name, bytes });
     }
     return InternPool.Alignment.fromByteUnits(bytes);
 }
@@ -2677,12 +2678,10 @@ fn evalAlignOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const ty = try sema.resolveDestType(un_node.operand, "@alignOf");
     if (ty == .noreturn_type) {
-        try sema.writer.writeAll("@alignOf: no align available for uninstantiable type 'noreturn'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@alignOf: no align available for uninstantiable type 'noreturn'", .{});
     }
     const alignment = Type.fromIndex(ty).abiAlignment(sema.intern_pool) orelse {
-        try sema.writer.writeAll("@alignOf: type not yet supported\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@alignOf: type not yet supported", .{});
     };
     const idx = try sema.intern_pool.internInt(.{
         .ty = .comptime_int_type,
@@ -2706,18 +2705,15 @@ fn evalSizeOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // unsized simple types) masquerade as a real size.
     if (key == .simple_type) switch (key.simple_type) {
         .noreturn => {
-            try sema.writer.writeAll("@sizeOf: no size available for uninstantiable type 'noreturn'\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@sizeOf: no size available for uninstantiable type 'noreturn'", .{});
         },
         .comptime_int, .comptime_float, .type, .null, .undefined, .enum_literal, .anyopaque => {
-            try sema.writer.print("@sizeOf: no size available for type '{s}'\n", .{@tagName(key.simple_type)});
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@sizeOf: no size available for type '{s}'", .{@tagName(key.simple_type)});
         },
         else => {},
     };
     const size = Type.fromIndex(ty).abiSize(sema.intern_pool) orelse {
-        try sema.writer.writeAll("@sizeOf: type not yet supported\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@sizeOf: type not yet supported", .{});
     };
     const idx = try sema.intern_pool.internInt(.{
         .ty = .comptime_int_type,
@@ -2734,10 +2730,7 @@ fn evalBitSizeOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const ty = try sema.resolveDestType(un_node.operand, "@bitSizeOf");
     const bits = Type.fromIndex(ty).bitSize(sema.intern_pool) orelse {
-        try sema.writer.writeAll("@bitSizeOf: no bit size available for type '");
-        try Type.print(.fromIndex(ty), sema.intern_pool, sema.writer);
-        try sema.writer.writeAll("'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@bitSizeOf: no bit size available for type '{f}'", .{Type.fromIndex(ty).fmt(sema.intern_pool)});
     };
     const idx = try sema.intern_pool.internInt(.{
         .ty = .comptime_int_type,
@@ -2805,18 +2798,12 @@ fn checkIntOrVector(sema: *Sema, operand: Value) Error!Type {
             switch (elem_ty.zigTypeTag(ip)) {
                 .int => return elem_ty,
                 else => {
-                    try sema.writer.writeAll("expected vector of integers; found vector of '");
-                    try Type.print(elem_ty, ip, sema.writer);
-                    try sema.writer.writeAll("'\n");
-                    return error.AnalysisFail;
+                    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected vector of integers; found vector of '{f}'", .{elem_ty.fmt(ip)});
                 },
             }
         },
         else => {
-            try sema.writer.writeAll("expected integer or vector, found '");
-            try Type.print(operand_ty, ip, sema.writer);
-            try sema.writer.writeAll("'\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected integer or vector, found '{f}'", .{operand_ty.fmt(ip)});
         },
     }
 }
@@ -2831,10 +2818,7 @@ fn evalByteSwap(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const scalar_ty = try sema.checkIntOrVector(operand);
     const bits = scalar_ty.intInfo(ip).?.bits;
     if (bits % 8 != 0) {
-        try sema.writer.writeAll("@byteSwap requires the number of bits to be evenly divisible by 8, but '");
-        try Type.print(scalar_ty, ip, sema.writer);
-        try sema.writer.print("' has {d} bits\n", .{bits});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@byteSwap requires the number of bits to be evenly divisible by 8, but '{f}' has {d} bits", .{ scalar_ty.fmt(ip), bits });
     }
     return try sema.byteSwap(operand, operand_ty);
 }
@@ -2952,8 +2936,7 @@ fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ptr = try sema.resolveRef(un_node.operand);
     const key = sema.intern_pool.indexToKey(ptr.index);
     if (key != .ptr) {
-        try sema.writer.writeAll("@intFromPtr: operand is not a pointer\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@intFromPtr: operand is not a pointer", .{});
     }
     const p = key.ptr;
     const ip = sema.intern_pool;
@@ -2988,8 +2971,7 @@ fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         // aggregate, which auto-layout aggregates don't expose here; a payload
         // pointer sits inside the optional's storage the same way.
         .field, .arr_elem, .opt_payload, .eu_payload => {
-            try sema.writer.writeAll("@intFromPtr: address of an aggregate element is not supported\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@intFromPtr: address of an aggregate element is not supported", .{});
         },
     };
 
@@ -3199,29 +3181,19 @@ fn validateDeref(sema: *Sema, operand: Value) Error!void {
     const operand_ty = operand.typeOf(ip);
     const ty_key = ip.indexToKey(operand_ty.toIndex());
     if (ty_key != .ptr_type) {
-        try sema.writer.writeAll("cannot dereference non-pointer type '");
-        try operand_ty.print(ip, sema.writer);
-        try sema.writer.writeAll("'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "cannot dereference non-pointer type '{f}'", .{operand_ty.fmt(ip)});
     }
     switch (ty_key.ptr_type.flags.size) {
         .one, .c => {},
         .many => {
-            try sema.writer.writeAll("index syntax required for unknown-length pointer type '");
-            try operand_ty.print(ip, sema.writer);
-            try sema.writer.writeAll("'\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index syntax required for unknown-length pointer type '{f}'", .{operand_ty.fmt(ip)});
         },
         .slice => {
-            try sema.writer.writeAll("index syntax required for slice type '");
-            try operand_ty.print(ip, sema.writer);
-            try sema.writer.writeAll("'\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index syntax required for slice type '{f}'", .{operand_ty.fmt(ip)});
         },
     }
     if (ip.indexToKey(operand.index) == .undef) {
-        try sema.writer.writeAll("cannot dereference undefined value\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "cannot dereference undefined value", .{});
     }
 }
 
@@ -3240,15 +3212,13 @@ fn evalStoreNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ptr_value = try sema.resolveRef(bin.lhs);
     const ptr_key = ip.indexToKey(ptr_value.index);
     if (ptr_key != .ptr) {
-        try sema.writer.writeAll("store: lhs is not a pointer\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "store: lhs is not a pointer", .{});
     }
 
     const ptr_ty_key = ip.indexToKey(ptr_key.ptr.ty);
     assert(ptr_ty_key == .ptr_type);
     if (ptr_ty_key.ptr_type.flags.is_const) {
-        try sema.writer.writeAll("cannot assign to constant\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "cannot assign to constant", .{});
     }
 
     const rhs_value = try sema.resolveRef(bin.rhs);
@@ -3285,8 +3255,7 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
     const ip = sema.intern_pool;
     const ptr_key = ip.indexToKey(ptr.index);
     if (ptr_key != .ptr) {
-        try sema.writer.writeAll("internal error: load through non-pointer value\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "internal error: load through non-pointer value", .{});
     }
     switch (ptr_key.ptr.base_addr) {
         .nav => |nav| return .{ .index = ip.getNav(nav).resolved.?.value },
@@ -3360,8 +3329,7 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
                 .error_union => |e| switch (e.val) {
                     .payload => |p| .{ .index = p },
                     .err_name => {
-                        try sema.writer.writeAll("err_union_payload: operand carries an error, not a payload\n");
-                        return error.AnalysisFail;
+                        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "err_union_payload: operand carries an error, not a payload", .{});
                     },
                 },
                 else => unreachable,
@@ -3402,8 +3370,7 @@ fn loadUnionField(sema: *Sema, union_val: InternPool.Index, index: u32) Error!Va
 /// arrive with aggregates.
 fn lookupComptimeAlloc(sema: *Sema, ptr: InternPool.Key.Ptr) Error!*ComptimeAlloc {
     if (ptr.byte_offset != 0) {
-        try sema.writer.writeAll("comptime_alloc lookup: pointer offset not yet supported\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "comptime_alloc lookup: pointer offset not yet supported", .{});
     }
     const idx: u32 = @intFromEnum(ptr.base_addr.comptime_alloc);
     assert(idx < sema.comptime_allocs.items.len);
@@ -4219,8 +4186,7 @@ fn coerceValueToType(
         else => {},
     }
 
-    try sema.writer.print("{s}: cannot coerce value to destination type\n", .{op_name});
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: cannot coerce value to destination type", .{op_name});
 }
 
 /// Coerce an enum literal or tag to a tagged union by initialising the field the
@@ -4239,11 +4205,9 @@ fn coerceEnumToUnion(sema: *Sema, value: Value, union_ty: InternPool.Index, op_n
         return .{ .index = try ip.internUnion(.{ .ty = union_ty, .tag = enum_tag.index, .val = .void_value }) };
     }
     if (try sema.isNoPossibleValue(field.ty)) {
-        try sema.writer.print("{s}: cannot initialize union field with uninstantiable type\n", .{op_name});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: cannot initialize union field with uninstantiable type", .{op_name});
     }
-    try sema.writer.print("{s}: cannot initialize union field '{s}' from a bare tag\n", .{ op_name, ip.stringSlice(tag_name) });
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: cannot initialize union field '{s}' from a bare tag", .{ op_name, ip.stringSlice(tag_name) });
 }
 
 /// Coerce an error value to a destination error-set type (`anyerror` or a wider
@@ -4254,8 +4218,7 @@ fn coerceToErrorSet(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_nam
     const ip = sema.intern_pool;
     const key = ip.indexToKey(value.index);
     if (key != .err) {
-        try sema.writer.print("{s}: expected an error value\n", .{op_name});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: expected an error value", .{op_name});
     }
     const imc = try sema.coerceInMemoryAllowedErrorSets(Type.fromIndex(dest_ty), Value.typeOf(value, ip));
     if (imc != .ok) {
@@ -4353,12 +4316,7 @@ fn coerceToFixedWidthInt(sema: *Sema, value: Value, dest_ty: InternPool.Index, o
         const value_type = Value.typeOf(value, ip);
         if (intTypeInfo(ip, value_type.index)) |src| {
             if (!intCoercible(src, dst)) {
-                try sema.writer.writeAll("expected type '");
-                try Type.print(.fromIndex(dest_ty), ip, sema.writer);
-                try sema.writer.writeAll("', found '");
-                try Type.print(.fromIndex(value_type.index), ip, sema.writer);
-                try sema.writer.writeAll("'\n");
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected type '{f}', found '{f}'", .{ Type.fromIndex(dest_ty).fmt(ip), Type.fromIndex(value_type.index).fmt(ip) });
             }
         }
     }
@@ -4379,10 +4337,7 @@ fn coerceToFloat(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_name: 
         const widens = isFloatTypeIndex(value_type.index) and
             numericBitSize(ip, value_type.index).? <= numericBitSize(ip, dest_ty).?;
         if (!widens) {
-            try sema.writer.print("{s}: a runtime value does not coerce to ", .{op_name});
-            try Type.print(.fromIndex(dest_ty), ip, sema.writer);
-            try sema.writer.writeAll(" (needs @floatCast or @floatFromInt)\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: a runtime value does not coerce to {f} (needs @floatCast or @floatFromInt)", .{ op_name, Type.fromIndex(dest_ty).fmt(ip) });
         }
     }
     if (coerceToTargetFloat(ip.indexToKey(value.index), dest_ty)) |coerced| {
@@ -4430,8 +4385,7 @@ fn evalReifyInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const signedness = try sema.resolveStdLangEnum(.Signedness, extra.lhs);
     const bits: u16 = @intCast(try sema.resolveInt(try sema.resolveRef(extra.rhs), .u16_type, "int bit width"));
     if (bits == 0 and signedness == .signed) {
-        try sema.writer.print("signed integer cannot have bit width 0\n", .{});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "signed integer cannot have bit width 0", .{});
     }
     return .{ .index = try sema.intern_pool.internIntType(signedness, bits) };
 }
@@ -4455,8 +4409,7 @@ fn evalReifyTuple(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Valu
     for (field_types, 0..) |*field_ty, field_idx| {
         const field_ty_val = InternPool.aggregateElementAt(array, field_idx);
         if (ip.indexToKey(field_ty_val) == .undef) {
-            try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "use of undefined value here causes illegal behavior", .{});
         }
         try sema.validateTupleFieldType(field_ty_val);
         field_ty.* = field_ty_val;
@@ -4477,8 +4430,7 @@ fn derefSliceAsArray(sema: *Sema, val: Value) Error!Value {
         .slice => |s| s.ptr,
         .ptr => val.index,
         else => {
-            try sema.writer.writeAll("reify: expected a comptime array-backed slice\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "reify: expected a comptime array-backed slice", .{});
         },
     };
     switch (ip.indexToKey(array_ptr).ptr.base_addr) {
@@ -4487,8 +4439,7 @@ fn derefSliceAsArray(sema: *Sema, val: Value) Error!Value {
         .arr_elem => |ae| if (ae.index == 0) return try sema.loadValue(.{ .index = ae.base }),
         else => {},
     }
-    try sema.writer.writeAll("reify: expected a comptime array-backed slice\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "reify: expected a comptime array-backed slice", .{});
 }
 
 /// Reject a tuple field type that cannot be embedded, as the compiler's
@@ -4496,12 +4447,10 @@ fn derefSliceAsArray(sema: *Sema, val: Value) Error!Value {
 /// here (the REPL has no nominal opaque types).
 fn validateTupleFieldType(sema: *Sema, field_ty: InternPool.Index) Error!void {
     if (field_ty == .anyopaque_type) {
-        try sema.writer.writeAll("opaque types have unknown size and therefore cannot be directly embedded in tuples\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "opaque types have unknown size and therefore cannot be directly embedded in tuples", .{});
     }
     if (field_ty == .noreturn_type) {
-        try sema.writer.writeAll("tuple fields cannot be 'noreturn'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "tuple fields cannot be 'noreturn'", .{});
     }
 }
 
@@ -4540,20 +4489,16 @@ fn evalReifyPointer(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Va
 
     const elem_ty = try sema.resolveDestType(extra.elem_ty, "pointer child");
     if (elem_ty == .noreturn_type) {
-        try sema.writer.writeAll("pointer to noreturn not allowed\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "pointer to noreturn not allowed", .{});
     }
     if (elem_ty == .null_type) {
-        try sema.writer.writeAll("cannot reify pointer to '@TypeOf(null)'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "cannot reify pointer to '@TypeOf(null)'", .{});
     }
     if (elem_ty == .anyopaque_type and size != .one) {
-        try sema.writer.writeAll("indexable pointer to opaque type not allowed\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "indexable pointer to opaque type not allowed", .{});
     }
     if (ip.indexToKey(elem_ty) == .func_type and size != .one) {
-        try sema.writer.writeAll("function pointers must be single pointers\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "function pointers must be single pointers", .{});
     }
 
     const sentinel_ty = try ip.internOptionalType(elem_ty);
@@ -4562,8 +4507,7 @@ fn evalReifyPointer(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Va
     if (opt_sentinel != .none) switch (size) {
         .many, .slice => {},
         .one, .c => {
-            try sema.writer.writeAll("sentinels are only allowed on slices and unknown-length pointers\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "sentinels are only allowed on slices and unknown-length pointers", .{});
         },
     };
 
@@ -4624,14 +4568,12 @@ fn interpretCallConv(sema: *Sema, val: Value) Error!std.lang.CallingConvention {
     const idx = (try sema.enumTagFieldIndex(tag_enum, .{ .index = un.tag })).?;
     const name = ip.stringSlice((try sema.enumFieldName(tag_enum, idx)).?);
     const tag = std.meta.stringToEnum(std.meta.Tag(std.lang.CallingConvention), name) orelse {
-        try sema.writer.print("calling convention: unknown variant '{s}'\n", .{name});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "calling convention: unknown variant '{s}'", .{name});
     };
     switch (tag) {
         inline else => |t| {
             if (@FieldType(std.lang.CallingConvention, @tagName(t)) != void) {
-                try sema.writer.print("calling convention '{s}' is not modelled\n", .{@tagName(t)});
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "calling convention '{s}' is not modelled", .{@tagName(t)});
             }
             return @unionInit(std.lang.CallingConvention, @tagName(t), {});
         },
@@ -4668,8 +4610,7 @@ fn evalReifyFn(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
         const param_attr = ip.indexToKey(InternPool.aggregateElementAt(param_attrs_arr, param_idx)).aggregate;
         if (InternPool.aggregateElementAt(param_attr, 0) == .bool_true) {
             if (param_idx > 31) {
-                try sema.writer.writeAll("this compiler implementation only supports 'noalias' on the first 32 parameters\n");
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "this compiler implementation only supports 'noalias' on the first 32 parameters", .{});
             }
             noalias_bits |= @as(u32, 1) << @intCast(param_idx);
         }
@@ -4713,8 +4654,7 @@ fn sliceToIpString(sema: *Sema, slice_val: Value) Error!InternPool.NullTerminate
     // `internStringLiteral` builds), so the bytes are read back one slot at a time.
     // An undef byte is rejected here, as the compiler's `toIpString` checks.
     for (buf, 0..) |*b, i| b.* = @intCast(sema.intAsI128(InternPool.aggregateElementAt(agg, i)) orelse {
-        try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "use of undefined value here causes illegal behavior", .{});
     });
     return try ip.getOrPutString(sema.gpa, buf);
 }
@@ -4774,8 +4714,7 @@ fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.In
         // Reject undefined field values, as the compiler's `anyUndef` check does;
         // field names are checked in `sliceToIpString`.
         if (ip.indexToKey(v.*) == .undef) {
-            try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
         }
     }
 
@@ -4827,13 +4766,11 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
     // backing_ty is `?type`: null unless a packed struct declares a backing integer.
     const backing_val = try sema.coerceValueToType(try sema.resolveRef(extra.backing_ty), try ip.internOptionalType(.type_type), "struct backing integer type");
     if (ip.indexToKey(backing_val.index) == .undef) {
-        try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
     }
     const backing_int = ip.indexToKey(backing_val.index).opt.val;
     if (backing_int != .none and layout != .@"packed") {
-        try sema.writer.writeAll("non-packed struct does not support backing integer type\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "non-packed struct does not support backing integer type", .{});
     }
 
     const names_slice = try sema.coerceValueToType(try sema.resolveRef(extra.field_names), try sema.sliceOfStringTy(), "struct field names");
@@ -4882,15 +4819,13 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
         name_out.* = try sema.sliceToIpString(.{ .index = InternPool.aggregateElementAt(names_agg, i) });
         type_out.* = InternPool.aggregateElementAt(types_agg, i);
         if (ip.indexToKey(type_out.*) == .undef) {
-            try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
         }
         // Field attributes are `.{ comptime: bool, align: ?usize, default_value_ptr:
         // ?*const anyopaque }` (the order `@typeInfo`'s struct arm emits).
         const attr_elem = InternPool.aggregateElementAt(attrs_agg, i);
         if (ip.indexToKey(attr_elem) == .undef) {
-            try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
         }
         const attr = ip.indexToKey(attr_elem).aggregate;
         const comptime_elem = InternPool.aggregateElementAt(attr, 0);
@@ -4906,12 +4841,10 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
 
         if (comptime_elem == .bool_true) {
             if (field_default == .none) {
-                try sema.writer.writeAll("comptime field without default initialization value\n");
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "comptime field without default initialization value", .{});
             }
             if (layout != .auto) {
-                try sema.writer.writeAll("non-auto struct fields cannot be marked comptime\n");
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "non-auto struct fields cannot be marked comptime", .{});
             }
             comptime_words[i / 32] |= @as(u32, 1) << @intCast(i % 32);
             any_comptime = true;
@@ -4919,8 +4852,7 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
 
         if (align_opt != .none) {
             if (layout == .@"packed") {
-                try sema.writer.writeAll("packed struct fields cannot be aligned\n");
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "packed struct fields cannot be aligned", .{});
             }
             aligns[i] = align_opt;
             any_aligns = true;
@@ -4979,8 +4911,7 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
     // backing integer (not modelled as a tag); for `.extern` it is not allowed.
     const arg_val = try sema.coerceValueToType(try sema.resolveRef(extra.arg_ty), try ip.internOptionalType(.type_type), "union tag/backing type");
     if (ip.indexToKey(arg_val.index) == .undef) {
-        try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
     }
     // `arg_ty` is the tag enum for an `.auto` union and the backing integer for a
     // `.packed` one, matching how `zirReifyUnion` splits `explicit_tag_ty` from
@@ -4990,8 +4921,7 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
     var backing_int: InternPool.Index = .none;
     if (arg_ty != .none) switch (layout) {
         .@"extern" => {
-            try sema.writer.writeAll("extern union does not support enum tag type\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "extern union does not support enum tag type", .{});
         },
         .@"packed" => backing_int = arg_ty,
         .auto => tag_type = arg_ty,
@@ -5039,20 +4969,17 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
         name_out.* = try sema.sliceToIpString(.{ .index = InternPool.aggregateElementAt(names_agg, i) });
         type_out.* = InternPool.aggregateElementAt(types_agg, i);
         if (ip.indexToKey(type_out.*) == .undef) {
-            try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
         }
         // A union field's attributes are `.{ align: ?usize }`.
         const attr_elem = InternPool.aggregateElementAt(attrs_agg, i);
         if (ip.indexToKey(attr_elem) == .undef) {
-            try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
         }
         const align_opt = ip.indexToKey(InternPool.aggregateElementAt(ip.indexToKey(attr_elem).aggregate, 0)).opt.val;
         if (align_opt != .none) {
             if (layout == .@"packed") {
-                try sema.writer.writeAll("packed union fields cannot be aligned\n");
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "packed union fields cannot be aligned", .{});
             }
             aligns[i] = align_opt;
             any_aligns = true;
@@ -5111,8 +5038,7 @@ fn evalArrayTypeSentinel(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const sentinel = try sema.coerceValueToType(uncasted_sentinel, elem_type, "array sentinel");
     // resolveConstDefinedValue: the sentinel must be a defined comptime value.
     if (sema.intern_pool.indexToKey(sentinel.index) == .undef) {
-        try sema.writer.writeAll("use of undefined value here causes illegal behavior\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
     }
     const array_ty = try sema.intern_pool.internArrayType(.{
         .len = len,
@@ -5128,10 +5054,7 @@ fn evalArrayTypeSentinel(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// element cannot carry a sentinel). Always the equality form (`==`).
 fn checkSentinelType(sema: *Sema, elem_type: InternPool.Index) Error!void {
     if (!Type.fromIndex(elem_type).isSelfComparable(sema.intern_pool, true)) {
-        try sema.writer.writeAll("non-scalar sentinel type '");
-        try Type.print(.fromIndex(elem_type), sema.intern_pool, sema.writer);
-        try sema.writer.writeAll("'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "non-scalar sentinel type '{f}'", .{Type.fromIndex(elem_type).fmt(sema.intern_pool)});
     }
 }
 
@@ -5147,8 +5070,7 @@ fn evalVectorType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const len64 = try sema.resolveArrayLen(bin.lhs, "vector_type");
     const len = std.math.cast(u32, len64) orelse {
-        try sema.writer.print("vector_type: length {d} exceeds u32\n", .{len64});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "vector_type: length {d} exceeds u32", .{len64});
     };
     const child = try sema.resolveDestType(bin.rhs, "vector_type");
     if (!isVectorElemType(sema.intern_pool, child)) {
@@ -5171,13 +5093,11 @@ fn evalSelect(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
 
     const elem_ty = try sema.resolveDestType(extra.elem_type, "@select");
     if (!isVectorElemType(ip, elem_ty)) {
-        try sema.writer.writeAll("@select: expected integer, float, bool, or pointer for the element type\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@select: expected integer, float, bool, or pointer for the element type", .{});
     }
     const pred = try sema.resolveRef(extra.pred);
     const pred_info = indexableInfo(ip, Value.typeOf(pred, ip).index) orelse {
-        try sema.writer.writeAll("@select: expected vector or array for the predicate\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@select: expected vector or array for the predicate", .{});
     };
     const vec_len = pred_info.len;
 
@@ -5256,12 +5176,10 @@ fn evalOptionalPayload(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand = try sema.resolveRef(un_node.operand);
     const key = sema.intern_pool.indexToKey(operand.index);
     if (key != .opt) {
-        try sema.writer.writeAll("optional unwrap: operand is not an optional\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "optional unwrap: operand is not an optional", .{});
     }
     if (key.opt.val == .none) {
-        try sema.writer.writeAll("unable to unwrap null\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "unable to unwrap null", .{});
     }
     return .{ .index = key.opt.val };
 }
@@ -5287,14 +5205,12 @@ fn optPayloadPtr(sema: *Sema, optional_ptr: Value, comptime initializing: bool) 
     const ptr_type = ip.indexToKey(optional_ptr.typeOf(ip).toIndex()).ptr_type;
     const opt_key = ip.indexToKey(ptr_type.child);
     if (opt_key != .opt_type) {
-        try sema.writer.writeAll("optional unwrap: pointer child is not an optional\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "optional unwrap: pointer child is not an optional", .{});
     }
     if (!initializing) {
         const opt_val = try sema.loadValue(optional_ptr);
         if (ip.indexToKey(opt_val.index).opt.val == .none) {
-            try sema.writer.writeAll("unable to unwrap null\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "unable to unwrap null", .{});
         }
     }
     const child_ptr_ty = try ip.internPtrType(.{ .child = opt_key.opt_type, .sentinel = ptr_type.sentinel, .flags = ptr_type.flags });
@@ -5331,10 +5247,7 @@ fn isNonNullVal(sema: *Sema, operand: Value) Error!Value {
     const ip = sema.intern_pool;
     const key = ip.indexToKey(operand.index);
     if (key != .opt) {
-        try sema.writer.writeAll("expected optional type, found '");
-        try Type.print(operand.typeOf(ip), ip, sema.writer);
-        try sema.writer.writeAll("'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected optional type, found '{f}'", .{operand.typeOf(ip).fmt(ip)});
     }
     return .{ .index = if (key.opt.val == .none) .bool_false else .bool_true };
 }
@@ -5456,8 +5369,7 @@ fn importPath(sema: *Sema, path: []const u8) Error!InternPool.Index {
     // importer's own filename.
     if (std.mem.endsWith(u8, path, ".zig")) {
         const importer = sema.importerSubPath() orelse {
-            try sema.writer.print("no module named '{s}' available\n", .{path});
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "no module named '{s}' available", .{path});
         };
         // Anchor at "/" so the join is absolute for canonicalisation; the leading
         // slash is stripped to yield a path relative to the source root.
@@ -5466,13 +5378,11 @@ fn importPath(sema: *Sema, path: []const u8) Error!InternPool.Index {
         return sema.loadModuleFile(anchored[1..]);
     }
 
-    try sema.writer.print("no module named '{s}' available\n", .{path});
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "no module named '{s}' available", .{path});
 }
 
 fn failUnloadedModule(sema: *Sema, path: []const u8) Error {
-    try sema.writer.print("@import(\"{s}\"): module loading is not supported\n", .{path});
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@import(\"{s}\"): module loading is not supported", .{path});
 }
 
 /// The sub-path (relative to the source root) of the file being analysed, or
@@ -5497,8 +5407,7 @@ fn loadModuleFile(sema: *Sema, canonical: []const u8) Error!InternPool.Index {
     const source = session.module_source orelse return sema.failUnloadedModule(canonical);
 
     const bytes = source.read(sema.gpa, canonical) catch |err| {
-        try sema.writer.print("@import(\"{s}\"): {s}\n", .{ canonical, @errorName(err) });
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@import(\"{s}\"): {s}", .{ canonical, @errorName(err) });
     };
     defer sema.gpa.free(bytes);
     return sema.lowerModule(canonical, bytes);
@@ -5518,8 +5427,7 @@ fn lowerModule(sema: *Sema, canonical: []const u8, bytes: [:0]const u8) Error!In
     var zir = try std.zig.AstGen.generate(sema.gpa, tree);
     if (zir.hasCompileErrors()) {
         zir.deinit(sema.gpa);
-        try sema.writer.print("@import(\"{s}\"): source did not compile\n", .{canonical});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@import(\"{s}\"): source did not compile", .{canonical});
     }
 
     // Append the file. Its `sub_file_path` is the owned canonical path and is
@@ -5622,8 +5530,7 @@ fn getStdLangType(sema: *Sema, decl: StdLangDecl) Error!InternPool.Index {
 fn resolveDeclType(sema: *Sema, container_ty: InternPool.Index, name: []const u8) Error!InternPool.Index {
     const name_nts = try sema.intern_pool.getOrPutString(sema.gpa, name);
     const v = (try sema.containerDeclByName(container_ty, name_nts)) orelse {
-        try sema.writer.print("std.lang: missing declaration '{s}'\n", .{name});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "std.lang: missing declaration '{s}'", .{name});
     };
     return v.index;
 }
@@ -5648,8 +5555,7 @@ fn interpretStdLangEnum(sema: *Sema, comptime E: type, enum_ty: InternPool.Index
     const idx = (try sema.enumTagFieldIndex(enum_ty, val)).?;
     const name = sema.intern_pool.stringSlice((try sema.enumFieldName(enum_ty, idx)).?);
     return std.meta.stringToEnum(E, name) orelse {
-        try sema.writer.print("{s}: unknown variant '{s}'\n", .{ ctx, name });
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: unknown variant '{s}'", .{ ctx, name });
     };
 }
 
@@ -5688,8 +5594,7 @@ fn evalStdLangValue(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Va
             const cc_ty = try sema.getStdLangType(.CallingConvention);
             const name = try sema.intern_pool.getOrPutString(sema.gpa, "c");
             return (try sema.containerDeclByName(cc_ty, name)) orelse {
-                try sema.writer.print("std.lang is corrupt: CallingConvention.c\n", .{});
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "std.lang is corrupt: CallingConvention.c", .{});
             };
         },
         .calling_convention_inline => return .{ .index = try sema.callConvValue(.@"inline") },
@@ -6226,8 +6131,7 @@ fn arrayInitElemType(
             return error.AnalysisFail;
         },
         else => {
-            try sema.writer.print("{s}: type does not support array-init syntax\n", .{op_name});
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: type does not support array-init syntax", .{op_name});
         },
     }
 }
@@ -6310,13 +6214,11 @@ fn evalShuffle(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const elem_ty = try sema.resolveDestType(extra.elem_type, "@shuffle");
     if (!isVectorElemType(ip, elem_ty)) {
-        try sema.writer.writeAll("@shuffle: expected integer, float, bool, or pointer for the element type\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@shuffle: expected integer, float, bool, or pointer for the element type", .{});
     }
     const mask = try sema.resolveRef(extra.mask);
     const mask_len = (indexableInfo(ip, Value.typeOf(mask, ip).index) orelse {
-        try sema.writer.writeAll("@shuffle: expected vector or array for the mask\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@shuffle: expected vector or array for the mask", .{});
     }).len;
     const av = try sema.resolveRef(extra.a);
     const bv = try sema.resolveRef(extra.b);
@@ -6331,8 +6233,7 @@ fn evalShuffle(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     defer sema.gpa.free(elems);
     for (elems, 0..) |*e, i| {
         const raw = sema.intAsI128(InternPool.aggregateElementAt(mask_agg, i)) orelse {
-            try sema.writer.writeAll("@shuffle: mask element is not a comptime integer\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@shuffle: mask element is not a comptime integer", .{});
         };
         // A non-negative index selects `a`; a negative one selects `b` at `~raw`.
         const from_agg, const idx, const len = if (raw >= 0)
@@ -6340,8 +6241,7 @@ fn evalShuffle(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         else
             .{ b_agg, @as(u64, @intCast(~raw)), b_len };
         if (idx >= len) {
-            try sema.writer.print("mask element at index '{d}' selects out-of-bounds index\n", .{i});
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "mask element at index '{d}' selects out-of-bounds index", .{i});
         }
         e.* = InternPool.aggregateElementAt(from_agg, idx);
     }
@@ -6360,10 +6260,7 @@ fn failShuffleOperand(sema: *Sema, elem_ty: InternPool.Index) Error {
 /// or vector type, found '{f}'" error otherwise. Shared by the `@splat` handlers.
 fn expectArrayOrVector(sema: *Sema, ty: InternPool.Index) Error!IndexableInfo {
     return indexableInfo(sema.intern_pool, ty) orelse {
-        try sema.writer.writeAll("expected array or vector type, found '");
-        try Type.print(.fromIndex(ty), sema.intern_pool, sema.writer);
-        try sema.writer.writeAll("'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected array or vector type, found '{f}'", .{Type.fromIndex(ty).fmt(sema.intern_pool)});
     };
 }
 
@@ -6392,26 +6289,20 @@ fn validateArrayInitTy(sema: *Sema, init_count: u32, ty: InternPool.Index) Error
     const ip = sema.intern_pool;
     switch (ip.indexToKey(ty)) {
         .array_type => |at| if (init_count != at.len) {
-            try sema.writer.print("expected {d} array elements; found {d}\n", .{ at.len, init_count });
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected {d} array elements; found {d}", .{ at.len, init_count });
         },
         .vector_type => |vt| if (init_count != vt.len) {
-            try sema.writer.print("expected {d} vector elements; found {d}\n", .{ vt.len, init_count });
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected {d} vector elements; found {d}", .{ vt.len, init_count });
         },
         // The compiler allows FEWER than the field count (trailing comptime-
         // defaulted fields may be omitted) and catches a genuine shortfall later
         // in struct-init. This evaluator models no comptime tuple defaults, so
         // every field is required -- an exact count, checked here.
         .tuple_type => |tt| if (init_count != tt.types.len) {
-            try sema.writer.print("expected {d} tuple fields; found {d}\n", .{ tt.types.len, init_count });
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected {d} tuple fields; found {d}", .{ tt.types.len, init_count });
         },
         else => {
-            try sema.writer.writeAll("type '");
-            try Type.print(.fromIndex(ty), ip, sema.writer);
-            try sema.writer.writeAll("' does not support array initialization syntax\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "type '{f}' does not support array initialization syntax", .{Type.fromIndex(ty).fmt(ip)});
         },
     }
 }
@@ -6460,10 +6351,7 @@ fn evalValidateRefTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_tok = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_tok;
     const ty_operand = try sema.resolveDestType(un_tok.operand, "address-of");
     if (sema.intern_pool.indexToKey(sema.optEuBaseType(ty_operand)) != .ptr_type) {
-        try sema.writer.writeAll("expected type '");
-        try Type.print(.fromIndex(ty_operand), sema.intern_pool, sema.writer);
-        try sema.writer.writeAll("', found pointer\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected type '{f}', found pointer", .{Type.fromIndex(ty_operand).fmt(sema.intern_pool)});
     }
     return null;
 }
@@ -6501,12 +6389,7 @@ fn evalCoercePtrElemTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
                 .vector_type => |vt| vt.len,
                 .tuple_type => |tt| tt.types.len,
                 else => {
-                    try sema.writer.writeAll("expected array of '");
-                    try Type.print(.fromIndex(elem_ty), ip, sema.writer);
-                    try sema.writer.writeAll("', found '");
-                    try Type.print(.fromIndex(val_ty), ip, sema.writer);
-                    try sema.writer.writeAll("'\n");
-                    return error.AnalysisFail;
+                    return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected array of '{f}', found '{f}'", .{ Type.fromIndex(elem_ty).fmt(ip), Type.fromIndex(val_ty).fmt(ip) });
                 },
             };
             const want_ty = try ip.internArrayType(.{ .len = len, .child = elem_ty, .sentinel = ptr_ty.sentinel });
@@ -6687,8 +6570,7 @@ fn resolveCaptures(sema: *Sema, zir_captures: []const Zir.Inst.Capture) Error![]
             .instruction_load => |i| (try sema.loadValue(try sema.resolveRef(i.toRef()))).index,
             .nested => |idx| sema.intern_pool.indexToKey(sema.this_type).struct_type.id.captures()[idx],
             .decl_val, .decl_ref => {
-                try sema.writer.writeAll("closure capture: decl captures are not supported\n");
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "closure capture: decl captures are not supported", .{});
             },
         };
     }
@@ -6726,8 +6608,7 @@ fn enterSourceZir(sema: *Sema, source_zir_id: u32, ctx: []const u8) Error!ZirFra
 }
 
 fn failZirUnavailable(sema: *Sema, ctx: []const u8) Error {
-    try sema.writer.print("{s}: defining ZIR is no longer available\n", .{ctx});
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: defining ZIR is no longer available", .{ctx});
 }
 
 /// A container's resolution context: its source ZIR frame, the `this_type` that
@@ -7025,8 +6906,7 @@ fn callConvValue(sema: *Sema, cc: std.lang.CallingConvention) Error!InternPool.I
     switch (cc) {
         inline else => |payload, tag| {
             if (@TypeOf(payload) != void) {
-                try sema.writer.print("@typeInfo: calling convention '{s}' is not modelled\n", .{@tagName(tag)});
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@typeInfo: calling convention '{s}' is not modelled", .{@tagName(tag)});
             }
             const idx = (try sema.enumFieldIndex(tag_enum, try ip.getOrPutString(sema.gpa, @tagName(tag)))).?;
             const tag_val = (try sema.enumValueFieldIndex(tag_enum, idx)).?;
@@ -7179,10 +7059,7 @@ pub fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPoo
     if (decl.kind == .tagged_explicit) {
         const ty = (try sema.resolveInlineBody(decl.arg_type_body.?, cf.decl_inst)).index;
         if (ip.indexToKey(ty) != .enum_type) {
-            try sema.writer.writeAll("expected enum tag type, found '");
-            try Type.print(.fromIndex(ty), ip, sema.writer);
-            try sema.writer.writeAll("'\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected enum tag type, found '{f}'", .{Type.fromIndex(ty).fmt(ip)});
         }
         return ty;
     }
@@ -7281,8 +7158,7 @@ fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.En
         const cur: i128 = if (field.value_body) |body| blk: {
             const raw = try sema.resolveInlineBody(body, cf.decl_inst);
             break :blk sema.intAsI128(raw.index) orelse {
-                try sema.writer.writeAll("enum: tag value is not an integer\n");
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "enum: tag value is not an integer", .{});
             };
         } else next_auto;
         next_auto = cur + 1;
@@ -7399,8 +7275,7 @@ fn matchEnumField(
 /// `enum_tag` holds. Shared by `matchEnumField` and `resolveEnumFields`.
 fn enumTagIntValue(sema: *Sema, tag_ty: InternPool.Index, value: i128) Error!InternPool.Index {
     const i64v = std.math.cast(i64, value) orelse {
-        try sema.writer.writeAll("enum: tag value out of supported range\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "enum: tag value out of supported range", .{});
     };
     const raw = try sema.intern_pool.internInt(.{ .ty = .comptime_int_type, .storage = .{ .i64 = i64v } });
     return (try sema.coerceValueToType(.{ .index = raw }, tag_ty, "enum tag")).index;
@@ -7461,21 +7336,18 @@ fn evalEnumFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
     const dest_ty = (try sema.resolveRef(bin.lhs)).index;
     if (ip.indexToKey(dest_ty) != .enum_type) {
-        try sema.writer.writeAll("@enumFromInt: destination is not an enum\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@enumFromInt: destination is not an enum", .{});
     }
     const operand = try sema.resolveRef(bin.rhs);
     const value = sema.intAsI128(operand.index) orelse {
-        try sema.writer.writeAll("@enumFromInt: operand is not an integer\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@enumFromInt: operand is not an integer", .{});
     };
     // Mirror `intToEnum`: the value must name a field (`tagValueIndex`), then take
     // that field's canonical tag (`enumValueFieldIndex`).
     if (try sema.enumTagFieldIndex(dest_ty, operand)) |field_index|
         return (try sema.enumValueFieldIndex(dest_ty, field_index)).?;
     const name = ip.stringSlice(ip.indexToKey(dest_ty).enum_type.name);
-    try sema.writer.print("enum '{s}' has no tag with value '{d}'\n", .{ name, value });
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "enum '{s}' has no tag with value '{d}'", .{ name, value });
 }
 
 /// `int_from_bool` (`@intFromBool(b)`): `false` -> `0`, `true` -> `1`, as `u1`.
@@ -7553,8 +7425,7 @@ fn fieldValOnType(sema: *Sema, ty: InternPool.Index, name: InternPool.NullTermin
             return sema.failBadMemberAccess(ty, name);
         },
         else => {
-            try sema.writer.writeAll("decl literal: result type is not a container with members\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "decl literal: result type is not a container with members", .{});
         },
     }
 }
@@ -7567,8 +7438,7 @@ fn evalIntFromEnum(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand = try sema.resolveRef(un_node.operand);
     const key = sema.intern_pool.indexToKey(operand.index);
     if (key != .enum_tag) {
-        try sema.writer.writeAll("@intFromEnum: operand is not an enum value\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@intFromEnum: operand is not an enum value", .{});
     }
     return .{ .index = key.enum_tag.int };
 }
@@ -7587,18 +7457,12 @@ fn evalTagName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .enum_tag => |et| et,
         .un => |uv| blk: {
             if (!try sema.unionIsTagged(uv.ty)) {
-                try sema.writer.writeAll("union '");
-                try Type.print(.fromIndex(uv.ty), ip, sema.writer);
-                try sema.writer.writeAll("' is untagged\n");
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "union '{f}' is untagged", .{Type.fromIndex(uv.ty).fmt(ip)});
             }
             break :blk ip.indexToKey(uv.tag).enum_tag;
         },
         else => {
-            try sema.writer.writeAll("expected enum or union; found '");
-            try Type.print(operand.typeOf(ip), ip, sema.writer);
-            try sema.writer.writeAll("'\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected enum or union; found '{f}'", .{operand.typeOf(ip).fmt(ip)});
         },
     };
     // A valid enum_tag always names one of its type's fields: value -> index -> name.
@@ -7724,10 +7588,7 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
         // A by-pointer field access on a non-aggregate, non-type operand. Mirrors
         // fieldPtr's fallthrough "type '{f}' does not support field access".
         else => {
-            try sema.writer.writeAll("type '");
-            try Type.print(.fromIndex(container_ty), ip, sema.writer);
-            try sema.writer.writeAll("' does not support field access\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "type '{f}' does not support field access", .{Type.fromIndex(container_ty).fmt(ip)});
         },
     };
     // An anonymous struct's field carries no ZIR-resolvable type (`.none`); read
@@ -7986,8 +7847,7 @@ fn resolveConstStringIntern(sema: *Sema, ref: Zir.Inst.Ref) Error!InternPool.Nul
     const key = ip.indexToKey(agg.index);
     const arr = if (key == .aggregate) ip.indexToKey(key.aggregate.ty) else key;
     if (key != .aggregate or arr != .array_type or arr.array_type.child != .u8_type) {
-        try sema.writer.writeAll("expected a comptime string\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected a comptime string", .{});
     }
     const len: usize = @intCast(slice_len orelse arr.array_type.len);
     const bytes = try sema.gpa.alloc(u8, len);
@@ -8004,8 +7864,7 @@ fn resolveConstStringIntern(sema: *Sema, ref: Zir.Inst.Ref) Error!InternPool.Nul
 fn evalCompileError(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const msg = try sema.resolveConstStringIntern(un_node.operand);
-    try sema.writer.print("{s}\n", .{sema.intern_pool.stringSlice(msg)});
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "{s}", .{sema.intern_pool.stringSlice(msg)});
 }
 
 /// `@setEvalBranchQuota(n)`: raise the comptime branch-count ceiling. Mirrors
@@ -8060,14 +7919,14 @@ fn evalUnionInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const extra = sema.zir.extraData(Zir.Inst.UnionInit, pl_node.payload_index).data;
     const union_ty = try sema.resolveDestType(extra.union_type, "@unionInit");
     if (ip.indexToKey(union_ty) != .union_type) {
-        return sema.fail("@unionInit: expected union type, found '{f}'", .{Type.fromIndex(union_ty).fmt(ip)});
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@unionInit: expected union type, found '{f}'", .{Type.fromIndex(union_ty).fmt(ip)});
     }
     const field_name = try sema.resolveConstStringIntern(extra.field_name);
     const field = (try sema.unionFieldByName(union_ty, field_name)) orelse
         return sema.failBadUnionFieldAccess(union_ty, field_name);
     const payload = try sema.coerceValueToType(try sema.resolveRef(extra.init), field.ty, "@unionInit");
     if (ip.unionFields(union_ty)) |uf| if (uf.layout == .@"packed") {
-        return sema.fail("@unionInit of a packed union is not supported", .{});
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@unionInit of a packed union is not supported", .{});
     };
     const tag_enum = try sema.unionTagEnumType(union_ty);
     const tag_val = (try sema.enumValueFieldIndex(tag_enum, field.index)).?;
@@ -8096,7 +7955,7 @@ fn evalFieldTypeRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         },
         .union_type => ((try sema.unionFieldByName(aggregate_ty, field_name)) orelse
             return sema.failBadUnionFieldAccess(aggregate_ty, field_name)).ty,
-        else => return sema.fail("expected struct or union; found '{f}'", .{Type.fromIndex(aggregate_ty).fmt(ip)}),
+        else => return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected struct or union; found '{f}'", .{Type.fromIndex(aggregate_ty).fmt(ip)}),
     };
     return .{ .index = field_ty };
 }
@@ -8114,7 +7973,7 @@ fn evalMergeErrorSets(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const lhs = try sema.resolveRef(bin.lhs);
     const rhs = try sema.resolveRef(bin.rhs);
     if (Value.typeOf(lhs, ip).index == .bool_type and Value.typeOf(rhs, ip).index == .bool_type) {
-        return sema.fail("expected error set type, found 'bool' ('||' merges error sets; 'or' performs boolean OR)", .{});
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected error set type, found 'bool' ('||' merges error sets; 'or' performs boolean OR)", .{});
     }
     // `resolveDestType` is the REPL's `analyzeAsType`: it validates each operand is
     // a type before the error-set-tag check reads it.
@@ -8122,7 +7981,7 @@ fn evalMergeErrorSets(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const rhs_ty = try sema.resolveDestType(bin.rhs, "error set merge");
     inline for (.{ lhs_ty, rhs_ty }) |ty| {
         if (Type.fromIndex(ty).zigTypeTag(ip) != .error_set) {
-            return sema.fail("expected error set type, found '{f}'", .{Type.fromIndex(ty).fmt(ip)});
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected error set type, found '{f}'", .{Type.fromIndex(ty).fmt(ip)});
         }
     }
     if (lhs_ty == .anyerror_type or rhs_ty == .anyerror_type) return .{ .index = .anyerror_type };
@@ -8181,10 +8040,7 @@ fn evalHasField(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             .array_type => break :hf field_name.eqlSlice("len", ip),
             else => {},
         }
-        try sema.writer.writeAll("type '");
-        try Type.print(.fromIndex(ty), ip, sema.writer);
-        try sema.writer.writeAll("' does not support '@hasField'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "type '{f}' does not support '@hasField'", .{Type.fromIndex(ty).fmt(ip)});
     };
     return .{ .index = if (has_field) .bool_true else .bool_false };
 }
@@ -8202,10 +8058,7 @@ fn evalHasDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // checkNamespaceType: `@hasDecl` requires a container (the REPL has no opaque).
     // A non-namespace type is a compile error, not a `false` result.
     if (sema.containerNamespace(container_type) == null) {
-        try sema.writer.writeAll("expected struct, enum, union, or opaque; found '");
-        try Type.print(.fromIndex(container_type), sema.intern_pool, sema.writer);
-        try sema.writer.writeAll("'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected struct, enum, union, or opaque; found '{f}'", .{Type.fromIndex(container_type).fmt(sema.intern_pool)});
     }
     // getNamespace + lookupInNamespace; `.accessible` is always true in the REPL's
     // single-file model, so a present name is the answer.
@@ -8335,8 +8188,7 @@ fn storePointee(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
             try sema.storePointee(ip.indexToKey(base).ptr, new_eu);
         },
         .nav, .uav => {
-            try sema.writer.writeAll("unable to evaluate comptime expression: store through a pointer to a declaration\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "unable to evaluate comptime expression: store through a pointer to a declaration", .{});
         },
     }
 }
@@ -8381,8 +8233,7 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // error. Mirrors `validateUnionInit`.
     if (ip.indexToKey(struct_ty) == .union_type) {
         if (body.len != 1) {
-            try sema.writer.writeAll("cannot initialize multiple union fields at once; unions can only have one active field\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "cannot initialize multiple union fields at once; unions can only have one active field", .{});
         }
         return null;
     }
@@ -8405,8 +8256,7 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         if (std.mem.indexOfScalar(InternPool.NullTerminatedString, stored, name) != null) continue;
         const default = try sema.structFieldDefault(struct_ty, name);
         if (default == .none) {
-            try sema.writer.print("missing struct field: {s}\n", .{ip.stringSlice(name)});
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "missing struct field: {s}", .{ip.stringSlice(name)});
         }
         const alloc = try sema.lookupComptimeAlloc(ip.indexToKey(object_ptr.index).ptr);
         alloc.val = try sema.setAggregateElement(alloc.val, struct_ty, i, .{ .index = default });
@@ -8426,8 +8276,7 @@ fn evalValidateStructInitTy(sema: *Sema, inst: Zir.Inst.Index, comptime is_resul
     switch (sema.intern_pool.indexToKey(struct_ty)) {
         .struct_type, .union_type => return null,
         else => {
-            try sema.writer.writeAll("struct init: type does not support struct initialization syntax\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "struct init: type does not support struct initialization syntax", .{});
         },
     }
 }
@@ -8447,8 +8296,7 @@ fn evalStructInitFieldType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .union_type => ((try sema.unionFieldByName(container_ty, name)) orelse
             return sema.failBadUnionFieldAccess(container_ty, name)).ty,
         else => {
-            try sema.writer.writeAll("struct init: initializer type is not a struct or union\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "struct init: initializer type is not a struct or union", .{});
         },
     };
     return .{ .index = field_ty };
@@ -8478,8 +8326,7 @@ fn evalStructInit(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Erro
         .struct_type => {},
         .union_type => return try sema.evalStructInitUnion(struct_ty, result_ty, inst, is_ref),
         else => {
-            try sema.writer.writeAll("struct init: initializer type is not a struct or union\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "struct init: initializer type is not a struct or union", .{});
         },
     }
 
@@ -8516,8 +8363,7 @@ fn evalStructInitUnion(sema: *Sema, union_ty: InternPool.Index, result_ty: Inter
     const datas = sema.zir.instructions.items(.data);
     const extra = sema.zir.extraData(Zir.Inst.StructInit, datas[@intFromEnum(inst)].pl_node.payload_index);
     if (extra.data.fields_len != 1) {
-        try sema.writer.writeAll("union initialization expects exactly one field\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "union initialization expects exactly one field", .{});
     }
 
     const item = sema.zir.extraData(Zir.Inst.StructInit.Item, extra.end).data;
@@ -8536,12 +8382,10 @@ fn evalStructInitUnion(sema: *Sema, union_ty: InternPool.Index, result_ty: Inter
     // active-field check reads the tag's position, so a mismatch would misreport
     // it. Mirrors the compiler's union/tag field-order validation.
     if (tag_index != field.index) {
-        try sema.writer.writeAll("union field order does not match tag enum field order\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "union field order does not match tag enum field order", .{});
     }
     if ((try sema.enumFieldCount(tag_enum)) != try sema.unionFieldCount(union_ty)) {
-        try sema.writer.writeAll("enum field missing from union\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "enum field missing from union", .{});
     }
     const tag = (try sema.enumValueFieldIndex(tag_enum, tag_index)).?;
     const value: Value = .{ .index = try ip.internUnion(.{ .ty = union_ty, .tag = tag.index, .val = val }) };
@@ -8556,8 +8400,7 @@ fn evalStructInitEmpty(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const struct_ty = (try sema.resolveRef(un_node.operand)).index;
     if (sema.intern_pool.indexToKey(struct_ty) != .struct_type) {
-        try sema.writer.writeAll("struct init: type does not support struct initialization syntax\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "struct init: type does not support struct initialization syntax", .{});
     }
     return try sema.structInitEmpty(struct_ty);
 }
@@ -8592,12 +8435,10 @@ fn evalStructInitEmptyResult(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref:
         .struct_type, .tuple_type => try sema.structInitEmpty(obj_ty),
         .array_type, .vector_type => try sema.arrayInitEmpty(obj_ty),
         .union_type => {
-            try sema.writer.writeAll("union initializer must initialize one field\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "union initializer must initialize one field", .{});
         },
         else => {
-            try sema.writer.writeAll("struct init: type does not support struct initialization syntax\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "struct init: type does not support struct initialization syntax", .{});
         },
     };
     const value = if (init_ty == obj_ty) base else try sema.coerceValueToType(base, init_ty, "struct init");
@@ -8614,8 +8455,7 @@ fn arrayInitEmpty(sema: *Sema, obj_ty: InternPool.Index) Error!Value {
         else => unreachable,
     };
     if (arr_len != 0) {
-        try sema.writer.print("expected {d} {s} elements; found 0\n", .{ arr_len, if (key == .array_type) "array" else "vector" });
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected {d} {s} elements; found 0", .{ arr_len, if (key == .array_type) "array" else "vector" });
     }
     return .{ .index = try sema.intern_pool.internAggregate(.{ .ty = obj_ty, .storage = .{ .elems = &.{} } }) };
 }
@@ -8636,8 +8476,7 @@ fn finishStructInit(sema: *Sema, struct_ty: InternPool.Index, result_ty: InternP
         const name = (try sema.structFieldNameAt(struct_ty, @intCast(i))).?;
         const default = try sema.structFieldDefault(struct_ty, name);
         if (default == .none) {
-            try sema.writer.print("missing struct field: {s}\n", .{ip.stringSlice(name)});
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "missing struct field: {s}", .{ip.stringSlice(name)});
         }
         elem.* = default;
     }
@@ -8727,12 +8566,10 @@ fn elemPtr(sema: *Sema, array_ptr: Value, index: u64) Error!Value {
     // A vector indexes exactly like an array (`@Vector(N, T)` inits and indexes
     // through the same `array_init_elem_ptr` / `elem_ptr` ZIR), so accept both.
     const elems = indexableInfo(ip, child_ty) orelse {
-        try sema.writer.writeAll("elem ptr: operand is not an array pointer\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "elem ptr: operand is not an array pointer", .{});
     };
     if (index >= elems.len) {
-        try sema.writer.print("index {d} outside array of length {d}\n", .{ index, elems.len });
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index {d} outside array of length {d}", .{ index, elems.len });
     }
     const elem_ptr_ty = try ip.internPtrType(.{
         .child = elems.child,
@@ -8757,8 +8594,7 @@ fn elemPtrSlice(sema: *Sema, slice_ptr: Value, index: u64, slice_ty: InternPool.
     const s = ip.indexToKey(slice_val.index).slice;
     const len = try sema.resolveUsizeInt(.{ .index = s.len }, "slice index");
     if (index >= len) {
-        try sema.writer.print("index {d} outside slice of length {d}\n", .{ index, len });
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index {d} outside slice of length {d}", .{ index, len });
     }
     const many = ip.indexToKey(s.ptr).ptr;
     const base: InternPool.Index, const start: u64 = if (many.base_addr == .arr_elem)
@@ -8804,8 +8640,7 @@ fn evalValidatePtrArrayInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // The init target is an array or a vector (both use `array_init_elem_ptr`).
     const array_len = (indexableInfo(ip, array_ty) orelse return null).len;
     if (body.len != array_len) {
-        try sema.writer.print("expected {d} array elements; found {d}\n", .{ array_len, body.len });
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected {d} array elements; found {d}", .{ array_len, body.len });
     }
     return null;
 }
@@ -8880,16 +8715,14 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
     const end_is_len = end == len;
 
     if (start > end) {
-        try sema.writer.print("start index {d} is larger than end index {d}\n", .{ start, end });
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "start index {d} is larger than end index {d}", .{ start, end });
     }
     if (end > len + @intFromBool(ptr_sentinel != .none)) {
         // The printed length excludes the sentinel; a `" +1 (sentinel)"` suffix
         // notes it is admissible as the end index when the operand is terminated.
         const sentinel_label: []const u8 = if (ptr_sentinel != .none) " +1 (sentinel)" else "";
         const kind: []const u8 = if (operand_is_slice) "slice" else "array";
-        try sema.writer.print("end index {d} out of bounds for {s} of length {d}{s}\n", .{ end, kind, len, sentinel_label });
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "end index {d} out of bounds for {s} of length {d}{s}", .{ end, kind, len, sentinel_label });
     }
 
     // Result sentinel: an explicit `:S`, else inherited when slicing to the end of a
@@ -8901,8 +8734,7 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
             // The sentinel sits at index `end` of the backing; verify it matches.
             const actual = try sema.aggregateElementByIndex(try sema.loadValue(.{ .index = backing }), base_offset + end);
             if (actual.index != casted.index) {
-                try sema.writer.writeAll("value in memory does not match slice sentinel\n");
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "value in memory does not match slice sentinel", .{});
             }
             break :s casted.index;
         }
@@ -8923,8 +8755,7 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
 }
 
 fn failSliceNotArrayPtr(sema: *Sema) Error {
-    try sema.writer.writeAll("slice: operand is not an array pointer\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "slice: operand is not an array pointer", .{});
 }
 
 fn evalSliceStart(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
@@ -8978,10 +8809,7 @@ fn evalSliceSentinelTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const lhs_ty = switch (ip.indexToKey(lhs_ptr_ty.index)) {
         .ptr_type => |pt| pt.child,
         else => {
-            try sema.writer.writeAll("expected pointer, found '");
-            try Type.print(lhs_ptr_ty, ip, sema.writer);
-            try sema.writer.writeAll("'\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected pointer, found '{f}'", .{lhs_ptr_ty.fmt(ip)});
         },
     };
     const sentinel_ty: InternPool.Index = switch (ip.indexToKey(lhs_ty)) {
@@ -8991,16 +8819,12 @@ fn evalSliceSentinelTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             .one => switch (ip.indexToKey(pt.child)) {
                 .array_type => |at| at.child,
                 else => {
-                    try sema.writer.writeAll("slice of single-item pointer cannot have sentinel\n");
-                    return error.AnalysisFail;
+                    return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "slice of single-item pointer cannot have sentinel", .{});
                 },
             },
         },
         else => {
-            try sema.writer.writeAll("slice of non-array type '");
-            try Type.print(Type.fromIndex(lhs_ty), ip, sema.writer);
-            try sema.writer.writeAll("'\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "slice of non-array type '{f}'", .{Type.fromIndex(lhs_ty).fmt(ip)});
         },
     };
     return .{ .index = sentinel_ty };
@@ -9057,13 +8881,11 @@ fn aggregateElementByIndex(sema: *Sema, array_value: Value, index: u64) Error!Va
     while (ip.indexToKey(agg.index) == .ptr) agg = try sema.loadValue(agg);
     const agg_key = ip.indexToKey(agg.index);
     if (agg_key != .aggregate) {
-        try sema.writer.writeAll("elem access: operand is not an indexable aggregate\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "elem access: operand is not an indexable aggregate", .{});
     }
     const count = slice_len orelse ip.aggregateElementCount(agg_key.aggregate.ty);
     if (index >= count) {
-        try sema.writer.print("index {d} outside array of length {d}\n", .{ index, count });
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index {d} outside array of length {d}", .{ index, count });
     }
     return .{ .index = InternPool.aggregateElementAt(agg_key.aggregate, start_offset + index) };
 }
@@ -9086,10 +8908,7 @@ fn memOperandType(sema: *Sema, value: Value) ?Type {
 }
 
 fn failMemOperand(sema: *Sema, ty: Type) Error {
-    try sema.writer.writeAll("@memcpy: type '");
-    try Type.print(ty, sema.intern_pool, sema.writer);
-    try sema.writer.writeAll("' is not an indexable pointer; operand must be a slice, a many pointer or a pointer to an array\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@memcpy: type '{f}' is not an indexable pointer; operand must be a slice, a many pointer or a pointer to an array", .{ty.fmt(sema.intern_pool)});
 }
 
 /// The element count of a `@memcpy` operand, or null for many/C pointers (which
@@ -9156,8 +8975,7 @@ fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const src_ty = sema.memOperandType(src) orelse return sema.failMemOperand(src.typeOf(ip));
 
     if (dest_ty.isConstPtr(ip)) {
-        try sema.writer.writeAll("@memcpy: cannot copy to constant pointer\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@memcpy: cannot copy to constant pointer", .{});
     }
 
     const dest_elem = dest_ty.indexableElem(ip);
@@ -9176,12 +8994,10 @@ fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const dest_len = try sema.indexableMemLen(dest);
     const src_len = try sema.indexableMemLen(src);
     if (dest_len == null and src_len == null) {
-        try sema.writer.writeAll("@memcpy: unknown copy length\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@memcpy: unknown copy length", .{});
     }
     if (dest_len != null and src_len != null and dest_len.? != src_len.?) {
-        try sema.writer.print("@memcpy: non-matching copy lengths {d} and {d}\n", .{ dest_len.?, src_len.? });
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@memcpy: non-matching copy lengths {d} and {d}", .{ dest_len.?, src_len.? });
     }
     const len = dest_len orelse src_len.?;
     if (len == 0) return null;
@@ -9193,8 +9009,7 @@ fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     if (!src_elem.comptimeOnly(ip) and (src_elem.abiSize(ip) orelse 0) == 0) return null;
 
     if (sema.doPointersOverlap(dest, src, len)) {
-        try sema.writer.writeAll("@memcpy: arguments alias\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@memcpy: arguments alias", .{});
     }
 
     // Copy as one array load and one array store, as zirMemcpy does: upgrade each
@@ -9238,13 +9053,11 @@ fn resolveInt(sema: *Sema, value: Value, ty: InternPool.Index, op_name: []const 
     const coerced = try sema.coerceValueToType(value, ty, op_name);
     const key = sema.intern_pool.indexToKey(coerced.index);
     if (key != .int) {
-        try sema.writer.print("{s}: expected an integer\n", .{op_name});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: expected an integer", .{op_name});
     }
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     return key.int.storage.toBigInt(&space).toInt(u64) catch {
-        try sema.writer.print("{s}: value out of range\n", .{op_name});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: value out of range", .{op_name});
     };
 }
 
@@ -9305,8 +9118,7 @@ fn evalBitNot(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand_key = ip.indexToKey(operand_value.index);
 
     if (operand_key != .int) {
-        try sema.writer.writeAll("bit_not: operand is not an int\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "bit_not: operand is not an int", .{});
     }
 
     if (operand_key.int.ty == .comptime_int_type) {
@@ -9314,8 +9126,7 @@ fn evalBitNot(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     }
 
     const dest_info = intTypeInfo(ip, operand_key.int.ty) orelse {
-        try sema.writer.writeAll("bit_not: int type not yet supported\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "bit_not: int type not yet supported", .{});
     };
     return try sema.runFixedWidthBitNot(operand_key.int, operand_key.int.ty, dest_info);
 }
@@ -9389,8 +9200,7 @@ fn resolveRef(sema: *Sema, ref: Zir.Inst.Ref) Error!Value {
     }
 
     if (wellKnownRefToValue(ref)) |value| return value;
-    try sema.writer.print("unsupported ZIR ref: {s}\n", .{@tagName(ref)});
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "unsupported ZIR ref: {s}", .{@tagName(ref)});
 }
 
 /// Maps a static ZIR `Ref` to the corresponding interned Value.
@@ -9444,8 +9254,7 @@ fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return .{ .index = found.resolved.value };
     }
     const name = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir);
-    try sema.writer.print("decl_val '{s}': not found in scope\n", .{name});
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "decl_val '{s}': not found in scope", .{name});
 }
 
 /// `decl_ref name`: AstGen emits this (rather than `decl_val`) when the use
@@ -9468,8 +9277,7 @@ fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     }
     const found = (try sema.lookupDecl(inst, "decl_ref")) orelse {
         const name = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir);
-        try sema.writer.print("decl_ref '{s}': not found in scope\n", .{name});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "decl_ref '{s}': not found in scope", .{name});
     };
     const ip = sema.intern_pool;
     const ptr_ty = try ip.internPtrType(.{
@@ -9500,8 +9308,7 @@ fn lookupDecl(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error!?Dec
     const name = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes);
 
     const ns_idx = sema.namespace orelse {
-        try sema.writer.print("{s} '{s}': no namespace in scope\n", .{ op_name, name_bytes });
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "{s} '{s}': no namespace in scope", .{ op_name, name_bytes });
     };
 
     if (try sema.lookupName(ns_idx, name)) |nav_idx| {
@@ -9573,6 +9380,10 @@ fn bindOneDecl(
     ns_idx: InternPool.NamespaceIndex,
     decl_inst: Zir.Inst.Index,
 ) Error!void {
+    // Anchor source locations for this decl's bodies at its own node, so a `fail`
+    // here resolves against the right declaration. Mirrors the compiler analyzing
+    // each decl in a block whose `src_base_inst` is that decl.
+    sema.block.src_base_inst = decl_inst;
     const unwrapped = sema.zir.getDeclaration(decl_inst);
     if (unwrapped.kind == .@"comptime" or unwrapped.kind == .unnamed_test) {
         return sema.bindAnonymousDecl(ns_idx, decl_inst, unwrapped);
@@ -9810,15 +9621,13 @@ fn errUnionCodeVal(sema: *Sema, operand_value: Value) Error!Value {
     const ip = sema.intern_pool;
     const operand_key = ip.indexToKey(operand_value.index);
     if (operand_key != .error_union) {
-        try sema.writer.print("err_union_code: operand is not an error union\n", .{});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "err_union_code: operand is not an error union", .{});
     }
     const eu_type = ip.indexToKey(operand_key.error_union.ty).error_union_type;
     switch (operand_key.error_union.val) {
         .err_name => |name| return .{ .index = try ip.internErr(.{ .ty = eu_type.error_set_type, .name = name }) },
         .payload => {
-            try sema.writer.print("err_union_code: operand carries a payload, not an error\n", .{});
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "err_union_code: operand carries a payload, not an error", .{});
         },
     }
 }
@@ -9845,14 +9654,12 @@ fn errUnionPayloadPtr(sema: *Sema, eu_ptr: Value, comptime initializing: bool) E
     const ptr_type = ip.indexToKey(eu_ptr.typeOf(ip).toIndex()).ptr_type;
     const eu_key = ip.indexToKey(ptr_type.child);
     if (eu_key != .error_union_type) {
-        try sema.writer.writeAll("err_union_payload: pointer child is not an error union\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "err_union_payload: pointer child is not an error union", .{});
     }
     if (!initializing) {
         const eu_val = try sema.loadValue(eu_ptr);
         if (ip.indexToKey(eu_val.index).error_union.val == .err_name) {
-            try sema.writer.writeAll("err_union_payload: operand carries an error, not a payload\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "err_union_payload: operand carries an error, not a payload", .{});
         }
     }
     const child_ptr_ty = try ip.internPtrType(.{ .child = eu_key.error_union_type.payload_type, .sentinel = ptr_type.sentinel, .flags = ptr_type.flags });
@@ -9876,8 +9683,7 @@ fn evalTry(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const err_union = try sema.resolveRef(extra.data.operand);
     const key = ip.indexToKey(err_union.index);
     if (key != .error_union) {
-        try sema.writer.writeAll("expected error union type\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected error union type", .{});
     }
     return switch (key.error_union.val) {
         .payload => |p| .{ .index = p },
@@ -9900,8 +9706,7 @@ fn evalTryPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const err_union = try sema.loadValue(operand);
     const key = ip.indexToKey(err_union.index);
     if (key != .error_union) {
-        try sema.writer.writeAll("expected error union type\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected error union type", .{});
     }
     return switch (key.error_union.val) {
         .payload => try sema.errUnionPayloadPtr(operand, false),
@@ -9922,8 +9727,7 @@ fn evalEnsureErrUnionPayloadVoid(sema: *Sema, inst: Zir.Inst.Index) Error!?Value
     if (eu_ty.zigTypeTag(ip) != .error_union) return null;
     const payload_tag = eu_ty.errorUnionPayload(ip).zigTypeTag(ip);
     if (payload_tag != .void and payload_tag != .noreturn) {
-        try sema.writer.writeAll("error union payload is ignored\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "error union payload is ignored", .{});
     }
     return null;
 }
@@ -9944,15 +9748,13 @@ fn evalErrUnionPayloadUnsafe(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand_value = try sema.resolveRef(un_node.operand);
     const operand_key = sema.intern_pool.indexToKey(operand_value.index);
     if (operand_key != .error_union) {
-        try sema.writer.print("err_union_payload: operand is not an error union\n", .{});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "err_union_payload: operand is not an error union", .{});
     }
 
     switch (operand_key.error_union.val) {
         .payload => |payload_idx| return .{ .index = payload_idx },
         .err_name => {
-            try sema.writer.print("err_union_payload: operand carries an error, not a payload\n", .{});
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "err_union_payload: operand carries an error, not a payload", .{});
         },
     }
 }
@@ -9992,8 +9794,7 @@ fn evalIsNonErrPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 fn isNonErrVal(sema: *Sema, operand_value: Value) Error!Value {
     const operand_key = sema.intern_pool.indexToKey(operand_value.index);
     if (operand_key != .error_union) {
-        try sema.writer.print("is_non_err: operand is not an error union\n", .{});
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "is_non_err: operand is not an error union", .{});
     }
     return switch (operand_key.error_union.val) {
         .payload => Value.bool_true,
@@ -10045,23 +9846,20 @@ fn evalForLen(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             while (ip.indexToKey(obj.index) == .ptr) obj = try sema.loadValue(obj);
             const key = ip.indexToKey(obj.index);
             if (key != .aggregate) {
-                try sema.writer.writeAll("for: operand is not a range or indexable\n");
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "for: operand is not a range or indexable", .{});
             }
             break :blk ip.aggregateElementCount(key.aggregate.ty);
         } else blk: {
             const start = try sema.resolveUsizeInt(try sema.resolveRef(pair[0]), "for range start");
             const end = try sema.resolveUsizeInt(try sema.resolveRef(pair[1]), "for range end");
             if (end < start) {
-                try sema.writer.writeAll("for: range end is before range start\n");
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "for: range end is before range start", .{});
             }
             break :blk end - start;
         };
         if (len) |existing| {
             if (existing != arg_len) {
-                try sema.writer.writeAll("for: non-matching loop lengths\n");
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "for: non-matching loop lengths", .{});
             }
         } else len = arg_len;
     }
@@ -10116,16 +9914,14 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // the comptime_alloc slot.
     if (tag == .switch_block_err_union) {
         const non_err = sw.non_err_case orelse {
-            try sema.writer.writeAll("switch_block_err_union: missing non_err_case\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "switch_block_err_union: missing non_err_case", .{});
         };
         if (non_err.operand_is_ref) {
             operand = try sema.loadValue(operand);
         }
         const eu_key = sema.intern_pool.indexToKey(operand.index);
         if (eu_key != .error_union) {
-            try sema.writer.writeAll("switch_block_err_union: operand is not an error_union\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "switch_block_err_union: operand is not an error_union", .{});
         }
         switch (eu_key.error_union.val) {
             .payload => {
@@ -10159,8 +9955,7 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     if (sema.intern_pool.indexToKey(operand.index) == .un) {
         const uv = sema.intern_pool.indexToKey(operand.index).un;
         if (!try sema.unionIsTagged(uv.ty)) {
-            try sema.writer.writeAll("switch on union with no attached enum\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "switch on union with no attached enum", .{});
         }
         cond = .{ .index = uv.tag };
         union_operand = uv;
@@ -10209,8 +10004,7 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return try sema.resolveInlineBody(else_case.body, inst);
     }
 
-    try sema.writer.writeAll("switch: no matching case and no else\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "switch: no matching case and no else", .{});
 }
 
 /// The subset of `zigTypeTag` that `validateSwitchBlock`'s exhaustiveness switch
@@ -10254,10 +10048,7 @@ fn isAnyerrorSet(ip: *const InternPool, item_ty: InternPool.Index) bool {
 /// whose domain cannot be enumerated; a no-op when an `else` is present.
 fn requireSwitchElse(sema: *Sema, item_ty: InternPool.Index, has_else: bool) Error!void {
     if (has_else) return;
-    try sema.writer.writeAll("else prong required when switching on type '");
-    try Type.print(.fromIndex(item_ty), sema.intern_pool, sema.writer);
-    try sema.writer.writeAll("'\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "else prong required when switching on type '{f}'", .{Type.fromIndex(item_ty).fmt(sema.intern_pool)});
 }
 /// Miniature of the compiler's `RangeSet`: `i128` integer intervals with overlap
 /// (duplicate) and full-range spanning tests; `[lo, hi]` inclusive.
@@ -10395,10 +10186,7 @@ fn validateSwitchBlock(sema: *Sema, inst: Zir.Inst.Index, item_ty: InternPool.In
 
     const type_tag = switchTypeTag(ip, item_ty);
     if (type_tag == .other) {
-        try sema.writer.writeAll("switch on type '");
-        try Type.print(.fromIndex(item_ty), ip, sema.writer);
-        try sema.writer.writeAll("'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "switch on type '{f}'", .{Type.fromIndex(item_ty).fmt(ip)});
     }
 
     var seen_enum_fields: []bool = &.{};
@@ -10427,8 +10215,7 @@ fn validateSwitchBlock(sema: *Sema, inst: Zir.Inst.Index, item_ty: InternPool.In
         for (case.item_infos) |item_info| {
             const dup = switch (item_info.unwrap()) {
                 .under => {
-                    try sema.writer.writeAll("'_' prong only allowed when switching on non-exhaustive enums\n");
-                    return error.AnalysisFail;
+                    return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "'_' prong only allowed when switching on non-exhaustive enums", .{});
                 },
                 .enum_literal => |n| blk: {
                     const name = try ip.getOrPutString(gpa, sema.zir.nullTerminatedString(n));
@@ -10449,8 +10236,7 @@ fn validateSwitchBlock(sema: *Sema, inst: Zir.Inst.Index, item_ty: InternPool.In
                 },
             };
             if (dup) {
-                try sema.writer.writeAll("duplicate switch value\n");
-                return error.AnalysisFail;
+                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "duplicate switch value", .{});
             }
         }
         for (case.range_infos) |range_pair| {
@@ -10464,8 +10250,7 @@ fn validateSwitchBlock(sema: *Sema, inst: Zir.Inst.Index, item_ty: InternPool.In
                 const lo = try sema.coerceValueToType(try sema.resolveInlineBody(sema.zir.bodySlice(extra_index, lo_len), inst), item_ty, "switch range");
                 const hi = try sema.coerceValueToType(try sema.resolveInlineBody(sema.zir.bodySlice(extra_index + lo_len, hi_len), inst), item_ty, "switch range");
                 if (try range_set.add(gpa, sema.intAsI128(lo.index).?, sema.intAsI128(hi.index).?)) {
-                    try sema.writer.writeAll("duplicate switch value\n");
-                    return error.AnalysisFail;
+                    return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "duplicate switch value", .{});
                 }
             }
             extra_index += lo_len + hi_len;
@@ -10474,10 +10259,7 @@ fn validateSwitchBlock(sema: *Sema, inst: Zir.Inst.Index, item_ty: InternPool.In
 
     // Ranges are only meaningful for integers (validateSwitchBlock 11366).
     if (saw_range and type_tag != .int and type_tag != .comptime_int) {
-        try sema.writer.writeAll("ranges not allowed when switching on type '");
-        try Type.print(.fromIndex(item_ty), ip, sema.writer);
-        try sema.writer.writeAll("'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "ranges not allowed when switching on type '{f}'", .{Type.fromIndex(item_ty).fmt(ip)});
     }
 
     // Exhaustiveness per type tag (validateSwitchBlock 11390).
@@ -10503,12 +10285,10 @@ fn validateSwitchBlock(sema: *Sema, inst: Zir.Inst.Index, item_ty: InternPool.In
     };
     if (has_else) {
         if (all_handled) {
-            try sema.writer.writeAll("unreachable else prong; all cases already handled\n");
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "unreachable else prong; all cases already handled", .{});
         }
     } else if (!all_handled) {
-        try sema.writer.writeAll("switch must handle all possibilities\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "switch must handle all possibilities", .{});
     }
 }
 
@@ -10665,8 +10445,7 @@ fn integerInRange(sema: *Sema, x: Value, lo: Value, hi: Value) Error!bool {
     const lo_key = sema.intern_pool.indexToKey(lo.index);
     const hi_key = sema.intern_pool.indexToKey(hi.index);
     if (x_key != .int or lo_key != .int or hi_key != .int) {
-        try sema.writer.writeAll("switch range: non-integer endpoint\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "switch range: non-integer endpoint", .{});
     }
     var x_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     var lo_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
@@ -10678,8 +10457,7 @@ fn integerInRange(sema: *Sema, x: Value, lo: Value, hi: Value) Error!bool {
 }
 
 fn failSwitch(sema: *Sema, what: []const u8) Error {
-    try sema.writer.print("unsupported switch construct: {s}\n", .{what});
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "unsupported switch construct: {s}", .{what});
 }
 
 /// `.param` / `.param_comptime`: evaluate the param's type body (break_target
@@ -10932,8 +10710,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
 
     const callee_key = sema.intern_pool.indexToKey(callee_value.index);
     if (callee_key != .func) {
-        try sema.writer.writeAll("call: callee is not a function value\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "call: callee is not a function value", .{});
     }
     const func = callee_key.func;
     var func_ty = sema.intern_pool.indexToKey(func.ty).func_type;
@@ -11142,8 +10919,7 @@ fn evalTypeof(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// `containerDeclByName` around a member's evaluation.
 fn evalThis(sema: *Sema) Error!?Value {
     if (sema.this_type == .none) {
-        try sema.writer.writeAll("@This(): no enclosing container\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@This(): no enclosing container", .{});
     }
     return Value{ .index = sema.this_type };
 }
@@ -11155,8 +10931,7 @@ fn evalThis(sema: *Sema) Error!?Value {
 /// arm; the runtime/nav arms do not arise in a comptime evaluator.
 fn evalClosureGet(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
     if (sema.this_type == .none) {
-        try sema.writer.writeAll("closure_get: no enclosing container\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "closure_get: no enclosing container", .{});
     }
     const captures = switch (sema.intern_pool.indexToKey(sema.this_type)) {
         .struct_type => |st| st.id.captures(),
@@ -11204,10 +10979,7 @@ fn evalOverflowArithmetic(sema: *Sema, extended: Zir.Inst.Extended.InstData, opc
     const rhs = try sema.coerceValueToType(uncasted_rhs, rhs_dest_ty.index, op_name);
 
     if (dest_ty.scalarType(ip).zigTypeTag(ip) != .int) {
-        try sema.writer.print("{s}: expected vector of integers or integer tag type, found '", .{op_name});
-        try Type.print(dest_ty, ip, sema.writer);
-        try sema.writer.writeAll("'\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: expected vector of integers or integer tag type, found '{f}'", .{ op_name, dest_ty.fmt(ip) });
     }
 
     // The result is a `.{ dest_ty, u1|@Vector(N,u1) }` tuple; `overflow_ty` is its
@@ -11318,8 +11090,7 @@ fn peerResolvePair(sema: *Sema, a: Value, b: Value) Error!Value {
     if (coerceNumericPairToFloat(a_key, b_key)) |pair| {
         return if (a_ty == pair[0].ty) a else b;
     }
-    try sema.writer.writeAll("@TypeOf: no peer type for the given operands\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@TypeOf: no peer type for the given operands", .{});
 }
 
 /// `.typeof_builtin`: `@TypeOf(...)` body-form -- AstGen wraps
@@ -11414,15 +11185,13 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .frame => return sema.failUseOfAsync(),
 
         inline else => |op| {
-            try sema.writer.print("unsupported extended ZIR opcode: {s}\n", .{@tagName(op)});
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "unsupported extended ZIR opcode: {s}", .{@tagName(op)});
         },
     }
 }
 
 fn reportUnsupportedTag(sema: *Sema, comptime tag: Zir.Inst.Tag) Error {
-    try sema.writer.print("unsupported ZIR instruction: {s}\n", .{@tagName(tag)});
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "unsupported ZIR instruction: {s}", .{@tagName(tag)});
 }
 
 /// Reject an async/frame operation (`anyframe`, `anyframe->T`, `@Frame`, `suspend`,
@@ -11431,8 +11200,7 @@ fn reportUnsupportedTag(sema: *Sema, comptime tag: Zir.Inst.Tag) Error {
 /// to `failWithUseOfAsync`, so the REPL mirrors that rather than the type build the
 /// dead code past `if (true)` in `zirAnyframeType` would suggest.
 fn failUseOfAsync(sema: *Sema) Error!?Value {
-    try sema.writer.writeAll("async has not been implemented in the self-hosted compiler yet\n");
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "async has not been implemented in the self-hosted compiler yet", .{});
 }
 
 const testing = std.testing;

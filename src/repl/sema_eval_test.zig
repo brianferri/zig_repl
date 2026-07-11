@@ -21,7 +21,16 @@ fn analyzeZir(session: *Session, zir: std.zig.Zir, writer: *std.Io.Writer) anyer
         owned.deinit(session.gpa);
         return err;
     };
-    return Sema.analyze(session, idx, writer);
+    return Sema.analyze(session, idx, writer) catch |err| {
+        // Driver role: surface the stored error's message. These tests match on
+        // text, so the flat message suffices (no `Ast` here to anchor a caret).
+        if (session.failed_analysis) |em| {
+            writer.print("{s}\n", .{em.msg}) catch {};
+            em.destroy(session.gpa);
+            session.failed_analysis = null;
+        }
+        return err;
+    };
 }
 
 fn evalSource(
