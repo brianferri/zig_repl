@@ -457,6 +457,14 @@ test "compliance: out-of-bounds and mismatched-sentinel slices are rejected" {
     try expectBothReject(a, &.{"blk: { var x: i32 = 5; _ = &x; const p: *i32 = &x; break :blk p[0..1 :0]; }"});
 }
 
+test "compliance: an error value widens into a superset error type" {
+    // The error-set coercion in `coerceValueToType`: a narrower error widens into
+    // `anyerror` (and into any wider explicit set) keeping its name.
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"blk: { const e: anyerror = error.Boom; break :blk e; }"});
+    try expectMatchesZig(a, &.{"blk: { const S = error{ A, B }; const e: S = error.A; const w: anyerror = e; break :blk w; }"});
+}
+
 test "compliance: @intCast widen" {
     try expectMatchesZig(testing.allocator, &.{"@as(u32, @intCast(@as(u8, 200)))"});
 }

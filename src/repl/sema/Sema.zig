@@ -4111,8 +4111,13 @@ fn coerceValueToType(
                 const big = ip.indexToKey(value.index).int.storage.toBigInt(&space);
                 return .{ .index = try ip.internIntValue(.comptime_int_type, big) };
             },
+            // `anyerror` accepts any error value (`isErrorSetType` is true for it).
+            .anyerror => return try sema.coerceToErrorSet(value, dest_ty, op_name),
             else => {},
         },
+        // `.error_set` arm: a narrower error value widens into this set (or fails
+        // if it carries an error the set lacks).
+        .error_set_type => return try sema.coerceToErrorSet(value, dest_ty, op_name),
         // `.error_union` arm: an error value becomes the `.err` arm; any other
         // value coerces to the payload type and becomes the `.payload` arm.
         .error_union_type => return try sema.coerceToErrorUnion(value, dest_ty, op_name),
@@ -4177,6 +4182,26 @@ fn coerceEnumToUnion(sema: *Sema, value: Value, union_ty: InternPool.Index, op_n
     }
     try sema.writer.print("{s}: cannot initialize union field '{s}' from a bare tag\n", .{ op_name, ip.stringSlice(tag_name) });
     return error.AnalysisFail;
+}
+
+/// Coerce an error value to a destination error-set type (`anyerror` or a wider
+/// set): validate membership via `coerceInMemoryAllowedErrorSets`, then re-tag the
+/// value's type. Mirrors `getCoerced`'s `.err` arm (which re-interns `.err` with
+/// the new set type once the in-memory check has passed).
+fn coerceToErrorSet(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_name: []const u8) Error!Value {
+    const ip = sema.intern_pool;
+    const key = ip.indexToKey(value.index);
+    if (key != .err) {
+        try sema.writer.print("{s}: expected an error value\n", .{op_name});
+        return error.AnalysisFail;
+    }
+    const imc = try sema.coerceInMemoryAllowedErrorSets(Type.fromIndex(dest_ty), Value.typeOf(value, ip));
+    if (imc != .ok) {
+        try sema.writer.print("{s}: cannot coerce error set\n", .{op_name});
+        try imc.report(sema);
+        return error.AnalysisFail;
+    }
+    return .{ .index = try ip.internErr(.{ .ty = dest_ty, .name = key.err.name }) };
 }
 
 /// Coerce a single-pointer-to-array value (`*const [N]T`) into `dest_ty` (a slice
