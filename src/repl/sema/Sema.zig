@@ -486,6 +486,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .cmp_gt => sema.evalComparison(inst, .gt),
         .cmp_neq => sema.evalComparison(inst, .neq),
         .negate, .negate_wrap => sema.evalNegate(inst, tag),
+        .sqrt, .sin, .cos, .tan, .exp, .exp2, .log, .log2, .log10, .floor, .ceil, .round, .trunc => sema.evalUnaryMath(inst, tag),
         .bit_not => sema.evalBitNot(inst),
         .ptr_type => sema.evalPtrType(inst),
         .align_of => sema.evalAlignOf(inst),
@@ -2353,6 +2354,66 @@ fn compareFloatStorage(
 ///
 /// Compiler reference: src/Sema.zig:zirNegate (~13858) /
 /// src/Sema.zig:zirNegateWrap (~13896).
+/// The `@sqrt`/`@sin`/.../`@trunc` unary float builtins. Each maps to a distinct
+/// ZIR tag; the compiler funnels them through `zirUnaryMath` with the matching
+/// `Value` fn. Rejects a non-float scalar type, then folds scalar or elementwise
+/// (mirrors `Value.sqrt`'s scalar/vector split). The operand is comptime-known.
+fn evalUnaryMath(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const ip = sema.intern_pool;
+    const operand = try sema.resolveRef(un_node.operand);
+    const operand_ty = operand.typeOf(ip);
+    switch (operand_ty.scalarType(ip).zigTypeTag(ip)) {
+        .comptime_float, .float => {},
+        else => {
+            try sema.writer.writeAll("expected vector of floats or float type, found '");
+            try Type.print(operand_ty, ip, sema.writer);
+            try sema.writer.writeAll("'\n");
+            return error.AnalysisFail;
+        },
+    }
+    // An undef operand yields undef of the same type, for a scalar or a whole
+    // vector -- `maybeConstantUnaryMath` returns `undefRef(result_ty)` in both arms.
+    if (ip.indexToKey(operand.index) == .undef)
+        return .{ .index = try ip.get(.{ .undef = operand_ty.toIndex() }) };
+    if (operand_ty.zigTypeTag(ip) == .vector)
+        return try sema.evalVectorUnary(tag, operand, @tagName(tag), scalarUnaryMath);
+    return try sema.scalarUnaryMath(tag, ip.indexToKey(operand.index), @tagName(tag));
+}
+
+/// One lane of a unary float builtin: apply the op at the operand's native width
+/// and re-intern. The `inline else` over the float storage instantiates the math
+/// in f16..f128 (comptime_float is f128), like `evalBinaryArithFloat`.
+fn scalarUnaryMath(sema: *Sema, tag: Zir.Inst.Tag, operand_key: InternPool.Key, op_name: []const u8) Error!?Value {
+    _ = op_name;
+    const ip = sema.intern_pool;
+    const float = operand_key.float;
+    switch (float.storage) {
+        inline else => |v, storage_tag| {
+            const FloatT = @TypeOf(v);
+            const result: FloatT = switch (tag) {
+                .sqrt => @sqrt(v),
+                .sin => @sin(v),
+                .cos => @cos(v),
+                .tan => @tan(v),
+                .exp => @exp(v),
+                .exp2 => @exp2(v),
+                .log => @log(v),
+                .log2 => @log2(v),
+                .log10 => @log10(v),
+                .floor => @floor(v),
+                .ceil => @ceil(v),
+                .round => @round(v),
+                .trunc => @trunc(v),
+                else => unreachable,
+            };
+            const out_storage = @unionInit(InternPool.Key.Float.Storage, @tagName(storage_tag), result);
+            return .{ .index = try ip.internFloat(.{ .ty = float.ty, .storage = out_storage }) };
+        },
+    }
+}
+
 fn evalNegate(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     assert(tag == .negate or tag == .negate_wrap);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);

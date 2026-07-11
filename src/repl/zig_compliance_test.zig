@@ -412,6 +412,27 @@ test "compliance: @floatFromInt rounding" {
     try expectMatchesZig(testing.allocator, &.{"@as(f32, @floatFromInt(16777217))"});
 }
 
+test "compliance: unary float builtins fold at comptime" {
+    const a = testing.allocator;
+    // Each maps to a distinct ZIR tag funnelled through one handler; check a
+    // spread of ops at f32/f64, a vector, and comptime_float.
+    try expectMatchesZig(a, &.{"@sqrt(@as(f64, 16.0))"});
+    try expectMatchesZig(a, &.{"@floor(@as(f64, 3.7))"});
+    try expectMatchesZig(a, &.{"@ceil(@as(f32, 3.2))"});
+    try expectMatchesZig(a, &.{"@trunc(@as(f64, -3.7))"});
+    try expectMatchesZig(a, &.{"@round(@as(f64, 2.5))"});
+    try expectMatchesZig(a, &.{"@log2(@as(f64, 8.0))"});
+    try expectMatchesZig(a, &.{"@exp2(@as(f64, 3.0))"});
+    // A float vector folds elementwise; compare a lane (vector-of-float rendering
+    // itself differs from `zig`'s, so assert the value, not the printed form).
+    try expectMatchesZig(a, &.{"@sqrt(@as(@Vector(2, f32), .{ 4.0, 9.0 }))[1] == 3.0"});
+    try expectMatchesZig(a, &.{"@floor(3.7)"});
+    // A non-float operand is rejected in both.
+    try expectBothReject(a, &.{"@sqrt(@as(u8, 4))"});
+    // An undef operand yields undef of the same type (not a crash).
+    try expectMatchesZig(a, &.{"@TypeOf(@sqrt(@as(f64, undefined))) == f64"});
+}
+
 test "compliance: bit_not on fixed-width int" {
     try expectMatchesZig(testing.allocator, &.{"~@as(u8, 5)"});
 }
