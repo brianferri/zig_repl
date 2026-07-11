@@ -539,6 +539,231 @@ pub fn popCount(val: Value, ty: Type, pool: *const InternPool) u64 {
     return @intCast(bigint.popCount(ty.intInfo(pool).?.bits));
 }
 
+/// The untyped undef value. Ports `Value.undef` (`.ip_index = .undef`).
+pub const undef: Value = .{ .index = .undef };
+
+/// Ports `Value.isUndef`.
+pub fn isUndef(val: Value, pool: *const InternPool) bool {
+    return pool.indexToKey(val.index) == .undef;
+}
+
+/// Ports `Value.isFloat`.
+pub fn isFloat(self: Value, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(self.index)) {
+        .undef => unreachable,
+        .float => true,
+        else => false,
+    };
+}
+
+/// Ports `Value.isNan`: a float value that is NaN.
+pub fn isNan(val: Value, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(val.index)) {
+        .float => |float| switch (float.storage) {
+            inline else => |x| std.math.isNan(x),
+        },
+        else => false,
+    };
+}
+
+/// The numeric ordering of two number values. Ports `Value.order`: a float pair
+/// compares as f128, an int pair as bignums.
+pub fn order(lhs: Value, rhs: Value, pool: *const InternPool) std.math.Order {
+    if (lhs.isFloat(pool) or rhs.isFloat(pool)) {
+        const lhs_f128 = lhs.toFloat(f128, pool);
+        const rhs_f128 = rhs.toFloat(f128, pool);
+        return std.math.order(lhs_f128, rhs_f128);
+    }
+    var lhs_bigint_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    var rhs_bigint_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    const lhs_bigint = lhs.toBigInt(&lhs_bigint_space, pool);
+    const rhs_bigint = rhs.toBigInt(&rhs_bigint_space, pool);
+    return lhs_bigint.order(rhs_bigint);
+}
+
+/// Ports `Value.compareHetero` for numeric operands (`@min`/`@max`/`@reduce`
+/// never compare pointers here, so the compiler's pointer arms are omitted).
+pub fn compareHetero(lhs: Value, op: std.math.CompareOperator, rhs: Value, pool: *const InternPool) bool {
+    if (lhs.isNan(pool) or rhs.isNan(pool)) return op == .neq;
+    return order(lhs, rhs, pool).compare(op);
+}
+
+/// The smaller of two numbers (undef if either is undef; NaN loses). Ports
+/// `Value.numberMin`.
+pub fn numberMin(lhs: Value, rhs: Value, pool: *const InternPool) Value {
+    if (lhs.isUndef(pool) or rhs.isUndef(pool)) return undef;
+    if (lhs.isNan(pool)) return rhs;
+    if (rhs.isNan(pool)) return lhs;
+    if (compareHetero(lhs, .lt, rhs, pool)) {
+        return lhs;
+    } else {
+        return rhs;
+    }
+}
+
+/// The larger of two numbers. Ports `Value.numberMax`.
+pub fn numberMax(lhs: Value, rhs: Value, pool: *const InternPool) Value {
+    if (lhs.isUndef(pool) or rhs.isUndef(pool)) return undef;
+    if (lhs.isNan(pool)) return rhs;
+    if (rhs.isNan(pool)) return lhs;
+    if (compareHetero(lhs, .gt, rhs, pool)) {
+        return lhs;
+    } else {
+        return rhs;
+    }
+}
+
+pub const OverflowArithmeticResult = struct {
+    overflow_bit: Value,
+    wrapped_result: Value,
+};
+
+pub fn toBool(val: Value) bool {
+    return switch (val.index) {
+        .bool_true => true,
+        .bool_false => false,
+        else => unreachable,
+    };
+}
+
+pub fn makeBool(x: bool) Value {
+    return if (x) bool_true else bool_false;
+}
+
+pub fn toUnsignedInt(val: Value, pool: *const InternPool) u64 {
+    return getUnsignedInt(val, pool).?;
+}
+
+pub fn getUnsignedInt(val: Value, pool: *const InternPool) ?u64 {
+    return switch (val.index) {
+        .undef => unreachable,
+        .null_value => 0,
+        .bool_false => 0,
+        .bool_true => 1,
+        else => switch (pool.indexToKey(val.index)) {
+            .undef => unreachable,
+            .int => |int| switch (int.storage) {
+                .big_int => |big_int| big_int.toInt(u64) catch null,
+                .u64 => |x| x,
+                .i64 => |x| std.math.cast(u64, x),
+            },
+            else => null,
+        },
+    };
+}
+
+pub fn eqlScalarNum(lhs: Value, rhs: Value, pool: *const InternPool) bool {
+    if (lhs.isUndef(pool)) return false;
+    if (rhs.isUndef(pool)) return false;
+    if (lhs.isFloat(pool) or rhs.isFloat(pool)) {
+        const lhs_f128 = lhs.toFloat(f128, pool);
+        const rhs_f128 = rhs.toFloat(f128, pool);
+        return lhs_f128 == rhs_f128;
+    }
+    var lhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    var rhs_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+    return lhs.toBigInt(&lhs_space, pool).eql(rhs.toBigInt(&rhs_space, pool));
+}
+
+pub fn compareAllWithZero(lhs: Value, op: std.math.CompareOperator, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(lhs.index)) {
+        .float => |float| switch (float.storage) {
+            inline else => |x| std.math.compare(x, op, 0),
+        },
+        .aggregate => |aggregate| {
+            const len = pool.indexToKey(aggregate.ty).vector_type.len;
+            var i: u64 = 0;
+            return while (i < len) : (i += 1) {
+                const elem = Value.fromIndex(InternPool.aggregateElementAt(aggregate, i));
+                if (!elem.compareAllWithZero(op, pool)) break false;
+            } else true;
+        },
+        else => {
+            var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+            return lhs.toBigInt(&space, pool).orderAgainstScalar(0).compare(op);
+        },
+    };
+}
+
 pub const void_value: Value = .{ .index = .void_value };
 pub const bool_true: Value = .{ .index = .bool_true };
 pub const bool_false: Value = .{ .index = .bool_false };
+pub const zero_comptime_int: Value = .{ .index = .zero };
+pub const one_comptime_int: Value = .{ .index = .one };
+pub const zero_u1: Value = .{ .index = .zero_u1 };
+pub const undef_u1: Value = .{ .index = .undef_u1 };
+
+const testing = std.testing;
+
+fn testInt(pool: *InternPool, x: i64) !Value {
+    return .{ .index = try pool.internInt(.{ .ty = .comptime_int_type, .storage = .{ .i64 = x } }) };
+}
+
+fn testFloat(pool: *InternPool, x: f128) !Value {
+    return .{ .index = try pool.internFloat(.{ .ty = .comptime_float_type, .storage = .{ .f128 = x } }) };
+}
+
+test "compareHetero: covers the six operators on ints" {
+    var pool = try InternPool.init(testing.allocator);
+    defer pool.deinit();
+    const two = try testInt(&pool, 2);
+    const five = try testInt(&pool, 5);
+    try testing.expect(compareHetero(two, .lt, five, &pool));
+    try testing.expect(compareHetero(two, .lte, five, &pool));
+    try testing.expect(compareHetero(two, .neq, five, &pool));
+    try testing.expect(compareHetero(five, .gt, two, &pool));
+    try testing.expect(compareHetero(five, .gte, two, &pool));
+    try testing.expect(!compareHetero(two, .eq, five, &pool));
+}
+
+test "compareHetero: equal ints" {
+    var pool = try InternPool.init(testing.allocator);
+    defer pool.deinit();
+    const a = try testInt(&pool, 7);
+    const b = try testInt(&pool, 7);
+    try testing.expect(compareHetero(a, .eq, b, &pool));
+    try testing.expect(compareHetero(a, .lte, b, &pool));
+    try testing.expect(compareHetero(a, .gte, b, &pool));
+    try testing.expect(!compareHetero(a, .neq, b, &pool));
+}
+
+test "compareHetero: sign is decisive" {
+    var pool = try InternPool.init(testing.allocator);
+    defer pool.deinit();
+    const neg = try testInt(&pool, -5);
+    const pos = try testInt(&pool, 2);
+    try testing.expect(compareHetero(neg, .lt, pos, &pool));
+    try testing.expect(!compareHetero(neg, .gt, pos, &pool));
+}
+
+test "compareHetero: a mixed int/float pair orders by value" {
+    var pool = try InternPool.init(testing.allocator);
+    defer pool.deinit();
+    const five = try testInt(&pool, 5);
+    const one = try testInt(&pool, 1);
+    const one_point_five = try testFloat(&pool, 1.5);
+    try testing.expect(compareHetero(five, .gt, one_point_five, &pool));
+    try testing.expect(compareHetero(one, .lt, one_point_five, &pool));
+}
+
+test "compareHetero: float pair" {
+    var pool = try InternPool.init(testing.allocator);
+    defer pool.deinit();
+    const a = try testFloat(&pool, 1.5);
+    const b = try testFloat(&pool, 2.5);
+    try testing.expect(compareHetero(a, .lt, b, &pool));
+    try testing.expect(!compareHetero(a, .gte, b, &pool));
+}
+
+test "compareHetero: NaN is unordered, only != holds" {
+    var pool = try InternPool.init(testing.allocator);
+    defer pool.deinit();
+    const nan = try testFloat(&pool, std.math.nan(f128));
+    const one = try testFloat(&pool, 1.0);
+    try testing.expect(!compareHetero(nan, .eq, one, &pool));
+    try testing.expect(!compareHetero(nan, .lt, one, &pool));
+    try testing.expect(!compareHetero(nan, .gt, one, &pool));
+    try testing.expect(compareHetero(nan, .neq, one, &pool));
+    try testing.expect(!compareHetero(nan, .eq, nan, &pool));
+    try testing.expect(compareHetero(nan, .neq, nan, &pool));
+}
