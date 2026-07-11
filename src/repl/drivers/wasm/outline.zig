@@ -122,7 +122,7 @@ fn emitOutline(gpa: std.mem.Allocator, w: *std.Io.Writer, source: []const u8, se
         for (zir.typeDecls(.main_struct_inst)) |decl_inst| {
             const decl_node = datas[@intFromEnum(decl_inst)].declaration.src_node;
             if (view.translate(seg.result.tree.nodeToSpan(decl_node)) == null) continue;
-            try ZirWalk.walkDecl(zir, decl_inst, &sink);
+            try ZirWalk.walkDecl(ZirSink, zir, decl_inst, &sink);
         }
     }
     try json.endArray();

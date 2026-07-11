@@ -112,14 +112,14 @@ pub fn Walker(comptime Sink: type) type {
 /// Walk every top-level declaration in `zir`, reporting its
 /// declaration / section / instruction structure to `sink` (a pointer to a
 /// value implementing the sink methods).
-pub fn walk(zir: Zir, sink: anytype) anyerror!void {
-    var w = Walker(@TypeOf(sink.*)){ .zir = zir, .sink = sink };
+pub fn walk(comptime Sink: type, zir: Zir, sink: *Sink) anyerror!void {
+    var w = Walker(Sink){ .zir = zir, .sink = sink };
     try w.run();
 }
 
 /// Walk a single declaration. Callers that want only one of several
 /// declarations (e.g. the last, dropping an injected prelude) select it.
-pub fn walkDecl(zir: Zir, decl_inst: Zir.Inst.Index, sink: anytype) anyerror!void {
-    var w = Walker(@TypeOf(sink.*)){ .zir = zir, .sink = sink };
+pub fn walkDecl(comptime Sink: type, zir: Zir, decl_inst: Zir.Inst.Index, sink: *Sink) anyerror!void {
+    var w = Walker(Sink){ .zir = zir, .sink = sink };
     try w.declaration(decl_inst);
 }

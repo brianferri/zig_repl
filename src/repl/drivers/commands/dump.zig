@@ -141,7 +141,7 @@ fn dumpZir(zir: Zir, stdout: *std.Io.Writer) !void {
     if (zir.instructions.len == 0) return;
 
     var sink: TextSink = .{ .zir = zir, .stdout = stdout };
-    try ZirWalk.walk(zir, &sink);
+    try ZirWalk.walk(TextSink, zir, &sink);
 }
 
 const idx_col_width: u32 = 7;
