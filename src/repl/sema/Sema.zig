@@ -1479,13 +1479,27 @@ fn failLog2NonInt(sema: *Sema) Error {
 }
 
 /// The type valid as a shift amount for a value of int type `int_ty`:
-/// `comptime_int` for a `comptime_int`, else `unsigned(log2_ceil(bits))`. Null if
-/// `int_ty` is not an int. Mirrors the compiler's `log2IntType`.
+/// The type valid as a shift amount for a value of type `int_ty`: `comptime_int`
+/// for a `comptime_int`, `unsigned(log2_ceil(bits))` for an int, and elementwise
+/// for a vector. Null if `int_ty` is not a shiftable type. Ports the compiler's
+/// `log2IntType`, which dispatches on `zigTypeTag` (so it never depends on
+/// `intInfo` returning null to classify).
 fn log2IntType(sema: *Sema, int_ty: InternPool.Index) Error!?InternPool.Index {
-    if (int_ty == .comptime_int_type) return .comptime_int_type;
-    const info = Type.fromIndex(int_ty).intInfo(sema.intern_pool) orelse return null;
-    const log2_bits: u16 = if (info.bits == 0) 0 else std.math.log2_int_ceil(u16, info.bits);
-    return try sema.intern_pool.internIntType(.unsigned, log2_bits);
+    const ip = sema.intern_pool;
+    const operand = Type.fromIndex(int_ty);
+    switch (operand.zigTypeTag(ip)) {
+        .comptime_int => return .comptime_int_type,
+        .int => {
+            const bits = operand.intInfo(ip).?.bits;
+            const log2_bits: u16 = if (bits == 0) 0 else std.math.log2_int_ceil(u16, bits);
+            return try ip.internIntType(.unsigned, log2_bits);
+        },
+        .vector => {
+            const log2_elem = (try sema.log2IntType(operand.childType(ip).toIndex())) orelse return null;
+            return try ip.internVectorType(.{ .len = operand.vectorLen(ip), .child = log2_elem });
+        },
+        else => return null,
+    }
 }
 
 /// `as_node` / `as_shift_operand`: coerce `operand` to `dest_type`.
@@ -1632,9 +1646,10 @@ fn materialiseIntFromFloat(
         const idx = try sema.intern_pool.internComptimeInt(big);
         return .{ .index = idx };
     }
-    // `intInfo` accepts every fixed-width int -- `intN`, `usize`/`isize`, and the
-    // `c_*` types -- not just `.int_type`, matching the compiler's `.int` arm.
-    if (Type.fromIndex(dest_type_index).intInfo(sema.intern_pool)) |dest_int| {
+    // Classify by `zigTypeTag` (like the compiler), then read the int info; this
+    // covers every fixed-width int -- `intN`, `usize`/`isize`, and the `c_*` types.
+    if (Type.fromIndex(dest_type_index).zigTypeTag(sema.intern_pool) == .int) {
+        const dest_int = Type.fromIndex(dest_type_index).intInfo(sema.intern_pool).?;
         if (!big.fitsInTwosComp(dest_int.signedness, dest_int.bits)) {
             try sema.writer.print(
                 "@intFromFloat: value does not fit in {c}{d}\n",
@@ -2667,7 +2682,7 @@ fn evalBitCount(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Val
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const operand = try sema.resolveRef(un_node.operand);
     const operand_ty = operand.typeOf(ip);
-    const bits = (operand_ty.scalarType(ip).intInfo(ip) orelse {
+    const bits = (operand_ty.intInfo(ip) orelse {
         try sema.writer.writeAll("expected integer or vector of integers, found '");
         try Type.print(operand_ty, ip, sema.writer);
         try sema.writer.writeAll("'\n");
@@ -2723,7 +2738,7 @@ fn evalByteBitReverse(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Erro
     const operand = try sema.resolveRef(un_node.operand);
     const operand_ty = operand.typeOf(ip);
     const scalar_ty = operand_ty.scalarType(ip);
-    const info = scalar_ty.intInfo(ip) orelse {
+    const info = operand_ty.intInfo(ip) orelse {
         try sema.writer.writeAll("expected integer or vector of integers, found '");
         try Type.print(operand_ty, ip, sema.writer);
         try sema.writer.writeAll("'\n");
@@ -5509,7 +5524,8 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const type_info_ty = try sema.getStdLangType(.@"Type");
     const tag_enum = try sema.unionTagEnumType(type_info_ty);
 
-    if (Type.fromIndex(ty).intInfo(ip)) |it| {
+    if (Type.fromIndex(ty).zigTypeTag(ip) == .int) {
+        const it = Type.fromIndex(ty).intInfo(ip).?;
         const int_info_ty = try sema.getStdLangType(.@"Type.Int");
         const signedness_ty = try sema.getStdLangType(.@"Signedness");
         const sign_idx = (try sema.enumFieldIndex(signedness_ty, try ip.getOrPutString(sema.gpa, @tagName(it.signedness)))).?;

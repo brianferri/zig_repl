@@ -453,6 +453,32 @@ test "compliance: integer bit-count and bit/byte reversal builtins" {
     try expectBothReject(a, &.{"@byteSwap(@as(u12, 1))"});
 }
 
+test "compliance: intInfo unwraps vectors without misclassifying non-ints" {
+    // With intInfo unwrapping the vector, log2IntType reads the scalar width, so a
+    // vector shift resolves; @typeInfo still classifies vector/array/pointer by
+    // zigTypeTag first (not as .int). The @typeInfo checks need real std for
+    // std.lang.Type, so they run against a module-source session.
+    const gpa = testing.allocator;
+    try expectMatchesZig(gpa, &.{"(@as(@Vector(2, u8), .{ 1, 2 }) << @as(@Vector(2, u3), .{ 1, 2 }))[1]"}); // 8
+
+    var io_instance: Io.Threaded = .init(gpa, .{});
+    defer io_instance.deinit();
+    const io = io_instance.io();
+    var root = try std.Io.Dir.openDirAbsolute(io, @import("build_options").zig_std_dir, .{});
+    defer root.close(io);
+    var native: NativeModuleSource = .{ .io = io, .root = root };
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+    session.module_source = &native.interface;
+
+    try expectReplValue(&session, "@typeInfo(@Vector(4, u8)) == .vector", "true");
+    try expectReplValue(&session, "@typeInfo([4]u8) == .array", "true");
+    try expectReplValue(&session, "@typeInfo(*u8) == .pointer", "true");
+}
+
 test "compliance: bit_not on fixed-width int" {
     try expectMatchesZig(testing.allocator, &.{"~@as(u8, 5)"});
 }

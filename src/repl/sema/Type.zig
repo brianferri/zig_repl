@@ -161,22 +161,32 @@ pub fn bitSize(ty: Type, pool: *const InternPool) ?u64 {
 }
 
 /// `{signedness, bits}` of a fixed-width int, else null. Mirrors `Type.intInfo`.
-pub fn intInfo(ty: Type, pool: *const InternPool) ?std.lang.Type.Int {
-    return switch (ty.index) {
-        .usize_type => .{ .signedness = .unsigned, .bits = target.ptrBitWidth() },
-        .isize_type => .{ .signedness = .signed, .bits = target.ptrBitWidth() },
-        .c_char_type => .{ .signedness = target.cCharSignedness(), .bits = target.cTypeBitSize(.char) },
-        .c_short_type => .{ .signedness = .signed, .bits = target.cTypeBitSize(.short) },
-        .c_ushort_type => .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ushort) },
-        .c_int_type => .{ .signedness = .signed, .bits = target.cTypeBitSize(.int) },
-        .c_uint_type => .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.uint) },
-        .c_long_type => .{ .signedness = .signed, .bits = target.cTypeBitSize(.long) },
-        .c_ulong_type => .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ulong) },
-        .c_longlong_type => .{ .signedness = .signed, .bits = target.cTypeBitSize(.longlong) },
-        .c_ulonglong_type => .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ulonglong) },
+/// Ports `Type.intInfo`: the integer info of a fixed-width int, unwrapping the
+/// wrappers whose underlying representation is that int -- a vector to its element
+/// and an enum to its tag type -- in a loop. The compiler's packed-struct/union and
+/// error-set arms are omitted (the REPL models neither a packed backing int nor
+/// `errorSetBits`, and routes error-set reflection separately); those and every
+/// other non-int type return `null` (the compiler asserts unreachable there, but
+/// the REPL uses `intInfo` as a nullable classifier).
+pub fn intInfo(starting_ty: Type, pool: *const InternPool) ?std.lang.Type.Int {
+    var ty = starting_ty;
+    while (true) switch (ty.index) {
+        .usize_type => return .{ .signedness = .unsigned, .bits = target.ptrBitWidth() },
+        .isize_type => return .{ .signedness = .signed, .bits = target.ptrBitWidth() },
+        .c_char_type => return .{ .signedness = target.cCharSignedness(), .bits = target.cTypeBitSize(.char) },
+        .c_short_type => return .{ .signedness = .signed, .bits = target.cTypeBitSize(.short) },
+        .c_ushort_type => return .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ushort) },
+        .c_int_type => return .{ .signedness = .signed, .bits = target.cTypeBitSize(.int) },
+        .c_uint_type => return .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.uint) },
+        .c_long_type => return .{ .signedness = .signed, .bits = target.cTypeBitSize(.long) },
+        .c_ulong_type => return .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ulong) },
+        .c_longlong_type => return .{ .signedness = .signed, .bits = target.cTypeBitSize(.longlong) },
+        .c_ulonglong_type => return .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ulonglong) },
         else => switch (pool.indexToKey(ty.index)) {
-            .int_type => |it| it,
-            else => null,
+            .int_type => |it| return it,
+            .enum_type => ty = .fromIndex(pool.enumFields(ty.index).?.int_tag_type),
+            .vector_type => |vector_type| ty = .fromIndex(vector_type.child),
+            else => return null,
         },
     };
 }
