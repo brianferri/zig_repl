@@ -374,6 +374,17 @@ test "compliance: vector arithmetic is lane-wise" {
     try expectMatchesZig(a, &.{"-@as(@Vector(2, i32), .{ 1, -2 })"});
 }
 
+test "compliance: @min/@max fold and refine the result type" {
+    const a = testing.allocator;
+    try expectMatchesZig(a, &.{"@min(3, 7)"});
+    try expectMatchesZig(a, &.{"@max(@as(u8, 200), @as(u8, 100))"});
+    try expectMatchesZig(a, &.{"@min(@as(u8, 200), @as(u8, 100))"});
+    try expectMatchesZig(a, &.{"@max(@as(f32, 1.0), @as(f64, 2.5))"});
+    try expectMatchesZig(a, &.{"@max(@as(u32, 5), @as(i64, -3))"});
+    try expectMatchesZig(a, &.{"@TypeOf(@max(@as(u32, 5), @as(i64, -3)))"});
+    try expectMatchesZig(a, &.{"@min(@as(@Vector(3, i32), .{ 1, 5, 2 }), @as(@Vector(3, i32), .{ 4, 2, 3 }))"});
+}
+
 test "compliance: @reduce folds a vector to a scalar" {
     // `@reduce`'s op arg is a `std.lang.ReduceOp`, so it needs std loaded --
     // use a `module_source`-backed session rather than the `zig run` harness.

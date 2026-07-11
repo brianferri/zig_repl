@@ -65,6 +65,139 @@ pub fn maxIntScalar(ty: Type, sema: *Sema, dest_ty: Type) !Value {
     return sema.intValue_big(dest_ty, res.toConst());
 }
 
+/// The single value inhabiting `ty`, or `null` if it has zero or many. Ports the
+/// compiler's `Type.onePossibleValue` (`src/Type.zig`). Takes `sema` (like
+/// `minInt`/`maxInt`) because the aggregate arms recurse through this evaluator's
+/// field resolvers; the compiler reaches equivalent stored fields through public
+/// `loadStructType`. The `one_possible_value` classification the compiler caches on
+/// the type is computed on demand here by field recursion.
+pub fn onePossibleValue(ty: Type, sema: *Sema) Sema.Error!?Value {
+    const ip = sema.intern_pool;
+    return switch (ip.indexToKey(ty.index)) {
+        .ptr_type,
+        .error_union_type,
+        .func_type,
+        .anyframe_type,
+        .error_set_type,
+        => null,
+
+        .simple_type => |t| switch (t) {
+            .f16,
+            .f32,
+            .f64,
+            .f80,
+            .f128,
+            .usize,
+            .isize,
+            .c_char,
+            .c_short,
+            .c_ushort,
+            .c_int,
+            .c_uint,
+            .c_long,
+            .c_ulong,
+            .c_longlong,
+            .c_ulonglong,
+            .c_longdouble,
+            .anyopaque,
+            .bool,
+            .type,
+            .anyerror,
+            .comptime_int,
+            .comptime_float,
+            .enum_literal,
+            .adhoc_inferred_error_set,
+            .null,
+            .undefined,
+            .noreturn,
+            => null,
+
+            .void => Value.void_value,
+
+            .generic_poison => unreachable,
+        },
+        .int_type => |int_type| if (int_type.bits == 0) try sema.intValue_u64(ty, 0) else null,
+        .array_type => |arr| {
+            const has_sentinel = arr.sentinel != .none;
+            if (arr.len + @intFromBool(has_sentinel) == 0) return try sema.aggregateValue(ty, &.{});
+            if (try Type.fromIndex(arr.child).onePossibleValue(sema)) |opv| return try sema.aggregateSplatValue(ty, opv);
+            return null;
+        },
+        .vector_type => |vec| {
+            if (vec.len == 0) return try sema.aggregateValue(ty, &.{});
+            if (try Type.fromIndex(vec.child).onePossibleValue(sema)) |opv| return try sema.aggregateSplatValue(ty, opv);
+            return null;
+        },
+        .opt_type => |child| if (try sema.isNoPossibleValue(child))
+            .{ .index = try ip.internOpt(.{ .ty = ty.index, .val = .none }) }
+        else
+            null,
+        .enum_type => if (try Type.fromIndex(try sema.enumIntTagTypeOf(ty.index)).onePossibleValue(sema)) |int_tag_opv|
+            .{ .index = try ip.internEnumTag(.{ .ty = ty.index, .int = int_tag_opv.index }) }
+        else
+            null,
+        .tuple_type => |tuple| {
+            const field_vals = try sema.arena.alloc(InternPool.Index, tuple.types.len);
+            for (field_vals, tuple.types) |*field_val, field_ty| {
+                field_val.* = ((try Type.fromIndex(field_ty).onePossibleValue(sema)) orelse return null).index;
+            }
+            return try sema.aggregateValue(ty, field_vals);
+        },
+        .struct_type => {
+            const count = try sema.structFieldCount(ty.index);
+            const field_vals = try sema.arena.alloc(InternPool.Index, count);
+            for (field_vals, 0..) |*field_val, i| {
+                const name = (try sema.structFieldNameAt(ty.index, @intCast(i))).?;
+                const field = (try sema.structFieldByName(ty.index, name)).?;
+                if (field.is_comptime) {
+                    const default = try sema.structFieldDefault(ty.index, name);
+                    assert(default != .none);
+                    field_val.* = default;
+                    continue;
+                }
+                field_val.* = ((try Type.fromIndex(field.ty).onePossibleValue(sema)) orelse return null).index;
+            }
+            return try sema.aggregateValue(ty, field_vals);
+        },
+        .union_type => {
+            // The OPV comes from exactly one field whose type is OPV, all others NPV.
+            const count = try sema.unionFieldCount(ty.index);
+            var opv_index: ?u32 = null;
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const name = (try sema.unionFieldNameAt(ty.index, i)).?;
+                const field_ty = (try sema.unionFieldByName(ty.index, name)).?.ty;
+                if (try sema.isNoPossibleValue(field_ty)) continue;
+                if (opv_index != null) return null; // more than one inhabitable field
+                opv_index = i;
+            }
+            const field_index = opv_index orelse return null; // all fields NPV
+            const name = (try sema.unionFieldNameAt(ty.index, field_index)).?;
+            const field_ty = (try sema.unionFieldByName(ty.index, name)).?.ty;
+            const payload = (try Type.fromIndex(field_ty).onePossibleValue(sema)) orelse return null;
+            const tag_val = (try sema.enumValueFieldIndex(try sema.unionTagEnumType(ty.index), field_index)).?;
+            return .{ .index = try ip.internUnion(.{ .ty = ty.index, .tag = tag_val.index, .val = payload.index }) };
+        },
+
+        // values, not types
+        .simple_value,
+        .enum_literal,
+        .int,
+        .float,
+        .undef,
+        .ptr,
+        .slice,
+        .err,
+        .error_union,
+        .func,
+        .opt,
+        .aggregate,
+        .enum_tag,
+        .un,
+        => unreachable,
+    };
+}
+
 pub fn fromIndex(index: InternPool.Index) Type {
     assert(index != .none);
     return .{ .index = index };

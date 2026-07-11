@@ -500,6 +500,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .round => sema.evalUnaryMath(inst, Value.round),
         .trunc => sema.evalUnaryMath(inst, Value.trunc),
         .mul_add => sema.evalMulAdd(inst),
+        .min => sema.evalMinMax(inst, .min),
+        .max => sema.evalMinMax(inst, .max),
         .reduce => sema.evalReduce(inst),
         .abs => sema.evalAbs(inst),
         .bit_not => sema.evalBitNot(inst),
@@ -791,6 +793,37 @@ pub fn aggregateValue(sema: *Sema, ty: Type, elems: []const InternPool.Index) Er
 
 pub fn vectorType(sema: *Sema, info: InternPool.Key.VectorType) Error!Type {
     return .fromIndex(try sema.intern_pool.internVectorType(info));
+}
+
+/// Bits needed to represent `val` as an integer: twos-complement signed if
+/// `sign`, else unsigned. Ports `intBitsForValue` (`src/Zcu/PerThread.zig`).
+fn intBitsForValue(sema: *Sema, val: Value, sign: bool) u16 {
+    switch (sema.intern_pool.indexToKey(val.index).int.storage) {
+        .i64 => |x| {
+            if (std.math.cast(u64, x)) |casted| return Type.smallestUnsignedBits(casted) + @intFromBool(sign);
+            assert(sign);
+            if (x == std.math.minInt(i64)) return 64;
+            return Type.smallestUnsignedBits(@as(u64, @intCast(-(x + 1)))) + 1;
+        },
+        .u64 => |x| return Type.smallestUnsignedBits(x) + @intFromBool(sign),
+        .big_int => |big| {
+            if (big.positive) return @intCast(big.bitCountAbs() + @intFromBool(sign));
+            if (big.eqlZero()) return 0;
+            return @intCast(big.bitCountTwosComp());
+        },
+    }
+}
+
+/// Smallest int type holding the inclusive range `[min, max]`. Ports
+/// `intFittingRange` (`src/Zcu/PerThread.zig`).
+fn intFittingRange(sema: *Sema, min: Value, max: Value) Error!Type {
+    const pool = sema.intern_pool;
+    assert(!min.isUndef(pool));
+    assert(!max.isUndef(pool));
+    const sign = min.compareHetero(.lt, Value.zero_comptime_int, pool);
+    const min_val_bits = sema.intBitsForValue(min, sign);
+    const max_val_bits = sema.intBitsForValue(max, sign);
+    return .fromIndex(try pool.internIntType(if (sign) .signed else .unsigned, @max(min_val_bits, max_val_bits)));
 }
 
 pub fn failWithUseOfUndef(sema: *Sema) Error {
@@ -2106,6 +2139,215 @@ fn evalUnaryMath(
         },
     }
     return try sema.maybeConstantUnaryMath(operand, operand_ty, eval);
+}
+
+fn checkNumericType(sema: *Sema, ty: Type) Error!void {
+    const ip = sema.intern_pool;
+    switch (ty.zigTypeTag(ip)) {
+        .comptime_float, .float, .comptime_int, .int => {},
+        .vector => switch (ty.childType(ip).zigTypeTag(ip)) {
+            .comptime_float, .float, .comptime_int, .int => {},
+            else => |t| {
+                try sema.writer.print("expected number, found '{t}'\n", .{t});
+                return error.AnalysisFail;
+            },
+        },
+        else => {
+            try sema.writer.writeAll("expected number, found '");
+            try Type.print(ty, ip, sema.writer);
+            try sema.writer.writeAll("'\n");
+            return error.AnalysisFail;
+        },
+    }
+}
+
+/// `@min`/`@max`: fold two numeric operands, refining the result type to the
+/// narrowest that holds it (`@max(u32, i64)` -> `u63`). Ports `analyzeMinMax`
+/// (`src/Sema.zig`); every operand is comptime-known here, so only the runtime
+/// path is dropped.
+fn evalMinMax(sema: *Sema, inst: Zir.Inst.Index, comptime op: enum { min, max }) Error!?Value {
+    const ip = sema.intern_pool;
+    const bin = sema.binData(inst);
+    const operands = [_]Value{ try sema.resolveRef(bin.lhs), try sema.resolveRef(bin.rhs) };
+    const opFunc = switch (op) {
+        .min => Value.numberMin,
+        .max => Value.numberMax,
+    };
+
+    const vector_len: ?u64 = vec_len: {
+        const first_ty = Value.typeOf(operands[0], ip);
+        try sema.checkNumericType(first_ty);
+        if (first_ty.zigTypeTag(ip) == .vector) {
+            const vec_len = first_ty.vectorLen(ip);
+            for (operands[1..]) |operand| {
+                const operand_ty = Value.typeOf(operand, ip);
+                try sema.checkNumericType(operand_ty);
+                if (operand_ty.zigTypeTag(ip) != .vector) {
+                    try sema.writer.writeAll("expected vector, found '");
+                    try Type.print(operand_ty, ip, sema.writer);
+                    try sema.writer.writeAll("'\n");
+                    return error.AnalysisFail;
+                }
+                if (operand_ty.vectorLen(ip) != vec_len) {
+                    try sema.writer.print("expected vector of length '{d}', found '", .{vec_len});
+                    try Type.print(operand_ty, ip, sema.writer);
+                    try sema.writer.writeAll("'\n");
+                    return error.AnalysisFail;
+                }
+            }
+            break :vec_len vec_len;
+        } else {
+            for (operands[1..]) |operand| {
+                const operand_ty = Value.typeOf(operand, ip);
+                try sema.checkNumericType(operand_ty);
+                if (operand_ty.zigTypeTag(ip) == .vector) {
+                    try sema.writer.writeAll("expected vector, found '");
+                    try Type.print(first_ty, ip, sema.writer);
+                    try sema.writer.writeAll("'\n");
+                    return error.AnalysisFail;
+                }
+            }
+            break :vec_len null;
+        }
+    };
+
+    // The result scalar type, in "priority" order: float > comptime_float > int.
+    const TypeStrat = union(enum) {
+        float: Type,
+        comptime_float,
+        int: struct {
+            all_comptime_int: bool,
+            result_min: Value,
+            result_max: Value,
+            operand_min: Value,
+            operand_max: Value,
+        },
+        none,
+    };
+    var cur_strat: TypeStrat = .none;
+    for (operands) |operand| {
+        const operand_scalar_ty = Value.typeOf(operand, ip).scalarType(ip);
+        const want_strat: TypeStrat = switch (operand_scalar_ty.zigTypeTag(ip)) {
+            .comptime_int => s: {
+                if (operand.isUndef(ip)) break :s .none;
+                break :s .{ .int = .{
+                    .all_comptime_int = true,
+                    .result_min = operand,
+                    .result_max = operand,
+                    .operand_min = operand,
+                    .operand_max = operand,
+                } };
+            },
+            .comptime_float => .comptime_float,
+            .float => .{ .float = operand_scalar_ty },
+            .int => s: {
+                const min: Value, const max: Value = bounds: {
+                    if (vector_len) |len| {
+                        var min = try operand.elemValue(ip, 0);
+                        var max = min;
+                        for (1..@intCast(len)) |elem_idx| {
+                            const elem_val = try operand.elemValue(ip, elem_idx);
+                            min = Value.numberMin(min, elem_val, ip);
+                            max = Value.numberMax(max, elem_val, ip);
+                        }
+                        if (!min.isUndef(ip) and !max.isUndef(ip)) break :bounds .{ min, max };
+                    } else {
+                        if (!operand.isUndef(ip)) break :bounds .{ operand, operand };
+                    }
+                    break :bounds .{
+                        try operand_scalar_ty.minInt(sema, operand_scalar_ty),
+                        try operand_scalar_ty.maxInt(sema, operand_scalar_ty),
+                    };
+                };
+                break :s .{ .int = .{
+                    .all_comptime_int = false,
+                    .result_min = min,
+                    .result_max = max,
+                    .operand_min = min,
+                    .operand_max = max,
+                } };
+            },
+            else => unreachable,
+        };
+        if (@intFromEnum(want_strat) < @intFromEnum(cur_strat)) {
+            cur_strat = want_strat;
+        } else if (@intFromEnum(want_strat) == @intFromEnum(cur_strat)) {
+            switch (cur_strat) {
+                .none, .comptime_float => {},
+                .float => |cur_float| {
+                    const want_float = want_strat.float;
+                    if (want_float.floatBits() > cur_float.floatBits() or
+                        (want_float.floatBits() == cur_float.floatBits() and
+                            cur_float.index == .c_longdouble_type and
+                            want_float.index != .c_longdouble_type))
+                    {
+                        cur_strat = want_strat;
+                    }
+                },
+                .int => |*cur_int| {
+                    const want_int = want_strat.int;
+                    if (!want_int.all_comptime_int) cur_int.all_comptime_int = false;
+                    cur_int.result_min = opFunc(cur_int.result_min, want_int.result_min, ip);
+                    cur_int.result_max = opFunc(cur_int.result_max, want_int.result_max, ip);
+                    cur_int.operand_min = Value.numberMin(cur_int.operand_min, want_int.operand_min, ip);
+                    cur_int.operand_max = Value.numberMax(cur_int.operand_max, want_int.operand_max, ip);
+                },
+            }
+        }
+    }
+
+    const result_scalar_ty: Type = switch (cur_strat) {
+        .float => |ty| ty,
+        .comptime_float => .fromIndex(.comptime_float_type),
+        .int => |int| if (int.all_comptime_int)
+            .fromIndex(.comptime_int_type)
+        else
+            try sema.intFittingRange(int.result_min, int.result_max),
+        .none => .fromIndex(.comptime_int_type),
+    };
+    const result_ty: Type = if (vector_len) |l|
+        try sema.vectorType(.{ .len = @intCast(l), .child = result_scalar_ty.index })
+    else
+        result_scalar_ty;
+
+    // We might have refined all the way down to a one-possible-value type.
+    if (try result_ty.onePossibleValue(sema)) |opv| return opv;
+
+    // Fold the comptime-known operands element-wise.
+    const elems = try sema.arena.alloc(InternPool.Index, @intCast(vector_len orelse 1));
+    var elems_populated = false;
+    for (operands) |operand| {
+        if (vector_len != null) {
+            if (elems_populated) {
+                for (elems, 0..) |*elem, elem_idx| {
+                    const new_elem = try operand.elemValue(ip, elem_idx);
+                    elem.* = opFunc(.{ .index = elem.* }, new_elem, ip).index;
+                }
+            } else {
+                elems_populated = true;
+                for (elems, 0..) |*elem_out, elem_idx| {
+                    elem_out.* = (try operand.elemValue(ip, elem_idx)).index;
+                }
+            }
+        } else {
+            if (elems_populated) {
+                elems[0] = opFunc(.{ .index = elems[0] }, operand, ip).index;
+            } else {
+                elems_populated = true;
+                elems[0] = operand.index;
+            }
+        }
+    }
+    // Coerce each result element to the refined scalar type (always fits).
+    for (elems) |*elem| {
+        const ev: Value = .{ .index = elem.* };
+        elem.* = if (ev.isUndef(ip))
+            (try sema.undefValue(result_scalar_ty)).index
+        else
+            (try sema.coerceValueToType(ev, result_scalar_ty.index, @tagName(op))).index;
+    }
+    if (vector_len == null) return Value{ .index = elems[0] };
+    return try sema.aggregateValue(result_ty, elems);
 }
 
 /// `@reduce(op, vec)`: fold a vector to a scalar with the `std.lang.ReduceOp`
@@ -6448,7 +6690,7 @@ fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: Intern
 /// via `ensureStructDefaultsResolved`) separate from field types and reads them
 /// only for aggregate init and `@typeInfo`, never during field access -- see
 /// `structFieldDefault`. Void-typed and align-less fields leave the rest at rest.
-const FieldInfo = struct {
+pub const FieldInfo = struct {
     index: u32,
     ty: InternPool.Index,
     is_comptime: bool = false,
@@ -6476,7 +6718,7 @@ fn structFieldAlign(sema: *Sema, f: InternPool.StructFields, i: usize) ?u64 {
 /// field matches. Field types that reference the defining line's locals are out
 /// of scope -- the swapped frame shares the session namespace but not that
 /// line's per-instruction results.
-fn structFieldByName(
+pub fn structFieldByName(
     sema: *Sema,
     struct_ty: InternPool.Index,
     name: InternPool.NullTerminatedString,
@@ -6527,7 +6769,7 @@ fn structFieldByName(
 /// -- a default like `= .auto` resolves against the field type, not the accessing
 /// scope, so evaluating it off the access path would misbind. An anonymous struct
 /// has no declared defaults (its values come from the init), so it yields `.none`.
-fn structFieldDefault(
+pub fn structFieldDefault(
     sema: *Sema,
     struct_ty: InternPool.Index,
     name: InternPool.NullTerminatedString,
@@ -6585,7 +6827,7 @@ fn anonStructFieldByName(sema: *Sema, decl_inst: Zir.Inst.Index, name: InternPoo
 /// Resolve a union field by name to its index and type. Mirrors `structFieldByName`
 /// over the union decl's fields (`getUnionDecl().iterateFields()`); a field with no
 /// type body is `void`. Returns null if no field matches.
-fn unionFieldByName(
+pub fn unionFieldByName(
     sema: *Sema,
     union_ty: InternPool.Index,
     name: InternPool.NullTerminatedString,
@@ -6674,7 +6916,7 @@ fn callConvValue(sema: *Sema, cc: std.lang.CallingConvention) Error!InternPool.I
 /// The interned name of a struct's field at `index`, mirroring `unionFieldNameAt`
 /// -- lets `@typeInfo`'s struct arm iterate by position while `structFieldByName`
 /// supplies each field's type and attributes.
-fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
+pub fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
     const ip = sema.intern_pool;
     // A reified struct has no ZIR; its field names are stored.
     if (ip.structFields(struct_ty)) |f| return if (index < f.names.len) f.names[index] else null;
@@ -6689,7 +6931,7 @@ fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) Error
 }
 
 /// A union type's declared field count, read from its source ZIR.
-fn unionFieldCount(sema: *Sema, union_ty: InternPool.Index) Error!u32 {
+pub fn unionFieldCount(sema: *Sema, union_ty: InternPool.Index) Error!u32 {
     // A reified union has no ZIR; its field count comes from stored fields.
     if (sema.intern_pool.unionFields(union_ty)) |f| return @intCast(f.names.len);
     const cf = try sema.enterContainer(union_ty, "union field count");
@@ -6700,7 +6942,7 @@ fn unionFieldCount(sema: *Sema, union_ty: InternPool.Index) Error!u32 {
 /// The interned name of a union's field at `index`, for the active-field
 /// diagnostic (the compiler's `enumFieldName(active_index)`). Returns null if the
 /// index is out of range.
-fn unionFieldNameAt(sema: *Sema, union_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
+pub fn unionFieldNameAt(sema: *Sema, union_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
     const ip = sema.intern_pool;
     // A reified union has no ZIR; its field names are stored.
     if (ip.unionFields(union_ty)) |f| return if (index < f.names.len) f.names[index] else null;
@@ -6748,7 +6990,7 @@ fn cmpUnionTagNoValue(sema: *Sema, union_ty: InternPool.Index, tag_name: InternP
 /// fields are NPV. An optional or error union of an NPV type is NOT NPV -- it
 /// still holds `null` / an error. An enum's backing is always an integer, so an
 /// enum is never NPV (the compiler's `noreturn`-backed enum cannot be formed).
-fn isNoPossibleValue(sema: *Sema, ty: InternPool.Index) Error!bool {
+pub fn isNoPossibleValue(sema: *Sema, ty: InternPool.Index) Error!bool {
     const ip = sema.intern_pool;
     return switch (ip.indexToKey(ty)) {
         .simple_type => |s| s == .noreturn or s == .anyopaque,
@@ -6791,7 +7033,7 @@ fn unionAllFieldsNpv(sema: *Sema, union_ty: InternPool.Index) Error!bool {
     return true;
 }
 
-fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPool.Index {
+pub fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPool.Index {
     const ip = sema.intern_pool;
     // A reified union with an explicit tag enum uses it; an untagged one gets a
     // generated tag enum keyed on the union (auto-numbered), like a declared bare
@@ -6962,7 +7204,7 @@ fn generatedTagScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Er
 /// `union(enum(T))`'s explicit `T` for a generated tag enum), else the auto
 /// smallest-unsigned. Mirrors `LoadedEnumType.int_tag_type`, and is the single
 /// source `enumFieldScan`/`generatedTagScan` draw the tag type from for coercion.
-fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Index {
+pub fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Index {
     const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
     // A reified enum has no ZIR; its tag type is stored. (A declared enum's fields
     // are not yet resolved when this is called during resolution, so it reads ZIR.)
@@ -7065,7 +7307,7 @@ fn enumFieldName(sema: *Sema, enum_ty: InternPool.Index, index: u32) Error!?Inte
 }
 
 /// The `enum_tag` value of field `index`. Mirrors `pt.enumValueFieldIndex`.
-fn enumValueFieldIndex(sema: *Sema, enum_ty: InternPool.Index, index: u32) Error!?Value {
+pub fn enumValueFieldIndex(sema: *Sema, enum_ty: InternPool.Index, index: u32) Error!?Value {
     return if (try sema.enumFieldScan(enum_ty, .{ .index = index })) |m| m.tag else null;
 }
 
@@ -7261,7 +7503,7 @@ fn unionIsTagged(sema: *Sema, union_ty: InternPool.Index) Error!bool {
 
 /// A struct type's declared field count (read straight from its source ZIR's
 /// `field_names`; no field bodies are evaluated).
-fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
+pub fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
     // A reified struct has no ZIR; its field count comes from stored fields.
     if (sema.intern_pool.structFields(struct_ty)) |f| return @intCast(f.names.len);
     const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
@@ -10663,4 +10905,111 @@ fn reportUnsupportedTag(sema: *Sema, comptime tag: Zir.Inst.Tag) Error {
 fn failUseOfAsync(sema: *Sema) Error!?Value {
     try sema.writer.writeAll("async has not been implemented in the self-hosted compiler yet\n");
     return error.AnalysisFail;
+}
+
+const testing = std.testing;
+
+fn opvTestSema(gpa: std.mem.Allocator, pool: *InternPool, arena: *std.heap.ArenaAllocator, w: *std.Io.Writer) Sema {
+    return .{
+        .gpa = gpa,
+        .arena = arena.allocator(),
+        .intern_pool = pool,
+        .zir = undefined,
+        .writer = w,
+        .results = .empty,
+        .comptime_allocs = .empty,
+        .namespace = null,
+    };
+}
+
+fn opvNames(sema: *Sema, names: []const []const u8) ![]InternPool.NullTerminatedString {
+    const out = try sema.arena.alloc(InternPool.NullTerminatedString, names.len);
+    for (names, out) |n, *h| h.* = try sema.intern_pool.getOrPutString(sema.gpa, n);
+    return out;
+}
+
+/// A reified enum whose fields are `names`; `hash` keeps its identity distinct.
+fn opvEnum(sema: *Sema, hash: u64, names: []const []const u8) !Type {
+    const pool = sema.intern_pool;
+    const handles = try opvNames(sema, names);
+    const tag_ty = try sema.enumIntTagType(@intCast(names.len));
+    const enum_ty = try pool.internEnumType(.{
+        .name = try pool.getOrPutString(sema.gpa, "E"),
+        .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
+    });
+    try pool.setEnumFields(enum_ty, tag_ty, false, handles, &.{});
+    return .fromIndex(enum_ty);
+}
+
+fn opvStruct(sema: *Sema, hash: u64, names: []const []const u8, types: []const InternPool.Index) !Type {
+    const pool = sema.intern_pool;
+    const handles = try opvNames(sema, names);
+    const struct_ty = try pool.internStructType(.{
+        .name = try pool.getOrPutString(sema.gpa, "S"),
+        .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
+    });
+    try pool.setStructFields(struct_ty, .auto, .none, handles, types, &.{}, &.{}, &.{});
+    return .fromIndex(struct_ty);
+}
+
+fn opvUnion(sema: *Sema, hash: u64, tag_hash: u64, names: []const []const u8, types: []const InternPool.Index) !Type {
+    const pool = sema.intern_pool;
+    const tag_enum = try opvEnum(sema, tag_hash, names);
+    const handles = try opvNames(sema, names);
+    const union_ty = try pool.internUnionType(.{
+        .name = try pool.getOrPutString(sema.gpa, "U"),
+        .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
+    });
+    try pool.setUnionFields(union_ty, .auto, tag_enum.index, .none, handles, types, &.{});
+    return .fromIndex(union_ty);
+}
+
+test "onePossibleValue: every type-kind branch" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var sema = opvTestSema(gpa, &pool, &arena_state, &w);
+    const s = &sema;
+
+    const expectOpv = struct {
+        fn f(se: *Sema, ty: Type, has: bool) !void {
+            try testing.expectEqual(has, (try ty.onePossibleValue(se)) != null);
+        }
+    }.f;
+
+    // int: only a 0-bit int is OPV.
+    try expectOpv(s, .fromIndex(.u0_type), true);
+    try expectOpv(s, .fromIndex(.u8_type), false);
+    // simple: void is OPV; bool / type / comptime_int are not.
+    try expectOpv(s, .fromIndex(.void_type), true);
+    try expectOpv(s, .fromIndex(.bool_type), false);
+    try expectOpv(s, .fromIndex(.type_type), false);
+    try expectOpv(s, .fromIndex(.comptime_int_type), false);
+    // array: element-driven; a zero-length array is OPV.
+    try expectOpv(s, .fromIndex(try pool.internArrayType(.{ .len = 3, .child = .u0_type })), true);
+    try expectOpv(s, .fromIndex(try pool.internArrayType(.{ .len = 3, .child = .u8_type })), false);
+    try expectOpv(s, .fromIndex(try pool.internArrayType(.{ .len = 0, .child = .u8_type })), true);
+    // vector.
+    try expectOpv(s, .fromIndex(try pool.internVectorType(.{ .len = 3, .child = .u0_type })), true);
+    try expectOpv(s, .fromIndex(try pool.internVectorType(.{ .len = 3, .child = .u8_type })), false);
+    // optional: `?noreturn` is OPV (only null); `?u8` is not.
+    try expectOpv(s, .fromIndex(try pool.internOptionalType(.noreturn_type)), true);
+    try expectOpv(s, .fromIndex(try pool.internOptionalType(.u8_type)), false);
+    // tuple: OPV iff every field is.
+    try expectOpv(s, .fromIndex(try pool.internTupleType(&.{ .u0_type, .void_type })), true);
+    try expectOpv(s, .fromIndex(try pool.internTupleType(&.{.u8_type})), false);
+    // enum: OPV iff it has a single tag.
+    try expectOpv(s, try opvEnum(s, 0x1001, &.{"only"}), true);
+    try expectOpv(s, try opvEnum(s, 0x1002, &.{ "a", "b" }), false);
+    // struct: OPV iff every field is.
+    try expectOpv(s, try opvStruct(s, 0x2001, &.{ "x", "y" }, &.{ .u0_type, .void_type }), true);
+    try expectOpv(s, try opvStruct(s, 0x2002, &.{"x"}, &.{.u8_type}), false);
+    // union: OPV iff exactly one field is inhabitable and it is OPV.
+    try expectOpv(s, try opvUnion(s, 0x3001, 0x4001, &.{"x"}, &.{.u0_type}), true);
+    try expectOpv(s, try opvUnion(s, 0x3002, 0x4002, &.{"x"}, &.{.u8_type}), false);
+    try expectOpv(s, try opvUnion(s, 0x3003, 0x4003, &.{ "a", "b" }, &.{ .u0_type, .u0_type }), false);
 }
