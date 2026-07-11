@@ -374,6 +374,32 @@ test "compliance: vector arithmetic is lane-wise" {
     try expectMatchesZig(a, &.{"-@as(@Vector(2, i32), .{ 1, -2 })"});
 }
 
+test "compliance: @reduce folds a vector to a scalar" {
+    // `@reduce`'s op arg is a `std.lang.ReduceOp`, so it needs std loaded --
+    // use a `module_source`-backed session rather than the `zig run` harness.
+    const gpa = testing.allocator;
+    var io_instance: Io.Threaded = .init(gpa, .{});
+    defer io_instance.deinit();
+    const io = io_instance.io();
+    var root = try std.Io.Dir.openDirAbsolute(io, @import("build_options").zig_std_dir, .{});
+    defer root.close(io);
+    var native: NativeModuleSource = .{ .io = io, .root = root };
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+    session.module_source = &native.interface;
+
+    try expectReplValue(&session, "@reduce(.Add, @as(@Vector(4, i32), .{ 1, 2, 3, 4 }))", "10");
+    try expectReplValue(&session, "@reduce(.Mul, @as(@Vector(4, i32), .{ 1, 2, 3, 4 }))", "24");
+    try expectReplValue(&session, "@reduce(.Min, @as(@Vector(4, i32), .{ 3, 1, 4, 1 }))", "1");
+    try expectReplValue(&session, "@reduce(.Max, @as(@Vector(4, i32), .{ 3, 1, 4, 1 }))", "4");
+    try expectReplValue(&session, "@reduce(.And, @as(@Vector(3, u8), .{ 255, 15, 240 }))", "0");
+    try expectReplValue(&session, "@reduce(.Or, @as(@Vector(3, u8), .{ 1, 2, 4 }))", "7");
+    try expectReplValue(&session, "@reduce(.Xor, @as(@Vector(3, u8), .{ 255, 15, 0 }))", "240");
+}
+
 test "compliance: @intCast widen" {
     try expectMatchesZig(testing.allocator, &.{"@as(u32, @intCast(@as(u8, 200)))"});
 }

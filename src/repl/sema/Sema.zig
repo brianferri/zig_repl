@@ -500,6 +500,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .round => sema.evalUnaryMath(inst, Value.round),
         .trunc => sema.evalUnaryMath(inst, Value.trunc),
         .mul_add => sema.evalMulAdd(inst),
+        .reduce => sema.evalReduce(inst),
         .abs => sema.evalAbs(inst),
         .bit_not => sema.evalBitNot(inst),
         .ptr_type => sema.evalPtrType(inst),
@@ -2105,6 +2106,67 @@ fn evalUnaryMath(
         },
     }
     return try sema.maybeConstantUnaryMath(operand, operand_ty, eval);
+}
+
+/// `@reduce(op, vec)`: fold a vector to a scalar with the `std.lang.ReduceOp`
+/// operation. Mirrors `zirReduce` (`src/Sema.zig`); the accumulator folds through
+/// the same arith / Value methods the compiler uses.
+fn evalReduce(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const bin = sema.binData(inst);
+    const operation = try sema.resolveStdLangEnum(.ReduceOp, bin.lhs);
+    const operand = try sema.resolveRef(bin.rhs);
+    const operand_ty = operand.typeOf(ip);
+
+    if (operand_ty.zigTypeTag(ip) != .vector) {
+        try sema.writer.writeAll("expected vector, found '");
+        try Type.print(operand_ty, ip, sema.writer);
+        try sema.writer.writeAll("'\n");
+        return error.AnalysisFail;
+    }
+
+    const scalar_ty = operand_ty.childType(ip);
+    switch (operation) {
+        .And, .Or, .Xor => switch (scalar_ty.zigTypeTag(ip)) {
+            .int, .bool => {},
+            else => return sema.failReduceOperand(operation, operand_ty, "integer or boolean"),
+        },
+        .Min, .Max, .Add, .Mul => switch (scalar_ty.zigTypeTag(ip)) {
+            .int, .float => {},
+            else => return sema.failReduceOperand(operation, operand_ty, "integer or float"),
+        },
+    }
+
+    const vec_len = operand_ty.vectorLen(ip);
+    if (vec_len == 0) {
+        try sema.writer.writeAll("@reduce operation requires a vector with nonzero length\n");
+        return error.AnalysisFail;
+    }
+
+    if (ip.indexToKey(operand.index) == .undef) return try sema.undefValue(scalar_ty);
+
+    var accum: Value = try operand.elemValue(ip, 0);
+    var i: u32 = 1;
+    while (i < vec_len) : (i += 1) {
+        const elem_val = try operand.elemValue(ip, i);
+        accum = switch (operation) {
+            .And => try arith.bitwiseBin(sema, scalar_ty, accum, elem_val, .@"and"),
+            .Or => try arith.bitwiseBin(sema, scalar_ty, accum, elem_val, .@"or"),
+            .Xor => try arith.bitwiseBin(sema, scalar_ty, accum, elem_val, .xor),
+            .Min => Value.numberMin(accum, elem_val, ip),
+            .Max => Value.numberMax(accum, elem_val, ip),
+            .Add => try arith.addMaybeWrap(sema, scalar_ty, accum, elem_val),
+            .Mul => try arith.mulMaybeWrap(sema, scalar_ty, accum, elem_val),
+        };
+    }
+    return accum;
+}
+
+fn failReduceOperand(sema: *Sema, operation: std.lang.ReduceOp, operand_ty: Type, want: []const u8) Error {
+    try sema.writer.print("@reduce operation '{s}' requires {s} operand; found '", .{ @tagName(operation), want });
+    try Type.print(operand_ty, sema.intern_pool, sema.writer);
+    try sema.writer.writeAll("'\n");
+    return error.AnalysisFail;
 }
 
 /// `mul_add` (`@mulAdd(T, a, b, c)`): the fused multiply-add `a * b + c` at `T`'s
