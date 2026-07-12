@@ -7,44 +7,71 @@ const ZirErrors = @import("../front/ZirErrors.zig");
 const max_renderable_parse_errors: u32 = 64;
 const repl_source_path: []const u8 = "<repl>";
 
-/// Render a Sema error anchored at `node` through the same `std.zig.ErrorBundle`
-/// path the compiler and `ZirErrors` use, so the source line + caret match std's
-/// output exactly. A node that anchors entirely in the injected wrap prefix
-/// (`view.translate` returns null) is emitted without a source location.
+/// A sub-note on a Sema error: the compiler's `ErrorMsg.notes`, each already
+/// resolved to an absolute AST node by the driver (which holds the ZIR).
+pub const Note = struct {
+    node: std.zig.Ast.Node.Index,
+    msg: []const u8,
+};
+
+/// Render a Sema error anchored at `node`, with its `notes`, through the same
+/// `std.zig.ErrorBundle` path the compiler and `ZirErrors` use, so the source line
+/// + caret + `note:` lines match std's output exactly. A node that anchors entirely
+/// in the injected wrap prefix (`view.translate` returns null) is emitted without a
+/// source location.
 pub fn renderSemaError(
     gpa: std.mem.Allocator,
     tree: std.zig.Ast,
     view: Pipeline.UserView,
     node: std.zig.Ast.Node.Index,
     msg: []const u8,
+    notes: []const Note,
     writer: *std.Io.Writer,
 ) !void {
     var wip: std.zig.ErrorBundle.Wip = undefined;
     try wip.init(gpa);
     defer wip.deinit();
 
-    if (view.translate(tree.nodeToSpan(node))) |span| {
-        const loc = view.findLoc(span.main);
-        try wip.addRootErrorMessage(.{
-            .msg = try wip.addString(msg),
-            .src_loc = try wip.addSourceLocation(.{
-                .src_path = try wip.addString(repl_source_path),
-                .span_start = span.start,
-                .span_main = span.main,
-                .span_end = span.end,
-                .line = @intCast(loc.line),
-                .column = @intCast(loc.column),
-                .source_line = try wip.addString(loc.source_line),
-            }),
+    const note_ems = try gpa.alloc(std.zig.ErrorBundle.ErrorMessage, notes.len);
+    defer gpa.free(note_ems);
+    for (note_ems, notes) |*ne, n| {
+        ne.* = .{
+            .msg = try wip.addString(n.msg),
+            .src_loc = try sourceLocation(&wip, tree, view, n.node),
             .notes_len = 0,
-        });
-    } else {
-        try wip.addRootErrorMessage(.{ .msg = try wip.addString(msg), .src_loc = .none, .notes_len = 0 });
+        };
     }
+
+    try wip.addRootErrorMessageWithNotes(.{
+        .msg = try wip.addString(msg),
+        .src_loc = try sourceLocation(&wip, tree, view, node),
+        .notes_len = @intCast(notes.len),
+    }, note_ems);
 
     var bundle = try wip.toOwnedBundle("");
     defer bundle.deinit(gpa);
     try bundle.renderToWriter(.{}, writer);
+}
+
+/// The `ErrorBundle` source location for `node` translated into the user's frame,
+/// or `.none` when `node` anchors entirely in the injected wrap prefix.
+fn sourceLocation(
+    wip: *std.zig.ErrorBundle.Wip,
+    tree: std.zig.Ast,
+    view: Pipeline.UserView,
+    node: std.zig.Ast.Node.Index,
+) !std.zig.ErrorBundle.SourceLocationIndex {
+    const span = view.translate(tree.nodeToSpan(node)) orelse return .none;
+    const loc = view.findLoc(span.main);
+    return try wip.addSourceLocation(.{
+        .src_path = try wip.addString(repl_source_path),
+        .span_start = span.start,
+        .span_main = span.main,
+        .span_end = span.end,
+        .line = @intCast(loc.line),
+        .column = @intCast(loc.column),
+        .source_line = try wip.addString(loc.source_line),
+    });
 }
 
 /// Render parse errors with positions translated into the user's

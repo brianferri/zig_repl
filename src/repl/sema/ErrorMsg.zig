@@ -39,12 +39,30 @@ pub const LazySrcLoc = struct {
         }
     };
 
-    /// The declaration node the `offset` is relative to. Mirrors
-    /// `Zcu.resolveBaseNode`'s `.declaration` arm; the base is always a
-    /// declaration instruction (the block's `src_base_inst`), single-file, so
-    /// the compiler's `TrackedInst`/multi-tag resolution collapses to one read.
+    /// The base AST node `offset` is relative to. Mirrors `Zcu.resolveBaseNode`,
+    /// arm for arm: a declaration, a struct-init, or an `extended` container
+    /// declaration. The compiler's `else => unreachable` becomes `.root` here: its
+    /// `TrackedInst` names the file the base lives in, but the REPL's fileless
+    /// `Zir.Inst.Index` cannot, so a note anchored at a prior line's container
+    /// (resolved against this line's ZIR) may land on an unrelated tag -- degrade to
+    /// the file root rather than crash. Same-file bases resolve exactly.
     pub fn resolveBaseNode(base_node_inst: Zir.Inst.Index, zir: Zir) Ast.Node.Index {
-        return zir.instructions.items(.data)[@intFromEnum(base_node_inst)].declaration.src_node;
+        if (base_node_inst == .main_struct_inst) return .root;
+        if (@intFromEnum(base_node_inst) >= zir.instructions.len) return .root;
+        const inst = zir.instructions.get(@intFromEnum(base_node_inst));
+        return switch (inst.tag) {
+            .declaration => inst.data.declaration.src_node,
+            .struct_init, .struct_init_ref => zir.extraData(Zir.Inst.StructInit, inst.data.pl_node.payload_index).data.abs_node,
+            .struct_init_anon => zir.extraData(Zir.Inst.StructInitAnon, inst.data.pl_node.payload_index).data.abs_node,
+            .extended => switch (inst.data.extended.opcode) {
+                .struct_decl => zir.getStructDecl(base_node_inst).src_node,
+                .union_decl => zir.getUnionDecl(base_node_inst).src_node,
+                .enum_decl => zir.getEnumDecl(base_node_inst).src_node,
+                .opaque_decl => zir.getOpaqueDecl(base_node_inst).src_node,
+                else => .root,
+            },
+            else => .root,
+        };
     }
 
     /// The absolute AST node the caret anchors on: the base declaration node with

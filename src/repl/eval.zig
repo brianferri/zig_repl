@@ -120,7 +120,12 @@ fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !O
             }
             if (session.files.items[line_index].zir) |file_zir| {
                 const node = em.src_loc.resolveNode(file_zir);
-                Diagnostic.renderSemaError(session.gpa, result.tree, result.userView(), node, em.msg, diag) catch {};
+                var notes_buf: [16]Diagnostic.Note = undefined;
+                const n = @min(em.notes.len, notes_buf.len);
+                for (notes_buf[0..n], em.notes[0..n]) |*dst, note| {
+                    dst.* = .{ .node = note.src_loc.resolveNode(file_zir), .msg = note.msg };
+                }
+                Diagnostic.renderSemaError(session.gpa, result.tree, result.userView(), node, em.msg, notes_buf[0..n], diag) catch {};
             }
         }
         // Tombstone the failed line: free its ZIR but keep the `File` slot (and
