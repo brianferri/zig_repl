@@ -561,8 +561,7 @@ fn divScalar(sema: *Sema, ty: Type, lhs_val: Value, rhs_val: Value, op: DivOp, i
             },
             .div_exact => switch (try intDivExact(sema, lhs_val, rhs_val, ty)) {
                 .remainder => {
-                    try sema.writer.writeAll("exact division produced remainder\n");
-                    return error.AnalysisFail;
+                    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "exact division produced remainder", .{});
                 },
                 .overflow => |val| return sema.failWithIntegerOverflow(ty, val),
                 .success => |val| return val,
@@ -592,8 +591,7 @@ fn divScalar(sema: *Sema, ty: Type, lhs_val: Value, rhs_val: Value, op: DivOp, i
             .div_floor => return floatDivFloor(sema, lhs_val, rhs_val, ty),
             .div_exact => {
                 if (!floatDivIsExact(sema, lhs_val, rhs_val, ty)) {
-                    try sema.writer.writeAll("exact division produced remainder\n");
-                    return error.AnalysisFail;
+                    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "exact division produced remainder", .{});
                 }
                 return floatDivTrunc(sema, lhs_val, rhs_val, ty);
             },
@@ -1474,8 +1472,7 @@ fn intShr(sema: *Sema, lhs_ty: Type, rhs_ty: Type, lhs: Value, rhs: Value, op: S
         return sema.failWithTooLargeShiftAmount(lhs_ty, rhs);
     }
     if (op == .shr_exact and lhs_bigint.ctz(shift_amt) < shift_amt) {
-        try sema.writer.writeAll("exact shift shifted out 1 bits\n");
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "exact shift shifted out 1 bits", .{});
     }
     const result_limbs = lhs_bigint.limbs.len -| (shift_amt / (@sizeOf(Limb) * 8));
     if (result_limbs == 0) {

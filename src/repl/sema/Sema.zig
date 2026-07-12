@@ -424,15 +424,14 @@ fn evalBody(sema: *Sema, body: []const Zir.Inst.Index) Error!Value {
 fn emitBackwardBranch(sema: *Sema) Error!void {
     sema.branch_count += 1;
     if (sema.branch_count > sema.branch_quota) {
-        try sema.writer.print(
-            "evaluation exceeded {d} backwards branches\n",
-            .{sema.branch_quota},
-        );
-        try sema.writer.print(
-            "use @setEvalBranchQuota() to raise the branch limit from {d}\n",
-            .{sema.branch_quota},
-        );
-        return error.AnalysisFail;
+        const src = sema.block.nodeOffset(.zero);
+        const msg = msg: {
+            const msg = try sema.errMsg(src, "evaluation exceeded {d} backwards branches", .{sema.branch_quota});
+            errdefer msg.destroy(sema.gpa);
+            try sema.errNote(src, msg, "use @setEvalBranchQuota() to raise the branch limit from {d}", .{sema.branch_quota});
+            break :msg msg;
+        };
+        return sema.failWithOwnedErrorMsg(sema.block, msg);
     }
 }
 
@@ -910,11 +909,20 @@ fn errNote(sema: *Sema, src: LazySrcLoc, parent: *ErrorMsg, comptime format: []c
 /// and render later. Without one (bare-Sema unit tests) there is no store, so the
 /// flat message goes to `writer`.
 fn failWithOwnedErrorMsg(sema: *Sema, block: ?*Block, em: *ErrorMsg) Error {
+    @branchHint(.cold);
     _ = block;
-    sema.err = em;
     if (sema.session) |session| {
-        if (session.failed_analysis) |old| old.destroy(sema.gpa);
-        session.failed_analysis = em;
+        // Prefer the first error recorded for the unit: the compiler's
+        // `failed_analysis.getOrPut(sema.owner)` keeps the existing entry and
+        // destroys the newcomer. One unit per analyze call, so the slot stands in
+        // for the per-`AnalUnit` entry.
+        if (session.failed_analysis != null) {
+            sema.err = null;
+            em.destroy(sema.gpa);
+        } else {
+            sema.err = em;
+            session.failed_analysis = em;
+        }
     } else {
         sema.writer.print("{s}\n", .{em.msg}) catch {};
         em.destroy(sema.gpa);
@@ -923,10 +931,14 @@ fn failWithOwnedErrorMsg(sema: *Sema, block: ?*Block, em: *ErrorMsg) Error {
 }
 
 /// Mirrors the compiler's `Sema.fail`: build the message at `src` and fail with it.
-/// `block` is carried for signature parity (the compiler attaches inlining-chain
-/// and `Type.Formatter` "declared here" notes through it); the REPL uses neither.
-fn fail(sema: *Sema, block: *Block, src: LazySrcLoc, comptime format: []const u8, args: anytype) Error {
-    return sema.failWithOwnedErrorMsg(block, try sema.errMsg(src, format, args));
+pub fn fail(sema: *Sema, block: *Block, src: LazySrcLoc, comptime format: []const u8, args: anytype) Error {
+    const err_msg = try sema.errMsg(src, format, args);
+    // The compiler's `inline for (args)` here adds a "declared here" note for each
+    // `Type.Formatter` arg via `addDeclaredHereNote`, resolving the type's declaration
+    // source. That anchor must name the file the type was declared in; the REPL's
+    // single-file `Zir.Inst.Index` base cannot point at a type declared on a prior
+    // line, so the note waits on the base carrying a file (as `TrackedInst` does).
+    return sema.failWithOwnedErrorMsg(block, err_msg);
 }
 
 /// The relative `Ast.Node.Offset` of instruction `inst` -- its `inst_data.src_node`.
@@ -1066,12 +1078,11 @@ fn resolveScalarNumericPeer(sema: *Sema, lhs_key: InternPool.Key, rhs_key: Inter
 /// operands with no common type are "incompatible"; a non-numeric operand is
 /// "non-numeric or mismatched".
 fn failNumericOperands(sema: *Sema, op_name: []const u8, lhs_key: InternPool.Key, rhs_key: InternPool.Key) Error {
+    const src = sema.block.nodeOffset(.zero);
     if ((lhs_key == .int or lhs_key == .float) and (rhs_key == .int or rhs_key == .float)) {
-        sema.writer.print("{s}: incompatible numeric operands\n", .{op_name}) catch |e| return e;
-    } else {
-        sema.writer.print("{s}: non-numeric or mismatched operands\n", .{op_name}) catch |e| return e;
+        return sema.fail(sema.block, src, "{s}: incompatible numeric operands", .{op_name});
     }
-    return error.AnalysisFail;
+    return sema.fail(sema.block, src, "{s}: non-numeric or mismatched operands", .{op_name});
 }
 
 /// Validate two operands for a lane-wise comparison: both must be vectors of the
@@ -1309,14 +1320,14 @@ fn refitIntToFixedWidth(
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const result_big = sema.intern_pool.indexToKey(comptime_int_idx).int.storage.toBigInt(&space);
     if (!result_big.fitsInTwosComp(dest_info.signedness, dest_info.bits)) {
-        try sema.writer.print(
-            "{s}: value does not fit in {c}{d}\n",
-            .{ op_name, @as(u8, switch (dest_info.signedness) {
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: value does not fit in {c}{d}", .{
+            op_name,
+            @as(u8, switch (dest_info.signedness) {
                 .signed => 'i',
                 .unsigned => 'u',
-            }), dest_info.bits },
-        );
-        return error.AnalysisFail;
+            }),
+            dest_info.bits,
+        });
     }
     const idx = try sema.intern_pool.internIntValue(dest_ty, result_big);
     return .{ .index = idx };
@@ -1476,8 +1487,7 @@ fn evalTypeofLog2IntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 fn failLog2NonInt(sema: *Sema) Error {
-    sema.writer.writeAll("typeof_log2_int_type: non-integer operand not yet supported\n") catch |e| return e;
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "typeof_log2_int_type: non-integer operand not yet supported", .{});
 }
 
 /// The type valid as a shift amount for a value of int type `int_ty`:
@@ -1647,14 +1657,13 @@ fn materialiseIntFromFloat(
     if (Type.fromIndex(dest_type_index).zigTypeTag(sema.intern_pool) == .int) {
         const dest_int = Type.fromIndex(dest_type_index).intInfo(sema.intern_pool).?;
         if (!big.fitsInTwosComp(dest_int.signedness, dest_int.bits)) {
-            try sema.writer.print(
-                "@intFromFloat: value does not fit in {c}{d}\n",
-                .{ @as(u8, switch (dest_int.signedness) {
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@intFromFloat: value does not fit in {c}{d}", .{
+                @as(u8, switch (dest_int.signedness) {
                     .signed => 'i',
                     .unsigned => 'u',
-                }), dest_int.bits },
-            );
-            return error.AnalysisFail;
+                }),
+                dest_int.bits,
+            });
         }
         const idx = try sema.intern_pool.internIntValue(dest_type_index, big);
         return .{ .index = idx };
@@ -1768,11 +1777,7 @@ fn evalBitCast(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@bitCast: operands must be fixed-width numeric types", .{});
     }
     if (operand_bits.? != dest_bits.?) {
-        try sema.writer.print(
-            "@bitCast: type sizes differ ({d} vs {d} bits)\n",
-            .{ operand_bits.?, dest_bits.? },
-        );
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@bitCast: type sizes differ ({d} vs {d} bits)", .{ operand_bits.?, dest_bits.? });
     }
 
     return try sema.reinterpretBitCast(operand_key, dest_type_index, dest_bits.?);
@@ -3357,10 +3362,9 @@ fn loadUnionField(sema: *Sema, union_val: InternPool.Index, index: u32) Error!Va
     if (active_index == index) return .{ .index = uv.val };
     const accessed = (try sema.unionFieldNameAt(uv.ty, index)) orelse unreachable;
     const active_name = (try sema.unionFieldNameAt(uv.ty, active_index)) orelse unreachable;
-    try sema.writer.print("access of union field '{s}' while field '{s}' is active\n", .{
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "access of union field '{s}' while field '{s}' is active", .{
         ip.stringSlice(accessed), ip.stringSlice(active_name),
     });
-    return error.AnalysisFail;
 }
 
 /// Locate the `ComptimeAlloc` entry referenced by a `Key.Ptr`. Returns
@@ -3450,77 +3454,80 @@ const InMemoryCoercionResult = union(enum) {
     /// `render_value.render` instead of the compiler's `{f}` value formatters; the
     /// `no_match` case's "declared here" notes are `LazySrcLoc`-only, so they are
     /// omitted (the caller's message already names the two types).
-    fn report(res: *const InMemoryCoercionResult, sema: *Sema) Error!void {
+    fn report(res: *const InMemoryCoercionResult, sema: *Sema, src: LazySrcLoc, msg: *ErrorMsg) Error!void {
         const ip = sema.intern_pool;
-        const w = sema.writer;
         var cur = res;
         while (true) switch (cur.*) {
             .ok => unreachable,
             .no_match => break,
             .int_not_coercible => |int| {
-                try w.print("{s} {d}-bit int cannot represent all possible {s} {d}-bit values\n", .{
+                try sema.errNote(src, msg, "{s} {d}-bit int cannot represent all possible {s} {d}-bit values", .{
                     @tagName(int.wanted_signedness), int.wanted_bits, @tagName(int.actual_signedness), int.actual_bits,
                 });
                 break;
             },
             .comptime_int_not_coercible => |int| {
-                try w.writeAll("type '");
-                try Type.print(int.wanted, ip, w);
-                try w.writeAll("' cannot represent value '");
-                try render_value.render(int.actual, ip, w);
-                try w.writeAll("'\n");
+                try sema.errNote(src, msg, "type '{f}' cannot represent value '{f}'", .{ int.wanted.fmt(ip), render_value.fmt(int.actual, ip) });
                 break;
             },
             .error_union_payload => |pair| {
-                try noteTwoTypes(sema, "error union payload '", pair.actual, "' cannot cast into error union payload '", pair.wanted);
+                try noteTwoTypes(sema, src, msg, "error union payload '", pair.actual, "' cannot cast into error union payload '", pair.wanted);
                 cur = pair.child;
             },
             .array_len => |lens| {
-                try w.print("array of length {d} cannot cast into an array of length {d}\n", .{ lens.actual, lens.wanted });
+                try sema.errNote(src, msg, "array of length {d} cannot cast into an array of length {d}", .{ lens.actual, lens.wanted });
                 break;
             },
             .array_sentinel => |sentinel| {
-                try noteSentinel(sema, "source array cannot be guaranteed to maintain '", "destination array requires '", "array sentinel '", "' cannot cast into array sentinel '", sentinel);
+                try noteSentinel(sema, src, msg, "source array cannot be guaranteed to maintain '", "destination array requires '", "array sentinel '", "' cannot cast into array sentinel '", sentinel);
                 break;
             },
             .array_elem => |pair| {
-                try noteTwoTypes(sema, "array element type '", pair.actual, "' cannot cast into array element type '", pair.wanted);
+                try noteTwoTypes(sema, src, msg, "array element type '", pair.actual, "' cannot cast into array element type '", pair.wanted);
                 cur = pair.child;
             },
             .vector_len => |lens| {
-                try w.print("vector of length {d} cannot cast into a vector of length {d}\n", .{ lens.actual, lens.wanted });
+                try sema.errNote(src, msg, "vector of length {d} cannot cast into a vector of length {d}", .{ lens.actual, lens.wanted });
                 break;
             },
             .vector_elem => |pair| {
-                try noteTwoTypes(sema, "vector element type '", pair.actual, "' cannot cast into vector element type '", pair.wanted);
+                try noteTwoTypes(sema, src, msg, "vector element type '", pair.actual, "' cannot cast into vector element type '", pair.wanted);
                 cur = pair.child;
             },
             .optional_shape => |pair| {
-                try noteTwoTypes(sema, "optional type child '", pair.actual.optionalChild(ip), "' cannot cast into optional type child '", pair.wanted.optionalChild(ip));
+                try noteTwoTypes(sema, src, msg, "optional type child '", pair.actual.optionalChild(ip), "' cannot cast into optional type child '", pair.wanted.optionalChild(ip));
                 break;
             },
             .optional_child => |pair| {
-                try noteTwoTypes(sema, "optional type child '", pair.actual, "' cannot cast into optional type child '", pair.wanted);
+                try noteTwoTypes(sema, src, msg, "optional type child '", pair.actual, "' cannot cast into optional type child '", pair.wanted);
                 cur = pair.child;
             },
             .from_anyerror => {
-                try w.writeAll("global error set cannot cast into a smaller set\n");
+                try sema.errNote(src, msg, "global error set cannot cast into a smaller set", .{});
                 break;
             },
             .missing_error => |missing_errors| {
-                for (missing_errors) |err| try w.print("'error.{s}' not a member of destination error set\n", .{ip.stringSlice(err)});
+                for (missing_errors) |err| try sema.errNote(src, msg, "'error.{s}' not a member of destination error set", .{ip.stringSlice(err)});
                 break;
             },
             .fn_var_args => |wanted_var_args| {
-                try w.writeAll(if (wanted_var_args) "non-variadic function cannot cast into a variadic function\n" else "variadic function cannot cast into a non-variadic function\n");
+                if (wanted_var_args) {
+                    try sema.errNote(src, msg, "non-variadic function cannot cast into a variadic function", .{});
+                } else {
+                    try sema.errNote(src, msg, "variadic function cannot cast into a non-variadic function", .{});
+                }
                 break;
             },
             .fn_generic => |wanted_generic| {
-                try w.writeAll(if (wanted_generic) "non-generic function cannot cast into a generic function\n" else "generic function cannot cast into a non-generic function\n");
+                if (wanted_generic) {
+                    try sema.errNote(src, msg, "non-generic function cannot cast into a generic function", .{});
+                } else {
+                    try sema.errNote(src, msg, "generic function cannot cast into a non-generic function", .{});
+                }
                 break;
             },
             .fn_param_count => |lens| {
-                try w.print("function with {d} parameters cannot cast into a function with {d} parameters\n", .{ lens.actual, lens.wanted });
+                try sema.errNote(src, msg, "function with {d} parameters cannot cast into a function with {d} parameters", .{ lens.actual, lens.wanted });
                 break;
             },
             .fn_param_noalias => |param| {
@@ -3535,65 +3542,61 @@ const InMemoryCoercionResult = union(enum) {
                     }
                 }
                 if (!actual_noalias) {
-                    try w.print("regular parameter {d} cannot cast into a noalias parameter\n", .{index});
+                    try sema.errNote(src, msg, "regular parameter {d} cannot cast into a noalias parameter", .{index});
                 } else {
-                    try w.print("noalias parameter {d} cannot cast into a regular parameter\n", .{index});
+                    try sema.errNote(src, msg, "noalias parameter {d} cannot cast into a regular parameter", .{index});
                 }
                 break;
             },
             .fn_param_comptime => |param| {
                 if (param.wanted) {
-                    try w.print("non-comptime parameter {d} cannot cast into a comptime parameter\n", .{param.index});
+                    try sema.errNote(src, msg, "non-comptime parameter {d} cannot cast into a comptime parameter", .{param.index});
                 } else {
-                    try w.print("comptime parameter {d} cannot cast into a non-comptime parameter\n", .{param.index});
+                    try sema.errNote(src, msg, "comptime parameter {d} cannot cast into a non-comptime parameter", .{param.index});
                 }
                 break;
             },
             .fn_param => |param| {
-                try w.print("parameter {d} '", .{param.index});
-                try Type.print(param.actual, ip, w);
-                try w.writeAll("' cannot cast into '");
-                try Type.print(param.wanted, ip, w);
-                try w.writeAll("'\n");
+                try sema.errNote(src, msg, "parameter {d} '{f}' cannot cast into '{f}'", .{ param.index, param.actual.fmt(ip), param.wanted.fmt(ip) });
                 cur = param.child;
             },
             .fn_cc => |cc| {
-                try w.print("calling convention '{s}' cannot cast into calling convention '{s}'\n", .{ @tagName(cc.actual), @tagName(cc.wanted) });
+                try sema.errNote(src, msg, "calling convention '{s}' cannot cast into calling convention '{s}'", .{ @tagName(cc.actual), @tagName(cc.wanted) });
                 break;
             },
             .fn_return_type => |pair| {
-                try noteTwoTypes(sema, "return type '", pair.actual, "' cannot cast into return type '", pair.wanted);
+                try noteTwoTypes(sema, src, msg, "return type '", pair.actual, "' cannot cast into return type '", pair.wanted);
                 cur = pair.child;
             },
             .ptr_child => |pair| {
-                try noteTwoTypes(sema, "pointer type child '", pair.actual, "' cannot cast into pointer type child '", pair.wanted);
+                try noteTwoTypes(sema, src, msg, "pointer type child '", pair.actual, "' cannot cast into pointer type child '", pair.wanted);
                 cur = pair.child;
             },
             .ptr_addrspace => |addr_space| {
-                try w.print("address space '{s}' cannot cast into address space '{s}'\n", .{ @tagName(addr_space.actual), @tagName(addr_space.wanted) });
+                try sema.errNote(src, msg, "address space '{s}' cannot cast into address space '{s}'", .{ @tagName(addr_space.actual), @tagName(addr_space.wanted) });
                 break;
             },
             .ptr_sentinel => |sentinel| {
-                try noteSentinel(sema, "", "destination pointer requires '", "pointer sentinel '", "' cannot cast into pointer sentinel '", sentinel);
+                try noteSentinel(sema, src, msg, "", "destination pointer requires '", "pointer sentinel '", "' cannot cast into pointer sentinel '", sentinel);
                 break;
             },
             .ptr_size => |size| {
-                try w.print("a {s} cannot cast into a {s}\n", .{ pointerSizeString(size.actual), pointerSizeString(size.wanted) });
+                try sema.errNote(src, msg, "a {s} cannot cast into a {s}", .{ pointerSizeString(size.actual), pointerSizeString(size.wanted) });
                 break;
             },
             .ptr_const => |pair| {
                 if (pair.actual.isConstPtr(ip) and !pair.wanted.isConstPtr(ip)) {
-                    try w.writeAll("cast discards const qualifier\n");
+                    try sema.errNote(src, msg, "cast discards const qualifier", .{});
                 } else {
-                    try noteTwoTypes(sema, "mutable '", pair.wanted, "' would allow illegal const pointers stored to type '", pair.actual);
+                    try noteTwoTypes(sema, src, msg, "mutable '", pair.wanted, "' would allow illegal const pointers stored to type '", pair.actual);
                 }
                 break;
             },
             .ptr_volatile => |pair| {
                 if (pair.actual.isVolatilePtr(ip) and !pair.wanted.isVolatilePtr(ip)) {
-                    try w.writeAll("cast discards volatile qualifier\n");
+                    try sema.errNote(src, msg, "cast discards volatile qualifier", .{});
                 } else {
-                    try noteTwoTypes(sema, "mutable '", pair.wanted, "' would allow illegal volatile pointers stored to type '", pair.actual);
+                    try noteTwoTypes(sema, src, msg, "mutable '", pair.wanted, "' would allow illegal volatile pointers stored to type '", pair.actual);
                 }
                 break;
             },
@@ -3601,66 +3604,53 @@ const InMemoryCoercionResult = union(enum) {
                 const wanted_allow_zero = pair.wanted.ptrAllowsZero(ip);
                 const actual_allow_zero = pair.actual.ptrAllowsZero(ip);
                 if (actual_allow_zero and !wanted_allow_zero) {
-                    try noteTwoTypes(sema, "'", pair.actual, "' could have null values which are illegal in type '", pair.wanted);
+                    try noteTwoTypes(sema, src, msg, "'", pair.actual, "' could have null values which are illegal in type '", pair.wanted);
                 } else {
-                    try noteTwoTypes(sema, "mutable '", pair.wanted, "' would allow illegal null values stored to type '", pair.actual);
+                    try noteTwoTypes(sema, src, msg, "mutable '", pair.wanted, "' would allow illegal null values stored to type '", pair.actual);
                 }
                 break;
             },
             .ptr_bit_range => |bit_range| {
                 if (bit_range.actual_host != bit_range.wanted_host)
-                    try w.print("pointer host size '{d}' cannot cast into pointer host size '{d}'\n", .{ bit_range.actual_host, bit_range.wanted_host });
+                    try sema.errNote(src, msg, "pointer host size '{d}' cannot cast into pointer host size '{d}'", .{ bit_range.actual_host, bit_range.wanted_host });
                 if (bit_range.actual_offset != bit_range.wanted_offset)
-                    try w.print("pointer bit offset '{d}' cannot cast into pointer bit offset '{d}'\n", .{ bit_range.actual_offset, bit_range.wanted_offset });
+                    try sema.errNote(src, msg, "pointer bit offset '{d}' cannot cast into pointer bit offset '{d}'", .{ bit_range.actual_offset, bit_range.wanted_offset });
                 break;
             },
             .ptr_alignment => |pair| {
-                try w.print("pointer alignment '{d}' cannot cast into pointer alignment '{d}'\n", .{ pair.actual.toByteUnits() orelse 0, pair.wanted.toByteUnits() orelse 0 });
+                try sema.errNote(src, msg, "pointer alignment '{d}' cannot cast into pointer alignment '{d}'", .{ pair.actual.toByteUnits() orelse 0, pair.wanted.toByteUnits() orelse 0 });
                 break;
             },
             .double_ptr_to_anyopaque => |pair| {
-                try noteTwoTypes(sema, "cannot implicitly cast double pointer '", pair.actual, "' to anyopaque pointer '", pair.wanted);
+                try noteTwoTypes(sema, src, msg, "cannot implicitly cast double pointer '", pair.actual, "' to anyopaque pointer '", pair.wanted);
                 break;
             },
             .slice_to_anyopaque => |pair| {
-                try noteTwoTypes(sema, "cannot implicitly cast slice '", pair.actual, "' to anyopaque pointer '", pair.wanted);
-                try w.writeAll("consider using '.ptr'\n");
+                try noteTwoTypes(sema, src, msg, "cannot implicitly cast slice '", pair.actual, "' to anyopaque pointer '", pair.wanted);
+                try sema.errNote(src, msg, "consider using '.ptr'", .{});
                 break;
             },
         };
     }
 };
 
-/// A `report` note of the shape `<pre>TYPE<mid>TYPE'\n` (the two-type notes that
+/// A `report` note of the shape `<pre>TYPE<mid>TYPE'` (the two-type notes that
 /// pepper `InMemoryCoercionResult.report`).
-fn noteTwoTypes(sema: *Sema, pre: []const u8, a: Type, mid: []const u8, b: Type) Error!void {
-    const w = sema.writer;
-    try w.writeAll(pre);
-    try Type.print(a, sema.intern_pool, w);
-    try w.writeAll(mid);
-    try Type.print(b, sema.intern_pool, w);
-    try w.writeAll("'\n");
+fn noteTwoTypes(sema: *Sema, src: LazySrcLoc, msg: *ErrorMsg, pre: []const u8, a: Type, mid: []const u8, b: Type) Error!void {
+    const ip = sema.intern_pool;
+    try sema.errNote(src, msg, "{s}{f}{s}{f}'", .{ pre, a.fmt(ip), mid, b.fmt(ip) });
 }
 
 /// The sentinel-mismatch note shared by `array_sentinel` and `ptr_sentinel`
 /// (`unreachable_value` means "no sentinel").
-fn noteSentinel(sema: *Sema, missing_actual: []const u8, missing_wanted: []const u8, both_pre: []const u8, both_mid: []const u8, sentinel: InMemoryCoercionResult.Sentinel) Error!void {
+fn noteSentinel(sema: *Sema, src: LazySrcLoc, msg: *ErrorMsg, missing_actual: []const u8, missing_wanted: []const u8, both_pre: []const u8, both_mid: []const u8, sentinel: InMemoryCoercionResult.Sentinel) Error!void {
     const ip = sema.intern_pool;
-    const w = sema.writer;
     if (sentinel.wanted.index == .unreachable_value) {
-        try w.writeAll(missing_actual);
-        try render_value.render(sentinel.actual, ip, w);
-        try w.writeAll("'\n");
+        try sema.errNote(src, msg, "{s}{f}'", .{ missing_actual, render_value.fmt(sentinel.actual, ip) });
     } else if (sentinel.actual.index == .unreachable_value) {
-        try w.writeAll(missing_wanted);
-        try render_value.render(sentinel.wanted, ip, w);
-        try w.writeAll("'\n");
+        try sema.errNote(src, msg, "{s}{f}'", .{ missing_wanted, render_value.fmt(sentinel.wanted, ip) });
     } else {
-        try w.writeAll(both_pre);
-        try render_value.render(sentinel.actual, ip, w);
-        try w.writeAll(both_mid);
-        try render_value.render(sentinel.wanted, ip, w);
-        try w.writeAll("'\n");
+        try sema.errNote(src, msg, "{s}{f}{s}{f}'", .{ both_pre, render_value.fmt(sentinel.actual, ip), both_mid, render_value.fmt(sentinel.wanted, ip) });
     }
 }
 
@@ -4222,9 +4212,14 @@ fn coerceToErrorSet(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_nam
     }
     const imc = try sema.coerceInMemoryAllowedErrorSets(Type.fromIndex(dest_ty), Value.typeOf(value, ip));
     if (imc != .ok) {
-        try sema.writer.print("{s}: cannot coerce error set\n", .{op_name});
-        try imc.report(sema);
-        return error.AnalysisFail;
+        const src = sema.block.nodeOffset(.zero);
+        const msg = msg: {
+            const msg = try sema.errMsg(src, "{s}: cannot coerce error set", .{op_name});
+            errdefer msg.destroy(sema.gpa);
+            try imc.report(sema, src, msg);
+            break :msg msg;
+        };
+        return sema.failWithOwnedErrorMsg(sema.block, msg);
     }
     return .{ .index = try ip.internErr(.{ .ty = dest_ty, .name = key.err.name }) };
 }
@@ -5074,10 +5069,7 @@ fn evalVectorType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     };
     const child = try sema.resolveDestType(bin.rhs, "vector_type");
     if (!isVectorElemType(sema.intern_pool, child)) {
-        try sema.writer.writeAll(
-            "vector_type: expected integer, float, bool, or pointer for the vector element type\n",
-        );
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "vector_type: expected integer, float, bool, or pointer for the vector element type", .{});
     }
     const vector_ty = try sema.intern_pool.internVectorType(.{ .len = len, .child = child });
     return .{ .index = vector_ty };
@@ -6032,10 +6024,7 @@ fn typeInfoErrorSet(sema: *Sema, err_ty: ?InternPool.Index) Error!?Value {
 }
 
 fn failTypeInfoUnsupported(sema: *Sema, ty: InternPool.Index) Error {
-    sema.writer.writeAll("@typeInfo: unsupported type '") catch |e| return e;
-    Type.print(.fromIndex(ty), sema.intern_pool, sema.writer) catch |e| return e;
-    sema.writer.writeAll("'\n") catch |e| return e;
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@typeInfo: unsupported type '{f}'", .{Type.fromIndex(ty).fmt(sema.intern_pool)});
 }
 
 /// Assemble a `std.lang.Type` union value: the field named `tag_name` active,
@@ -6124,11 +6113,7 @@ fn arrayInitElemType(
         .vector_type => |vt| return vt.child,
         .tuple_type => |tt| {
             if (index < tt.types.len) return tt.types[index];
-            try sema.writer.print(
-                "{s}: element {d} is out of range for a {d}-field tuple\n",
-                .{ op_name, index, tt.types.len },
-            );
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: element {d} is out of range for a {d}-field tuple", .{ op_name, index, tt.types.len });
         },
         else => {
             return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: type does not support array-init syntax", .{op_name});
@@ -6250,10 +6235,7 @@ fn evalShuffle(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 fn failShuffleOperand(sema: *Sema, elem_ty: InternPool.Index) Error {
-    sema.writer.writeAll("@shuffle: expected a vector of '") catch |e| return e;
-    Type.print(.fromIndex(elem_ty), sema.intern_pool, sema.writer) catch |e| return e;
-    sema.writer.writeAll("'\n") catch |e| return e;
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@shuffle: expected a vector of '{f}'", .{Type.fromIndex(elem_ty).fmt(sema.intern_pool)});
 }
 
 /// The `{len, child}` of an array/vector type, or the compiler's "expected array
@@ -6428,11 +6410,7 @@ fn evalTupleDecl(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value
         const zir_field_ty = refs[i * 2];
         const zir_field_init = refs[i * 2 + 1];
         if (zir_field_init != .none) {
-            try sema.writer.print(
-                "tuple field {d}: comptime field defaults are not supported\n",
-                .{i},
-            );
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "tuple field {d}: comptime field defaults are not supported", .{i});
         }
         ty.* = try sema.resolveDestType(zir_field_ty, "tuple field type");
     }
@@ -6645,11 +6623,28 @@ fn enterContainer(sema: *Sema, container_ty: InternPool.Index, ctx: []const u8) 
 /// misses names both the field and the struct. Shared by every field-access site
 /// (`field_ptr`, field loads, struct init) so the wording is one message keyed on
 /// the struct -- not a per-syntax context string. Mirrors src/Sema.zig.
+/// The source of `container_ty`'s declaration, for a "declared here" note. Mirrors
+/// the compiler's `Type.srcLoc`: a `LazySrcLoc` anchored at the container's decl inst.
+fn containerTypeSrc(sema: *Sema, container_ty: InternPool.Index) LazySrcLoc {
+    const id: InternPool.Key.ContainerId = switch (sema.intern_pool.indexToKey(container_ty)) {
+        .struct_type => |st| st.id,
+        .union_type => |ut| ut.id,
+        .enum_type => |et| et.id,
+        else => return sema.block.nodeOffset(.zero),
+    };
+    return .{ .base_node_inst = id.declInst(), .offset = .{ .node_offset = .zero } };
+}
+
 fn failBadStructFieldAccess(sema: *Sema, struct_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error {
     const ip = sema.intern_pool;
     const st_name = ip.stringSlice(ip.indexToKey(struct_ty).struct_type.name);
-    sema.writer.print("no field named '{s}' in struct '{s}'\n", .{ ip.stringSlice(name), st_name }) catch |e| return e;
-    return error.AnalysisFail;
+    const msg = msg: {
+        const msg = try sema.errMsg(sema.block.nodeOffset(.zero), "no field named '{s}' in struct '{s}'", .{ ip.stringSlice(name), st_name });
+        errdefer msg.destroy(sema.gpa);
+        try sema.errNote(sema.containerTypeSrc(struct_ty), msg, "struct declared here", .{});
+        break :msg msg;
+    };
+    return sema.failWithOwnedErrorMsg(sema.block, msg);
 }
 
 /// The union counterpart of `failBadStructFieldAccess`: a field lookup that misses
@@ -6658,8 +6653,13 @@ fn failBadStructFieldAccess(sema: *Sema, struct_ty: InternPool.Index, name: Inte
 fn failBadUnionFieldAccess(sema: *Sema, union_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error {
     const ip = sema.intern_pool;
     const un_name = ip.stringSlice(ip.indexToKey(union_ty).union_type.name);
-    sema.writer.print("no field named '{s}' in union '{s}'\n", .{ ip.stringSlice(name), un_name }) catch |e| return e;
-    return error.AnalysisFail;
+    const msg = msg: {
+        const msg = try sema.errMsg(sema.block.nodeOffset(.zero), "no field named '{s}' in union '{s}'", .{ ip.stringSlice(name), un_name });
+        errdefer msg.destroy(sema.gpa);
+        try sema.errNote(sema.containerTypeSrc(union_ty), msg, "union declared here", .{});
+        break :msg msg;
+    };
+    return sema.failWithOwnedErrorMsg(sema.block, msg);
 }
 
 /// The compiler's `failWithBadMemberAccess` diagnostic: a namespace/tag lookup
@@ -6668,22 +6668,31 @@ fn failBadUnionFieldAccess(sema: *Sema, union_ty: InternPool.Index, name: Intern
 /// Mirrors src/Sema.zig (kw_name + type name).
 fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error {
     const ip = sema.intern_pool;
+    const src = sema.block.nodeOffset(.zero);
     const key = ip.indexToKey(container_ty);
-    const kw: []const u8, const ct_name: InternPool.NullTerminatedString = switch (key) {
-        .struct_type => |st| .{ "struct", st.name },
-        .enum_type => |et| .{ "enum", et.name },
-        .union_type => |ut| .{ "union", ut.name },
+    const kw_name: []const u8 = switch (key) {
+        .struct_type => "struct",
+        .enum_type => "enum",
+        .union_type => "union",
         // A non-container type reaches here only through a field call on a type
         // that carries no namespace (`u8.foo()`); name it via its printed form.
-        else => {
-            sema.writer.print("type '", .{}) catch |e| return e;
-            Type.print(.fromIndex(container_ty), ip, sema.writer) catch |e| return e;
-            sema.writer.print("' has no member named '{s}'\n", .{ip.stringSlice(name)}) catch |e| return e;
-            return error.AnalysisFail;
-        },
+        else => return sema.fail(sema.block, src, "type '{f}' has no member named '{s}'", .{ Type.fromIndex(container_ty).fmt(ip), ip.stringSlice(name) }),
     };
-    sema.writer.print("{s} '{s}' has no member named '{s}'\n", .{ kw, ip.stringSlice(ct_name), ip.stringSlice(name) }) catch |e| return e;
-    return error.AnalysisFail;
+    // Mirror the compiler's `main_struct_inst` arm: a miss on the file-root struct
+    // reads "root source file struct". `typeDeclInst` is null for a generated tag.
+    const decl_inst: ?Zir.Inst.Index = switch (key) {
+        .struct_type => |st| st.id.declInst(),
+        .union_type => |ut| ut.id.declInst(),
+        .enum_type => |et| switch (et.id) {
+            .generated_union_tag => null,
+            else => et.id.declInst(),
+        },
+        else => unreachable,
+    };
+    if (decl_inst) |di| if (di == .main_struct_inst) {
+        return sema.fail(sema.block, src, "root source file struct '{f}' has no member named '{s}'", .{ Type.fromIndex(container_ty).fmt(ip), ip.stringSlice(name) });
+    };
+    return sema.fail(sema.block, src, "{s} '{f}' has no member named '{s}'", .{ kw_name, Type.fromIndex(container_ty).fmt(ip), ip.stringSlice(name) });
 }
 
 /// A resolved container field. `index`/`ty` serve every caller. The reflection
@@ -6965,8 +6974,7 @@ pub fn unionFieldNameAt(sema: *Sema, union_ty: InternPool.Index, index: u32) Err
 /// empty. Every auto-layout union has one, and its tag values drive the
 /// active-field check.
 fn failUntaggedUnionCmp(sema: *Sema) Error {
-    sema.writer.writeAll("comparison of union and enum literal is only valid for tagged union types\n") catch |e| return e;
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "comparison of union and enum literal is only valid for tagged union types", .{});
 }
 
 /// The union half of `analyzeCmpUnionTag`: reject a comparison against an
@@ -7791,10 +7799,7 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
 /// access on a type that has no such member (an array without `len`/`ptr`, or a
 /// non-aggregate). Mirrors fieldVal's array/else arms.
 fn failNoMember(sema: *Sema, ty: InternPool.Index, name: InternPool.NullTerminatedString) Error {
-    sema.writer.print("no member named '{s}' in '", .{sema.intern_pool.stringSlice(name)}) catch |e| return e;
-    Type.print(.fromIndex(ty), sema.intern_pool, sema.writer) catch |e| return e;
-    sema.writer.writeAll("'\n") catch |e| return e;
-    return error.AnalysisFail;
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "no member named '{s}' in '{f}'", .{ sema.intern_pool.stringSlice(name), Type.fromIndex(ty).fmt(sema.intern_pool) });
 }
 
 /// `field_ptr_named_load` (`@field(object, "name")`): the same read as
@@ -8982,13 +8987,14 @@ fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const src_elem = src_ty.indexableElem(ip);
     const imc = try sema.coerceInMemoryAllowed(dest_elem, src_elem, false, null);
     if (imc != .ok) {
-        try sema.writer.writeAll("@memcpy: pointer element type '");
-        try Type.print(src_elem, ip, sema.writer);
-        try sema.writer.writeAll("' cannot coerce into element type '");
-        try Type.print(dest_elem, ip, sema.writer);
-        try sema.writer.writeAll("'\n");
-        try imc.report(sema);
-        return error.AnalysisFail;
+        const err_src = sema.block.nodeOffset(sema.srcNodeOffset(inst));
+        const msg = msg: {
+            const msg = try sema.errMsg(err_src, "@memcpy: pointer element type '{f}' cannot coerce into element type '{f}'", .{ src_elem.fmt(ip), dest_elem.fmt(ip) });
+            errdefer msg.destroy(sema.gpa);
+            try imc.report(sema, err_src, msg);
+            break :msg msg;
+        };
+        return sema.failWithOwnedErrorMsg(sema.block, msg);
     }
 
     const dest_len = try sema.indexableMemLen(dest);
@@ -9192,11 +9198,7 @@ fn resolveRef(sema: *Sema, ref: Zir.Inst.Ref) Error!Value {
             sema.operand_comptime = sema.operand_comptime and value.is_comptime;
             return value;
         }
-        try sema.writer.print(
-            "internal error: unresolved instruction ref %{d}\n",
-            .{@intFromEnum(inst_idx)},
-        );
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst_idx)), "internal error: unresolved instruction ref %{d}", .{@intFromEnum(inst_idx)});
     }
 
     if (wellKnownRefToValue(ref)) |value| return value;
@@ -9314,18 +9316,10 @@ fn lookupDecl(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error!?Dec
     if (try sema.lookupName(ns_idx, name)) |nav_idx| {
         const nav = sema.intern_pool.getNav(nav_idx);
         const resolved = nav.resolved orelse {
-            try sema.writer.print(
-                "{s} '{s}': binding recorded but value not resolved (test / comptime / extern)\n",
-                .{ op_name, name_bytes },
-            );
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s} '{s}': binding recorded but value not resolved (test / comptime / extern)", .{ op_name, name_bytes });
         };
         if (resolved.value == .none) {
-            try sema.writer.print(
-                "{s} '{s}': type resolved but value not yet\n",
-                .{ op_name, name_bytes },
-            );
-            return error.AnalysisFail;
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s} '{s}': type resolved but value not yet", .{ op_name, name_bytes });
         }
         return .{ .nav = nav_idx, .resolved = resolved };
     }
@@ -9420,11 +9414,7 @@ fn bindValueDecl(
     unwrapped: std.zig.Zir.Inst.Declaration.Unwrapped,
 ) Error!void {
     const value_body = unwrapped.value_body orelse {
-        try sema.writer.print(
-            "bindDecls '{s}': no value_body (extern decl)\n",
-            .{sema.intern_pool.stringSlice(name)},
-        );
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "bindDecls '{s}': no value_body (extern decl)", .{sema.intern_pool.stringSlice(name)});
     };
 
     // Resolve the type annotation (`const x: T = ...`) before the
@@ -10724,11 +10714,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
 
     const args_len = explicit_len + @as(u32, @intFromBool(self_val != null));
     if (func_ty.param_types.len != args_len) {
-        try sema.writer.print(
-            "expected {d} argument(s), found {d}\n",
-            .{ func_ty.param_types.len, args_len },
-        );
-        return error.AnalysisFail;
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected {d} argument(s), found {d}", .{ func_ty.param_types.len, args_len });
     }
     const raw_args = try sema.evalCallArgs(inst, self_val, explicit_len, args_body, func_ty.param_types);
     defer sema.gpa.free(raw_args);
