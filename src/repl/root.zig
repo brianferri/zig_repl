@@ -7,6 +7,9 @@ pub const eval = @import("eval.zig");
 pub const sema = @import("sema/root.zig");
 pub const front = @import("front/root.zig");
 pub const render = @import("render/root.zig");
+/// The source-provider interface `@import` resolves against; `NativeModuleSource`
+/// is the on-disk implementation.
+pub const ModuleSource = @import("ModuleSource.zig");
 /// A `ModuleSource` reading a real directory. Native frontends wire it to the
 /// system standard library so `@import("std")` resolves; locating that directory
 /// is the frontend's job (the core opens no files itself).
@@ -36,5 +39,5 @@ test {
     _ = @import("sema/Sema.zig");
     _ = @import("sema/arith.zig");
     _ = @import("sema_eval_test.zig");
-    _ = @import("zig_compliance_test.zig");
+    _ = @import("compliance/root.zig");
 }
