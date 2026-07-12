@@ -250,6 +250,39 @@ fn expectReplDiagnostic(gpa: std.mem.Allocator, inputs: []const []const u8, need
     }
 }
 
+test "diagnostic: a Sema error renders a source-anchored caret with notes" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+
+    var diag: std.Io.Writer.Allocating = .init(gpa);
+    defer diag.deinit();
+    // A `u16 -> u8` @memcpy element mismatch: the error anchors on the `@memcpy`
+    // node (a precise column) and carries an `int_not_coercible` note.
+    try testing.expectError(error.AnalysisFail, eval.run(
+        &session,
+        "blk: { var dst = [_]u8{ 0, 0 }; const src = [_]u16{ 1, 2 }; @memcpy(dst[0..2], src[0..2]); break :blk dst[0]; }",
+        &diag.writer,
+    ));
+    const out = diag.written();
+    for ([_][]const u8{
+        "<repl>:1:", // source-anchored location in the user's frame
+        "error:",
+        "@memcpy", // the echoed source line
+        "^", // the caret
+        "note:", // the errNote chain is rendered, not dropped
+        "cannot represent all possible", // the note's text
+    }) |needle| {
+        if (std.mem.indexOf(u8, out, needle) == null) {
+            std.debug.print("caret diagnostic missing '{s}':\n{s}\n", .{ needle, out });
+            return error.TestCaretMismatch;
+        }
+    }
+}
+
 /// Assert a known, intentional divergence: the REPL accepts `inputs` while
 /// `zig run` rejects it. The comptime-only REPL evaluates everything at comptime
 /// and so cannot enforce rules that exist only at the runtime boundary (e.g. a
@@ -1916,6 +1949,9 @@ test "compliance: union sad paths pin the REPL's diagnostics" {
     // to crash: the diagnostic assumed a struct type).
     try expectReplDiagnostic(a, &.{"blk: { " ++ U ++ " const u = U{ .z = 1 }; break :blk u.a; }"}, "no field named 'z' in union");
     try expectReplDiagnostic(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 1 }; break :blk u.z; }"}, "no field named 'z' in union");
+    // ...with a "declared here" note anchored at the union's declaration (the compiler
+    // attaches one via `errNote(union_ty.srcLoc, ...)`).
+    try expectReplDiagnostic(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 1 }; break :blk u.z; }"}, "union declared here");
     // A union init names exactly one field.
     try expectReplDiagnostic(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 1, .b = 2 }; break :blk u.a; }"}, "union initialization expects exactly one field");
     // The init value must coerce to the field type.
