@@ -11111,6 +11111,34 @@ fn evalTypeofBuiltin(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 ///   * `struct_decl` -- a named struct type (`struct { x: i32 }`).
 ///
 /// Every other opcode surfaces a structured
+/// `@intFromError(e)`: the error's global integer. Mirrors `zirIntFromError`
+/// reduced to the comptime case -- the operand's value is always known, so the
+/// runtime/inferred-error-set paths drop away.
+fn evalIntFromError(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
+    const ip = sema.intern_pool;
+    const extra = sema.zir.extraData(Zir.Inst.UnNode, extended.operand).data;
+    const operand = try sema.coerceValueToType(try sema.resolveRef(extra.operand), .anyerror_type, "@intFromError");
+    const err_int_ty = Type.fromIndex(ip.errorIntType());
+    if (operand.isUndef(ip)) return try sema.undefValue(err_int_ty);
+    const err_name = ip.indexToKey(operand.index).err.name;
+    return try sema.intValue_u64(err_int_ty, try ip.getErrorValue(err_name));
+}
+
+/// `@errorFromInt(n)`: the error whose global integer is `n`. Mirrors
+/// `zirErrorFromInt` reduced to the comptime case.
+fn evalErrorFromInt(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
+    const ip = sema.intern_pool;
+    const extra = sema.zir.extraData(Zir.Inst.UnNode, extended.operand).data;
+    const err_int_ty = Type.fromIndex(ip.errorIntType());
+    const operand = try sema.coerceValueToType(try sema.resolveRef(extra.operand), err_int_ty.index, "@errorFromInt");
+    const int = operand.toUnsignedInt(ip);
+    if (int == 0 or int > ip.global_error_set.count()) {
+        return sema.fail(sema.block, sema.block.nodeOffset(extra.node), "integer value '{d}' represents no error", .{int});
+    }
+    const name = ip.global_error_set.keys()[@intCast(int - 1)];
+    return .fromIndex(try ip.internErr(.{ .ty = .anyerror_type, .name = name }));
+}
+
 /// "unsupported extended opcode: <name>" diagnostic; the `inline
 /// else` expansion ensures stdlib adding a new Opcode variant
 /// keeps compiling but routes through the same fallback.
@@ -11154,6 +11182,8 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .typeof_peer => return sema.evalTypeofPeer(extended, inst),
         .this => return sema.evalThis(),
         .closure_get => return sema.evalClosureGet(extended),
+        .int_from_error => return sema.evalIntFromError(extended),
+        .error_from_int => return sema.evalErrorFromInt(extended),
 
         // The result type for a compound assignment (`s += x`, `s -= x`): the
         // lhs's own type, against which the rhs is coerced before the arith +

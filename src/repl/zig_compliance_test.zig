@@ -283,6 +283,16 @@ test "diagnostic: a Sema error renders a source-anchored caret with notes" {
     }
 }
 
+test "compliance: @intFromError / @errorFromInt round-trip" {
+    const a = testing.allocator;
+    // A round-trip is numbering-independent, so it matches `zig run` even though the
+    // REPL's incremental global error set need not assign the same integer as a
+    // whole-program compile.
+    try expectMatchesZig(a, &.{"@errorFromInt(@intFromError(error.Bar))"});
+    // 0 -- and any out-of-range integer -- represents no error.
+    try expectReplDiagnostic(a, &.{"@errorFromInt(0)"}, "represents no error");
+}
+
 /// Assert a known, intentional divergence: the REPL accepts `inputs` while
 /// `zig run` rejects it. The comptime-only REPL evaluates everything at comptime
 /// and so cannot enforce rules that exist only at the runtime boundary (e.g. a

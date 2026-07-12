@@ -2296,6 +2296,13 @@ navs: std.ArrayListUnmanaged(Nav),
 namespaces: std.ArrayListUnmanaged(Namespace),
 /// Backing store for `ComptimeUnit.Id`. Append-only.
 comptime_units: std.ArrayListUnmanaged(ComptimeUnit),
+/// Every error name that has been assigned a global integer, in assignment
+/// order; the value of `error.X` is its index + 1 (0 means "no error"). Mirrors
+/// the compiler's `InternPool.global_error_set`. `@intFromError` / `@errorFromInt`
+/// map between an error and this number. Order-dependent: the incremental REPL
+/// registers names as they are first seen, so a multi-error program's numbers need
+/// not match a whole-program `zig run` (a single-error program's do).
+global_error_set: std.AutoArrayHashMapUnmanaged(NullTerminatedString, void),
 
 /// Adapter for `string_map.getOrPutAdapted(bytes, StringAdapter)`:
 /// hashes / compares against the byte content reachable through
@@ -2344,6 +2351,7 @@ pub fn init(gpa: Allocator) Allocator.Error!InternPool {
         .navs = .empty,
         .namespaces = .empty,
         .comptime_units = .empty,
+        .global_error_set = .empty,
     };
     errdefer pool.deinit();
 
@@ -2357,6 +2365,7 @@ pub fn init(gpa: Allocator) Allocator.Error!InternPool {
 }
 
 pub fn deinit(pool: *InternPool) void {
+    pool.global_error_set.deinit(pool.gpa);
     pool.items.deinit(pool.gpa);
     pool.extra.deinit(pool.gpa);
     pool.string_bytes.deinit(pool.gpa);
@@ -2374,6 +2383,27 @@ pub fn deinit(pool: *InternPool) void {
     pool.big_int_limbs.deinit(pool.gpa);
     pool.map.deinit(pool.gpa);
     pool.* = undefined;
+}
+
+/// The global integer for error `name`, assigning the next one if unseen. Mirrors
+/// the compiler's `InternPool.getErrorValue`: the value is the 1-based insertion
+/// index (0 is reserved for "no error").
+pub fn getErrorValue(pool: *InternPool, name: NullTerminatedString) Allocator.Error!u32 {
+    const gop = try pool.global_error_set.getOrPut(pool.gpa, name);
+    return @intCast(gop.index + 1);
+}
+
+/// Like `getErrorValue` but returns null instead of assigning. Mirrors
+/// `InternPool.getErrorValueIfExists`.
+pub fn getErrorValueIfExists(pool: *const InternPool, name: NullTerminatedString) ?u32 {
+    return @intCast((pool.global_error_set.getIndex(name) orelse return null) + 1);
+}
+
+/// The unsigned integer type wide enough for any error value. Mirrors
+/// `Zcu.PerThread.errorIntType` = `intType(unsigned, errorSetBits())`; with the
+/// default `error_limit` of `maxInt(u16) - 1`, `errorSetBits()` is 16, so `u16`.
+pub fn errorIntType(_: *const InternPool) Index {
+    return .u16_type;
 }
 
 /// Seed `NullTerminatedString.empty` so a handle of `0` always
