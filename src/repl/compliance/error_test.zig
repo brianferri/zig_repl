@@ -131,3 +131,33 @@ test "compliance: @intFromError / @errorFromInt round-trip" {
     });
     try compliance.expectDiagnostic(a, &.{"@errorFromInt(0)"}, "represents no error");
 }
+
+test "compliance: @errorCast recasts across error sets and unions" {
+    // @errorCast takes one argument; its destination is the result-location type,
+    // supplied here by the enclosing @as.
+    try compliance.check(a, .{
+        // Widen a subset into a superset, and to anyerror.
+        .{ .src = &.{"@as(error{ A, B, C }, @errorCast(@as(error{ A, B }, error.A)))"}, .want = @as(error{ A, B, C }, @errorCast(@as(error{ A, B }, error.A))) },
+        .{ .src = &.{"@as(anyerror, @errorCast(@as(error{A}, error.A)))"}, .want = @as(anyerror, @errorCast(@as(error{A}, error.A))) },
+        // Narrow a superset to a subset the value belongs to.
+        .{ .src = &.{"@as(error{A}, @errorCast(@as(error{ A, B }, error.A)))"}, .want = @as(error{A}, @errorCast(@as(error{ A, B }, error.A))) },
+        // Error set -> error union (the value wraps as the error arm).
+        .{ .src = &.{"@as(error{A}!u8, @errorCast(@as(error{A}, error.A)))"}, .want = @as(error{A}!u8, @errorCast(@as(error{A}, error.A))) },
+        // Error union -> error union: error arm and payload arm both recast.
+        .{ .src = &.{"@as(error{ A, B }!u8, @errorCast(@as(error{A}!u8, error.A)))"}, .want = @as(error{ A, B }!u8, @errorCast(@as(error{A}!u8, error.A))) },
+        .{ .src = &.{"@as(error{ A, B }!u8, @errorCast(@as(error{A}!u8, 5)))"}, .want = @as(error{ A, B }!u8, @errorCast(@as(error{A}!u8, 5))) },
+        // An optional destination peels one layer (.remove_opt): the cast targets
+        // the error set, then the outer @as re-wraps the optional.
+        .{ .src = &.{"@as(?error{ A, B }, @errorCast(@as(error{A}, error.A)))"}, .want = @as(?error{ A, B }, @errorCast(@as(error{A}, error.A))) },
+        // Rejections: non-error destination, EU -> error set, payload mismatch,
+        // disjoint sets, and a value outside an overlapping destination set.
+        .{ .src = &.{"@as(u8, @errorCast(error.A))"}, .reject = {} },
+        .{ .src = &.{"@as(error{A}, @errorCast(@as(error{A}!u8, error.A)))"}, .reject = {} },
+        .{ .src = &.{"@as(error{A}!u16, @errorCast(@as(error{A}!u8, error.A)))"}, .reject = {} },
+        .{ .src = &.{"@as(error{B}, @errorCast(@as(error{A}, error.A)))"}, .reject = {} },
+        .{ .src = &.{"@as(error{ A, C }, @errorCast(@as(error{ A, B }, error.B)))"}, .reject = {} },
+    });
+    try compliance.expectDiagnostic(a, &.{"@as(error{ A, C }, @errorCast(@as(error{ A, B }, error.B)))"}, "not a member of error set");
+    try compliance.expectDiagnostic(a, &.{"@as(error{B}, @errorCast(@as(error{A}, error.A)))"}, "have no common errors");
+    try compliance.expectDiagnostic(a, &.{"@as(error{A}!u16, @errorCast(@as(error{A}!u8, error.A)))"}, "payload types of error unions must match");
+}

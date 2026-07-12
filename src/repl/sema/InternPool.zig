@@ -263,6 +263,28 @@ pub const NullTerminatedString = enum(u32) {
         if (std.mem.indexOfScalar(u8, slice, '_')) |_| return null;
         return std.fmt.parseUnsigned(u32, slice, 10) catch null;
     }
+
+    const FormatData = struct {
+        string: NullTerminatedString,
+        ip: *const InternPool,
+        id: bool,
+    };
+    fn format(data: FormatData, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const slice = data.ip.stringSlice(data.string);
+        if (!data.id) {
+            try writer.writeAll(slice);
+        } else {
+            try writer.print("{f}", .{std.zig.fmtIdP(slice)});
+        }
+    }
+
+    pub fn fmt(string: NullTerminatedString, ip: *const InternPool) std.fmt.Alt(FormatData, format) {
+        return .{ .data = .{ .string = string, .ip = ip, .id = false } };
+    }
+
+    pub fn fmtId(string: NullTerminatedString, ip: *const InternPool) std.fmt.Alt(FormatData, format) {
+        return .{ .data = .{ .string = string, .ip = ip, .id = true } };
+    }
 };
 
 /// Optional version of `NullTerminatedString`. Sentinel `none` is
@@ -927,6 +949,12 @@ pub const Key = union(enum) {
     /// valid for the pool's lifetime.
     pub const ErrorSetType = struct {
         names: []const NullTerminatedString,
+
+        pub fn nameIndex(self: ErrorSetType, pool: *const InternPool, name: NullTerminatedString) ?u32 {
+            _ = pool;
+            const i = std.mem.indexOfScalar(NullTerminatedString, self.names, name) orelse return null;
+            return @intCast(i);
+        }
     };
 
     /// Anonymous tuple type: one type per positional field.

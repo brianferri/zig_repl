@@ -547,6 +547,43 @@ pub fn errorUnionSet(ty: Type, pool: *const InternPool) Type {
     return .fromIndex(pool.indexToKey(ty.index).error_union_type.error_set_type);
 }
 
+pub fn errorSetIsEmpty(ty: Type, pool: *const InternPool) bool {
+    return switch (ty.index) {
+        .anyerror_type, .adhoc_inferred_error_set_type => false,
+        else => switch (pool.indexToKey(ty.index)) {
+            .error_set_type => |error_set_type| error_set_type.names.len == 0,
+            else => unreachable,
+        },
+    };
+}
+
+/// Returns true if it is an error set that includes anyerror, false otherwise.
+pub fn isAnyError(ty: Type, pool: *const InternPool) bool {
+    _ = pool;
+    return switch (ty.index) {
+        .anyerror_type => true,
+        .adhoc_inferred_error_set_type => false,
+        else => false,
+    };
+}
+
+pub fn errorSetNames(ty: Type, pool: *const InternPool) []const InternPool.NullTerminatedString {
+    return switch (pool.indexToKey(ty.index)) {
+        .error_set_type => |x| x.names,
+        else => unreachable,
+    };
+}
+
+pub fn errorSetHasField(ty: Type, name: InternPool.NullTerminatedString, pool: *const InternPool) bool {
+    return switch (ty.index) {
+        .anyerror_type => true,
+        else => switch (pool.indexToKey(ty.index)) {
+            .error_set_type => |error_set_type| error_set_type.nameIndex(pool, name) != null,
+            else => unreachable,
+        },
+    };
+}
+
 /// Peel optional and error-union wrappers to the innermost payload; `?T`, `E!T`,
 /// and `?E!T` all yield `T`. A result-location type carries these wrappers (from
 /// `@as(?S, .{...})`), but the init syntax binds against the payload container.

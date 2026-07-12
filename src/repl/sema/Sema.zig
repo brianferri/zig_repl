@@ -11139,6 +11139,124 @@ fn evalErrorFromInt(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Va
     return .fromIndex(try ip.internErr(.{ .ty = .anyerror_type, .name = name }));
 }
 
+/// `@errorCast(x)`: recast an error value to the result-location error set or
+/// error union. Mirrors `zirErrorCast` reduced to the comptime case: the operand
+/// is always a known value, so the runtime safety check, the AIR `error_cast`
+/// lowering, and the inferred-error-set resolution all drop away, leaving the
+/// type checks, the set-membership classification, and the interned result.
+///
+/// Compiler reference: src/Sema.zig:zirErrorCast.
+fn evalErrorCast(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
+    const ip = sema.intern_pool;
+    const extra = sema.zir.extraData(Zir.Inst.BinNode, extended.operand).data;
+    const src = sema.block.nodeOffset(extra.node);
+
+    // resolveDestType's `.remove_opt`: peel one optional layer, keeping `E!T`.
+    var dest_ty = Type.fromIndex(try sema.resolveDestType(extra.lhs, "@errorCast"));
+    if (dest_ty.zigTypeTag(ip) == .optional) dest_ty = dest_ty.optionalChild(ip);
+    const operand = try sema.resolveRef(extra.rhs);
+    const operand_ty = Value.typeOf(operand, ip);
+
+    const dest_tag = dest_ty.zigTypeTag(ip);
+    const operand_tag = operand_ty.zigTypeTag(ip);
+
+    if (dest_tag != .error_set and dest_tag != .error_union) {
+        return sema.fail(sema.block, src, "expected error set or error union type, found '{s}'", .{@tagName(dest_tag)});
+    }
+    if (operand_tag != .error_set and operand_tag != .error_union) {
+        return sema.fail(sema.block, src, "expected error set or error union type, found '{s}'", .{@tagName(operand_tag)});
+    }
+    if (dest_tag == .error_set and operand_tag == .error_union) {
+        return sema.fail(sema.block, src, "cannot cast an error union type to error set", .{});
+    }
+    if (dest_tag == .error_union and operand_tag == .error_union and
+        dest_ty.errorUnionPayload(ip).index != operand_ty.errorUnionPayload(ip).index)
+    {
+        const msg = try sema.errMsg(src, "payload types of error unions must match", .{});
+        try sema.errNote(src, msg, "destination payload is '{f}'", .{dest_ty.errorUnionPayload(ip).fmt(ip)});
+        try sema.errNote(src, msg, "operand payload is '{f}'", .{operand_ty.errorUnionPayload(ip).fmt(ip)});
+        return sema.failWithOwnedErrorMsg(sema.block, msg);
+    }
+
+    const dest_err_ty = switch (dest_tag) {
+        .error_union => dest_ty.errorUnionSet(ip),
+        .error_set => dest_ty,
+        else => unreachable,
+    };
+    const operand_err_ty = switch (operand_tag) {
+        .error_union => operand_ty.errorUnionSet(ip),
+        .error_set => operand_ty,
+        else => unreachable,
+    };
+
+    const result: enum {
+        /// The operand and destination error sets are disjoint, i.e. have no errors in common.
+        disjoint,
+        /// The destination error set is a superset of the operand error set, so the operation is
+        /// effectively equivalent to a coercion.
+        superset,
+        /// The operand and destination error sets have *some* errors in common, but the destination
+        /// is not a superset of the operand, so a safety check may be needed.
+        overlap,
+    } = if (operand_err_ty.errorSetIsEmpty(ip)) res: {
+        break :res .disjoint;
+    } else check: switch (dest_err_ty.index) {
+        .anyerror_type => .superset,
+        // `@errorCast` to this function's own error set.
+        .adhoc_inferred_error_set_type => .superset,
+        else => |err_set_ty| switch (ip.indexToKey(err_set_ty)) {
+            .error_set_type => |dest| {
+                if (dest.names.len == 0) break :check .disjoint; // dest is 'error{}'
+                if (operand_err_ty.isAnyError(ip)) break :check .overlap; // anyerror -> error{...} (non-empty)
+                var dest_has_all = true;
+                var dest_has_any = false;
+                for (operand_err_ty.errorSetNames(ip)) |operand_err_name| {
+                    if (dest.nameIndex(ip, operand_err_name) != null) {
+                        dest_has_any = true;
+                    } else {
+                        dest_has_all = false;
+                    }
+                }
+                if (!dest_has_any) break :check .disjoint;
+                if (dest_has_all) break :check .superset;
+                break :check .overlap;
+            },
+            else => unreachable,
+        },
+    };
+
+    if (result == .disjoint and !(operand_tag == .error_union and dest_tag == .error_union)) {
+        return sema.fail(sema.block, src, "error sets '{f}' and '{f}' have no common errors", .{
+            operand_err_ty.fmt(ip), dest_err_ty.fmt(ip),
+        });
+    }
+
+    // operand must be defined since it can be an invalid error value
+    const err_name: InternPool.NullTerminatedString = switch (ip.indexToKey(operand.index)) {
+        .err => |err| err.name,
+        .error_union => |eu| switch (eu.val) {
+            .err_name => |name| name,
+            .payload => |payload_val| {
+                assert(dest_tag == .error_union); // should be guaranteed from the type checks above
+                return try sema.coerceToErrorUnion(.{ .index = payload_val }, dest_ty.index, "@errorCast");
+            },
+        },
+        else => unreachable,
+    };
+
+    if (result != .superset and !dest_err_ty.errorSetHasField(err_name, ip)) {
+        return sema.fail(sema.block, src, "'error.{f}' not a member of error set '{f}'", .{
+            err_name.fmt(ip), dest_err_ty.fmt(ip),
+        });
+    }
+
+    return switch (dest_tag) {
+        .error_set => .{ .index = try ip.internErr(.{ .ty = dest_ty.index, .name = err_name }) },
+        .error_union => .{ .index = try ip.internErrorUnion(.{ .ty = dest_ty.index, .val = .{ .err_name = err_name } }) },
+        else => unreachable,
+    };
+}
+
 /// "unsupported extended opcode: <name>" diagnostic; the `inline
 /// else` expansion ensures stdlib adding a new Opcode variant
 /// keeps compiling but routes through the same fallback.
@@ -11184,6 +11302,7 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .closure_get => return sema.evalClosureGet(extended),
         .int_from_error => return sema.evalIntFromError(extended),
         .error_from_int => return sema.evalErrorFromInt(extended),
+        .error_cast => return sema.evalErrorCast(extended),
 
         // The result type for a compound assignment (`s += x`, `s -= x`): the
         // lhs's own type, against which the rhs is coerced before the arith +
