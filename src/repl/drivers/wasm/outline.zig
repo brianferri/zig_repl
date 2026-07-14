@@ -86,8 +86,8 @@ fn emitEmpty(w: *std.Io.Writer) !void {
     try w.writeAll("{\"source\":\"\",\"ast\":[],\"zir\":[]}");
 }
 
-/// Emit the merged `{ source, ast, zir }` for `segments` in order. Each
-/// segment's nodes map into injected/prelude bytes are dropped (no user-frame
+/// Emit the merged `{ source, ast, zir }` for `segments` in order. Segment
+/// nodes that map into injected/prelude bytes are dropped (no user-frame
 /// span); the rest are shifted by the segment's `off`.
 fn emitOutline(gpa: std.mem.Allocator, w: *std.Io.Writer, source: []const u8, segments: []const Segment) !void {
     var json: Json = .{ .writer = w, .options = .{ .emit_null_optional_fields = false } };
@@ -178,7 +178,6 @@ fn emitAstNode(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index, off
 /// (often repeated) type expressions -- the signature reads better as text.
 fn emitChildren(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index, off: Offset) anyerror!void {
     switch (tree.nodeTag(node)) {
-        // `lhs OP rhs` binary operators store both operands in `node_and_node`.
         .mul,
         .div,
         .mod,
@@ -210,7 +209,6 @@ fn emitChildren(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index, of
             try emitAstNode(json, tree, view, rhs, off);
         },
 
-        // `OP expr` prefix operators store the operand in `node`.
         .negation,
         .negation_wrap,
         .bit_not,
@@ -219,10 +217,8 @@ fn emitChildren(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index, of
         .optional_type,
         => try emitAstNode(json, tree, view, tree.nodeData(node).node, off),
 
-        // `( expr )` keeps the inner node in `node_and_token`.
         .grouped_expression => try emitAstNode(json, tree, view, tree.nodeData(node).node_and_token[0], off),
 
-        // `fn proto body`: show the signature (as a leaf) then the body block.
         .fn_decl => {
             const proto, const body = tree.nodeData(node).node_and_node;
             try emitAstNode(json, tree, view, proto, off);
@@ -355,7 +351,6 @@ const ZirSink = struct {
 /// mapped; the rest stay unlinked.
 fn instNode(base: Ast.Node.Index, tag: Zir.Inst.Tag, data: Zir.Inst.Data) ?Ast.Node.Index {
     return switch (tag) {
-        // Binary ops + coercion carry `pl_node.src_node`.
         .add,
         .addwrap,
         .add_sat,
@@ -383,7 +378,6 @@ fn instNode(base: Ast.Node.Index, tag: Zir.Inst.Tag, data: Zir.Inst.Data) ?Ast.N
         .as_node,
         => data.pl_node.src_node.toAbsolute(base),
 
-        // Unary ops carry `un_node.src_node`.
         .negate,
         .negate_wrap,
         .bit_not,

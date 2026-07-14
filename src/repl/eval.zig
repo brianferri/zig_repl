@@ -91,9 +91,8 @@ fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !O
     // Register this line as a file BEFORE analysing it, so its `File.Index` is
     // fixed and any module `@import`d mid-analysis takes a later index without
     // colliding. A Func bound here replays its body on a later cross-line call by
-    // that index. The Ast + wrapped source move onto the `File` (mirroring
-    // `Zcu.File.tree`/`.source`), kept so a Sema error resolves against this file's
-    // own tree -- as the compiler resolves `SrcLoc.span` against `file.getTree`.
+    // that index. The Ast + wrapped source move onto the `File`, kept so a Sema
+    // error resolves against this file's own tree.
     const shape = result.wrapped.shape;
     committed = true;
     const line_index: Session.Index = @intCast(session.files.items.len);
@@ -111,8 +110,7 @@ fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !O
         // Render the source-anchored caret for a Sema failure. Sema stored the
         // (unresolved) error in `failed_analysis`; resolve its `LazySrcLoc` against
         // this file's ZIR and Ast -- both now owned by the `File` (so `result`'s
-        // handles alias live memory) -- as the compiler resolves late against
-        // `file.getTree` in its driver.
+        // handles alias live memory).
         if (session.failed_analysis) |em| {
             defer {
                 em.destroy(session.gpa);
@@ -130,7 +128,7 @@ fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !O
         }
         // Tombstone the failed line: free its ZIR but keep the `File` slot (and
         // any modules it loaded, at later indices) so `File.Index` values stay
-        // stable -- the compiler likewise retains failed files.
+        // stable.
         if (session.files.items[line_index].zir) |*z| z.deinit(session.gpa);
         session.files.items[line_index].zir = null;
         return err;

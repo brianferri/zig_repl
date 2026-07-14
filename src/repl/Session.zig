@@ -24,7 +24,7 @@ gpa: std.mem.Allocator,
 intern_pool: *InternPool,
 /// The session-root namespace -- the parent-less scope into which
 /// top-level `const` / `var` lines bind. Mirrors the role of the
-/// compiler's per-file-root namespace; future modules hang their own
+/// compiler's per-file-root namespace; modules hang their own
 /// namespaces off this root via the `parent` chain.
 root_namespace: InternPool.NamespaceIndex,
 /// Every source file the session has lowered to ZIR: each committed REPL line
@@ -57,10 +57,8 @@ module_source: ?*ModuleSource = null,
 /// Index into `files`; the REPL's `Zcu.File.Index`.
 pub const Index = u32;
 
-/// A lowered source file. Mirrors the fields of `Zcu.File` this evaluator uses;
-/// the compiler's `status`/`stat`/`zoir`/`mod`/`prev_zir` have no analogue here
-/// (no incremental rebuild, ZON, or multi-module graph). `is_builtin` arrives
-/// with generated-`builtin` support.
+/// A lowered source file, the REPL's `Zcu.File`. No incremental rebuild, ZON,
+/// or multi-module graph here.
 pub const File = struct {
     /// The lowered ZIR, or `null` for a REPL line whose analysis failed -- kept
     /// as a tombstone so later `File.Index` values stay stable, as the compiler
@@ -69,11 +67,11 @@ pub const File = struct {
     /// The Ast this file was lowered from, kept so a Sema diagnostic can resolve its
     /// `LazySrcLoc` (base declaration node + offset) into a byte span. Mirrors
     /// `Zcu.File.tree`; the compiler additionally makes it droppable and re-parses via
-    /// `getTree`, an optimization not yet needed here. `null` only before it is set.
+    /// `getTree`, an optimization not adopted here. `null` only before it is set.
     tree: ?std.zig.Ast = null,
     /// The wrapped source the Ast was parsed from, and the coordinates that map it
     /// back to what the user typed. Mirrors `Zcu.File.source`; a diagnostic renderer
-    /// slices the caret's source line out of it. `null` for files with no wrap (none today).
+    /// slices the caret's source line out of it. `null` for files with no wrap.
     wrapped: ?InputShape.Wrapped = null,
     /// Path relative to the source root, the base for this file's own relative
     /// imports (`Zcu.File.sub_file_path`). `null` for a REPL line, which has no

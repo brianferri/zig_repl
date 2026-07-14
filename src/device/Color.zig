@@ -16,9 +16,8 @@ const std = @import("std");
 /// emits no escapes.
 pub const ColorLevel = enum { none, basic, palette256, truecolor };
 
-/// Tier from the environment strings. `no_color` forces `.none`;
-/// otherwise `COLORTERM=truecolor|24bit` wins, then a `*256color*`
-/// `TERM`, else basic 16-color.
+/// Resolve tier from the environment strings. Precedence: `no_color`,
+/// then `COLORTERM`, then `TERM`.
 pub fn detect(no_color: bool, colorterm: ?[]const u8, term: ?[]const u8) ColorLevel {
     if (no_color) return .none;
     if (colorterm) |c| {

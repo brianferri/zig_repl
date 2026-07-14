@@ -27,7 +27,6 @@ pub fn main(init: std.process.Init) !void {
         session.module_source = &source.interface;
     }
 
-    // The tty driver wraps the core session with the terminal/IO surface.
     var driver = try tty.Repl.init(&session, init.io);
     return driver.run(init.environ_map);
 }

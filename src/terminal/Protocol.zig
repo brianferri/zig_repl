@@ -3,20 +3,6 @@
 //! `Protocol` as a field named `interface` and recover the concrete
 //! `*Self` inside their vtable functions via
 //! `@fieldParentPtr("interface", p)`.
-//!
-//! Each protocol owns every piece of knowledge about itself:
-//!   * `query_sequence`   -- bytes to emit during negotiation
-//!     (empty for always-supported protocols).
-//!   * `setup_sequence`   -- bytes to emit to enable, post-negotiation.
-//!   * `teardown_sequence` -- bytes to emit on shutdown.
-//!   * `vtable.detectSupport` -- scans the negotiation response and
-//!     reports whether this protocol's support marker is present.
-//!   * `vtable.tryInterpret`  -- token-to-Event interpreter.
-//!
-//! Adding a new protocol is therefore a single-file change: drop a
-//! new file under `protocol/`, register it in the
-//! `known_protocols` list in `Terminal.zig`. No edits to a separate
-//! capabilities module, no edits to a separate dispatcher table.
 
 const std = @import("std");
 const assert = std.debug.assert;

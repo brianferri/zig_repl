@@ -145,7 +145,6 @@ test "arithmetic crosses the u64/int_big boundary" {
 
     // u64.max + 1 promotes to a 2-limb result on 64-bit hosts.
     try expectEvalDecimal(gpa, &pool, "18446744073709551615 + 1", "18446744073709551616");
-    // Multiplying two values that exceed u64.
     try expectEvalDecimal(
         gpa,
         &pool,
@@ -312,7 +311,7 @@ test "@as identity coercion is a free passthrough" {
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
 
-    // comptime_int -> comptime_int (identity) was the original supported case.
+    // comptime_int -> comptime_int is the identity coercion.
     try expectEvalDecimal(gpa, &pool, "@as(comptime_int, 42)", "42");
 }
 
@@ -565,7 +564,6 @@ test "fixed-width float arithmetic at every width" {
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
 
-    // f32 path
     try expectEvalTypedFloat(
         gpa,
         &pool,
@@ -588,7 +586,6 @@ test "fixed-width float arithmetic at every width" {
         @as(u32, @bitCast(@as(f32, 3.0))),
     );
 
-    // f64 path
     try expectEvalTypedFloat(
         gpa,
         &pool,
@@ -604,7 +601,6 @@ test "fixed-width float arithmetic at every width" {
         @as(u64, @bitCast(@as(f64, 3.0))),
     );
 
-    // f128 path
     try expectEvalTypedFloat(
         gpa,
         &pool,
@@ -783,8 +779,7 @@ test "fixed-width int + comptime_float is rejected" {
     defer pool.deinit();
 
     // Real Zig: "incompatible types: 'i32' and 'comptime_float'". Our
-    // diagnostic groups this with the still-pending fixed-width-int
-    // arith axis.
+    // diagnostic groups this under the fixed-width-int arith axis.
     try expectEvalFails(gpa, &pool, "@as(i32, 5) + 1.5", "incompatible numeric operands");
     try expectEvalFails(gpa, &pool, "1.5 + @as(i32, 5)", "incompatible numeric operands");
 }
@@ -953,7 +948,7 @@ test "@bitCast reinterprets matching-width bits" {
 
 /// Drive a type-expression through the full Pipeline + Sema + render,
 /// asserting that the rendered name matches `expected`. Used for
-/// ptr_type and (later) aggregate / function types.
+/// ptr_type and aggregate / function types.
 fn expectEvalTypeName(
     gpa: std.mem.Allocator,
     intern_pool: *InternPool,
@@ -1269,9 +1264,9 @@ test "cast builtins reject ptr_type destinations with their own diagnostic" {
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
 
-    // Each builtin uses `resolveDestType` so a ptr_type dest is now
-    // *accepted* as a type Index -- the kind-specific check inside
-    // the handler is what rejects the mismatch. Each one names its
+    // Each builtin uses `resolveDestType`, so a ptr_type dest is
+    // accepted as a type Index -- the kind-specific check inside
+    // the handler rejects the mismatch. Each one names its
     // own kind in the diagnostic, not "destination is not a type".
     try expectEvalFails(gpa, &pool, "@as(*const u8, @intCast(5))", "destination is not a supported int type");
     try expectEvalFails(gpa, &pool, "@as(*u8, @bitCast(@as(u64, 0)))", "operands must be fixed-width numeric types");
@@ -1562,7 +1557,6 @@ test "decl: rebinding the same name fails with duplicate-member error" {
     const ns = try pool.createNamespace(gpa, .none);
 
     var diag_buf: [4096]u8 = undefined;
-    // First line binds successfully.
     _ = try evalSessionLines(gpa, &pool, ns, &.{"const x = 10;"}, &diag_buf);
 
     // Second line tries to rebind x; wrap-injection re-emits the
@@ -1639,7 +1633,6 @@ test "diagnostic: shadow rejection renders main error in user frame" {
     defer pool.deinit();
     const ns = try pool.createNamespace(gpa, .none);
 
-    // Establish `w` in the session namespace.
     var diag_buf: [4096]u8 = undefined;
     _ = try evalSessionLines(gpa, &pool, ns, &.{"const w = 10;"}, &diag_buf);
 
@@ -1752,7 +1745,6 @@ test "error_value: error.Foo creates singleton set + err value" {
     try testing.expectEqual(@as(usize, 1), ty_key.error_set_type.names.len);
     try testing.expectEqual(ty_key.error_set_type.names[0], key.err.name);
 
-    // The name round-trips back to "Foo".
     try testing.expectEqualStrings("Foo", pool.stringSlice(key.err.name));
 }
 
@@ -2168,9 +2160,9 @@ test "aggregate: structural eql dedups all-equal elems vs repeated_elem" {
         .ty = arr_ty,
         .storage = .{ .repeated_elem = seven },
     });
-    // Compiler-faithful: hash/eql canonicalize across flavors so
-    // both calls return the same Index. Storage flavor preserved
-    // from the first insertion -- here `.elems`.
+    // hash/eql canonicalize across flavors so both calls return the
+    // same Index. Storage flavor preserved from the first insertion
+    // -- here `.elems`.
     try testing.expectEqual(via_elems, via_repeat);
     const decoded = pool.indexToKey(via_elems).aggregate;
     try testing.expect(decoded.storage == .elems);

@@ -10,8 +10,7 @@
 //! mis-dispatching as `escape_alt('\\')`.
 //!
 //! Emits no token -- the dispatcher drops the bytes and pulls the
-//! next sequence. Mirrors the StringCommand consume-and-drop
-//! pattern for the same reason: ST carries no input-event payload.
+//! next sequence: ST carries no input-event payload.
 
 const std = @import("std");
 const assert = std.debug.assert;

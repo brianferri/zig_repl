@@ -26,10 +26,6 @@
 //! `Pipeline.UserView`. This module asks `view.translate(span)` and
 //! drops or emits based on the answer, never inspecting wrap
 //! offsets directly.
-//!
-//! Per-item walk mirrors `std.zig.ErrorBundle.Wip.addZirErrorMessages`
-//! (~line 502) so span / source-location / notes plumbing stays
-//! bit-identical to what `zig` itself would render.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -39,10 +35,10 @@ const ErrorBundle = std.zig.ErrorBundle;
 const Ast = std.zig.Ast;
 const Pipeline = @import("Pipeline.zig");
 
-/// True if `item` is a REPL-advisory diagnostic we drop. Currently:
-/// any error anchored on a var-decl name identifier (covers both
-/// "local variable is never mutated" and "unused local variable" --
-/// both are style guidance the REPL has no use for).
+/// True if `item` is a REPL-advisory diagnostic we drop: any error
+/// anchored on a var-decl name identifier (covers both "local variable
+/// is never mutated" and "unused local variable" -- both are style
+/// guidance the REPL has no use for).
 fn isSuppressed(tree: Ast, item: Zir.Inst.CompileErrors.Item) bool {
     const opt_token = item.token.unwrap() orelse return false;
     if (opt_token == 0) return false;
@@ -68,9 +64,9 @@ pub fn countActionable(zir: Zir, tree: Ast) u32 {
     return actionable;
 }
 
-/// Render only the actionable compile errors to `writer`. Builds an
-/// `ErrorBundle` the same way the compiler does (via `Wip`), skipping
-/// suppressed items entirely so they neither block nor surface.
+/// Render only the actionable compile errors to `writer` via an
+/// `ErrorBundle.Wip`, skipping suppressed items entirely so they
+/// neither block nor surface.
 ///
 /// `view` provides the user-frame translation: all wrap-shape
 /// knowledge (where the user's text starts inside the wrapped
@@ -107,10 +103,9 @@ pub fn renderActionable(
     return bundle.errorMessageCount();
 }
 
-/// Append a single CompileErrors.Item (plus its actionable notes)
-/// to `wip`. An item whose span anchors entirely in the injection
-/// prefix is dropped (`view.translate` returns null) -- the main
-/// error message has no place to render in the user's frame.
+/// An item whose span anchors entirely in the injection prefix is
+/// dropped (`view.translate` returns null) -- the main error message
+/// has no place to render in the user's frame.
 fn appendItem(
     wip: *ErrorBundle.Wip,
     zir: Zir,

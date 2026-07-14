@@ -41,8 +41,7 @@ const BracketedPaste = @import("protocol/BracketedPaste.zig");
 /// compile time, so dispatch is by-name through the concrete module
 /// -- no runtime vtable indirection. Backends share an identical
 /// public surface (`init`, `deinit`, `setRawMode`, `restore`,
-/// `read`); adding a new platform = drop a sibling file under
-/// `platform/` and extend this switch.
+/// `read`).
 pub const PlatformBackend = switch (builtin.os.tag) {
     .windows => @import("platform/Windows.zig"),
     else => @import("platform/Posix.zig"),
@@ -55,10 +54,7 @@ const Terminal = @This();
 /// 18 bytes; 256 holds the worst-case sequence plus slack.
 const read_buffer_bytes: u32 = 256;
 
-/// Source of truth for which protocols exist. Adding a new one is a
-/// single-file change: drop `protocol/Foo.zig`, append its
-/// `.protocol()` here in priority order. The negotiator + dispatcher
-/// pick it up automatically; no other module learns about it.
+/// Source of truth for which protocols exist, in priority order.
 ///
 /// BracketedPaste sits at the top so an in-flight paste claims
 /// every token before any keypress interpreter sees it.

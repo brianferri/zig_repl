@@ -3,12 +3,6 @@
 //! thread sharding, `memoized_call`) and keeps the canonical-storage core.
 //!
 //! Reference: src/InternPool.zig in the Zig compiler tree.
-//! The well-known `Index` set, `SimpleType`/`SimpleValue` shape, and
-//! `Item.Tag` naming mirror the compiler so the port reads against it
-//! directly. The `adhoc_inferred_error_set` marker plus the convenience
-//! pointer/slice/vector well-knowns are deliberately deferred -- they need
-//! Key variants (`ptr_type`, `vector_type`, etc.) that land alongside their
-//! handlers.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -384,7 +378,7 @@ pub const Nav = struct {
 
 /// Stable handle into `pool.namespaces`. Defined here so `Nav`'s
 /// `analysis.namespace` field can reference it without forward-
-/// declaration acrobatics; the storage and methods land in commit 3.
+/// declaration acrobatics.
 pub const NamespaceIndex = enum(u32) { _ };
 
 pub const OptionalNamespaceIndex = enum(u32) {
@@ -402,10 +396,8 @@ pub const OptionalNamespaceIndex = enum(u32) {
     }
 };
 
-/// Stable handle into a file table that lands with module loading.
-/// Defined here so `Namespace.file_scope` matches the compiler's
-/// `Zcu.File.Index` type today; the actual file storage is empty
-/// until the loader exists. Same shape as `src/Zcu.zig:1232`.
+/// Stable handle into the file table. Defined here so `Namespace.file_scope`
+/// matches the compiler's `Zcu.File.Index` type. Same shape as `src/Zcu.zig:1232`.
 pub const FileIndex = enum(u32) { _ };
 
 /// Optional `FileIndex`. The REPL session-root namespace uses `.none`
@@ -479,10 +471,8 @@ pub const Alignment = enum(u6) {
 };
 
 /// A `comptime { ... }` top-level block. Mirrors the compiler's
-/// `InternPool.ComptimeUnit` (`src/InternPool.zig` ~498). These
-/// are recorded so `bindDecls` can register them in a namespace's
-/// `comptime_decls` list; execution lands when Sema gains a
-/// comptime evaluator.
+/// `InternPool.ComptimeUnit` (`src/InternPool.zig` ~498). Recorded so
+/// `bindDecls` can register them in a namespace's `comptime_decls` list.
 ///
 /// Known deviation: `zir_index` is `Zir.Inst.Index`, not
 /// `TrackedInst.Index` (see `Nav.analysis.zir_index` for the
@@ -594,8 +584,8 @@ pub const Namespace = struct {
     }
 };
 
-/// Mirrors compiler `InternPool.SimpleType`. Each variant's integer value is
-/// the corresponding `Index`, so converting between the two is identity.
+/// Each variant's integer value is the corresponding `Index`, so converting
+/// between the two is identity.
 pub const SimpleType = enum(u32) {
     usize = @intFromEnum(Index.usize_type),
     isize = @intFromEnum(Index.isize_type),
@@ -629,7 +619,7 @@ pub const SimpleType = enum(u32) {
     generic_poison = @intFromEnum(Index.generic_poison_type),
 };
 
-/// Mirrors compiler `InternPool.SimpleValue`. Same identity trick as `SimpleType`.
+/// Same identity trick as `SimpleType`: each variant's value is its `Index`.
 pub const SimpleValue = enum(u32) {
     void = @intFromEnum(Index.void_value),
     null = @intFromEnum(Index.null_value),
@@ -642,8 +632,7 @@ pub const Key = union(enum) {
     simple_type: SimpleType,
     simple_value: SimpleValue,
     /// A bare enum literal (`.foo`), type `enum_literal_type`; carries only the
-    /// name and coerces to a concrete enum/union on use. Mirrors the compiler's
-    /// `Key.enum_literal`.
+    /// name and coerces to a concrete enum/union on use.
     enum_literal: NullTerminatedString,
     /// Concrete fixed-width integer type. Shape matches `@typeInfo(T).int`.
     int_type: std.lang.Type.Int,
@@ -664,17 +653,13 @@ pub const Key = union(enum) {
     float: Float,
     /// `undefined` of type `Index`. Untyped `undefined` uses
     /// `.undefined_type` here; the well-known `Index.undef` slot stores
-    /// exactly that shape. Mirrors the compiler's `Key.undef`.
+    /// exactly that shape.
     undef: Index,
     /// A pointer type (`*T`, `*const T`, `[*]T`, `[]T`, etc.). Mirrors
     /// the compiler's `Key.PtrType` -- the same shape but a subset of
-    /// the flag set; we carry what the current alloc/store/load
-    /// subset needs and widen as features land.
+    /// the flag set: what the alloc/store/load subset needs.
     ptr_type: PtrType,
-    /// A pointer value. Mirrors the compiler's `Key.Ptr`. `base_addr`
-    /// today only has `.comptime_alloc` -- enough for REPL session
-    /// allocations; `.nav` / `.uav` / `.int` etc. land alongside their
-    /// dependent stages.
+    /// A pointer value.
     ptr: Ptr,
     /// A slice value: `{ty, ptr, len}`. Mirrors the compiler's `Key.Slice`
     /// (`ptr_slice`): `ptr` addresses the elements, `len` is a `usize` value.
@@ -713,9 +698,8 @@ pub const Key = union(enum) {
     /// ~2228) with the comptime-only minimum: `ty` and the ZIR
     /// instruction that owns the body. The compiler's
     /// `analysis_extra_index` / `branch_quota_extra_index` /
-    /// `generic_owner` / `comptime_args` / source-range fields
-    /// land if/when incremental compilation does -- same
-    /// deferred-vestigial story as `Nav.analysis.zir_index`.
+    /// source-range fields are omitted -- no incremental compilation;
+    /// same deferred-vestigial story as `Nav.analysis.zir_index`.
     func: Func,
     /// `[N]T` and `[N:s]T` array types. Stored across two
     /// `Item.Tag` entries: `type_array_small` (no sentinel, len fits
@@ -833,10 +817,9 @@ pub const Key = union(enum) {
     /// Pointer type. A subset of the compiler's `Key.PtrType` -- shape
     /// matches but the flag field carries only what the supported pointer
     /// syntax needs (size, alignment, is_const, is_volatile, is_allowzero,
-    /// address_space). The compiler's `vector_index` and the `packed_offset`
-    /// (bit-range) field are omitted until their syntax is handled. An
-    /// `extern struct` to match the compiler's `Key.PtrType` layout
-    /// discipline.
+    /// address_space). The compiler's `vector_index` and `packed_offset`
+    /// (bit-range) field are omitted. An `extern struct` to match the
+    /// compiler's `Key.PtrType` layout discipline.
     pub const PtrType = extern struct {
         child: Index,
         sentinel: Index = .none,
@@ -869,8 +852,7 @@ pub const Key = union(enum) {
     /// Pointer value. `ty` is the pointer's type (always a `ptr_type`
     /// Index). `base_addr` identifies the storage the pointer addresses and
     /// `byte_offset` the offset within it. `BaseAddr` is a subset of the
-    /// compiler's `Key.Ptr.BaseAddr` (`src/InternPool.zig`); variants are
-    /// added as their dependent ZIR tags land.
+    /// compiler's `Key.Ptr.BaseAddr` (`src/InternPool.zig`).
     pub const Ptr = struct {
         ty: Index,
         base_addr: BaseAddr,
@@ -1228,9 +1210,8 @@ pub const Key = union(enum) {
         /// The ZIR `func` / `func_inferred` / `func_fancy`
         /// instruction that owns the body. The compiler uses
         /// `TrackedInst.Index` here for incremental-update
-        /// bookkeeping; we use the bare `Zir.Inst.Index` until
-        /// incremental compilation lands -- same deferred-vestigial
-        /// story as `Nav.analysis.zir_index`.
+        /// bookkeeping; we use the bare `Zir.Inst.Index` -- same
+        /// deferred-vestigial story as `Nav.analysis.zir_index`.
         zir_body_inst: std.zig.Zir.Inst.Index,
         /// The container type whose namespace declared this function -- where
         /// its body resolves bare sibling names (a type `Set` referenced
@@ -1256,13 +1237,11 @@ pub const Key = union(enum) {
         /// element is the comptime-known value bound to the
         /// corresponding parameter of `generic_owner`'s type
         /// (`.none` for runtime-known elements). Mirrors
-        /// `Key.Func.comptime_args`. Generics populate this.
+        /// `Key.Func.comptime_args`.
         comptime_args: []const Index = &.{},
     };
 
-    /// Stable hash for dedup. `pool` is reserved for future Key variants
-    /// (e.g. `struct_type`) whose canonical form requires pool lookup;
-    /// today's variants ignore it. Storage variants of `int` are
+    /// Stable hash for dedup. Storage variants of `int` are
     /// normalised to `BigIntConst` before hashing so that
     /// `.{ .u64 = 5 }` and `.{ .big_int = +5 }` hash identically -- the
     /// read-side compresses limbs back to inline storage so the pool's
@@ -1442,7 +1421,6 @@ pub const Key = union(enum) {
                 // f128 on emit (except f80, which has its own tag). Two
                 // c_longdouble Keys with different storage widths compare
                 // equal IFF they round-trip to the same f128 bit-pattern.
-                // Mirrors the compiler's `Key.eql` branch.
                 if (x.ty == .c_longdouble_type and x.storage != .f80) {
                     const a_bits: u128 = switch (x.storage) {
                         inline else => |v| @bitCast(@as(f128, @floatCast(v))),
@@ -1530,9 +1508,8 @@ pub const Key = union(enum) {
                 const y = b.aggregate;
                 if (x.ty != y.ty) break :blk false;
                 // Structural element-by-element equality regardless of
-                // storage flavor, matching the compiler at
-                // src/InternPool.zig ~3057. `.elems = [I, I, I]` and
-                // `.repeated_elem = I` (same `ty`) compare equal even
+                // storage flavor (src/InternPool.zig). `.elems = [I, I, I]`
+                // and `.repeated_elem = I` (same `ty`) compare equal even
                 // though their storage variants differ.
                 const count = aggregateLen(pool, x);
                 if (count != aggregateLen(pool, y)) break :blk false;
@@ -1657,8 +1634,7 @@ fn eqlContainerId(x: Key.ContainerId, y: Key.ContainerId) bool {
     };
 }
 
-/// Tagged storage. `data` interpretation depends on `tag`. Naming mirrors
-/// the compiler's `Item.Tag` to keep ports legible.
+/// Tagged storage. `data` interpretation depends on `tag`.
 const Item = struct {
     tag: Tag,
     data: u32,
@@ -1671,7 +1647,7 @@ const Item = struct {
         type_int_signed, // data = bits
         type_anyframe, // data = Index of the frame's child type (or .none for untyped anyframe)
         // Type-specialised int storage. The tag implies the type; the value
-        // is inline in `data`. Mirrors the compiler's compact encoding.
+        // is inline in `data`.
         int_u8, // ty = .u8_type;  data = the u8 value
         int_u16, // ty = .u16_type; data = the u16 value
         int_u32, // ty = .u32_type; data = the u32 value
@@ -1685,9 +1661,7 @@ const Item = struct {
         // Arbitrary-precision integer. Sign is in the tag; the packed `Int`
         // header (ty + limbs_len) lives at `big_int_limbs[data]` and
         // occupies `IntBigHeader.limbs_items_len` Limb slots, with the
-        // actual limbs trailing directly after. Mirrors the compiler's
-        // `int_positive` / `int_negative` encoding (packed header at the
-        // head of a Limb-aligned arena, limbs trailing).
+        // actual limbs trailing directly after.
         int_positive,
         int_negative,
         // Floats. Tag implies the type. For f16/f32 the bit-pattern fits in
@@ -1707,55 +1681,46 @@ const Item = struct {
         float_comptime_float, // ty = .comptime_float_type; data = extra index of Float128
         undef, // data = Index of the value's type (`undefined_type` for untyped)
         // Pointer type. data = extra index of PtrTypeRepr (3 u32 slots:
-        // child, sentinel, flags). Mirrors the compiler's
-        // `Item.Tag.type_pointer`.
+        // child, sentinel, flags).
         type_pointer,
         // Pointer value with `BaseAddr.comptime_alloc`. data = extra
         // index of PtrComptimeAllocRepr (4 u32 slots: ty,
         // comptime_alloc index, byte_offset_lo, byte_offset_hi).
-        // Mirrors the compiler's `Item.Tag.ptr_comptime_alloc`.
         ptr_comptime_alloc,
         // Pointer value with `BaseAddr.nav`. data = extra index of a
-        // PtrNavRepr. Mirrors the compiler's `Item.Tag.ptr_nav`.
+        // PtrNavRepr.
         ptr_nav,
         // Pointer value with `BaseAddr.uav`. data = extra index of a
-        // PtrUavRepr. Mirrors the compiler's `Item.Tag.ptr_uav`.
+        // PtrUavRepr.
         ptr_uav,
         // Pointer value with `BaseAddr.field`. data = extra index of 6 u32
         // slots: ty, base ptr Index, index_lo, index_hi, byte_offset_lo,
-        // byte_offset_hi. Mirrors the compiler's `Item.Tag.ptr_field`.
+        // byte_offset_hi.
         ptr_field,
         // Pointer value with `BaseAddr.arr_elem`. Same PtrFieldRepr layout as
-        // `ptr_field`. Mirrors the compiler's `Item.Tag.ptr_arr_elem`.
+        // `ptr_field`.
         ptr_arr_elem,
         // Pointer value with `BaseAddr.opt_payload`. data = extra index of
-        // `PtrBase` (ty, base ptr, byte_offset). Mirrors the compiler's
-        // `Item.Tag.ptr_opt_payload`.
+        // `PtrBase` (ty, base ptr, byte_offset).
         ptr_opt_payload,
         // Pointer value with `BaseAddr.eu_payload`. Same `PtrBase` layout as
-        // `ptr_opt_payload`. Mirrors the compiler's `Item.Tag.ptr_eu_payload`.
+        // `ptr_opt_payload`.
         ptr_eu_payload,
         // Slice value. data = extra index of SliceRepr (3 u32 slots: ty, ptr,
-        // len). Mirrors the compiler's `Item.Tag.ptr_slice`.
+        // len).
         ptr_slice,
         // Error set type. data = extra index of `[names_len, name0,
         // name1, ...]` -- one u32 length followed by `names_len`
-        // interned-string handles. Mirrors the compiler's
-        // `Item.Tag.type_error_set`.
+        // interned-string handles.
         type_error_set,
         // Anonymous tuple type. data = extra index of `[types_len,
         // type0, type1, ...]` -- one u32 length then `types_len`
-        // field-type Indices. Mirrors the slice storage of
-        // `type_error_set`; the compiler's `Item.Tag.type_tuple`
-        // additionally trails per-field values (deferred, see the
-        // `tuple_type` Key doc).
+        // field-type Indices. The compiler additionally trails per-field
+        // values (deferred, see the `tuple_type` Key doc).
         type_tuple,
         // Named struct type. data = extra index of StructTypeRepr (3 u32
         // slots: source_zir_id, decl_inst, name). Nominal identity; fields
-        // are resolved from the decl's ZIR on demand, not stored. The
-        // compiler splits declared vs reified container types across
-        // separate tags (`Item.Tag.type_struct*`); we emit only the
-        // declared flavor today.
+        // are resolved from the decl's ZIR on demand, not stored.
         type_struct,
         // Named enum type. data = extra index of EnumTypeRepr (4 u32 slots:
         // source_zir_id, decl_inst, name, generated_union) then trailing captures,
@@ -1763,20 +1728,19 @@ const Item = struct {
         // values are resolved from the decl's ZIR on demand.
         type_enum,
         // Enum tag value. data = extra index of EnumTagRepr (2 u32 slots: ty,
-        // int). Mirrors the compiler's `Item.Tag.enum_tag`.
+        // int).
         enum_tag,
         // Named union type. data = extra index of UnionTypeRepr (3 u32 slots) then
         // trailing captures, laid out exactly like `type_enum`.
         type_union,
         // Union value. data = extra index of UnionValueRepr (3 u32 slots: ty, tag,
-        // val). Mirrors the compiler's `Item.Tag.union_value`.
+        // val).
         union_value,
         // Error value. data = extra index of ErrRepr (2 u32 slots:
-        // ty, name). Mirrors the compiler's `Item.Tag.error_set_error`.
+        // ty, name).
         error_set_error,
         // Error-union type (`E!T`). data = extra index of
         // ErrorUnionTypeRepr (2 u32 slots: error_set, payload).
-        // Mirrors `Item.Tag.type_error_union`.
         type_error_union,
         // Error-union value carrying an error. data = extra index of
         // ErrorUnionErrRepr (2 u32 slots: ty, err_name).
@@ -1786,76 +1750,58 @@ const Item = struct {
         error_union_payload,
         // Function type. data = extra index of FuncTypeRepr (3 u32
         // slots) plus trailing comptime_bits / noalias_bits (when
-        // present per flags) and `param_types[N]`. Mirrors the
-        // compiler's `Item.Tag.type_function`.
+        // present per flags) and `param_types[N]`.
         type_function,
         // Function value at a declaration site. data = extra index
-        // of FuncDeclRepr (2 u32 slots: ty, zir_body_inst). Mirrors
-        // the compiler's `Item.Tag.func_decl` minus the
-        // incremental-compilation extras. Today this is the only
-        // func tag the REPL emits.
+        // of FuncDeclRepr (2 u32 slots: ty, zir_body_inst). Omits the
+        // compiler's incremental-compilation extras.
         func_decl,
         // Function value from a generic-fn instantiation. data =
         // extra index of FuncInstanceRepr (3 u32 slots: ty,
         // generic_owner, comptime_args_len) plus trailing
-        // `comptime_args[comptime_args_len]`. Lands with
-        // generics; the tag slot exists today so the dispatcher,
-        // hash, and eql paths cover the variant without later
-        // refactoring.
+        // `comptime_args[comptime_args_len]`. The tag exists so the
+        // dispatcher, hash, and eql paths cover the variant even
+        // before generics emit it.
         func_instance,
         // Function value coerced to a different fn type. data =
         // extra index of FuncCoercedRepr (2 u32 slots: ty,
         // inner_func). The inner index points at another
         // func_decl / func_instance; `uncoerced_ty` derives from
-        // the inner's `ty`. Lands when fn coercion does -- shape
-        // ready today.
+        // the inner's `ty`.
         func_coerced,
         // `@Vector(len, child)`. data = extra index of VectorTypeRepr
-        // (2 u32 slots: len, child). Mirrors the compiler's
-        // `Item.Tag.type_vector` (`src/InternPool.zig` ~4168).
+        // (2 u32 slots: len, child).
         type_vector,
         // `?child` optional type. data = the child type Index.
-        // Mirrors the compiler's `Item.Tag.type_optional`
-        // (`src/InternPool.zig` ~4171).
         type_optional,
         // Sentinel-free `[len]child` array type where len fits in
         // u32. data = extra index of VectorTypeRepr (2 u32 slots:
-        // len, child). Mirrors the compiler's
-        // `Item.Tag.type_array_small` (`src/InternPool.zig` ~4172)
-        // which reuses the same `len, child` packing.
+        // len, child), reusing the same `len, child` packing.
         type_array_small,
         // Array type with a sentinel value OR with len >= 2^32.
         // data = extra index of ArrayTypeBigRepr (4 u32 slots:
-        // len_lo, len_hi, child, sentinel). Mirrors the compiler's
-        // `Item.Tag.type_array_big` (`src/InternPool.zig` ~4171).
+        // len_lo, len_hi, child, sentinel).
         type_array_big,
         // Aggregate value with one element per slot. data = extra
         // index of AggregateRepr (1 u32 slot: ty) followed by
         // `element_values[N]` where N = effective element count
-        // derived from `ty`. Mirrors the compiler's
-        // `Item.Tag.aggregate` (`src/InternPool.zig` ~4276).
+        // derived from `ty`.
         aggregate,
         // Aggregate value with every slot equal. data = extra
         // index of RepeatedRepr (2 u32 slots: ty, elem_val).
-        // Mirrors the compiler's `Item.Tag.repeated`
-        // (`src/InternPool.zig` ~4283).
         repeated,
         // Non-null optional value. data = extra index of OptPayloadRepr
-        // (2 u32 slots: ty, val). Mirrors the compiler's
-        // `Item.Tag.opt_payload` (`src/InternPool.zig` ~4230).
+        // (2 u32 slots: ty, val).
         opt_payload,
         // Null optional value. data = the optional type Index.
-        // Mirrors the compiler's `Item.Tag.opt_null`
-        // (`src/InternPool.zig` ~4231).
         opt_null,
     };
 };
 
-/// Extra-arena payload for `Item.Tag.int_small`. Mirrors the compiler's
-/// `IntSmall`: a typed value that fits in `u32` but whose type isn't
-/// covered by the type-specialised inline tags. Stored as two
-/// consecutive `u32`s in `extra`: `ty` then `value`. Values that
-/// exceed `u32` skip this encoding and go straight to
+/// Extra-arena payload for `Item.Tag.int_small`: a typed value that fits
+/// in `u32` but whose type isn't covered by the type-specialised inline
+/// tags. Stored as two consecutive `u32`s in `extra`: `ty` then `value`.
+/// Values that exceed `u32` skip this encoding and go straight to
 /// `int_positive` / `int_negative`.
 const IntSmall = extern struct {
     ty: u32,
@@ -1863,10 +1809,9 @@ const IntSmall = extern struct {
 };
 
 /// Extra-arena payload for `Item.Tag.type_pointer`. Three u32 slots:
-/// child, sentinel, and the bit-packed `Key.PtrType.Flags`. Mirrors
-/// the compiler's `Tag.TypePointer` storage shape (smaller because we
-/// haven't ported `packed_offset` yet -- adds when the
-/// host-int-backed slice machinery for aggregates needs it).
+/// child, sentinel, and the bit-packed `Key.PtrType.Flags`. Narrower
+/// than the compiler's `Tag.TypePointer`, which also carries a
+/// `packed_offset` the REPL has no need for.
 const PtrTypeRepr = extern struct {
     child: u32,
     sentinel: u32,
@@ -1875,8 +1820,7 @@ const PtrTypeRepr = extern struct {
 
 /// Extra-arena header for `Item.Tag.type_function`. Three u32
 /// slots followed by optional `comptime_bits` / `noalias_bits`
-/// and `param_types[params_len]`. The compiler's
-/// `Tag.TypeFunction` shape; storage discipline matches.
+/// and `param_types[params_len]`.
 const FuncTypeRepr = extern struct {
     params_len: u32,
     return_type: u32,
@@ -1934,8 +1878,7 @@ const FuncCoercedRepr = extern struct {
 /// Extra-arena payload for `Item.Tag.type_vector` -- `len` then
 /// `child`. `Item.Tag.type_array_small` reuses this same layout for
 /// sentinel-free arrays whose len fits in u32; the Tag, not the repr,
-/// is what `indexToKey` discriminates on. Mirrors the compiler's
-/// `Vector { len, child }` (`src/InternPool.zig` ~5967).
+/// is what `indexToKey` discriminates on.
 const VectorTypeRepr = extern struct {
     len: u32,
     child: u32,
@@ -1943,8 +1886,7 @@ const VectorTypeRepr = extern struct {
 
 /// Extra-arena payload for `Item.Tag.opt_payload` -- the optional type
 /// then the (non-none) payload value. `opt_null` needs no repr; it
-/// stores the optional type inline. Mirrors the compiler's
-/// `Tag.TypeValue` reuse for `opt_payload` (`src/InternPool.zig` ~4230).
+/// stores the optional type inline.
 const OptPayloadRepr = extern struct {
     ty: u32,
     val: u32,
@@ -1953,9 +1895,7 @@ const OptPayloadRepr = extern struct {
 /// Extra-arena payload for `Item.Tag.type_array_big`. Four u32
 /// slots: `len_lo`, `len_hi`, `child`, `sentinel`. Sentinel == 0
 /// (`Index.none`) is invalid here -- the dispatcher routes to
-/// `type_array_small` in that case. Mirrors the compiler's
-/// `Array { len0, len1, child, sentinel }` (`src/InternPool.zig`
-/// ~5972) with the same u32 pair for the 64-bit length.
+/// `type_array_small` in that case. The u32 pair holds the 64-bit length.
 const ArrayTypeBigRepr = extern struct {
     len_lo: u32,
     len_hi: u32,
@@ -1966,25 +1906,22 @@ const ArrayTypeBigRepr = extern struct {
 /// Extra-arena header for `Item.Tag.aggregate`. One u32 slot for
 /// the aggregate `ty`; the N element Indices follow inline. N is
 /// not stored -- it derives from the aggregate type's element
-/// count (`lenIncludingSentinel` for arrays). Mirrors the compiler
-/// `Tag.Aggregate { ty }` + trailing `element_values: []Index`
-/// (`src/InternPool.zig` ~5395).
+/// count (`lenIncludingSentinel` for arrays).
 const AggregateRepr = extern struct {
     ty: u32,
 };
 
 /// Extra-arena payload for `Item.Tag.repeated`. Two u32 slots:
-/// `ty` then `elem_val`. Mirrors the compiler's `Repeated`
-/// (`src/InternPool.zig` ~5730).
+/// `ty` then `elem_val`.
 const RepeatedRepr = extern struct {
     ty: u32,
     elem_val: u32,
 };
 
-/// A container's identity flavor is folded onto its `captures_len` slot, mirroring
-/// the compiler's `CapturesLen`: a real value is a declared type's capture count;
-/// the sentinels select a reified or generated-tag type whose trailing data differs
-/// (see `appendContainerId`/`readContainerId`). Captures, `type_hash`, and
+/// A container's identity flavor is folded onto its `captures_len` slot: a real
+/// value is a declared type's capture count; the sentinels select a reified or
+/// generated-tag type whose trailing data differs (see
+/// `appendContainerId`/`readContainerId`). Captures, `type_hash`, and
 /// `owner_union` are mutually exclusive trailing data, so one word selects all of it.
 const captures_len_reified: u32 = std.math.maxInt(u32);
 const captures_len_generated_union_tag: u32 = std.math.maxInt(u32) - 1;
@@ -2110,8 +2047,7 @@ const SliceRepr = extern struct {
 
 /// Extra-arena payload for `Item.Tag.ptr_comptime_alloc`. Four u32 slots: ty,
 /// comptime-alloc index, and the 64-bit byte_offset split into lo/hi u32s.
-/// Mirrors the compiler's `Tag.PtrComptimeAlloc` -- allocations born in Sema
-/// rather than backed by a declaration.
+/// An allocation born in Sema rather than backed by a declaration.
 const PtrComptimeAllocRepr = extern struct {
     ty: u32,
     alloc_index: u32,
@@ -2120,8 +2056,8 @@ const PtrComptimeAllocRepr = extern struct {
 };
 
 /// Extra-arena payload for `Item.Tag.ptr_nav`. Four u32 slots: ty, nav index,
-/// and the 64-bit byte_offset split into lo/hi u32s. Mirrors the compiler's
-/// `Tag.PtrNav` -- a pointer backed by a declaration rather than a Sema alloc.
+/// and the 64-bit byte_offset split into lo/hi u32s. A pointer backed by a
+/// declaration rather than a Sema alloc.
 const PtrNavRepr = extern struct {
     ty: u32,
     nav_index: u32,
@@ -2131,8 +2067,7 @@ const PtrNavRepr = extern struct {
 
 /// Extra-arena payload for `Item.Tag.ptr_uav`. Five u32 slots: ty, the inline
 /// pointee value, the canonical pointer type, and the 64-bit byte_offset split
-/// into lo/hi u32s. Mirrors the compiler's `Tag.PtrUav` -- a pointer to an
-/// anonymous decl whose value is stored inline.
+/// into lo/hi u32s. A pointer to an anonymous decl whose value is stored inline.
 const PtrUavRepr = extern struct {
     ty: u32,
     val: u32,
@@ -2154,8 +2089,7 @@ const PtrFieldRepr = extern struct {
 
 /// Extra-arena payload for base-plus-offset pointers -- `Item.Tag.ptr_opt_payload`
 /// and `ptr_eu_payload`. Four u32 slots: ty, the base pointer, and the 64-bit
-/// byte_offset split high (`_a`) then low (`_b`). Mirrors the compiler's shared
-/// `InternPool.PtrBase`, field names included.
+/// byte_offset split high (`_a`) then low (`_b`).
 const PtrBase = extern struct {
     ty: u32,
     base: u32,
@@ -2164,8 +2098,7 @@ const PtrBase = extern struct {
 };
 
 /// Extra-arena payload for `Item.Tag.error_set_error`. Two u32 slots: the
-/// error-set type Index and the interned error-name handle. Mirrors
-/// the compiler's `Tag.Err` shape.
+/// error-set type Index and the interned error-name handle.
 const ErrRepr = extern struct {
     ty: u32,
     name: u32,
@@ -2194,8 +2127,7 @@ const ErrorUnionPayloadRepr = extern struct {
 
 /// Header for `Item.Tag.int_positive` / `Item.Tag.int_negative`. Lives at
 /// the front of a contiguous `big_int_limbs` slice, with the actual limbs
-/// trailing directly after. Sign is in the Item tag, not here. Matches the
-/// compiler's packed `Int`.
+/// trailing directly after. Sign is in the Item tag, not here.
 const IntBigHeader = packed struct {
     ty: u32,
     limbs_len: u32,
@@ -2204,9 +2136,8 @@ const IntBigHeader = packed struct {
     const limbs_items_len = @divExact(@sizeOf(IntBigHeader), @sizeOf(std.math.big.Limb));
 };
 
-/// Extra-arena payload for `Item.Tag.float_f64`. Mirrors the compiler's
-/// `Float64`: the f64 bit-pattern split into two u32 pieces so it fits
-/// in the u32-typed `extra` array.
+/// Extra-arena payload for `Item.Tag.float_f64`: the f64 bit-pattern split
+/// into two u32 pieces so it fits in the u32-typed `extra` array.
 pub const Float64 = extern struct {
     piece0: u32,
     piece1: u32,
@@ -2226,9 +2157,8 @@ pub const Float64 = extern struct {
 };
 
 /// Extra-arena payload for `Item.Tag.float_f80` and
-/// `Item.Tag.float_c_longdouble_f80`. Mirrors the compiler's `Float80`:
-/// the f80 bit-pattern split across two u32 pieces and one u16 piece
-/// (zero-padded to a u32 slot).
+/// `Item.Tag.float_c_longdouble_f80`: the f80 bit-pattern split across two
+/// u32 pieces and one u16 piece (zero-padded to a u32 slot).
 pub const Float80 = extern struct {
     piece0: u32,
     piece1: u32,
@@ -2254,8 +2184,8 @@ pub const Float80 = extern struct {
 
 /// Extra-arena payload for `Item.Tag.float_f128`,
 /// `Item.Tag.float_c_longdouble_f128`, and
-/// `Item.Tag.float_comptime_float`. Mirrors the compiler's `Float128`:
-/// the f128 bit-pattern split into four u32 pieces.
+/// `Item.Tag.float_comptime_float`: the f128 bit-pattern split into four
+/// u32 pieces.
 pub const Float128 = extern struct {
     piece0: u32,
     piece1: u32,
@@ -2295,8 +2225,7 @@ big_int_limbs: std.ArrayListUnmanaged(std.math.big.Limb),
 map: std.AutoArrayHashMapUnmanaged(void, void),
 
 /// Raw bytes of every interned string, each followed by a `0` sentinel.
-/// Mirrors the compiler's `string_bytes` (`src/InternPool.zig`). Byte
-/// `0` is the lone sentinel for `NullTerminatedString.empty`, so
+/// Byte `0` is the lone sentinel for `NullTerminatedString.empty`, so
 /// `string_starts.items[0]` is always `0` and the first dynamic
 /// string begins at offset `1`.
 string_bytes: std.ArrayListUnmanaged(u8),
@@ -2325,9 +2254,9 @@ namespaces: std.ArrayListUnmanaged(Namespace),
 /// Backing store for `ComptimeUnit.Id`. Append-only.
 comptime_units: std.ArrayListUnmanaged(ComptimeUnit),
 /// Every error name that has been assigned a global integer, in assignment
-/// order; the value of `error.X` is its index + 1 (0 means "no error"). Mirrors
-/// the compiler's `InternPool.global_error_set`. `@intFromError` / `@errorFromInt`
-/// map between an error and this number. Order-dependent: the incremental REPL
+/// order; the value of `error.X` is its index + 1 (0 means "no error").
+/// `@intFromError` / `@errorFromInt` map between an error and this number.
+/// Order-dependent: the incremental REPL
 /// registers names as they are first seen, so a multi-error program's numbers need
 /// not match a whole-program `zig run` (a single-error program's do).
 global_error_set: std.AutoArrayHashMapUnmanaged(NullTerminatedString, void),
@@ -2351,8 +2280,7 @@ const StringAdapter = struct {
 };
 
 /// Adapter that lets `getOrPutAdapted` hash and compare a `Key` against
-/// entries stored as bare `Index`es. Mirrors the role of the compiler's
-/// `KeyAdapter`.
+/// entries stored as bare `Index`es.
 const KeyAdapter = struct {
     pool: *const InternPool,
 
@@ -2413,23 +2341,20 @@ pub fn deinit(pool: *InternPool) void {
     pool.* = undefined;
 }
 
-/// The global integer for error `name`, assigning the next one if unseen. Mirrors
-/// the compiler's `InternPool.getErrorValue`: the value is the 1-based insertion
-/// index (0 is reserved for "no error").
+/// The global integer for error `name`, assigning the next one if unseen. The
+/// value is the 1-based insertion index (0 is reserved for "no error").
 pub fn getErrorValue(pool: *InternPool, name: NullTerminatedString) Allocator.Error!u32 {
     const gop = try pool.global_error_set.getOrPut(pool.gpa, name);
     return @intCast(gop.index + 1);
 }
 
-/// Like `getErrorValue` but returns null instead of assigning. Mirrors
-/// `InternPool.getErrorValueIfExists`.
+/// Like `getErrorValue` but returns null instead of assigning.
 pub fn getErrorValueIfExists(pool: *const InternPool, name: NullTerminatedString) ?u32 {
     return @intCast((pool.global_error_set.getIndex(name) orelse return null) + 1);
 }
 
-/// The unsigned integer type wide enough for any error value. Mirrors
-/// `Zcu.PerThread.errorIntType` = `intType(unsigned, errorSetBits())`; with the
-/// default `error_limit` of `maxInt(u16) - 1`, `errorSetBits()` is 16, so `u16`.
+/// The unsigned integer type wide enough for any error value. With the default
+/// `error_limit` of `maxInt(u16) - 1`, `errorSetBits()` is 16, so `u16`.
 pub fn errorIntType(_: *const InternPool) Index {
     return .u16_type;
 }
@@ -2455,17 +2380,12 @@ fn seedEmptyString(pool: *InternPool) Allocator.Error!void {
 }
 
 /// Intern `bytes` and return its stable `NullTerminatedString` handle.
-/// Mirrors the compiler's `getOrPutString` (`src/InternPool.zig`
-/// ~11255) collapsed to single-threaded shape: the compiler's
-/// implementation appends bytes, then dedups via a sharded map; we do
-/// the same with one map. The dedup-hit rollback is identical -- the
+/// Single-threaded shape: append bytes, then dedup via one map (the
+/// compiler shards this map). The dedup-hit rollback is trivial -- the
 /// trailing append simply leaves dead bytes that nothing references.
 ///
 /// Asserts there are no embedded `0` bytes. Current callers (decl
-/// names, type names) cannot legally contain them. When a `Key`
-/// variant eventually needs embedded-null content (e.g. error names),
-/// add an `EmbeddedNulls` policy parameter mirroring the compiler's
-/// `getOrPutString` signature.
+/// names, type names) cannot legally contain them.
 pub fn getOrPutString(
     pool: *InternPool,
     gpa: Allocator,
@@ -2504,9 +2424,7 @@ pub fn stringSlice(pool: *const InternPool, string: NullTerminatedString) [:0]co
 /// Append a fresh Nav with the given `name` and `fqn`. The Nav is
 /// created with `analysis = null` and `resolved = null`; the caller
 /// (typically `Sema.bindDecls`) populates `resolved` immediately
-/// after evaluating the decl's value body. Mirrors the compiler's
-/// `createNav` for the non-extern path (`src/InternPool.zig` ~11041)
-/// minus the multi-threaded acquire/release plumbing.
+/// after evaluating the decl's value body.
 pub fn createNav(
     pool: *InternPool,
     gpa: Allocator,
@@ -2582,7 +2500,6 @@ pub const root_namespace_name = "repl";
 
 /// A container type's name, used to qualify the names of its members.
 /// Only declared containers own namespaces, so only they reach here.
-/// Mirrors `Type.containerTypeName`.
 fn containerTypeName(pool: *const InternPool, ty: Index) NullTerminatedString {
     return switch (pool.indexToKey(ty)) {
         .struct_type => |st| st.name,
@@ -2593,9 +2510,7 @@ fn containerTypeName(pool: *const InternPool, ty: Index) NullTerminatedString {
 /// A namespace's own name -- the prefix its members qualify under: its
 /// owner container's name, or the session root (`repl`) when nothing owns
 /// it. This is the base of the fully-qualified-name recursion and the
-/// seed for the root naming context (the compiler's
-/// `block.type_name_ctx`). Mirrors the `ns.owner_type`-name lookup inside
-/// `Zcu.Namespace.internFullyQualifiedName`.
+/// seed for the root naming context.
 pub fn namespaceName(
     pool: *InternPool,
     gpa: Allocator,
@@ -2607,10 +2522,8 @@ pub fn namespaceName(
 }
 
 /// Fully-qualified name of declaration `name` in `ns_idx`:
-/// `<namespace name>.<name>`. Mirrors
-/// `Zcu.Namespace.internFullyQualifiedName` (whose empty-name branch --
-/// which just returns the namespace name, here `namespaceName` -- is
-/// dropped: every caller qualifies a real declaration name).
+/// `<namespace name>.<name>`. Every caller qualifies a real declaration
+/// name, so the empty-name case is not handled.
 pub fn fullyQualifiedName(
     pool: *InternPool,
     gpa: Allocator,
@@ -2630,7 +2543,7 @@ pub fn fullyQualifiedName(
 
 /// Record a `comptime { ... }` block. Returns its stable `Id` so
 /// the namespace's `comptime_decls` list can reference it. Execution
-/// is deferred until the `@comptime` evaluator lands.
+/// is deferred to the `@comptime` evaluator.
 pub fn createComptimeUnit(
     pool: *InternPool,
     gpa: Allocator,
@@ -2646,15 +2559,13 @@ pub fn createComptimeUnit(
     return @enumFromInt(new_index_raw);
 }
 
-/// Read a recorded `ComptimeUnit` by id.
 pub fn getComptimeUnit(pool: *const InternPool, id: ComptimeUnit.Id) ComptimeUnit {
     const raw: u32 = @intFromEnum(id);
     assert(raw < pool.comptime_units.items.len);
     return pool.comptime_units.items[raw];
 }
 
-/// Comptime well-known table mirroring the compiler's `static_keys` array
-/// in `src/InternPool.zig`. Each entry corresponds 1:1 to an `Index`
+/// Comptime well-known table: each entry corresponds 1:1 to an `Index`
 /// position; `populateWellKnown` iterates and dispatches per Key variant.
 const static_keys: [first_dynamic_index]Key = .{
     .{ .int_type = .{ .signedness = .unsigned, .bits = 0 } },
@@ -2914,10 +2825,6 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
     return @enumFromInt(@as(u32, @intCast(gop.index)));
 }
 
-/// The `std.lang.TypeId` of a type. Mirrors the compiler's `InternPool.zigTypeTag`:
-/// a fast-path `switch (index)` over the well-known types, then a `Key` switch for
-/// dynamically-interned ones (the compiler's fallback dispatches on the item tag;
-/// the REPL's equivalent is the `Key` variant).
 pub fn zigTypeTag(pool: *const InternPool, index: Index) std.lang.TypeId {
     return switch (index) {
         .u0_type,
@@ -3063,8 +2970,7 @@ pub fn zigTypeTag(pool: *const InternPool, index: Index) std.lang.TypeId {
 
         .none => unreachable,
 
-        // Dynamically-interned types: the compiler dispatches on the item tag; we
-        // dispatch on the `Key` variant, which carries the same information.
+        // Dynamically-interned types, resolved through the `Key` variant.
         _ => switch (pool.indexToKey(index)) {
             .int_type => .int,
             .array_type => .array,
@@ -3085,8 +2991,7 @@ pub fn zigTypeTag(pool: *const InternPool, index: Index) std.lang.TypeId {
     };
 }
 
-/// The child type of a pointer/array/vector/optional/anyframe. Mirrors the
-/// compiler's `InternPool.childType`.
+/// The child type of a pointer/array/vector/optional/anyframe.
 pub fn childType(pool: *const InternPool, i: Index) Index {
     return switch (pool.indexToKey(i)) {
         .ptr_type => |ptr_type| ptr_type.child,
@@ -3097,8 +3002,6 @@ pub fn childType(pool: *const InternPool, i: Index) Index {
     };
 }
 
-/// Look up the `Key` for an `Index`. Mirrors the compiler's
-/// `indexToKey` (`src/InternPool.zig`).
 pub fn indexToKey(pool: *const InternPool, index: Index) Key {
     assert(index != .none);
     const i = @intFromEnum(index);
@@ -3478,13 +3381,12 @@ fn intSmallFromExtra(pool: *const InternPool, extra_index: u32) Key {
     return intKey(ty, .{ .u64 = slice[1] });
 }
 
-/// Reconstruct an `int_positive` / `int_negative` Key. Mirrors the
-/// compiler's `indexToKeyBigInt` (`src/InternPool.zig`): on read, a
-/// big-int whose value fits in `u64` (or `i64` when negative) is
-/// re-surfaced as the matching inline storage variant so the read-side
-/// shape stays symmetric with the intern-side compression. Required for
-/// future dedup: hashing an inserted Key as `.u64=x` must agree with
-/// hashing the reconstructed Key.
+/// Reconstruct an `int_positive` / `int_negative` Key (compiler's
+/// `indexToKeyBigInt`, `src/InternPool.zig`): on read, a big-int whose
+/// value fits in `u64` (or `i64` when negative) is re-surfaced as the
+/// matching inline storage variant so the read-side shape stays symmetric
+/// with the intern-side compression. Dedup requires it: hashing an inserted
+/// Key as `.u64=x` must agree with hashing the reconstructed Key.
 fn intBigFromArena(pool: *const InternPool, limb_index: u32, positive: bool) Key {
     const header_end = limb_index + IntBigHeader.limbs_items_len;
     assert(header_end <= pool.big_int_limbs.items.len);
@@ -3521,12 +3423,9 @@ pub fn internIntType(
     return pool.get(.{ .int_type = .{ .signedness = signedness, .bits = bits } });
 }
 
-/// Emit the `Item` (and any extra / limbs) for a `Key.int`. Mirrors the
-/// `.int =>` arm of the compiler's `intern` (`src/InternPool.zig`): one
-/// labelled-block switch on `ty` for the type-specialised inline tags,
-/// then a fallthrough switch on `storage` for `int_small` or
-/// `int_positive` / `int_negative`. Callers must have ensured one item
-/// of capacity -- only reachable from `get`'s miss path.
+/// Emit the `Item` (and any extra / limbs) for a `Key.int` (the `.int =>` arm of
+/// the compiler's `intern`, `src/InternPool.zig`). Callers must have ensured one
+/// item of capacity -- only reachable from `get`'s miss path.
 fn emitInt(pool: *InternPool, int: Key.Int) Allocator.Error!void {
     assert(isIntegerType(pool, int.ty));
     const ty = int.ty;
@@ -3669,12 +3568,11 @@ pub fn internInt(pool: *InternPool, int: Key.Int) Allocator.Error!Index {
     return pool.get(.{ .int = int });
 }
 
-/// Emit the `Item` (and any extra) for a `Key.float`. Mirrors the
-/// `.float =>` arm of the compiler's `intern` (`src/InternPool.zig`):
-/// outer switch on `float.ty`; the c_longdouble arm picks a tag based
-/// on storage variant (f80 -> its own tag, otherwise promoted to f128);
-/// comptime_float always stores as f128. Callers must have ensured one
-/// item of capacity -- only reachable from `get`'s miss path.
+/// Emit the `Item` (and any extra) for a `Key.float` (the `.float =>` arm of the
+/// compiler's `intern`, `src/InternPool.zig`). The c_longdouble arm picks a tag by
+/// storage variant (f80 -> its own tag, otherwise promoted to f128); comptime_float
+/// always stores as f128. Callers must have ensured one item of capacity -- only
+/// reachable from `get`'s miss path.
 fn emitFloat(pool: *InternPool, float: Key.Float) Allocator.Error!void {
     assert(isFloatType(float.ty));
     switch (float.ty) {
@@ -3740,8 +3638,6 @@ pub fn internFloat(pool: *InternPool, float: Key.Float) Allocator.Error!Index {
     return pool.get(.{ .float = float });
 }
 
-/// Emit a `type_pointer` Item. Three u32 slots in extra:
-/// child Index, sentinel Index, packed-flags as u32.
 fn emitPtrType(pool: *InternPool, pt: Key.PtrType) Allocator.Error!void {
     assert(pt.child != .none);
     const extra_index = try pool.addExtra(PtrTypeRepr{
@@ -3752,9 +3648,7 @@ fn emitPtrType(pool: *InternPool, pt: Key.PtrType) Allocator.Error!void {
     pool.items.appendAssumeCapacity(.{ .tag = .type_pointer, .data = extra_index });
 }
 
-/// Emit a `ptr_alloc` Item for a `Key.ptr` whose base address is an
-/// `comptime_alloc`. Four u32 slots: ty, alloc_index, byte_offset
-/// (lo/hi).
+/// Emit a `ptr` Item, tag selected by base-address flavor.
 fn emitPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!void {
     assert(p.ty != .none);
     switch (p.base_addr) {
@@ -4007,7 +3901,6 @@ pub fn setStructFields(
     pool.extra.items[slot] = off;
 }
 
-/// Emit an `enum_tag` Item. Two u32 slots: `ty`, `int`.
 fn emitEnumTag(pool: *InternPool, et: Key.EnumTag) Allocator.Error!void {
     const extra_index = try pool.addExtra(EnumTagRepr{
         .ty = @intFromEnum(et.ty),
@@ -4101,7 +3994,6 @@ pub fn setUnionFields(
     pool.extra.items[slot] = off;
 }
 
-/// Emit a `union_value` Item. Three u32 slots: `ty`, `tag`, `val`.
 fn emitUnionValue(pool: *InternPool, uv: Key.Union) Allocator.Error!void {
     const extra_index = try pool.addExtra(UnionValueRepr{
         .ty = @intFromEnum(uv.ty),
@@ -4111,7 +4003,7 @@ fn emitUnionValue(pool: *InternPool, uv: Key.Union) Allocator.Error!void {
     pool.items.appendAssumeCapacity(.{ .tag = .union_value, .data = extra_index });
 }
 
-/// Emit a `ptr_slice` Item. Three u32 slots: `ty`, `ptr`, `len`.
+/// Emit a `ptr_slice` Item.
 fn emitSlice(pool: *InternPool, s: Key.Slice) Allocator.Error!void {
     const extra_index = try pool.addExtra(SliceRepr{
         .ty = @intFromEnum(s.ty),
@@ -4121,7 +4013,7 @@ fn emitSlice(pool: *InternPool, s: Key.Slice) Allocator.Error!void {
     pool.items.appendAssumeCapacity(.{ .tag = .ptr_slice, .data = extra_index });
 }
 
-/// Emit an `err` Item. Two u32 slots: `ty`, `name`.
+/// Emit an `error_set_error` Item.
 fn emitErr(pool: *InternPool, e: Key.Error) Allocator.Error!void {
     assert(e.ty != .none);
 
@@ -4132,13 +4024,11 @@ fn emitErr(pool: *InternPool, e: Key.Error) Allocator.Error!void {
     pool.items.appendAssumeCapacity(.{ .tag = .error_set_error, .data = extra_index });
 }
 
-/// Effective element count for an aggregate type. For an array
-/// it's `lenIncludingSentinel`; future struct / vector flavors plug
-/// in here. Used by both the encoder (deciding trailing length)
-/// and the decoder (slicing the trailing Indices). The compiler
-/// has the equivalent inline at the call sites of
-/// `Tag.Aggregate.trailing.element_values.len`
-/// (`src/InternPool.zig` ~4278).
+/// Effective element count for an aggregate type; for an array it's
+/// `lenIncludingSentinel`. Used by both the encoder (deciding trailing length) and
+/// the decoder (slicing the trailing Indices). The compiler has the equivalent
+/// inline at the call sites of `Tag.Aggregate.trailing.element_values.len`
+/// (`src/InternPool.zig`).
 pub fn aggregateElementCount(pool: *const InternPool, ty: Index) u64 {
     assert(ty != .none);
     const key = pool.indexToKey(ty);
@@ -4146,7 +4036,7 @@ pub fn aggregateElementCount(pool: *const InternPool, ty: Index) u64 {
         .array_type => |at| at.lenIncludingSentinel(),
         .vector_type => |vt| vt.len,
         .tuple_type => |tt| tt.types.len,
-        else => unreachable, // future aggregate types land here
+        else => unreachable,
     };
 }
 
@@ -4161,13 +4051,9 @@ fn aggregateLen(pool: *const InternPool, agg: Key.Aggregate) u64 {
     };
 }
 
-/// Resolve element `i` from any storage flavor. Mirrors the
-/// per-element extraction the compiler does at
-/// `src/InternPool.zig` ~3057 inside the aggregate eql arm. Hash
-/// and eql use this to walk the expanded element sequence so
-/// `.elems = [I, I, I]` and `.repeated_elem = I` (same `ty`)
-/// produce the same hash + compare equal without insert-time
-/// canonicalization.
+/// Resolve element `i` from any storage flavor. Hash and eql use this to walk the
+/// expanded element sequence so `.elems = [I, I, I]` and `.repeated_elem = I` (same
+/// `ty`) produce the same hash + compare equal without insert-time canonicalization.
 pub fn aggregateElementAt(agg: Key.Aggregate, i: u64) Index {
     return switch (agg.storage) {
         .repeated_elem => |e| e,
@@ -4182,7 +4068,7 @@ pub fn aggregateElementAt(agg: Key.Aggregate, i: u64) Index {
 /// Tag (`elems` -> `aggregate`, `repeated_elem` -> `repeated`).
 /// Hash/eql canonicalization in `get()` ensures equivalent
 /// sequences across flavors land at one Index without modifying
-/// caller input -- mirrors compiler src/InternPool.zig ~3057.
+/// caller input.
 fn emitAggregate(pool: *InternPool, agg: Key.Aggregate) Allocator.Error!void {
     assert(agg.ty != .none);
     switch (agg.storage) {
@@ -4206,11 +4092,9 @@ fn emitAggregate(pool: *InternPool, agg: Key.Aggregate) Allocator.Error!void {
 
 /// Emit an array type. Picks `type_array_small` when the length
 /// fits in u32 AND there's no sentinel; otherwise `type_array_big`.
-/// Mirrors the compiler's `getOrPutTypeTagLen` split
-/// (`src/InternPool.zig` ~7248). Adding sentinel support later for
-/// the small Tag would force a Tag-shape change; routing through
-/// big when present keeps `type_array_small` faithful to its
-/// "Vector { len, child }" layout.
+/// Adding sentinel support for the small Tag would force a Tag-shape
+/// change; routing through big when a sentinel is present keeps
+/// `type_array_small` faithful to its "Vector { len, child }" layout.
 fn emitArrayType(pool: *InternPool, at: Key.ArrayType) Allocator.Error!void {
     assert(at.child != .none);
     if (at.sentinel == .none and at.len <= std.math.maxInt(u32)) {
@@ -4304,17 +4188,14 @@ fn emitErrorUnion(pool: *InternPool, eu: Key.ErrorUnion) Allocator.Error!void {
     }
 }
 
-/// Intern a pointer type.
 pub fn internPtrType(pool: *InternPool, pt: Key.PtrType) Allocator.Error!Index {
     return pool.get(.{ .ptr_type = pt });
 }
 
-/// Intern a pointer value.
 pub fn internPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!Index {
     return pool.get(.{ .ptr = p });
 }
 
-/// Intern an anonymous tuple type from its field types.
 pub fn internTupleType(pool: *InternPool, types: []const Index) Allocator.Error!Index {
     return pool.get(.{ .tuple_type = .{ .types = types } });
 }
@@ -4370,27 +4251,22 @@ pub fn singletonErrorSetType(
     return pool.internErrorSetType(&.{name});
 }
 
-/// Intern an error value.
 pub fn internErr(pool: *InternPool, e: Key.Error) Allocator.Error!Index {
     return pool.get(.{ .err = e });
 }
 
-/// Intern an array type (`[N]T` / `[N:s]T`).
 pub fn internArrayType(pool: *InternPool, at: Key.ArrayType) Allocator.Error!Index {
     return pool.get(.{ .array_type = at });
 }
 
-/// Intern a vector type (`@Vector(N, T)`).
 pub fn internVectorType(pool: *InternPool, vt: Key.VectorType) Allocator.Error!Index {
     return pool.get(.{ .vector_type = vt });
 }
 
-/// Intern an optional type (`?T`).
 pub fn internOptionalType(pool: *InternPool, child: Index) Allocator.Error!Index {
     return pool.get(.{ .opt_type = child });
 }
 
-/// Intern an optional value (`val == .none` is `null`).
 pub fn internOpt(pool: *InternPool, o: Key.Opt) Allocator.Error!Index {
     return pool.get(.{ .opt = o });
 }
@@ -4408,17 +4284,14 @@ pub fn internErrorUnionType(pool: *InternPool, eu: Key.ErrorUnionType) Allocator
     return pool.get(.{ .error_union_type = eu });
 }
 
-/// Intern an error-union value.
 pub fn internErrorUnion(pool: *InternPool, eu: Key.ErrorUnion) Allocator.Error!Index {
     return pool.get(.{ .error_union = eu });
 }
 
-/// Intern a function type.
 pub fn internFuncType(pool: *InternPool, ft: Key.FuncType) Allocator.Error!Index {
     return pool.get(.{ .func_type = ft });
 }
 
-/// Intern a function value.
 pub fn internFunc(pool: *InternPool, f: Key.Func) Allocator.Error!Index {
     return pool.get(.{ .func = f });
 }
@@ -4459,9 +4332,7 @@ fn emitFuncType(pool: *InternPool, ft: Key.FuncType) Allocator.Error!void {
 
 /// Emit a `func` Item. Dispatches between Tag.func_decl,
 /// Tag.func_instance, and Tag.func_coerced based on the Key.Func
-/// shape -- mirrors the compiler's three-Item-tag layout so
-/// generics and the fn-coercion follow-up land as pure
-/// emit additions without disturbing existing call sites.
+/// shape.
 fn emitFunc(pool: *InternPool, f: Key.Func) Allocator.Error!void {
     assert(f.ty != .none);
     assert(f.uncoerced_ty != .none);
@@ -4644,8 +4515,7 @@ fn ccFromTag(tag: std.lang.CallingConvention.Tag) std.lang.CallingConvention {
     };
 }
 
-/// True IFF `ty` identifies a Zig float type. Mirrors the compiler's
-/// `isFloatType`.
+/// True IFF `ty` identifies a Zig float type.
 fn isFloatType(ty: Index) bool {
     return switch (ty) {
         .f16_type,
@@ -4662,7 +4532,6 @@ fn isFloatType(ty: Index) bool {
 
 /// True if `ty` identifies a Zig integer type: any int_type slot, any
 /// fixed-width int, comptime_int, usize / isize, or the c_* family.
-/// Mirrors the compiler's `isIntegerType`.
 fn isIntegerType(pool: *const InternPool, ty: Index) bool {
     return switch (ty) {
         .comptime_int_type,
@@ -4729,9 +4598,9 @@ fn limbsAliasPool(pool: *const InternPool, limbs: []const std.math.big.Limb) boo
     return slice_start >= buf_start and slice_start < buf_end;
 }
 
-/// Append an `int_positive` / `int_negative` item. Mirrors the compiler's
-/// `addInt`: packed `IntBigHeader` at the head of a `big_int_limbs` slot,
-/// limbs trailing inline. Aliasing-safe: dups through gpa if the source
+/// Append an `int_positive` / `int_negative` item: packed
+/// `IntBigHeader` at the head of a `big_int_limbs` slot, limbs
+/// trailing inline. Aliasing-safe: dups through gpa if the source
 /// limbs reference the arena itself.
 fn addBigInt(pool: *InternPool, ty: Index, value: BigIntConst) Allocator.Error!void {
     assert(ty != .none);
@@ -4805,8 +4674,6 @@ test "i0_type and anyframe_type slots match compiler ordering" {
     try std.testing.expectEqual(@as(u16, 0), pool.indexToKey(signed_zero_idx).int_type.bits);
     try std.testing.expectEqual(std.lang.Signedness.signed, pool.indexToKey(signed_zero_idx).int_type.signedness);
 
-    // anyframe_type with .none child (untyped anyframe) at the position
-    // between noreturn_type and null_type.
     try std.testing.expectEqual(Index.none, pool.indexToKey(.anyframe_type).anyframe_type);
 }
 
@@ -4904,13 +4771,11 @@ test "float storage: per-type tags and bit-pattern round-trip" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    // f32 inline tag.
     const f32_idx = try pool.internFloat(.{ .ty = .f32_type, .storage = .{ .f32 = 1.5 } });
     const f32_round = pool.indexToKey(f32_idx).float;
     try std.testing.expectEqual(Index.f32_type, f32_round.ty);
     try std.testing.expectEqual(@as(f32, 1.5), f32_round.storage.f32);
 
-    // f64 extra-arena tag.
     const f64_idx = try pool.internFloat(.{
         .ty = .f64_type,
         .storage = .{ .f64 = 3.141592653589793 },
@@ -4919,7 +4784,6 @@ test "float storage: per-type tags and bit-pattern round-trip" {
     try std.testing.expectEqual(Index.f64_type, f64_round.ty);
     try std.testing.expectEqual(@as(f64, 3.141592653589793), f64_round.storage.f64);
 
-    // f128 extra-arena tag.
     const f128_idx = try pool.internFloat(.{
         .ty = .f128_type,
         .storage = .{ .f128 = 1e30 },
@@ -4933,7 +4797,6 @@ test "float dedup: equal values intern once; equal bit-patterns dedup; differing
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    // Same value, same type: single Item.
     const items_before = pool.itemCount();
     const a = try pool.internFloat(.{ .ty = .f32_type, .storage = .{ .f32 = 2.5 } });
     const b = try pool.internFloat(.{ .ty = .f32_type, .storage = .{ .f32 = 2.5 } });
@@ -4949,7 +4812,6 @@ test "float dedup: equal values intern once; equal bit-patterns dedup; differing
     const n2 = try pool.internFloat(.{ .ty = .f32_type, .storage = .{ .f32 = nan2 } });
     try std.testing.expectEqual(n1, n2);
 
-    // NaN with a different payload bit-pattern: distinct Index.
     const other_nan: f32 = @bitCast(@as(u32, 0x7fc00002));
     const n3 = try pool.internFloat(.{ .ty = .f32_type, .storage = .{ .f32 = other_nan } });
     try std.testing.expect(n1 != n3);
@@ -4960,7 +4822,7 @@ test "undef Key variant: well-known slot and typed undef" {
     defer pool.deinit();
 
     // The well-known `Index.undef` slot is untyped undef, i.e. undef
-    // whose carrier type is `.undefined_type` -- compiler-exact shape.
+    // whose carrier type is `.undefined_type`.
     const untyped = pool.indexToKey(.undef).undef;
     try std.testing.expectEqual(Index.undefined_type, untyped);
 
@@ -4969,7 +4831,6 @@ test "undef Key variant: well-known slot and typed undef" {
     const round = try pool.get(.{ .undef = .undefined_type });
     try std.testing.expectEqual(Index.undef, round);
 
-    // Typed undef: undef of u32 is a distinct entry and round-trips.
     const u32_undef = try pool.get(.{ .undef = .u32_type });
     try std.testing.expect(u32_undef != .undef);
     try std.testing.expectEqual(Index.u32_type, pool.indexToKey(u32_undef).undef);
@@ -5035,7 +4896,6 @@ test "ptr_type round-trip and dedup" {
     try std.testing.expectEqual(true, round.flags.is_const);
     try std.testing.expectEqual(Key.PtrType.Size.one, round.flags.size);
 
-    // Same shape dedups; differing flag bits intern separately.
     const dedup = try pool.internPtrType(.{
         .child = .u8_type,
         .flags = .{ .size = .one, .is_const = true },
@@ -5067,7 +4927,6 @@ test "ptr value round-trip and dedup by base_addr + offset" {
     try std.testing.expectEqual(@as(u64, 16), round.byte_offset);
     try std.testing.expectEqual(@as(Key.ComptimeAllocIndex, @enumFromInt(7)), round.base_addr.comptime_alloc);
 
-    // Same {ty, slot, offset} dedups to the same Index.
     const p_dup = try pool.internPtr(.{
         .ty = ptr_ty,
         .base_addr = .{ .comptime_alloc = @enumFromInt(7) },
@@ -5076,7 +4935,6 @@ test "ptr value round-trip and dedup by base_addr + offset" {
     try std.testing.expectEqual(p0, p_dup);
     try std.testing.expectEqual(items_before + 1, pool.itemCount());
 
-    // Different offset (or slot) is a distinct value.
     const p_other_offset = try pool.internPtr(.{
         .ty = ptr_ty,
         .base_addr = .{ .comptime_alloc = @enumFromInt(7) },
@@ -5163,12 +5021,10 @@ test "string interning: many names round-trip and dedup correctly" {
     var handles: [names.len]NullTerminatedString = undefined;
     for (names, &handles) |name, *out| out.* = try pool.getOrPutString(pool.gpa, name);
 
-    // Round-trip every name via its stored handle.
     for (handles, names) |handle, expected| {
         try std.testing.expectEqualStrings(expected, pool.stringSlice(handle));
     }
 
-    // Re-interning yields the same handle, regardless of order.
     try std.testing.expectEqual(handles[2], try pool.getOrPutString(pool.gpa, "gamma"));
     try std.testing.expectEqual(handles[0], try pool.getOrPutString(pool.gpa, "alpha"));
     try std.testing.expectEqual(handles[4], try pool.getOrPutString(pool.gpa, "epsilon"));
@@ -5220,7 +5076,7 @@ test "Nav: createNav allocates a fresh handle each call (no dedup)" {
     defer pool.deinit();
 
     // Same name twice: createNav is *not* dedup-by-name -- a name
-    // collision is a namespace concern (the upcoming pub_decls map),
+    // collision is a namespace concern (the pub_decls map),
     // not a pool concern. createNav blindly appends.
     const name = try pool.getOrPutString(pool.gpa, "x");
     const first = try pool.createNav(pool.gpa, name, name);
@@ -5244,7 +5100,6 @@ test "Namespace: createNamespace seeds an empty parent-less scope" {
     try std.testing.expectEqual(@as(u32, 0), ns.generation);
     try std.testing.expectEqual(Index.none, ns.owner_type);
 
-    // All four decl containers start empty.
     try std.testing.expectEqual(@as(usize, 0), ns.pub_decls.count());
     try std.testing.expectEqual(@as(usize, 0), ns.priv_decls.count());
     try std.testing.expectEqual(@as(usize, 0), ns.test_decls.items.len);
@@ -5294,13 +5149,11 @@ test "Namespace: NavNameContext dedups Nav.Index entries by interned name" {
     const ns = pool.namespacePtr(ns_idx);
     const ctx: Namespace.NavNameContext = .{ .pool = &pool };
 
-    // Insert two distinct-name Navs.
     const gop_x = try ns.pub_decls.getOrPutContext(pool.gpa, first_x, ctx);
     try std.testing.expect(!gop_x.found_existing);
     const gop_y = try ns.pub_decls.getOrPutContext(pool.gpa, just_y, ctx);
     try std.testing.expect(!gop_y.found_existing);
 
-    // Same-name Nav re-insertion finds the existing entry.
     const gop_x_again = try ns.pub_decls.getOrPutContext(pool.gpa, second_x, ctx);
     try std.testing.expect(gop_x_again.found_existing);
     try std.testing.expectEqual(first_x, gop_x_again.key_ptr.*);
@@ -5341,12 +5194,9 @@ test "Namespace.lookupNav: walks pub_decls then priv_decls, no parent chain" {
     const ns_idx = try pool.createNamespace(pool.gpa, .none);
     const ns = pool.namespacePtr(ns_idx);
     const ctx: Namespace.NavNameContext = .{ .pool = &pool };
-    // x lives in pub_decls (e.g. `pub const x = ...`).
     _ = try ns.pub_decls.getOrPutContext(pool.gpa, nav_x, ctx);
-    // y lives in priv_decls (top-level `const y = ...` without `pub`).
     _ = try ns.priv_decls.getOrPutContext(pool.gpa, nav_y, ctx);
 
-    // lookupNav finds both regardless of which map they live in.
     try std.testing.expectEqual(@as(?Nav.Index, nav_x), ns.lookupNav(&pool, x));
     try std.testing.expectEqual(@as(?Nav.Index, nav_y), ns.lookupNav(&pool, y));
     try std.testing.expectEqual(@as(?Nav.Index, null), ns.lookupNav(&pool, missing));
@@ -5559,15 +5409,12 @@ test "func_coerced: ty != uncoerced_ty routes through Tag.func_coerced" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    // Two fn types that differ only in return type.
     const params = [_]Index{};
     const ty_void = try pool.internFuncType(.{ .param_types = &params, .return_type = .void_type });
     const ty_u32 = try pool.internFuncType(.{ .param_types = &params, .return_type = .u32_type });
 
     const body_inst: std.zig.Zir.Inst.Index = @enumFromInt(7);
-    // First intern the underlying func_decl.
     _ = try pool.internFunc(.{ .ty = ty_void, .uncoerced_ty = ty_void, .zir_body_inst = body_inst });
-    // Now request a coerced view: ty = ty_u32, uncoerced_ty = ty_void.
     const coerced = try pool.internFunc(.{ .ty = ty_u32, .uncoerced_ty = ty_void, .zir_body_inst = body_inst });
 
     const round = pool.indexToKey(coerced).func;

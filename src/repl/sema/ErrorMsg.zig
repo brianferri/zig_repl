@@ -19,7 +19,7 @@ pub const LazySrcLoc = struct {
     base_node_inst: Zir.Inst.Index,
     offset: Offset,
 
-    /// Mirrors `Zcu.LazySrcLoc.Offset`. Only the variants the REPL currently
+    /// Mirrors `Zcu.LazySrcLoc.Offset`. Only the variants the REPL
     /// constructs are listed; adding a new source-location kind trips the
     /// exhaustive switch in `resolveNode`, which is where its AST navigation is
     /// added.
@@ -69,7 +69,7 @@ pub const LazySrcLoc = struct {
     /// `offset` applied. Mirrors the node `Zcu.SrcLoc.span` resolves before taking
     /// a byte span; the driver applies `tree.nodeToSpan` to the result. The
     /// builtin-call-arg / bin-operand navigation `span` performs with the tree is
-    /// not yet modeled -- those resolve to the enclosing call / operator node.
+    /// not modeled -- those resolve to the enclosing call / operator node.
     pub fn resolveNode(src_loc: LazySrcLoc, zir: Zir) Ast.Node.Index {
         const base = resolveBaseNode(src_loc.base_node_inst, zir);
         return switch (src_loc.offset) {

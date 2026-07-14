@@ -21,8 +21,7 @@ vtable: *const VTable,
 
 pub const VTable = struct {
     /// Block until the next high-level input event. `null` signals
-    /// end-of-input (the device closed). The function recovers its
-    /// enclosing concrete type via `@fieldParentPtr("interface", d)`.
+    /// end-of-input (the device closed).
     readEvent: *const fn (d: *Device) anyerror!?Event.Event,
 };
 

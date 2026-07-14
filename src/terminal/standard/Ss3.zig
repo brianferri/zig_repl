@@ -12,9 +12,7 @@ const assert = std.debug.assert;
 const Standard = @import("../Standard.zig");
 
 pub const Sequence = struct {
-    /// Single byte following `ESC O`. ECMA-48 SS3 carries no
-    /// parameters in the input direction; DEC VT100 application-
-    /// mode arrow keys map to specific finals here.
+    /// Single byte following `ESC O`, selecting the key.
     final: u8,
 };
 

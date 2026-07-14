@@ -5,7 +5,7 @@
 //! Designates G2 character set for the immediately-following byte.
 //! Rare on input (xterm uses SS3 for keypad / arrow keys; few
 //! terminals emit SS2 for keyboard) but covered here for Fe-family
-//! completeness. Shape mirrors SS3 exactly.
+//! completeness.
 
 const std = @import("std");
 const assert = std.debug.assert;

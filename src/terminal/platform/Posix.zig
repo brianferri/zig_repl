@@ -164,8 +164,8 @@ fn clearCookedFlags(raw: *posix.termios) void {
 }
 
 /// Wrap a raw fd as a `std.Io.File` so close goes through the Io
-/// vtable. The new stdlib removed `posix.close`; File.close is the
-/// canonical path.
+/// vtable. stdlib has no `posix.close`; File.close is the canonical
+/// path.
 fn closeFd(io: std.Io, fd: posix.fd_t) void {
     const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
     std.Io.File.close(file, io);

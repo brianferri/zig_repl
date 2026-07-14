@@ -15,8 +15,7 @@ const Allocator = std.mem.Allocator;
 const native = @import("builtin");
 
 /// Emit the `builtin` source for the native target. Caller owns the returned
-/// bytes. Mirrors `Builtin.append`'s `abi`/`cpu`/`os`/`object_format`/`target`
-/// serialization.
+/// bytes.
 pub fn generate(gpa: Allocator) Allocator.Error![:0]u8 {
     const target = native.target;
     const arch_family_name = @tagName(target.cpu.arch.family());

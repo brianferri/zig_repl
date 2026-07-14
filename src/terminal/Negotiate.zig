@@ -13,11 +13,6 @@
 //! agnostic. POSIX backends configure VTIME for a 500ms read
 //! timeout; Windows backends configure ReadFile's overlapped path
 //! analogously.
-//!
-//! Adding a new probed protocol = write its file under `protocol/`
-//! and register it in `Terminal.known_protocols`. This module never
-//! changes; per-protocol probe logic lives in the protocol's own
-//! `detectSupport` vtable function.
 
 const std = @import("std");
 const assert = std.debug.assert;

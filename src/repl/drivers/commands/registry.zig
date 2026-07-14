@@ -24,7 +24,6 @@ pub fn Registry(comptime mods: []const type, comptime Ctx: type) type {
             break :blk std.StaticStringMap(usize).initComptime(pairs);
         };
 
-        /// The command named `name`, or null if none matches.
         pub fn find(name: []const u8) ?Command(Ctx) {
             return all[index.get(name) orelse return null];
         }

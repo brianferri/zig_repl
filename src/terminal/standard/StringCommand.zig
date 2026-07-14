@@ -29,8 +29,6 @@ pub const apc: Standard = .{ .introducer = '_', .name = "APC", .parse = parse };
 fn parse(input: []const u8) Standard.Result {
     assert(input.len >= 2);
     assert(input[0] == 0x1b);
-    // The payload is recognised only to skip it; emit no token so the
-    // dispatcher drops the consumed bytes and pulls the next sequence.
     const scan = Standard.scanStringTerminated(input) orelse
         return .{ .token = null, .consumed = 0 };
     return .{ .token = null, .consumed = scan.consumed };

@@ -4,15 +4,11 @@
 //! of these and dispatches on the byte that follows ESC.
 //!
 //! No vtable / `@fieldParentPtr`: standards are stateless byte-
-//! stream eaters, just `(introducer, name, parse)`. Adding a new
-//! standard is a single-file drop-in plus a one-line append to the
-//! `Parser` registry.
+//! stream eaters, just `(introducer, name, parse)`.
 //!
 //! Result-shape (`Result`) and the classified-output union (`Token`)
 //! live here too: they're intrinsic to what "standard" means. Each
-//! standard contributes one variant to `Token`; adding a standard
-//! means defining its `Sequence` type next to the parser and
-//! appending one variant here.
+//! standard contributes one variant to `Token`.
 
 const std = @import("std");
 

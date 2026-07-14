@@ -1,5 +1,5 @@
 //! Thin newtype over `InternPool.Index` that names "this index refers to a
-//! value". Mirror of `Type` on the value side.
+//! value".
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -34,7 +34,6 @@ pub fn toIndex(val: Value) InternPool.Index {
     return val.index;
 }
 
-/// Returns the type of the value, looked up through `pool`.
 pub fn typeOf(val: Value, pool: *const InternPool) Type {
     const key = pool.indexToKey(val.index);
     return switch (key) {
@@ -68,8 +67,7 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
     };
 }
 
-/// Interpret an int or float value as a float of type `T`. Ports `Value.toFloat`
-/// (`zcu` -> `pool`).
+/// Interpret an int or float value as a float of type `T`.
 pub fn toFloat(val: Value, comptime T: type, pool: *const InternPool) T {
     return switch (pool.indexToKey(val.index)) {
         .int => |int| switch (int.storage) {
@@ -89,8 +87,7 @@ pub fn toFloat(val: Value, comptime T: type, pool: *const InternPool) T {
 }
 
 /// The element at `index` of an aggregate value (the childless undef of an undef
-/// aggregate). Ports `Value.elemValue`; the storage variants are resolved by
-/// `aggregateElementAt`.
+/// aggregate).
 pub fn elemValue(val: Value, pool: *InternPool, index: usize) std.mem.Allocator.Error!Value {
     switch (pool.indexToKey(val.index)) {
         .undef => |ty| return .fromIndex(try pool.get(.{ .undef = Type.fromIndex(ty).childType(pool).index })),
@@ -99,7 +96,7 @@ pub fn elemValue(val: Value, pool: *InternPool, index: usize) std.mem.Allocator.
     }
 }
 
-/// `@mulAdd(float_type, mulend1, mulend2, addend)`. Ports `Value.mulAdd`.
+/// `@mulAdd(float_type, mulend1, mulend2, addend)`.
 pub fn mulAdd(
     float_type: Type,
     mulend1: Value,
@@ -140,7 +137,7 @@ pub fn mulAddScalar(
     return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
 }
 
-/// `@abs(val)` of type `ty`. Ports `Value.abs`.
+/// `@abs(val)` of type `ty`.
 pub fn abs(val: Value, ty: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
     if (ty.zigTypeTag(pool) == .vector) {
         const result_data = try arena.alloc(InternPool.Index, ty.vectorLen(pool));
@@ -182,10 +179,6 @@ pub fn absScalar(val: Value, ty: Type, pool: *InternPool, arena: std.mem.Allocat
         else => unreachable,
     }
 }
-
-// The unary float builtins. Each pair ports the compiler's `Value.<op>` /
-// `<op>Scalar`: a vector folds elementwise into an arena buffer, a scalar folds
-// directly via the `floatBits` switch over `toFloat` at each width.
 
 pub fn sqrt(val: Value, float_type: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
     if (float_type.zigTypeTag(pool) == .vector) {
@@ -513,14 +506,13 @@ pub fn truncScalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allo
 }
 
 /// The value as a `std.math.big.int.Const`, borrowing into `space` for the
-/// `.u64`/`.i64` storage forms. Ports `Value.toBigInt` (the REPL stores no lazy
-/// int, so it reads `int.storage.toBigInt` directly).
+/// `.u64`/`.i64` storage forms. The REPL stores no lazy int, so it reads
+/// `int.storage.toBigInt` directly.
 pub fn toBigInt(val: Value, space: *InternPool.Key.Int.Storage.BigIntSpace, pool: *const InternPool) std.math.big.int.Const {
     return pool.indexToKey(val.index).int.storage.toBigInt(space);
 }
 
-/// `@clz`/`@ctz`/`@popCount` of one integer value at `ty`'s width, via the same
-/// `std.math.big.int.Const` methods. Port `Value.clz`/`ctz`/`popCount`.
+/// `@clz`/`@ctz`/`@popCount` of one integer value at `ty`'s width.
 pub fn clz(val: Value, ty: Type, pool: *const InternPool) u64 {
     var bigint_buf: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const bigint = val.toBigInt(&bigint_buf, pool);
@@ -539,15 +531,13 @@ pub fn popCount(val: Value, ty: Type, pool: *const InternPool) u64 {
     return @intCast(bigint.popCount(ty.intInfo(pool).?.bits));
 }
 
-/// The untyped undef value. Ports `Value.undef` (`.ip_index = .undef`).
+/// The untyped undef value.
 pub const undef: Value = .{ .index = .undef };
 
-/// Ports `Value.isUndef`.
 pub fn isUndef(val: Value, pool: *const InternPool) bool {
     return pool.indexToKey(val.index) == .undef;
 }
 
-/// Ports `Value.isFloat`.
 pub fn isFloat(self: Value, pool: *const InternPool) bool {
     return switch (pool.indexToKey(self.index)) {
         .undef => unreachable,
@@ -556,7 +546,6 @@ pub fn isFloat(self: Value, pool: *const InternPool) bool {
     };
 }
 
-/// Ports `Value.isNan`: a float value that is NaN.
 pub fn isNan(val: Value, pool: *const InternPool) bool {
     return switch (pool.indexToKey(val.index)) {
         .float => |float| switch (float.storage) {
@@ -566,8 +555,8 @@ pub fn isNan(val: Value, pool: *const InternPool) bool {
     };
 }
 
-/// The numeric ordering of two number values. Ports `Value.order`: a float pair
-/// compares as f128, an int pair as bignums.
+/// The numeric ordering of two number values: a float pair compares as f128, an
+/// int pair as bignums.
 pub fn order(lhs: Value, rhs: Value, pool: *const InternPool) std.math.Order {
     if (lhs.isFloat(pool) or rhs.isFloat(pool)) {
         const lhs_f128 = lhs.toFloat(f128, pool);
@@ -581,15 +570,14 @@ pub fn order(lhs: Value, rhs: Value, pool: *const InternPool) std.math.Order {
     return lhs_bigint.order(rhs_bigint);
 }
 
-/// Ports `Value.compareHetero` for numeric operands (`@min`/`@max`/`@reduce`
-/// never compare pointers here, so the compiler's pointer arms are omitted).
+/// Compares numeric operands only; `@min`/`@max`/`@reduce` never compare
+/// pointers here.
 pub fn compareHetero(lhs: Value, op: std.math.CompareOperator, rhs: Value, pool: *const InternPool) bool {
     if (lhs.isNan(pool) or rhs.isNan(pool)) return op == .neq;
     return order(lhs, rhs, pool).compare(op);
 }
 
-/// The smaller of two numbers (undef if either is undef; NaN loses). Ports
-/// `Value.numberMin`.
+/// The smaller of two numbers (undef if either is undef; NaN loses).
 pub fn numberMin(lhs: Value, rhs: Value, pool: *const InternPool) Value {
     if (lhs.isUndef(pool) or rhs.isUndef(pool)) return undef;
     if (lhs.isNan(pool)) return rhs;
@@ -601,7 +589,7 @@ pub fn numberMin(lhs: Value, rhs: Value, pool: *const InternPool) Value {
     }
 }
 
-/// The larger of two numbers. Ports `Value.numberMax`.
+/// The larger of two numbers.
 pub fn numberMax(lhs: Value, rhs: Value, pool: *const InternPool) Value {
     if (lhs.isUndef(pool) or rhs.isUndef(pool)) return undef;
     if (lhs.isNan(pool)) return rhs;

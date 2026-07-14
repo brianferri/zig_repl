@@ -262,10 +262,7 @@ fn moveToLineEnd(editor: *LineEditor) !Outcome {
 }
 
 fn moveUp(editor: *LineEditor) !Outcome {
-    // Already in history mode -> step further back.
     if (editor.history_offset != null) return editor.recallOlder();
-    // Cursor on the first row of the current buffer -> enter
-    // history recall. Otherwise navigate buffer lines.
     if (!editor.onFirstBufferRow()) return editor.moveUpWithinBuffer();
     return editor.recallOlder();
 }

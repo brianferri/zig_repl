@@ -1,8 +1,7 @@
 //! Mock `Device`: events are queued up front rather than read from a
 //! terminal. Implements the `device/Device.zig` interface from a replayed
 //! event queue, so tests can drive a `Device` consumer (e.g. `LineEditor`)
-//! without a raw-mode tty -- and it's the second implementation of the
-//! interface beside the real `Terminal`, exercising the vtable.
+//! without a raw-mode tty.
 //!
 //! `readEvent` is non-blocking: it yields the next queued event, then
 //! `null` once the queue drains (end-of-input).
@@ -37,7 +36,7 @@ pub fn deinit(self: *Mock) void {
     self.* = undefined;
 }
 
-/// Hand out the device interface, mirroring `Terminal.device()`. Valid
+/// Hand out the device interface. Valid
 /// only for a live `Mock` at a stable address: the vtable
 /// recovers `*Mock` from `&interface` via `@fieldParentPtr`.
 pub fn device(self: *Mock) *Device {

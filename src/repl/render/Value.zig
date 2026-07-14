@@ -1,7 +1,4 @@
-//! Writes a Sema-produced Value to a writer in REPL display form. Initial
-//! coverage is integers (via std.math.big.int.Const.format) and the
-//! simple values void/true/false/null/undefined/unreachable. As Key
-//! variants land, add their renderers here.
+//! Writes a Sema-produced Value to a writer in REPL display form.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -35,9 +32,9 @@ pub fn fmt(value: Value, pool: *const InternPool) Formatter {
     return .{ .value = value, .pool = pool };
 }
 
-/// Writes a value to `writer` with no trailing newline -- the analog of the
-/// compiler's `print_value.print`. A REPL result line appends its own
-/// terminator at the print site; diagnostics embed the value mid-message.
+/// Writes a value to `writer` with no trailing newline: a REPL result line
+/// appends its own terminator at the print site; diagnostics embed the value
+/// mid-message.
 pub fn render(
     value: Value,
     pool: *const InternPool,
@@ -97,7 +94,6 @@ fn renderAggregate(
     pool: *const InternPool,
     writer: *std.Io.Writer,
 ) Error!void {
-    // Tuples print with a leading dot (`.{ ... }`); arrays don't.
     if (pool.indexToKey(agg.ty) == .tuple_type) try writer.writeByte('.');
     try writer.writeAll("{ ");
     // Arrays and vectors display their declared length, which excludes the
@@ -124,11 +120,9 @@ fn renderAggregate(
     try writer.writeAll(" }");
 }
 
-/// Inline-print a value: same as `render` but without the trailing
-/// newline. Used by `renderAggregate` so element values compose
-/// into the parent brace-list. The current subset is int /
-/// simple_value / undef. Unsupported keys render as `<elem>` rather
-/// than recurse.
+/// Inline-print a value: like `render` but without a trailing newline, so
+/// element values compose into the parent brace-list. Unsupported keys
+/// render as `<elem>` rather than recurse.
 fn renderElemInline(
     elem_idx: InternPool.Index,
     pool: *const InternPool,
@@ -169,8 +163,6 @@ fn simpleValueText(sv: InternPool.SimpleValue) []const u8 {
     };
 }
 
-/// Render a type Index as its Zig surface-syntax name, via the shared
-/// type-name printer `Type.print`.
 fn renderTypeRef(
     type_index: InternPool.Index,
     pool: *const InternPool,
@@ -193,8 +185,6 @@ fn renderFloat(
 ) Error!void {
     var buf: [128]u8 = undefined;
     const text = switch (float.storage) {
-        // f80 has no dedicated {d} formatter; widen to f128 for
-        // display only (stored value keeps its precision).
         .f80 => |v| std.fmt.bufPrint(&buf, "{d}", .{@as(f128, @floatCast(v))}) catch unreachable,
         inline else => |v| std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable,
     };

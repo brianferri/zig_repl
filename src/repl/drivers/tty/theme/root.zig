@@ -1,5 +1,4 @@
-//! Prompt-theme registry. Each theme lives in its own `theme/<name>.zig`;
-//! adding one is a new file plus a one-line entry here.
+//! Prompt-theme registry; each theme lives in its own `theme/<name>.zig`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -7,14 +6,12 @@ const assert = std.debug.assert;
 pub const Theme = @import("../Theme.zig");
 const ColorLevel = @import("device").Color.ColorLevel;
 
-/// Every registered theme.
 pub const themes = [_]*const Theme{
     &@import("zig.zig").theme,
     &@import("adwaita_dark.zig").theme,
     &@import("catppuccin.zig").theme,
 };
 
-/// The theme used when none is chosen.
 pub const default = themes[0];
 
 /// Write every registered theme name to `w`, colored to `level` and
@@ -26,7 +23,6 @@ pub fn writeList(w: *std.Io.Writer, level: ColorLevel) !void {
     }
 }
 
-/// Resolve a registered theme by name, or null if there is none.
 pub fn byName(name: []const u8) ?*const Theme {
     assert(name.len != 0);
     for (themes) |theme| {

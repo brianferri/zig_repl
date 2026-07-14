@@ -52,8 +52,7 @@ pub fn command(comptime Ctx: type) Command(Ctx) {
     };
 }
 
-/// Dump one input unit (no trailing-expression split): wrapped source,
-/// AST, then ZIR -- or the parse/ZIR diagnostics if the front end failed.
+/// Dump one input unit: no trailing-expression split (the caller does that).
 fn dumpInput(session: *Session, input: []const u8, stdout: *std.Io.Writer) !void {
     var result = Pipeline.runWithInjection(
         session.gpa,

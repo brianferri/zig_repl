@@ -114,7 +114,6 @@ fn interpretCsi(csi: Csi.Sequence) ?Event.Event {
     const modifier_param = csi.param(1, 0);
     const modifiers = Event.Modifiers.fromParam(modifier_param);
 
-    // Final-byte map for ECMA-48 CSI without `~` suffix.
     switch (csi.final) {
         'A' => return makePress(Event.key.up, modifiers),
         'B' => return makePress(Event.key.down, modifiers),

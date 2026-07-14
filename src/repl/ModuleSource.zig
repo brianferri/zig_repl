@@ -16,9 +16,7 @@ pub const Error = error{ OutOfMemory, FileNotFound, ReadFailed };
 pub const VTable = struct {
     /// Read the full source of `path` (resolved against the reader's own root),
     /// returning newly-allocated NUL-terminated bytes the caller owns. AstGen
-    /// requires the sentinel, so it is part of the contract. Receives
-    /// `*ModuleSource` and recovers its concrete type via
-    /// `@fieldParentPtr("interface", source)`.
+    /// requires the sentinel, so it is part of the contract.
     read: *const fn (source: *ModuleSource, gpa: std.mem.Allocator, path: []const u8) Error![:0]u8,
 };
 

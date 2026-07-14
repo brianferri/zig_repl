@@ -7,8 +7,8 @@
 //! Setup sequence pushes flag 1 ("disambiguate escape codes") onto
 //! the terminal's progressive-enhancement stack; teardown pops one
 //! stack frame. Flag 1 is the minimum for Shift+Enter / Ctrl+Tab.
-//! Event-report flag (0b10000) is intentionally not requested for
-//! v1 to keep the editor loop simple.
+//! Event-report flag (0b10000) is intentionally not requested, to
+//! keep the editor loop simple.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -62,9 +62,7 @@ fn interpretKitty(csi: Csi.Sequence) ?Event.Event {
     // The wire form's optional sub-params (alternate codepoint at
     // `params[0]:<alt>`, text codepoint at the third primary slot)
     // are parsed by the byte-level Parser but not surfaced on
-    // Event.Key today -- no consumer in the editor reads them.
-    // When a layout-aware extension lands, add the fields back at
-    // their named caller's site.
+    // Event.Key: no consumer in the editor reads them.
     const cp_raw = csi.params[0];
     const modifier_param: u32 = if (csi.params_count >= 2) csi.params[1] else 0;
     const event_type: u32 = if (csi.params_count >= 2 and csi.subparams_count[1] >= 1)

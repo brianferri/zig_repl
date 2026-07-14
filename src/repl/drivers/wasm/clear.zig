@@ -1,7 +1,5 @@
 //! `:clear` -- wipe the web output log. The log lives in the DOM, which the
 //! core cannot reach, so the command calls a host import the page supplies.
-//! This is the wasm frontend's analogue of the TTY's terminal-touching
-//! commands: it reaches a capability that only the frontend's host has.
 
 const std = @import("std");
 

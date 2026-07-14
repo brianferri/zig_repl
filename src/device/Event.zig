@@ -2,12 +2,6 @@
 //! its wire encoding into one of these variants so the consumer
 //! (LineEditor, future TUI layers) never branches on protocol
 //! identity.
-//!
-//! Variant set is fixed at v1 even though only `key_press`,
-//! `key_release`, `key_repeat`, `paste`, and `eof` emit today.
-//! Adding `resize` / `focus_in` / `focus_out` later lifts as a
-//! pure additional emit-site -- no consumer switch needs to grow
-//! because exhaustive matches already cover them.
 
 const std = @import("std");
 

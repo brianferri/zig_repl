@@ -5,9 +5,8 @@
 //! direct interpretation against the InternPool.
 //!
 //! Reference: src/Sema.zig in the Zig compiler tree.
-//! Handler arms land per ZIR-tag group; until a tag is explicitly handled
-//! it surfaces a deterministic `unsupported_zir_inst: <tag>` diagnostic.
-//! There is no silent fallback.
+//! An unhandled ZIR tag surfaces a deterministic `unsupported_zir_inst: <tag>`
+//! diagnostic; there is no silent fallback.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -97,8 +96,7 @@ comptime_break_inst: Zir.Inst.Index = undefined,
 /// src/Sema.zig:77. Each `repeat` / `repeat_inline` increments
 /// `branch_count`; when it exceeds `branch_quota`, Sema fails with
 /// the same "evaluation exceeded N backwards branches" diagnostic
-/// AstGen emits. The user-facing knob is `@setEvalBranchQuota`
-/// (lands with broader builtin coverage).
+/// AstGen emits. The user-facing knob is `@setEvalBranchQuota`.
 branch_quota: u32 = default_branch_quota,
 branch_count: u32 = 0,
 /// Value carried by an in-flight `error.ComptimeReturn`. Set by
@@ -134,8 +132,7 @@ current_zir_id: u32 = 0,
 /// `src/Sema.zig`; we keep it on Sema rather than in every
 /// signature since the REPL has no nested fn definitions or
 /// runtime-Block lowering that would require save/restore
-/// across handler frames. When those land, the compiler's
-/// threading pattern lifts here.
+/// across handler frames.
 block: *Block = undefined,
 /// Fully-qualified name of the declaration whose value body is being
 /// evaluated, used to name a container type declared in it
@@ -157,13 +154,10 @@ pub const default_branch_quota: u32 = 1000;
 pub const LazySrcLoc = @import("ErrorMsg.zig").LazySrcLoc;
 pub const ErrorMsg = @import("ErrorMsg.zig").ErrorMsg;
 
-/// Mirrors the compiler's `Sema.Block` (src/Sema.zig). Today
-/// only `params` is populated -- the other compiler fields
-/// (label, instructions, runtime_*, namespace overrides,
-/// comptime_reason, etc.) land alongside their dependent
-/// handlers. `params` accumulates `.param` / `.param_comptime`
-/// instructions seen during body walking, drained by
-/// `evalFunc` when the matching `.func` instruction lands.
+/// Mirrors the compiler's `Sema.Block` (src/Sema.zig). Only `params` is
+/// populated: it accumulates `.param` / `.param_comptime` instructions seen
+/// during body walking, drained by `evalFunc` when the matching `.func`
+/// instruction lands.
 pub const Block = struct {
     params: std.ArrayListUnmanaged(Param) = .empty,
     /// The instruction the block's source-location offsets are measured against
@@ -194,9 +188,7 @@ pub const Block = struct {
     }
 
     /// Mirrors `Block.Param` in the compiler. `name` is omitted
-    /// since fn types don't carry param names; bare-decl
-    /// rendering will surface them via the AST source when
-    /// needed.
+    /// since fn types don't carry param names.
     pub const Param = struct {
         ty: InternPool.Index,
         is_comptime: bool,
@@ -244,8 +236,8 @@ pub fn analyze(session: *Session, file_index: Session.Index, writer: *std.Io.Wri
     // Pipeline gates Sema entry via `hasZirErrors`; Sema itself
     // walks only the `__repl_input` body (or the namespace
     // bindDecls path) and is unaffected by the suppressed items, so
-    // the stronger `!hasCompileErrors()` assertion has been
-    // intentionally relaxed.
+    // this asserts only that instructions exist, not the stronger
+    // `!hasCompileErrors()`.
     assert(zir.instructions.len > 0);
 
     var top_block: Block = .{};
@@ -419,8 +411,7 @@ fn evalBody(sema: *Sema, body: []const Zir.Inst.Index) Error!Value {
 /// Mirrors src/Sema.zig:emitBackwardBranch at src/Sema.zig:25436.
 /// Increments `branch_count`; on overflow past `branch_quota`,
 /// emits the same diagnostic AstGen does and aborts via
-/// `error.AnalysisFail`. The limit will be raisable through
-/// `@setEvalBranchQuota` once that builtin lands.
+/// `error.AnalysisFail`.
 fn emitBackwardBranch(sema: *Sema) Error!void {
     sema.branch_count += 1;
     if (sema.branch_count > sema.branch_quota) {
@@ -623,8 +614,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         // dbg_stmt / dbg_var_val / dbg_var_ptr are AstGen-emitted
         // debug breadcrumbs for line/local tracking. Tolerated as
         // no-ops here so we don't reject any function body that
-        // declares a local. A future `:scope` extension can read
-        // dbg_var_* via str_op to surface live local names.
+        // declares a local.
         // validate_const is a runtime-safety guard the compiler
         // lowers to nothing in comptime context -- a no-op for us.
         .dbg_stmt, .dbg_var_val, .dbg_var_ptr, .validate_const => null,
@@ -705,8 +695,8 @@ fn evalStr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// Build a string-literal value: a `[N:0]u8` array (each byte a `u8`, plus the
 /// trailing 0 sentinel) behind a const pointer, `*const [N:0]u8`. Mirrors
 /// `addStrLit` -> `uavRef`. The compiler uses the aggregate `bytes` storage; this
-/// evaluator has only `elems` storage, so the bytes are interned one `u8` per slot
-/// until a `bytes` flavor lands. Shared by `str` and `@tagName`.
+/// evaluator has only `elems` storage, so the bytes are interned one `u8` per slot.
+/// Shared by `str` and `@tagName`.
 fn internStringLiteral(sema: *Sema, bytes: []const u8) Error!Value {
     const ip = sema.intern_pool;
     const u8_zero = try ip.internInt(.{ .ty = .u8_type, .storage = .{ .u64 = 0 } });
@@ -715,7 +705,7 @@ fn internStringLiteral(sema: *Sema, bytes: []const u8) Error!Value {
     const elems = try sema.gpa.alloc(InternPool.Index, bytes.len + 1);
     defer sema.gpa.free(elems);
     for (bytes, 0..) |b, i| elems[i] = try ip.internInt(.{ .ty = .u8_type, .storage = .{ .u64 = b } });
-    elems[bytes.len] = u8_zero; // the sentinel slot
+    elems[bytes.len] = u8_zero;
 
     const array_val = try ip.internAggregate(.{ .ty = array_ty, .storage = .{ .elems = elems } });
     return try sema.materializeConstPtr(.{ .index = array_val });
@@ -799,15 +789,6 @@ fn evalPassthroughUnNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return try sema.resolveRef(operand);
 }
 
-/// Binary arith dispatcher (`add/sub/mul/div(_*)?/mod/rem`). Picks int
-/// vs float kernels by operand type. When one operand is `comptime_int`
-/// and the other is `comptime_float`, the int side is promoted via
-/// `BigIntConst.toFloat(f128, .nearest_even)` -- peer-type resolution as
-/// the compiler does for these specific types. Fixed-width arithmetic
-/// and full peer-type resolution land with their coercion handlers.
-///
-/// Compiler reference: src/Sema.zig:zirArithmetic ->
-/// src/Sema/arith.zig:{add,sub,mul,divTrunc,divFloor,mod,rem}.
 pub fn intValue_big(sema: *Sema, ty: Type, x: std.math.big.int.Const) Error!Value {
     return .fromIndex(try sema.intern_pool.internIntValue(ty.index, x));
 }
@@ -1133,8 +1114,7 @@ fn resolveNumericPairToInt(
     const lhs_info: ?std.lang.Type.Int = if (lhs_is_cti) null else intTypeInfo(pool, lhs_int.ty);
     const rhs_info: ?std.lang.Type.Int = if (rhs_is_cti) null else intTypeInfo(pool, rhs_int.ty);
 
-    // Bail on int types we don't yet support as a peer target (usize,
-    // c_int, etc. -- separate target-aware axis).
+    // Bail on int types with no `intTypeInfo` (no supported peer-target width).
     if (!lhs_is_cti and lhs_info == null) return null;
     if (!rhs_is_cti and rhs_info == null) return null;
 
@@ -1355,9 +1335,9 @@ fn intCoercible(src: std.lang.Type.Int, dst: std.lang.Type.Int) bool {
 ///
 /// Each `evalBody` call corresponds to one block scope; `break_inline`
 /// inside the inner body terminates *that* call and returns the value
-/// here. Labeled multi-level breaks need a return-signal mechanism we
-/// haven't built yet; the single-target case suffices for `if`-as-value
-/// and the bodies AstGen emits around comparison/shift sequences.
+/// here. Labeled multi-level breaks would need a return-signal mechanism;
+/// the single-target case suffices for `if`-as-value and the bodies AstGen
+/// emits around comparison/shift sequences.
 ///
 /// Compiler reference: src/Sema.zig:zirBlock / zirBlockInline.
 fn evalBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
@@ -1490,7 +1470,6 @@ fn failLog2NonInt(sema: *Sema) Error {
     return sema.fail(sema.block, sema.block.nodeOffset(.zero), "typeof_log2_int_type: non-integer operand not yet supported", .{});
 }
 
-/// The type valid as a shift amount for a value of int type `int_ty`:
 /// The type valid as a shift amount for a value of type `int_ty`: `comptime_int`
 /// for a `comptime_int`, `unsigned(log2_ceil(bits))` for an int, and elementwise
 /// for a vector. Null if `int_ty` is not a shiftable type. Ports the compiler's
@@ -1514,15 +1493,8 @@ fn log2IntType(sema: *Sema, int_ty: InternPool.Index) Error!?InternPool.Index {
     }
 }
 
-/// `as_node` / `as_shift_operand`: coerce `operand` to `dest_type`.
-/// Currently supported:
-///   * identity (operand type == dest type) -- free passthrough.
-///   * comptime_int -> any fixed-width int: range-checked via stdlib's
-///     `BigIntConst.fitsInTwosComp`; failure raises a runtime-style
-///     "value does not fit" diagnostic and returns AnalysisFail.
-/// Other coercions (int widening / narrowing between fixed widths,
-/// float, optional, error union, pointer) land alongside their
-/// respective handlers.
+/// `as_node` / `as_shift_operand`: coerce `operand` to `dest_type` via
+/// `coerceValueToType`.
 ///
 /// Compiler reference: src/Sema.zig:zirAsNode -> analyzeAs.
 fn evalAsNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
@@ -1652,8 +1624,8 @@ fn materialiseIntFromFloat(
         const idx = try sema.intern_pool.internComptimeInt(big);
         return .{ .index = idx };
     }
-    // Classify by `zigTypeTag` (like the compiler), then read the int info; this
-    // covers every fixed-width int -- `intN`, `usize`/`isize`, and the `c_*` types.
+    // Classify by `zigTypeTag`, then read the int info; this covers every
+    // fixed-width int -- `intN`, `usize`/`isize`, and the `c_*` types.
     if (Type.fromIndex(dest_type_index).zigTypeTag(sema.intern_pool) == .int) {
         const dest_int = Type.fromIndex(dest_type_index).intInfo(sema.intern_pool).?;
         if (!big.fitsInTwosComp(dest_int.signedness, dest_int.bits)) {
@@ -1951,22 +1923,14 @@ fn narrowF128ToFloatStorage(value: f128, dest_ty: InternPool.Index) InternPool.K
     };
 }
 
-/// `shl / shr`. Same operand shape as the other binary ops, but `rhs` is a
-/// shift amount that must fit in `usize` and be non-negative -- the kernel's
-/// stdlib-named `ConvertError.NegativeIntoUnsigned` /
-/// `ConvertError.TargetTooSmall` flow through here and become runtime-style
-/// diagnostics + `AnalysisFail`.
-///
-/// `shl_exact` / `shr_exact` land alongside fixed-width int support -- the
-/// "no bits lost" check is meaningful only when the operand has a width.
-///
-/// Compiler reference: src/Sema.zig:zirShl / zirShr.
 /// `shl / shr / shl_exact / shr_exact / shl_sat`. Operand shape is
 /// `pl_node + Bin`; LHS may be any int type, RHS is the pre-coerced
 /// shift amount (typeof_log2_int_type). For fixed-width LHS, the
 /// result is computed in arbitrary precision and re-fit; `_exact`
 /// variants reject any bit-loss, `_sat` clamps via stdlib's
 /// `shiftLeftSat`.
+///
+/// Compiler reference: src/Sema.zig:zirShl / zirShr.
 fn evalShift(
     sema: *Sema,
     inst: Zir.Inst.Index,
@@ -2183,21 +2147,9 @@ fn evalVectorComparison(sema: *Sema, op: std.math.CompareOperator, lhs: Value, r
     return .{ .index = try ip.internAggregate(.{ .ty = vec_ty, .storage = .{ .elems = elems } }) };
 }
 
-/// `negate` / `negate_wrap`. AstGen lowers `-x` as `negate(x)`; constant-
-/// folded literals like `-1` / `-1.5` come through as well-known Refs or
-/// as a single signed literal and never reach here. `negate_wrap` is the
-/// `-%x` form, valid only on fixed-width int operands.
-///
-/// Compiler reference: src/Sema.zig:zirNegate (~13858) /
-/// src/Sema.zig:zirNegateWrap (~13896).
-/// The `@sqrt`/`@sin`/.../`@trunc` unary float builtins. Each maps to a distinct
-/// ZIR tag; the compiler funnels them through `zirUnaryMath` with the matching
-/// `Value` fn. Rejects a non-float scalar type, then folds scalar or elementwise
-/// (mirrors `Value.sqrt`'s scalar/vector split). The operand is comptime-known.
-/// `@sqrt`/`@sin`/.../`@trunc`: a unary float builtin. Ports zirUnaryMath ->
-/// unaryMath: reject a non-float scalar, then fold via `maybeConstantUnaryMath`
-/// with the matching `Value` function (passed by the dispatch, as the compiler
-/// passes `Value.sqrt` etc.).
+/// `@sqrt`/`@sin`/.../`@trunc`: a unary float builtin. Rejects a non-float
+/// scalar type, then folds scalar or elementwise via `maybeConstantUnaryMath`
+/// with the matching `Value` function. The operand is comptime-known.
 fn evalUnaryMath(
     sema: *Sema,
     inst: Zir.Inst.Index,
@@ -2571,6 +2523,12 @@ fn maybeConstantUnaryMath(
     }
 }
 
+/// `negate` / `negate_wrap`. AstGen lowers `-x` as `negate(x)`; constant-
+/// folded literals like `-1` / `-1.5` come through as well-known Refs or
+/// as a single signed literal and never reach here. `negate_wrap` is the
+/// `-%x` form, valid only on fixed-width int operands.
+///
+/// Compiler reference: src/Sema.zig:zirNegate / src/Sema.zig:zirNegateWrap.
 fn evalNegate(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     assert(tag == .negate or tag == .negate_wrap);
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
@@ -2606,11 +2564,9 @@ fn evalNegate(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value
 }
 
 /// `ptr_type`: evaluate a `*T` / `*const T` / `[*]T` / `[]T` / `[*c]T`
-/// type expression to an interned `Key.ptr_type` value. Sentinel,
-/// align, address_space, and bit_range extensions trail the payload
-/// via additional `Ref` slots in extra; the current subset handles
-/// only the base case (none of the optional extensions). Compiler reference:
-/// `src/Sema.zig:zirPtrType`.
+/// type expression to an interned `Key.ptr_type` value. Sentinel and align
+/// extensions trail the payload as `Ref` slots in extra; address_space and
+/// bit_range are rejected. Compiler reference: `src/Sema.zig:zirPtrType`.
 fn evalPtrType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
@@ -2786,11 +2742,6 @@ fn evalBitCount(
     }
 }
 
-/// `byte_swap`/`bit_reverse` (`@byteSwap`/`@bitReverse`): reverse the byte or bit
-/// order of a fixed-width integer (or vector of them), keeping the operand type.
-/// `@byteSwap` requires the width to be a multiple of 8. Mirrors zirByteSwap/
-/// zirBitReverse -> `arith.byteSwap`/`bitReverse`, folding via the same
-/// `std.math.big.int.Mutable` methods. An undef operand (or lane) stays undef.
 /// The scalar int type of an int or vector-of-int operand, else an error. Ports
 /// `checkIntOrVector`.
 fn checkIntOrVector(sema: *Sema, operand: Value) Error!Type {
@@ -2862,7 +2813,6 @@ fn byteSwap(sema: *Sema, val: Value, ty: Type) Error!Value {
     }
 }
 
-/// Ports `arith.bitReverse`.
 fn bitReverse(sema: *Sema, val: Value, ty: Type) Error!Value {
     const ip = sema.intern_pool;
     if (ip.indexToKey(val.index) == .undef) return val;
@@ -2898,7 +2848,6 @@ fn intByteSwap(sema: *Sema, val: Value, ty: Type) Error!Value {
     return .{ .index = try ip.internIntValue(ty.index, result_bigint.toConst()) };
 }
 
-/// Ports `arith.intBitReverse`.
 fn intBitReverse(sema: *Sema, val: Value, ty: Type) Error!Value {
     const ip = sema.intern_pool;
     const info = ty.intInfo(ip).?;
@@ -3019,13 +2968,6 @@ fn evalRetPtr(sema: *Sema) Error!?Value {
     return try sema.pushComptimeAlloc(ret_ty, .{ .index = undef_idx }, false, .none);
 }
 
-/// `make_ptr_const`: freeze an `alloc`'s pointer to `*const T` once the value
-/// is fully initialised. AstGen emits it for a `const` local (an `alloc` is
-/// mutable until then); it marks the comptime-alloc const so later stores are
-/// rejected and returns a const-typed pointer to the same slot. Mirrors
-/// zirMakePtrConst's "preserve the comptime alloc, just make the pointer
-/// const" branch (the anon-decl promotion is a runtime-codegen optimisation
-/// this comptime evaluator does not need).
 /// Mark the comptime alloc backing `ptr` as const so later stores through it are
 /// rejected. Recurses through aggregate-element and optional-payload pointers to
 /// the root alloc; a declaration (`.nav`) or anonymous constant (`.uav`) base is
@@ -3041,6 +2983,12 @@ fn freezeBacking(sema: *Sema, ptr: InternPool.Key.Ptr) void {
     }
 }
 
+/// `make_ptr_const`: freeze an `alloc`'s pointer to `*const T` once the value
+/// is fully initialised. AstGen emits it for a `const` local (an `alloc` is
+/// mutable until then); it marks the comptime-alloc const so later stores are
+/// rejected and returns a const-typed pointer to the same slot. The anon-decl
+/// promotion in zirMakePtrConst is a runtime-codegen optimisation this comptime
+/// evaluator does not need.
 fn evalMakePtrConst(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
@@ -3274,9 +3222,8 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
             const parent = try sema.loadValue(.{ .index = f.base });
             const parent_key = ip.indexToKey(parent.index);
             // A not-yet-initialised parent (mid array/struct init) projects to
-            // `undef`. Mirrors the compiler's `loadComptimePtrInner`, whose every
-            // level returns `.undef` when the value it projects from is `undef`
-            // (src/Sema/comptime_ptr_access.zig).
+            // `undef` -- every projection level returns `.undef` when the value it
+            // projects from is `undef` (src/Sema/comptime_ptr_access.zig).
             if (parent_key == .undef) return .{ .index = .undef };
             // A pointer whose pointee is itself an array reads that many consecutive
             // elements into a sub-array, not a single element -- the shape
@@ -3303,8 +3250,7 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
             }
             return switch (parent_key) {
                 // A union stores only the active field's payload, not a positional
-                // slot per field; reading a field pointer checks the active tag,
-                // mirroring `unionFieldPtr`'s comptime load.
+                // slot per field; reading a field pointer checks the active tag.
                 .un => try sema.loadUnionField(parent.index, @intCast(f.index)),
                 .aggregate => |agg| .{ .index = InternPool.aggregateElementAt(agg, @intCast(f.index)) },
                 else => unreachable, // an element/field ptr always projects one of the above
@@ -3381,12 +3327,11 @@ fn lookupComptimeAlloc(sema: *Sema, ptr: InternPool.Key.Ptr) Error!*ComptimeAllo
     return &sema.comptime_allocs.items[idx];
 }
 
-/// The result of `coerceInMemoryAllowed`. Mirrors the compiler's
-/// `InMemoryCoercionResult` (src/Sema.zig) variant-for-variant, including the
-/// recursive `child` reason tree (allocated in `sema.arena`, like the compiler).
-/// The compiler's `report` appends `LazySrcLoc`-anchored notes to a `Zcu.ErrorMsg`;
-/// the REPL has neither, so its `report` writes the same note text to `sema.writer`
-/// (the one bit that legitimately cannot port -- the note *sink*).
+/// The result of `coerceInMemoryAllowed` (src/Sema.zig `InMemoryCoercionResult`):
+/// a recursive `child` reason tree allocated in `sema.arena`. The compiler's
+/// `report` appends `LazySrcLoc`-anchored notes to a `Zcu.ErrorMsg`; the REPL has
+/// neither, so its `report` writes the same note text to `sema.writer` (the one bit
+/// that legitimately cannot port -- the note sink).
 const InMemoryCoercionResult = union(enum) {
     ok: Strategy,
     no_match: Pair,
@@ -3449,11 +3394,11 @@ const InMemoryCoercionResult = union(enum) {
         return res;
     }
 
-    /// Write the reason chain as diagnostic notes to `sema.writer`, mirroring the
-    /// compiler's `report`. Type/value formatting goes through `Type.print` /
-    /// `render_value.render` instead of the compiler's `{f}` value formatters; the
-    /// `no_match` case's "declared here" notes are `LazySrcLoc`-only, so they are
-    /// omitted (the caller's message already names the two types).
+    /// Write the reason chain as diagnostic notes to `sema.writer`. Type/value
+    /// formatting goes through `Type.print` / `render_value.render` instead of the
+    /// compiler's `{f}` value formatters; the `no_match` case's "declared here" notes
+    /// are `LazySrcLoc`-only, so they are omitted (the caller's message already names
+    /// the two types).
     fn report(res: *const InMemoryCoercionResult, sema: *Sema, src: LazySrcLoc, msg: *ErrorMsg) Error!void {
         const ip = sema.intern_pool;
         var cur = res;
@@ -3665,9 +3610,9 @@ fn pointerSizeString(size: std.lang.Type.Pointer.Size) []const u8 {
 
 /// If types `A` and `B` have identical representations in runtime memory, they are
 /// "in-memory coercible" -- `A` coerces to `B`, and so do pointers (`*const A` ->
-/// `*const B`). Mirrors the compiler's `coerceInMemoryAllowed`, arm for arm. The
-/// REPL drops the `block`/`*_src` (no `LazySrcLoc`) and `target` (single host
-/// target) parameters. `src_val` refines the comptime-int arm's diagnostic.
+/// `*const B`). The REPL drops the `block`/`*_src` (no `LazySrcLoc`) and `target`
+/// (single host target) parameters. `src_val` refines the comptime-int arm's
+/// diagnostic.
 fn coerceInMemoryAllowed(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_mut: bool, src_val: ?Value) Error!InMemoryCoercionResult {
     const ip = sema.intern_pool;
     if (dest_ty.index == src_ty.index) return .{ .ok = .same_type };
@@ -3845,8 +3790,8 @@ fn coerceInMemoryAllowed(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_mut: 
     return .{ .no_match = .{ .actual = dest_ty, .wanted = src_ty } };
 }
 
-/// Whether a `comptime_int` value fits in fixed-width int `ty`. Mirrors
-/// `Value.intFitsInType` via `std.math.big.int`'s `fitsInTwosComp`.
+/// Whether a `comptime_int` value fits in fixed-width int `ty`, via
+/// `std.math.big.int`'s `fitsInTwosComp`.
 fn intFitsInType(sema: *Sema, val: Value, ty: Type) bool {
     const info = ty.intInfo(sema.intern_pool).?;
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
@@ -3854,9 +3799,9 @@ fn intFitsInType(sema: *Sema, val: Value, ty: Type) bool {
     return big.fitsInTwosComp(info.signedness, info.bits);
 }
 
-/// Pointer (and slice) in-memory coercion. Mirrors `coerceInMemoryAllowedPtrs`.
-/// The REPL's no-layout pointer model carries no packed host-size/bit-offset, so
-/// the compiler's `ptr_bit_range` check is a no-op here and is omitted.
+/// Pointer (and slice) in-memory coercion. The REPL's no-layout pointer model
+/// carries no packed host-size/bit-offset, so the compiler's `ptr_bit_range` check
+/// is a no-op here and is omitted.
 fn coerceInMemoryAllowedPtrs(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_mut: bool) Error!InMemoryCoercionResult {
     const ip = sema.intern_pool;
     const dest_info = dest_ty.ptrInfo(ip);
@@ -3927,7 +3872,6 @@ fn coerceInMemoryAllowedPtrs(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_m
     return .{ .ok = .ptr_cast };
 }
 
-/// Function-type in-memory coercion. Mirrors `coerceInMemoryAllowedFns`.
 fn coerceInMemoryAllowedFns(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_mut: bool) Error!InMemoryCoercionResult {
     const ip = sema.intern_pool;
     const dest_info = ip.indexToKey(dest_ty.index).func_type;
@@ -3990,8 +3934,8 @@ fn coerceInMemoryAllowedFns(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_mu
     return .{ .ok = .none };
 }
 
-/// Whether a function type has runtime bits (i.e. is not generic). Mirrors
-/// `Type.fnHasRuntimeBits` using `comptimeOnly` for the param-class check.
+/// Whether a function type has runtime bits (i.e. is not generic), using
+/// `comptimeOnly` for the param-class check.
 fn fnTypeHasRuntimeBits(fn_ty: Type, pool: *const InternPool) bool {
     const info = pool.indexToKey(fn_ty.index).func_type;
     if (info.comptime_bits != 0) return false;
@@ -4003,8 +3947,8 @@ fn fnTypeHasRuntimeBits(fn_ty: Type, pool: *const InternPool) bool {
     return true;
 }
 
-/// Whether calling convention `src_cc` coerces to `dest_cc`. Copied verbatim from
-/// the compiler's `callconvCoerceAllowed`; the host target is the single REPL target.
+/// Whether calling convention `src_cc` coerces to `dest_cc`. The host target is the
+/// single REPL target.
 fn callconvCoerceAllowed(src_cc: std.lang.CallingConvention, dest_cc: std.lang.CallingConvention) bool {
     const target = &@import("builtin").target;
     const Tag = std.lang.CallingConvention.Tag;
@@ -4053,9 +3997,9 @@ fn callconvCoerceAllowed(src_cc: std.lang.CallingConvention, dest_cc: std.lang.C
     return true;
 }
 
-/// Error-set in-memory coercion. Mirrors `coerceInMemoryAllowedErrorSets` for the
-/// error-set flavours the REPL models -- concrete named sets, `anyerror`, and the
-/// `adhoc` marker. The REPL has no per-function inferred-error-set subsystem
+/// Error-set in-memory coercion for the error-set flavours the REPL models --
+/// concrete named sets, `anyerror`, and the `adhoc` marker. The REPL has no
+/// per-function inferred-error-set subsystem
 /// (`fn_ret_ty_ies` / `inferred_error_set_type`), so those arms do not apply: an
 /// `adhoc` destination accepts (as the compiler does, minus recording the set).
 fn coerceInMemoryAllowedErrorSets(sema: *Sema, dest_ty: Type, src_ty: Type) Error!InMemoryCoercionResult {
@@ -4083,8 +4027,6 @@ fn coerceInMemoryAllowedErrorSets(sema: *Sema, dest_ty: Type, src_ty: Type) Erro
 /// Coerce a Value to a destination type using the same paths
 /// `evalAsNode` follows: identity, comptime_int -> fixed-width int,
 /// any-numeric -> fixed-width float / comptime_float, `undef` re-tag.
-/// Mirrors the compiler's `coerceExtra` -> `coerceInMemory` ->
-/// `pt.getCoerced` chain.
 fn coerceValueToType(
     sema: *Sema,
     value: Value,
@@ -4105,10 +4047,8 @@ fn coerceValueToType(
         return .{ .index = idx };
     }
 
-    // Dispatch on the destination type, mirroring `coerceExtra`'s
-    // `switch (dest_ty.zigTypeTag())`; each arm is that type's coercion (a helper,
-    // as the compiler calls one per arm). Falling through the switch is the
-    // compiler's "cannot coerce" tail.
+    // Dispatch on the destination type (`switch (dest_ty.zigTypeTag())`); each arm
+    // is that type's coercion. Falling through the switch is the "cannot coerce" tail.
     switch (ip.indexToKey(dest_ty)) {
         // `.int` arm: any fixed-width int type (`intN`, `usize`/`isize`, `c_*`).
         .int_type => if (try sema.coerceToFixedWidthInt(value, dest_ty, op_name)) |c| return c,
@@ -4180,10 +4120,9 @@ fn coerceValueToType(
 }
 
 /// Coerce an enum literal or tag to a tagged union by initialising the field the
-/// tag selects. Mirrors the compiler's `coerceEnumToUnion`: resolve the tag
-/// against the union's tag enum, then -- for a field with a single possible value
-/// (a void payload) -- build the union value; a field needing a real payload
-/// cannot be initialised from a bare tag.
+/// tag selects: resolve the tag against the union's tag enum, then -- for a field
+/// with a single possible value (a void payload) -- build the union value; a field
+/// needing a real payload cannot be initialised from a bare tag.
 fn coerceEnumToUnion(sema: *Sema, value: Value, union_ty: InternPool.Index, op_name: []const u8) Error!Value {
     const ip = sema.intern_pool;
     const tag_enum = try sema.unionTagEnumType(union_ty);
@@ -4202,8 +4141,7 @@ fn coerceEnumToUnion(sema: *Sema, value: Value, union_ty: InternPool.Index, op_n
 
 /// Coerce an error value to a destination error-set type (`anyerror` or a wider
 /// set): validate membership via `coerceInMemoryAllowedErrorSets`, then re-tag the
-/// value's type. Mirrors `getCoerced`'s `.err` arm (which re-interns `.err` with
-/// the new set type once the in-memory check has passed).
+/// value's type.
 fn coerceToErrorSet(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_name: []const u8) Error!Value {
     const ip = sema.intern_pool;
     const key = ip.indexToKey(value.index);
@@ -4227,8 +4165,7 @@ fn coerceToErrorSet(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_nam
 /// Coerce a single-pointer-to-array value (`*const [N]T`) into `dest_ty` (a slice
 /// `[]T`): a slice whose `ptr` is the array pointer re-typed to the slice's
 /// many-pointer field type (`[*]T`) and whose `len` is the array length. Returns
-/// null if `value` is not a pointer to an array (caller reports). Mirrors
-/// coerceArrayPtrToSlice's comptime arm (getCoerced to `slicePtrFieldType`).
+/// null if `value` is not a pointer to an array (caller reports).
 fn coerceToSlice(sema: *Sema, value: Value, dest_ty: InternPool.Index) Error!?Value {
     const ip = sema.intern_pool;
     if (ip.indexToKey(value.index) != .ptr) return null;
@@ -4258,8 +4195,7 @@ fn coerceToSlice(sema: *Sema, value: Value, dest_ty: InternPool.Index) Error!?Va
 /// Coerce a single-pointer-to-array value (`*const [N]T`) into `dest_ty` (a
 /// many-pointer `[*]T`): re-tag the array pointer to the many-pointer type,
 /// keeping the same base address (indexing then derefs it like a slice's ptr).
-/// Returns null if `value` is not a pointer to an array. Mirrors
-/// coerceArrayPtrToMany's comptime arm (getCoerced to the many-pointer type).
+/// Returns null if `value` is not a pointer to an array.
 fn coerceToManyPtr(sema: *Sema, value: Value, dest_ty: InternPool.Index) Error!?Value {
     const ip = sema.intern_pool;
     if (ip.indexToKey(value.index) != .ptr) return null;
@@ -4275,7 +4211,6 @@ fn coerceToManyPtr(sema: *Sema, value: Value, dest_ty: InternPool.Index) Error!?
 /// re-tag the aggregate to `dest_ty`, coercing each element to the destination
 /// element type (identity for the same element type, widening otherwise). Returns
 /// null if `value` is not an aggregate or the lengths differ (caller reports).
-/// Mirrors coerceArrayLike's comptime in-memory / element-by-element arms.
 fn coerceArrayLike(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_name: []const u8) Error!?Value {
     const ip = sema.intern_pool;
     if (ip.indexToKey(value.index) != .aggregate) return null;
@@ -4373,7 +4308,7 @@ fn evalIntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// `@Int(signedness, bits)` (`reify_int`): reify an integer type from a
 /// `std.lang.Signedness` and a bit width -- the inverse of `@typeInfo`'s `.int`
-/// arm. Mirrors zirReifyInt.
+/// arm.
 fn evalReifyInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
@@ -4386,9 +4321,8 @@ fn evalReifyInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// `@Tuple(types)` (`reify_tuple`): build a tuple type from a `[]const type`.
-/// Mirrors zirReifyTuple. The REPL's tuple type carries only element types, so
-/// `getTupleType`'s parallel `values` array (all `.none` upstream, for comptime
-/// fields) has no analogue here.
+/// The REPL's tuple type carries only element types, so `getTupleType`'s parallel
+/// `values` array (all `.none` upstream, for comptime fields) has no analogue here.
 fn evalReifyTuple(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
     const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.UnNode, extended.operand).data;
@@ -4437,9 +4371,8 @@ fn derefSliceAsArray(sema: *Sema, val: Value) Error!Value {
     return sema.fail(sema.block, sema.block.nodeOffset(.zero), "reify: expected a comptime array-backed slice", .{});
 }
 
-/// Reject a tuple field type that cannot be embedded, as the compiler's
-/// `validateTupleFieldType` does. Only `anyopaque` and `noreturn` are expressible
-/// here (the REPL has no nominal opaque types).
+/// Reject a tuple field type that cannot be embedded. Only `anyopaque` and
+/// `noreturn` are expressible here (the REPL has no nominal opaque types).
 fn validateTupleFieldType(sema: *Sema, field_ty: InternPool.Index) Error!void {
     if (field_ty == .anyopaque_type) {
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "opaque types have unknown size and therefore cannot be directly embedded in tuples", .{});
@@ -4451,7 +4384,7 @@ fn validateTupleFieldType(sema: *Sema, field_ty: InternPool.Index) Error!void {
 
 /// `@Pointer(size, attrs, child, sentinel)` (`reify_pointer`): reify a pointer
 /// type from a `Type.Pointer.Size`, a `Type.Pointer.Attributes`, the element
-/// type, and an optional sentinel. Mirrors zirReifyPointer.
+/// type, and an optional sentinel.
 fn evalReifyPointer(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
     const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.ReifyPointer, extended.operand).data;
@@ -4522,7 +4455,7 @@ fn evalReifyPointer(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Va
 
 /// `reify_pointer_sentinel_ty`: the type `@Pointer`'s sentinel argument coerces
 /// to -- `?child`, or `?noreturn` when the child (opaque or `@TypeOf(null)`)
-/// cannot be an optional's payload. Mirrors zirReifyPointerSentinelTy.
+/// cannot be an optional's payload.
 fn evalReifyPointerSentinelTy(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
     const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.UnNode, extended.operand).data;
@@ -4532,9 +4465,7 @@ fn evalReifyPointerSentinelTy(sema: *Sema, extended: Zir.Inst.Extended.InstData)
 }
 
 /// `reify_slice_arg_ty`: the array-pointer type a reification slice argument
-/// coerces to -- `*const [len]out`, `len` from the operand slice's length. Mirrors
-/// zirReifySliceArgTy. The `@Fn` parameter-attributes and `@Struct` field-type /
-/// field-attributes mappings are modelled; `@Union`'s land with `reify_union`.
+/// coerces to -- `*const [len]out`, `len` from the operand slice's length.
 fn evalReifySliceArgTy(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
     const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.UnNode, extended.operand).data;
@@ -4577,9 +4508,9 @@ fn interpretCallConv(sema: *Sema, val: Value) Error!std.lang.CallingConvention {
 
 /// `@Fn(param_types, param_attrs, return_type, attrs)` (`reify_fn`): reify a
 /// function type from its parameter types, per-parameter attributes, return type,
-/// and function attributes (calling convention, varargs). Mirrors zirReifyFn; the
-/// comptime-only evaluator omits the runtime-representability checks
-/// (checkParamType / checkReturnTypeAndCallConv).
+/// and function attributes (calling convention, varargs). The comptime-only
+/// evaluator omits the runtime-representability checks (checkParamType /
+/// checkReturnTypeAndCallConv).
 fn evalReifyFn(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
     const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.ReifyFn, extended.operand).data;
@@ -4634,9 +4565,9 @@ fn sliceConstU8Ty(sema: *Sema) Error!InternPool.Index {
     return try sema.intern_pool.internPtrType(.{ .child = .u8_type, .flags = .{ .size = .slice, .is_const = true } });
 }
 
-/// Read a comptime `[]const u8` slice value into an interned name handle. Mirrors
-/// the compiler's `sliceToIpString`: the slice's backing `[N:0]u8` array holds one
-/// interned `u8` per byte, which are collected and interned as a string.
+/// Read a comptime `[]const u8` slice value into an interned name handle: the
+/// slice's backing `[N:0]u8` array holds one interned `u8` per byte, which are
+/// collected and interned as a string.
 fn sliceToIpString(sema: *Sema, slice_val: Value) Error!InternPool.NullTerminatedString {
     const ip = sema.intern_pool;
     const arr = try sema.derefSliceAsArray(slice_val);
@@ -4656,7 +4587,7 @@ fn sliceToIpString(sema: *Sema, slice_val: Value) Error!InternPool.NullTerminate
 
 /// `reify_enum_value_slice_ty`: the array-pointer type `@Enum`'s field-values
 /// argument coerces to -- `*const [len]tag_ty`, `len` from the field-names slice's
-/// length. Mirrors zirReifyEnumValueSliceTy.
+/// length.
 fn evalReifyEnumValueSliceTy(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
     const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.BinNode, extended.operand).data;
@@ -4669,10 +4600,9 @@ fn evalReifyEnumValueSliceTy(sema: *Sema, extended: Zir.Inst.Extended.InstData) 
 
 /// `@Enum(tag_ty, mode, field_names, field_values)` (`reify_enum`): reify an enum
 /// type from its integer tag type, exhaustive/non-exhaustive mode, field names, and
-/// per-field values. Mirrors zirReifyEnum: a reified enum's identity is its reify
-/// instruction plus a `type_hash` over its inputs (dedup-stable), and it gets an
-/// empty namespace. Field storage is filled eagerly from the arguments (there is no
-/// ZIR to resolve lazily).
+/// per-field values. A reified enum's identity is its reify instruction plus a
+/// `type_hash` over its inputs (dedup-stable), and it gets an empty namespace. Field
+/// storage is filled eagerly from the arguments (there is no ZIR to resolve lazily).
 fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const name_strategy: Zir.Inst.NameStrategy = @enumFromInt(extended.small);
@@ -4706,8 +4636,7 @@ fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.In
     defer sema.gpa.free(values);
     for (values, 0..) |*v, i| {
         v.* = InternPool.aggregateElementAt(values_agg, i);
-        // Reject undefined field values, as the compiler's `anyUndef` check does;
-        // field names are checked in `sliceToIpString`.
+        // Reject undefined field values; field names are checked in `sliceToIpString`.
         if (ip.indexToKey(v.*) == .undef) {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
         }
@@ -4745,10 +4674,9 @@ fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.In
 /// `@Struct(layout, backing_ty, field_names, field_types, field_attrs)`
 /// (`reify_struct`): reify a struct type from its layout, optional packed backing
 /// integer, field names/types, and per-field attributes (comptime, alignment,
-/// default). Mirrors zirReifyStruct. Fields are stored eagerly from the arguments:
-/// a reified struct cannot be self-referential (its field types are already-interned
-/// values), so no lazy resolution is needed. The runtime layout (offsets, size) is
-/// not modelled.
+/// default). Fields are stored eagerly from the arguments: a reified struct cannot
+/// be self-referential (its field types are already-interned values), so no lazy
+/// resolution is needed. The runtime layout (offsets, size) is not modelled.
 fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const name_strategy: Zir.Inst.NameStrategy = @enumFromInt(extended.small);
@@ -4803,8 +4731,8 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
     var any_aligns = false;
     var any_comptime = false;
 
-    // The dedup hash mirrors the compiler's: layout, the backing-int value, the
-    // (dedup-stable) field-type array, then per-field name/attributes.
+    // The dedup hash covers layout, the backing-int value, the (dedup-stable)
+    // field-type array, then per-field name/attributes.
     var hasher = std.hash.Wyhash.init(0);
     std.hash.autoHash(&hasher, layout);
     std.hash.autoHash(&hasher, backing_val.index);
@@ -4889,8 +4817,8 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
 
 /// `@Union(layout, arg_ty, field_names, field_types, field_attrs)` (`reify_union`):
 /// reify a union type from its layout, optional tag/backing type, field names/types,
-/// and per-field attributes (alignment only). Mirrors zirReifyUnion. Fields are
-/// stored eagerly from the arguments (like `@Struct`). `arg_ty` is the explicit tag
+/// and per-field attributes (alignment only). Fields are stored eagerly from the
+/// arguments (like `@Struct`). `arg_ty` is the explicit tag
 /// enum for an `.auto` union; for a `.packed` union it is a backing integer (not a
 /// tag), and for `.extern` it is rejected. The runtime layout is not modelled.
 fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.Inst.Index) Error!?Value {
@@ -4950,8 +4878,6 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
     @memset(aligns, .none);
     var any_aligns = false;
 
-    // The dedup hash mirrors the compiler's: layout, the arg-type value, the
-    // (dedup-stable) field-type and field-attribute arrays, then per-field name.
     // Field attributes hash wholesale -- a union field's only attribute is its
     // alignment, a value the InternPool already deduplicated.
     var hasher = std.hash.Wyhash.init(0);
@@ -5018,8 +4944,7 @@ fn evalArrayType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// `array_type_sentinel` (`[N:S]T`): `array_type` plus a sentinel terminator `S`
-/// coerced to the element type. Mirrors zirArrayTypeSentinel (resolve len + elem,
-/// coerce the sentinel, build the array type). The opaque-element and
+/// coerced to the element type. The opaque-element and
 /// comptime-var-sentinel guards have no REPL analogue; the sentinel is always
 /// comptime-known here, and `coerceValueToType` rejects one that will not fit the
 /// element type. Compiler reference: src/Sema.zig:zirArrayTypeSentinel (~7490).
@@ -5636,7 +5561,7 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
                 return try sema.typeInfoUnion(type_info_ty, tag_enum, "float", payload);
             },
             // Payload-free categories: the tag name is the simple type's name and
-            // the union payload is `void`. Mirrors zirTypeInfo's trivial arm.
+            // the union payload is `void`.
             .void, .bool, .type, .noreturn, .comptime_int, .comptime_float, .undefined, .null, .enum_literal => {
                 return try sema.typeInfoUnion(type_info_ty, tag_enum, @tagName(s), .void_value);
             },
@@ -6220,7 +6145,6 @@ fn evalShuffle(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         const raw = sema.intAsI128(InternPool.aggregateElementAt(mask_agg, i)) orelse {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@shuffle: mask element is not a comptime integer", .{});
         };
-        // A non-negative index selects `a`; a negative one selects `b` at `~raw`.
         const from_agg, const idx, const len = if (raw >= 0)
             .{ a_agg, @as(u64, @intCast(raw)), a_len }
         else
@@ -6303,7 +6227,6 @@ fn evalValidateArrayInitRefTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(ip.indexToKey(ptr_ty) == .ptr_type); // validated by a previous instruction
     switch (ip.indexToKey(ptr_ty)) {
         .ptr_type => |ptr_type| switch (ptr_type.flags.size) {
-            // Use an array of the correct length for a slice or many-pointer result.
             .slice, .many => return .{ .index = try ip.internArrayType(.{
                 .len = extra.elem_count,
                 .child = ptr_type.child,
@@ -6313,7 +6236,6 @@ fn evalValidateArrayInitRefTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         },
         else => {},
     }
-    // Otherwise, we just want the pointer child type.
     const ret_ty = ip.indexToKey(ptr_ty).ptr_type.child;
     if (ret_ty == .anyopaque_type) return .{ .index = .generic_poison_type };
     const arr_ty = sema.optEuBaseType(ret_ty);
@@ -6619,12 +6541,8 @@ fn enterContainer(sema: *Sema, container_ty: InternPool.Index, ctx: []const u8) 
     return .{ .zir = zir, .saved_this = saved_this, .decl_inst = ns.decl_inst };
 }
 
-/// The compiler's `failWithBadStructFieldAccess` diagnostic: a field lookup that
-/// misses names both the field and the struct. Shared by every field-access site
-/// (`field_ptr`, field loads, struct init) so the wording is one message keyed on
-/// the struct -- not a per-syntax context string. Mirrors src/Sema.zig.
-/// The source of `container_ty`'s declaration, for a "declared here" note. Mirrors
-/// the compiler's `Type.srcLoc`: a `LazySrcLoc` anchored at the container's decl inst.
+/// The source of `container_ty`'s declaration, for a "declared here" note: a
+/// `LazySrcLoc` anchored at the container's decl inst.
 fn containerTypeSrc(sema: *Sema, container_ty: InternPool.Index) LazySrcLoc {
     const id: InternPool.Key.ContainerId = switch (sema.intern_pool.indexToKey(container_ty)) {
         .struct_type => |st| st.id,
@@ -6635,6 +6553,9 @@ fn containerTypeSrc(sema: *Sema, container_ty: InternPool.Index) LazySrcLoc {
     return .{ .base_node_inst = id.declInst(), .offset = .{ .node_offset = .zero } };
 }
 
+/// A field lookup that misses names both the field and the struct. Shared by every
+/// field-access site (`field_ptr`, field loads, struct init), so the wording is one
+/// message keyed on the struct rather than a per-syntax context string.
 fn failBadStructFieldAccess(sema: *Sema, struct_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error {
     const ip = sema.intern_pool;
     const st_name = ip.stringSlice(ip.indexToKey(struct_ty).struct_type.name);
@@ -6648,8 +6569,7 @@ fn failBadStructFieldAccess(sema: *Sema, struct_ty: InternPool.Index, name: Inte
 }
 
 /// The union counterpart of `failBadStructFieldAccess`: a field lookup that misses
-/// on a union value/type. Mirrors the compiler's separate
-/// `failWithBadUnionFieldAccess` ("... in union '{f}'").
+/// on a union value/type.
 fn failBadUnionFieldAccess(sema: *Sema, union_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error {
     const ip = sema.intern_pool;
     const un_name = ip.stringSlice(ip.indexToKey(union_ty).union_type.name);
@@ -6665,7 +6585,6 @@ fn failBadUnionFieldAccess(sema: *Sema, union_ty: InternPool.Index, name: Intern
 /// The compiler's `failWithBadMemberAccess` diagnostic: a namespace/tag lookup
 /// that misses names the container kind, the container, and the member. Used for
 /// `T.member`, the static `T.decl()` call, and a missing enum tag (`E.z`).
-/// Mirrors src/Sema.zig (kw_name + type name).
 fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error {
     const ip = sema.intern_pool;
     const src = sema.block.nodeOffset(.zero);
@@ -6678,8 +6597,8 @@ fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: Intern
         // that carries no namespace (`u8.foo()`); name it via its printed form.
         else => return sema.fail(sema.block, src, "type '{f}' has no member named '{s}'", .{ Type.fromIndex(container_ty).fmt(ip), ip.stringSlice(name) }),
     };
-    // Mirror the compiler's `main_struct_inst` arm: a miss on the file-root struct
-    // reads "root source file struct". `typeDeclInst` is null for a generated tag.
+    // A miss on the file-root struct reads "root source file struct".
+    // `typeDeclInst` is null for a generated tag.
     const decl_inst: ?Zir.Inst.Index = switch (key) {
         .struct_type => |st| st.id.declInst(),
         .union_type => |ut| ut.id.declInst(),
@@ -6806,7 +6725,7 @@ pub fn structFieldDefault(
         // AstGen compiles the default with `coerced_ty = decl_inst.toRef()`, so a
         // decl literal in it (`= .foo`) takes its result type from the field's
         // decl inst; bind that to the resolved field type before evaluating, then
-        // restore. Mirrors the compiler's inst_map put/remove around the init body.
+        // restore.
         try sema.results.put(sema.gpa, cf.decl_inst, .{ .index = ty });
         const raw = sema.resolveInlineBody(body, cf.decl_inst);
         _ = sema.results.remove(cf.decl_inst);
@@ -6877,8 +6796,7 @@ pub fn unionFieldByName(
 }
 
 /// A field's explicit `align(N)` in bytes, or null when it has no alignment body.
-/// The `field.align_body` an iterator yields for struct and union fields; mirrors
-/// the compiler's `explicitFieldAlignment` collapsing to null when unspecified.
+/// The `field.align_body` an iterator yields for struct and union fields.
 fn fieldAlignBytes(sema: *Sema, align_body: ?[]const Zir.Inst.Index, decl_inst: Zir.Inst.Index) Error!?u64 {
     const body = align_body orelse return null;
     return try sema.resolveUsizeInt(try sema.resolveInlineBody(body, decl_inst), "field alignment");
@@ -6967,12 +6885,6 @@ pub fn unionFieldNameAt(sema: *Sema, union_ty: InternPool.Index, index: u32) Err
     return null;
 }
 
-/// The union's auto-generated tag enum: an `enum_type` whose identity is the
-/// union index alone (`generated_union`) and whose fields are the union's,
-/// resolved through that back-reference. Mirrors the compiler's
-/// `generated_union_tag` container: `owner_union` set, `zir_index`/`captures`
-/// empty. Every auto-layout union has one, and its tag values drive the
-/// active-field check.
 fn failUntaggedUnionCmp(sema: *Sema) Error {
     return sema.fail(sema.block, sema.block.nodeOffset(.zero), "comparison of union and enum literal is only valid for tagged union types", .{});
 }
@@ -7005,7 +6917,7 @@ pub fn isNoPossibleValue(sema: *Sema, ty: InternPool.Index) Error!bool {
     return switch (ip.indexToKey(ty)) {
         .simple_type => |s| s == .noreturn or s == .anyopaque,
         // A zero-length array without a sentinel has one value; otherwise it is
-        // NPV iff its element is (mirrors classify's array arm).
+        // NPV iff its element is.
         .array_type => |arr| arr.len != 0 and arr.sentinel == .none and try sema.isNoPossibleValue(arr.child),
         .tuple_type => |tup| {
             for (tup.types) |field_ty| if (try sema.isNoPossibleValue(field_ty)) return true;
@@ -7138,7 +7050,7 @@ fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error
 /// Resolve a declared enum's fields from its ZIR into the InternPool once, then
 /// return the stored view. The tag type and each field's name and (auto or
 /// explicit) value are read in the enum's own ZIR frame; subsequent calls read the
-/// cache. Mirrors the compiler resolving `LoadedEnumType`'s fields lazily.
+/// cache.
 fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.EnumFields {
     const ip = sema.intern_pool;
     if (ip.enumFields(enum_ty)) |f| return f;
@@ -7178,8 +7090,7 @@ fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.En
 
 /// `enumFieldScan` for a union's generated tag enum: the fields are the union's,
 /// auto-numbered from 0. The int tag type is `union(enum(T))`'s explicit `T`, else
-/// the auto smallest-unsigned. Mirrors the compiler treating the generated tag as
-/// an ordinary auto enum whose int mode is explicit only for `tagged_enum_explicit`.
+/// the auto smallest-unsigned.
 fn generatedTagScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?EnumMatchResult {
     const ip = sema.intern_pool;
     const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
@@ -7208,8 +7119,8 @@ fn generatedTagScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Er
 
 /// The integer tag type of an enum -- an explicit `enum(T)` backing (or a
 /// `union(enum(T))`'s explicit `T` for a generated tag enum), else the auto
-/// smallest-unsigned. Mirrors `LoadedEnumType.int_tag_type`, and is the single
-/// source `enumFieldScan`/`generatedTagScan` draw the tag type from for coercion.
+/// smallest-unsigned. The single source `enumFieldScan`/`generatedTagScan` draw
+/// the tag type from for coercion.
 pub fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Index {
     const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
     // A reified enum has no ZIR; its tag type is stored. (A declared enum's fields
@@ -7240,7 +7151,7 @@ pub fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool
 }
 
 /// Whether an enum is non-exhaustive (has a `_` field). A union's generated tag
-/// enum is always exhaustive. Mirrors `LoadedEnumType.nonexhaustive`.
+/// enum is always exhaustive.
 fn enumNonexhaustive(sema: *Sema, enum_ty: InternPool.Index) Error!bool {
     const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
     if (et.id.generatedUnion() != .none) return false;
@@ -7289,14 +7200,13 @@ fn enumTagIntValue(sema: *Sema, tag_ty: InternPool.Index, value: i128) Error!Int
     return (try sema.coerceValueToType(.{ .index = raw }, tag_ty, "enum tag")).index;
 }
 
-/// The field index of `name`, or null if the enum has no such field. Mirrors the
-/// compiler's `Type.enumFieldIndex` / `LoadedEnumType.nameIndex`.
+/// The field index of `name`, or null if the enum has no such field.
 fn enumFieldIndex(sema: *Sema, enum_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?u32 {
     return if (try sema.enumFieldScan(enum_ty, .{ .name = name })) |m| m.index else null;
 }
 
 /// The field index whose tag value is `tag` (an `enum_tag` or bare `int` value),
-/// or null if none. Mirrors `Type.enumTagFieldIndex` / `LoadedEnumType.tagValueIndex`.
+/// or null if none.
 fn enumTagFieldIndex(sema: *Sema, enum_ty: InternPool.Index, tag: Value) Error!?u32 {
     const int = switch (sema.intern_pool.indexToKey(tag.index)) {
         .enum_tag => |et| et.int,
@@ -7306,12 +7216,12 @@ fn enumTagFieldIndex(sema: *Sema, enum_ty: InternPool.Index, tag: Value) Error!?
     return if (try sema.enumFieldScan(enum_ty, .{ .value = sema.intAsI128(int).? })) |m| m.index else null;
 }
 
-/// The name of field `index`. Mirrors `Type.enumFieldName`.
+/// The name of field `index`.
 fn enumFieldName(sema: *Sema, enum_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
     return if (try sema.enumFieldScan(enum_ty, .{ .index = index })) |m| m.name else null;
 }
 
-/// The `enum_tag` value of field `index`. Mirrors `pt.enumValueFieldIndex`.
+/// The `enum_tag` value of field `index`.
 pub fn enumValueFieldIndex(sema: *Sema, enum_ty: InternPool.Index, index: u32) Error!?Value {
     return if (try sema.enumFieldScan(enum_ty, .{ .index = index })) |m| m.tag else null;
 }
@@ -7336,8 +7246,7 @@ fn intAsI128(sema: *Sema, index: InternPool.Index) ?i128 {
 
 /// `enum_from_int lhs, rhs`: `@enumFromInt(n)` -- the enum tag whose integer value
 /// is `n`. `lhs` is the destination enum type, `rhs` the integer. A value with no
-/// matching tag is rejected as the compiler's `enumHasInt` check does. Mirrors
-/// zirEnumFromInt's exhaustive comptime arm.
+/// matching tag is rejected as the compiler's `enumHasInt` check does.
 fn evalEnumFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
@@ -7350,8 +7259,8 @@ fn evalEnumFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const value = sema.intAsI128(operand.index) orelse {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@enumFromInt: operand is not an integer", .{});
     };
-    // Mirror `intToEnum`: the value must name a field (`tagValueIndex`), then take
-    // that field's canonical tag (`enumValueFieldIndex`).
+    // The value must name a field (`tagValueIndex`), then take that field's
+    // canonical tag (`enumValueFieldIndex`).
     if (try sema.enumTagFieldIndex(dest_ty, operand)) |field_index|
         return (try sema.enumValueFieldIndex(dest_ty, field_index)).?;
     const name = ip.stringSlice(ip.indexToKey(dest_ty).enum_type.name);
@@ -7359,7 +7268,6 @@ fn evalEnumFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// `int_from_bool` (`@intFromBool(b)`): `false` -> `0`, `true` -> `1`, as `u1`.
-/// Mirrors zirIntFromBool.
 fn evalIntFromBool(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand = try sema.resolveRef(sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node.operand);
     const u1_type = try sema.intern_pool.get(.{ .int_type = .{ .signedness = .unsigned, .bits = 1 } });
@@ -7371,7 +7279,7 @@ fn evalIntFromBool(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// `enum_literal` (`.foo`): a standalone literal carrying only the name (type
 /// `enum_literal_type`); it coerces to a concrete enum/union on use, e.g. in
-/// `e == .foo`. Mirrors zirEnumLiteral.
+/// `e == .foo`.
 fn evalEnumLiteral(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const bytes = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir);
     const name = try sema.intern_pool.getOrPutString(sema.gpa, bytes);
@@ -7392,9 +7300,9 @@ fn evalDeclLiteral(sema: *Sema, inst: Zir.Inst.Index, comptime do_coerce: bool) 
 }
 
 /// Resolve `.name` against the result type `orig_ty`, then (for `decl_literal`)
-/// coerce the member to it. Mirrors zirDeclLiteral -> analyzeDeclLiteral: peel any
-/// error-union / optional / single-pointer wrapper; a generic-poison, enum-literal,
-/// or error-set result type degrades to a plain `enum_literal` value.
+/// coerce the member to it: peel any error-union / optional / single-pointer
+/// wrapper; a generic-poison, enum-literal, or error-set result type degrades to a
+/// plain `enum_literal` value.
 fn analyzeDeclLiteral(sema: *Sema, orig_ty: InternPool.Index, name: InternPool.NullTerminatedString, comptime do_coerce: bool) Error!Value {
     const ip = sema.intern_pool;
     if (orig_ty == .generic_poison_type) return .{ .index = try ip.get(.{ .enum_literal = name }) };
@@ -7414,8 +7322,7 @@ fn analyzeDeclLiteral(sema: *Sema, orig_ty: InternPool.Index, name: InternPool.N
 }
 
 /// Type-level member access `T.name`: a namespace declaration takes precedence,
-/// then an enum tag or a union's tag-enum value. Mirrors the `.type` case of the
-/// compiler's `fieldVal` (union/enum/struct arms).
+/// then an enum tag or a union's tag-enum value.
 fn fieldValOnType(sema: *Sema, ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!Value {
     switch (sema.intern_pool.indexToKey(ty)) {
         .enum_type => {
@@ -7438,9 +7345,8 @@ fn fieldValOnType(sema: *Sema, ty: InternPool.Index, name: InternPool.NullTermin
     }
 }
 
-/// `int_from_enum operand`: the integer tag of an enum value. Mirrors
-/// zirIntFromEnum's comptime arm -- returns the `enum_tag`'s stored int (already
-/// typed as the enum's integer tag type).
+/// `int_from_enum operand`: the integer tag of an enum value -- the `enum_tag`'s
+/// stored int (already typed as the enum's integer tag type).
 fn evalIntFromEnum(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const operand = try sema.resolveRef(un_node.operand);
@@ -7453,14 +7359,13 @@ fn evalIntFromEnum(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// `tag_name operand`: `@tagName(e)` -- the name of an enum value's tag as a
 /// `*const [N:0]u8` string literal. Finds the tag by its integer value, then
-/// builds the string from the field name. Mirrors zirTagName's comptime arm,
-/// which returns `addNullTerminatedStrLit(field_name)`.
+/// builds the string from the field name.
 fn evalTagName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const operand = try sema.resolveRef(un_node.operand);
-    // Mirrors zirTagName's operand switch: an enum tag names itself; a union names
-    // its active field via its tag, but only if the union is tagged.
+    // An enum tag names itself; a union names its active field via its tag, but
+    // only if the union is tagged.
     const tag: InternPool.Key.EnumTag = switch (ip.indexToKey(operand.index)) {
         .enum_tag => |et| et,
         .un => |uv| blk: {
@@ -7481,8 +7386,7 @@ fn evalTagName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// Whether a union is tagged (`union(enum)` / `union(T)` / `union(enum(T))`), so
 /// its active field is a first-class enum tag reachable by `@tagName`/`switch`.
-/// Read from the union decl's ZIR `kind`, mirroring `unionTagType != null`
-/// (`tag_usage == .tagged`). Auto/extern/packed unions are untagged.
+/// Read from the union decl's ZIR `kind`. Auto/extern/packed unions are untagged.
 fn unionIsTagged(sema: *Sema, union_ty: InternPool.Index) Error!bool {
     // A reified union has no ZIR; it is tagged iff it stores an explicit tag enum.
     if (sema.intern_pool.unionFields(union_ty)) |f| return f.tag_type != .none;
@@ -7521,7 +7425,7 @@ pub fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
 /// only valid for the active field unless it is being initialized, so a
 /// non-initializing pointer to an inactive field is rejected here (as
 /// `unionFieldPtr`'s comptime branch does). The field pointer inherits the parent
-/// pointer's constness. Mirrors zirFieldPtr / zirStructInitFieldPtr.
+/// pointer's constness.
 fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index, comptime initializing: bool) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const ip = sema.intern_pool;
@@ -7534,18 +7438,16 @@ fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index, comptime initializing: bool) 
 
 /// `&object.name` shared by `field_ptr` / `struct_init_field_ptr` (name from ZIR)
 /// and `field_ptr_named` (`&@field(object, "name")` / an `@field` lvalue, name
-/// from a comptime string). Mirrors the compiler's shared `fieldPtr`. `object_ptr`
-/// is the resolved operand pointer; `initializing` skips the active-field check on
-/// a union field being written.
+/// from a comptime string). `object_ptr` is the resolved operand pointer;
+/// `initializing` skips the active-field check on a union field being written.
 fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedString, comptime initializing: bool) Error!?Value {
     const ip = sema.intern_pool;
     const parent_ty = ip.indexToKey(object_ptr.index).ptr.ty;
     const object_ty = ip.indexToKey(parent_ty).ptr_type.child;
     // Zig dereferences a single pointer during field lookup: `p.field` where `p`
-    // is a `*T` (so the operand is `*const *T`) reads the field on `T`. Mirrors
-    // `fieldPtr`'s `is_pointer_to` / `inner_ty` -- load the operand to the inner
-    // pointer and use that as the field-pointer base; a non-pointer container is
-    // unchanged (`inner_ty == object_ty`, `base_ptr == object_ptr`).
+    // is a `*T` (so the operand is `*const *T`) reads the field on `T`. Load the
+    // operand to the inner pointer and use that as the field-pointer base; a
+    // non-pointer container is unchanged (`inner_ty == object_ty`, `base_ptr == object_ptr`).
     const is_pointer_to = ip.indexToKey(object_ty) == .ptr_type and
         ip.indexToKey(object_ty).ptr_type.flags.size == .one;
     const container_ty = if (is_pointer_to) ip.indexToKey(object_ty).ptr_type.child else object_ty;
@@ -7554,8 +7456,7 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
 
     // Namespace decl access on a type (`&S.decl`, e.g. the intermediate `S.A` in
     // `S.A.y`): the operand points at a type value. Resolve the decl in that type's
-    // namespace and return a pointer to it. Mirrors fieldPtr's `.type` arm, whose
-    // `namespaceLookupRef` yields a `decl_ref`.
+    // namespace and return a pointer to it.
     if (container_ty == .type_type) {
         const container = try sema.loadValue(base_ptr);
         if (try sema.containerDeclByName(container.index, name)) |decl_val|
@@ -7563,9 +7464,8 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
         return sema.failBadMemberAccess(container.index, name);
     }
 
-    // `.array` / `.pointer` (slice) fieldPtr arms: `arr.len`, `slice.len`/`.ptr`
-    // taken by pointer. These fields are computed values, not `.field` projections,
-    // so return a `*const` to the value (the compiler's `uavRef` / field ptr).
+    // `arr.len`, `slice.len`/`.ptr` taken by pointer: these fields are computed
+    // values, not `.field` projections, so return a `*const` to the value.
     switch (ip.indexToKey(container_ty)) {
         .array_type => |at| {
             if (name.eqlSlice("len", ip))
@@ -7593,8 +7493,7 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
         },
         .struct_type => (try sema.structFieldByName(container_ty, name)) orelse
             return sema.failBadStructFieldAccess(container_ty, name),
-        // A by-pointer field access on a non-aggregate, non-type operand. Mirrors
-        // fieldPtr's fallthrough "type '{f}' does not support field access".
+        // A by-pointer field access on a non-aggregate, non-type operand.
         else => {
             return sema.fail(sema.block, sema.block.nodeOffset(.zero), "type '{f}' does not support field access", .{Type.fromIndex(container_ty).fmt(ip)});
         },
@@ -7627,13 +7526,6 @@ fn containerParent(sema: *Sema, container_ty: InternPool.Index) InternPool.Index
     };
 }
 
-/// Look up a member declaration by name in a container type's namespace (`P.id`)
-/// and return its evaluated value. Iterates the container decl's declarations in
-/// its source ZIR (swapped in for a cross-line type, as `structFieldByName`
-/// does), matching by name. Returns null if no declaration matches. Unnamed
-/// members (`comptime` blocks, tests) are skipped. Works for any nominal
-/// container -- struct, union, or enum -- since all share a decl namespace (the
-/// compiler's namespace lookup is container-kind agnostic).
 /// The ZIR coordinates of a container type's namespace (`struct`/`union`/`enum`),
 /// or null for a non-container. Shared by the decl-lookup walkers so the
 /// container-kind switch lives in one place.
@@ -7661,11 +7553,17 @@ fn containerNamespace(sema: *Sema, container_ty: InternPool.Index) ?ContainerNam
     };
 }
 
+/// Look up a member declaration by name in a container type's namespace (`P.id`)
+/// and return its evaluated value. Iterates the container decl's declarations in
+/// its source ZIR (swapped in for a cross-line type, as `structFieldByName`
+/// does), matching by name. Returns null if no declaration matches. Unnamed
+/// members (`comptime` blocks, tests) are skipped. Works for any nominal
+/// container -- struct, union, or enum -- since all share a decl namespace (the
+/// compiler's namespace lookup is container-kind agnostic).
 fn containerDeclByName(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
     const ns = sema.containerNamespace(container_ty) orelse return null;
     // Decls are not stored on the type; intern each decl name as we scan and
-    // compare interned handles against the query, as the compiler's namespace
-    // lookup does.
+    // compare interned handles against the query.
     const frame = try sema.enterSourceZir(ns.source_zir_id, "container decl");
     defer frame.restore(sema);
     for (sema.zir.typeDecls(ns.decl_inst)) |decl_inst| {
@@ -7718,28 +7616,26 @@ fn containerDeclByName(sema: *Sema, container_ty: InternPool.Index, name: Intern
 
 /// `field_ptr_load`: read `object.field` -- a struct field when `object` is a
 /// struct value, or a member declaration when it is a struct type (the split
-/// below). Mirrors zirFieldPtrLoad -> fieldPtrLoad.
+/// below).
 fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const ip = sema.intern_pool;
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.Field, pl_node.payload_index).data;
-    // Intern the field name once (as `zirFieldVal` does), then reuse the handle for
-    // every arm below -- the `len` check, the namespace lookups, and diagnostics.
+    // Intern the field name once, then reuse the handle for every arm below --
+    // the `len` check, the namespace lookups, and diagnostics.
     const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.field_name_start));
     const object = try sema.loadValue(try sema.resolveRef(extra.lhs));
     return sema.fieldPtrLoad(object, name);
 }
 
 /// `object.name` read shared by `field_ptr_load` (name from ZIR) and
-/// `field_ptr_named_load` (`@field`, name from a comptime string). Mirrors the
-/// compiler's `fieldPtrLoad`, which both `zirFieldPtrLoad` and
-/// `zirFieldPtrNamedLoad` call. `object` is the already-loaded operand value.
+/// `field_ptr_named_load` (`@field`, name from a comptime string). `object` is the
+/// already-loaded operand value.
 fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedString) Error!?Value {
     const ip = sema.intern_pool;
 
-    // Mirror fieldVal, which switches on the object's type tag. A *type* used as a
-    // value (`S.decl`, `E.tag`) is the `.type` arm: resolve the name in the type's
+    // A *type* used as a value (`S.decl`, `E.tag`) resolves the name in the type's
     // namespace. We look decls/tags up from the type's ZIR rather than a persistent
     // Namespace (no Zcu).
     switch (ip.indexToKey(object.index)) {
@@ -7755,34 +7651,29 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
     }
 
     // Otherwise `object` is a data value; dispatch on its (inner) type, auto-
-    // dereferencing a single pointer to the aggregate it addresses -- as fieldVal
-    // does for a single-pointer-to-array/struct. A string literal is a
-    // `*const [N:0]u8`, and `ref`-before-field nests one more pointer, so follow
-    // the chain.
+    // dereferencing a single pointer to the aggregate it addresses. A string literal
+    // is a `*const [N:0]u8`, and `ref`-before-field nests one more pointer, so
+    // follow the chain.
     var inner = object;
     while (ip.indexToKey(inner.index) == .ptr) inner = try sema.loadValue(inner);
     const inner_ty = inner.typeOf(ip).toIndex();
     switch (ip.indexToKey(inner_ty)) {
-        // `.array` arm: only `len` (the array length as a `usize`).
         .array_type => |at| {
             if (name.eqlSlice("len", ip))
                 return .{ .index = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = at.len } }) };
             return sema.failNoMember(inner_ty, name);
         },
-        // `.@"struct"` arm: the named field of a struct value.
         .struct_type => {
             const fld = (try sema.structFieldByName(inner_ty, name)) orelse
                 return sema.failBadStructFieldAccess(inner_ty, name);
             return .{ .index = InternPool.aggregateElementAt(ip.indexToKey(inner.index).aggregate, fld.index) };
         },
-        // `.@"union"` arm: the accessed field must be the active one, mirroring
-        // unionFieldVal's `active_index == field_index` check.
+        // `.@"union"` arm: the accessed field must be the active one.
         .union_type => {
             const fld = (try sema.unionFieldByName(inner_ty, name)) orelse
                 return sema.failBadUnionFieldAccess(inner_ty, name);
             return try sema.loadUnionField(inner.index, fld.index);
         },
-        // `.pointer` arm (a slice): `.len` / `.ptr` read from the slice value.
         .ptr_type => |ptr_ty| {
             if (ptr_ty.flags.size == .slice) {
                 const s = ip.indexToKey(inner.index).slice;
@@ -7797,14 +7688,14 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
 
 /// The compiler's `"no member named '{f}' in '{f}'"` diagnostic for a field
 /// access on a type that has no such member (an array without `len`/`ptr`, or a
-/// non-aggregate). Mirrors fieldVal's array/else arms.
+/// non-aggregate).
 fn failNoMember(sema: *Sema, ty: InternPool.Index, name: InternPool.NullTerminatedString) Error {
     return sema.fail(sema.block, sema.block.nodeOffset(.zero), "no member named '{s}' in '{f}'", .{ sema.intern_pool.stringSlice(name), Type.fromIndex(ty).fmt(sema.intern_pool) });
 }
 
 /// `field_ptr_named_load` (`@field(object, "name")`): the same read as
 /// `field_ptr_load`, but the field name is a comptime string operand rather than
-/// a ZIR-encoded name. Mirrors zirFieldPtrNamedLoad -> fieldPtrLoad.
+/// a ZIR-encoded name.
 fn evalFieldPtrNamedLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
@@ -7815,8 +7706,7 @@ fn evalFieldPtrNamedLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// `field_ptr_named` (`&@field(object, "name")`, or `@field(...) = v`): the
-/// pointer form of `@field`, name from a comptime string. Mirrors
-/// zirFieldPtrNamed -> fieldPtr.
+/// pointer form of `@field`, name from a comptime string.
 fn evalFieldPtrNamed(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
@@ -7830,8 +7720,7 @@ fn evalFieldPtrNamed(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// `@hasDecl` -- to an interned name. The operand is a comptime `[]const u8`: a
 /// string literal (`*const [N:0]u8`) or a slice of one. Unwrap to the backing
 /// `u8` aggregate, a start offset, and a length (as `aggregateElement` does),
-/// then read each byte. Mirrors the compiler's `resolveConstStringIntern`, which
-/// coerces the operand to `[]const u8` and interns its bytes.
+/// then read each byte.
 fn resolveConstStringIntern(sema: *Sema, ref: Zir.Inst.Ref) Error!InternPool.NullTerminatedString {
     const ip = sema.intern_pool;
     var agg = try sema.resolveRef(ref);
@@ -7864,17 +7753,16 @@ fn resolveConstStringIntern(sema: *Sema, ref: Zir.Inst.Ref) Error!InternPool.Nul
     return try ip.getOrPutString(sema.gpa, bytes);
 }
 
-/// `@compileError(msg)`: emit `msg` as a diagnostic and fail. Mirrors
-/// zirCompileError -> `resolveConstString` + `fail("{s}", msg)`.
+/// `@compileError(msg)`: emit `msg` as a diagnostic and fail.
 fn evalCompileError(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const msg = try sema.resolveConstStringIntern(un_node.operand);
     return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "{s}", .{sema.intern_pool.stringSlice(msg)});
 }
 
-/// `@setEvalBranchQuota(n)`: raise the comptime branch-count ceiling. Mirrors
-/// zirSetEvalBranchQuota; the `allow_memoize` clear has no analog here, as this
-/// evaluator does not memoize comptime calls.
+/// `@setEvalBranchQuota(n)`: raise the comptime branch-count ceiling. The
+/// `allow_memoize` clear has no analog here, as this evaluator does not memoize
+/// comptime calls.
 fn evalSetEvalBranchQuota(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const quota = try sema.resolveInt(try sema.resolveRef(un_node.operand), .u32_type, "@setEvalBranchQuota");
@@ -7883,16 +7771,15 @@ fn evalSetEvalBranchQuota(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// `@setRuntimeSafety(b)`: validate the bool operand, then no-op -- this
-/// comptime-only evaluator emits no runtime safety checks to toggle. Mirrors
-/// zirSetRuntimeSafety minus the `block.want_safety` write (no runtime block).
+/// comptime-only evaluator emits no runtime safety checks to toggle (no runtime
+/// block to set `want_safety` on).
 fn evalSetRuntimeSafety(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     _ = try sema.coerceValueToType(try sema.resolveRef(un_node.operand), .bool_type, "@setRuntimeSafety");
     return null;
 }
 
-/// `@typeName(T)`: the fully-qualified type name as a `*const [N:0]u8`. Mirrors
-/// zirTypeName -> `getOrPutStringFmt("{f}", ty.fmt)` -> `addNullTerminatedStrLit`.
+/// `@typeName(T)`: the fully-qualified type name as a `*const [N:0]u8`.
 fn evalTypeName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const ty = try sema.resolveDestType(un_node.operand, "@typeName");
@@ -7902,8 +7789,7 @@ fn evalTypeName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return try sema.internStringLiteral(name.written());
 }
 
-/// `@errorName(e)`: the error's name as a `*const [N:0]u8`. Mirrors zirErrorName's
-/// comptime path: coerce to `anyerror`, read `err.name`, `addNullTerminatedStrLit`.
+/// `@errorName(e)`: the error's name as a `*const [N:0]u8`.
 fn evalErrorName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
@@ -7913,8 +7799,7 @@ fn evalErrorName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// `@unionInit(U, "field", init)`: build the union value with `field` active.
-/// Mirrors zirUnionInit's comptime path: resolve the field's tag value, coerce the
-/// payload to the field type, and intern the union. A packed union bitcasts the
+/// A packed union bitcasts the
 /// payload to its backing integer -- the comptime-only evaluator has no bit layout
 /// to do that, so a (reified) packed union is rejected rather than mis-built as a
 /// tagged value; a declared union is modeled as `.auto`.
@@ -7940,7 +7825,7 @@ fn evalUnionInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// `field_type_ref`: the type of `container`'s field named `field_name`, as a type
 /// value. AstGen emits it to type the `init` argument of `@unionInit` (and struct
-/// field inits) against the field's declared type. Mirrors zirFieldTypeRef.
+/// field inits) against the field's declared type.
 fn evalFieldTypeRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
@@ -7965,13 +7850,12 @@ fn evalFieldTypeRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = field_ty };
 }
 
-/// `E1 || E2`: the error set that is the union of two error sets. Mirrors
-/// zirMergeErrorSets: two `bool` operands are the "`||` vs `or`" mistake; each
-/// operand must resolve to an error-set type; either side being `anyerror` yields
-/// `anyerror`; otherwise merge the name lists. The compiler's
-/// `inferred_error_set_type` arms have no analog -- this evaluator mints no
-/// inferred error sets (see [[no_inferred_error_sets]]), so both resolved operands
-/// are always `error_set_type`.
+/// `E1 || E2`: the error set that is the union of two error sets. Two `bool`
+/// operands are the "`||` vs `or`" mistake; each operand must resolve to an
+/// error-set type; either side being `anyerror` yields `anyerror`; otherwise merge
+/// the name lists. The compiler's `inferred_error_set_type` arms have no analog --
+/// this evaluator mints no inferred error sets, so both resolved operands are
+/// always `error_set_type`.
 fn evalMergeErrorSets(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const bin = sema.binData(inst);
@@ -7993,8 +7877,7 @@ fn evalMergeErrorSets(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = (try sema.errorSetMerge(lhs_ty, rhs_ty)).index };
 }
 
-/// Union two `error_set_type`s into one, dropping duplicate names. Mirrors
-/// `errorSetMerge`.
+/// Union two `error_set_type`s into one, dropping duplicate names.
 fn errorSetMerge(sema: *Sema, lhs_ty: InternPool.Index, rhs_ty: InternPool.Index) Error!Type {
     const ip = sema.intern_pool;
     const lhs_names = ip.indexToKey(lhs_ty).error_set_type.names;
@@ -8012,9 +7895,9 @@ fn errorSetMerge(sema: *Sema, lhs_ty: InternPool.Index, rhs_ty: InternPool.Index
 }
 
 /// `has_field` (`@hasField(T, "name")`): whether type `T` has a field named
-/// `name`. Mirrors zirHasField's type-tag switch: struct/union/enum by field or
-/// tag name, tuple by numeric index, array `len`, slice `ptr`/`len`. A type that
-/// has no fields at all is the compiler's "does not support '@hasField'" error.
+/// `name` -- struct/union/enum by field or tag name, tuple by numeric index, array
+/// `len`, slice `ptr`/`len`. A type that has no fields at all is the compiler's
+/// "does not support '@hasField'" error.
 fn evalHasField(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
@@ -8051,10 +7934,9 @@ fn evalHasField(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// `has_decl` (`@hasDecl(T, "name")`): whether container type `T` declares a
-/// member named `name`. Mirrors zirHasDecl -> a namespace lookup; the REPL's
-/// single-file model has no visibility restriction, so a present name is
-/// accessible. Scans decl names without evaluating them (as `lookupInNamespace`
-/// does), so a decl whose body would fail still counts as present.
+/// member named `name`. The REPL's single-file model has no visibility
+/// restriction, so a present name is accessible. Scans decl names without
+/// evaluating them, so a decl whose body would fail still counts as present.
 fn evalHasDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const bin = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
@@ -8065,14 +7947,14 @@ fn evalHasDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     if (sema.containerNamespace(container_type) == null) {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected struct, enum, union, or opaque; found '{f}'", .{Type.fromIndex(container_type).fmt(sema.intern_pool)});
     }
-    // getNamespace + lookupInNamespace; `.accessible` is always true in the REPL's
-    // single-file model, so a present name is the answer.
+    // `.accessible` is always true in the REPL's single-file model, so a present
+    // name is the answer.
     return .{ .index = if (try sema.containerHasDecl(container_type, decl_name)) .bool_true else .bool_false };
 }
 
 /// Whether container type `container_ty` declares a member named `name`, by
-/// scanning decl names only (no value evaluation). Mirrors the compiler's
-/// namespace name lookup; the value-resolving counterpart is `containerDeclByName`.
+/// scanning decl names only (no value evaluation). The value-resolving counterpart
+/// is `containerDeclByName`.
 fn containerHasDecl(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!bool {
     const ns = sema.containerNamespace(container_ty) orelse return false;
     const frame = try sema.enterSourceZir(ns.source_zir_id, "container decl");
@@ -8133,7 +8015,7 @@ fn storeElement(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
     const agg_ty = ip.indexToKey(base_ptr.ty).ptr_type.child;
     // A union stores only the active field's payload, so a store through
     // `&u.field` makes that field active -- a fresh `.un` with the field's tag --
-    // rather than a positional slot update. Mirrors `evalUnionInit`'s tag lookup.
+    // rather than a positional slot update.
     if (ip.indexToKey(agg_ty) == .union_type) {
         const tag_enum = try sema.unionTagEnumType(agg_ty);
         const tag = (try sema.enumValueFieldIndex(tag_enum, @intCast(f.index))).?;
@@ -8201,8 +8083,8 @@ fn storePointee(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
 /// `opt_eu_base_ptr_init`: project a result-location pointer down to the payload
 /// base it will initialize. A `*?T`/`*E!T` (or nested `*?E!T`) becomes a `*T`, so
 /// the following `struct_init_field_ptr` sees the struct/union, not the wrapper.
-/// Mirrors `optEuBasePtrInit`'s loop; a plain struct/array is already the base and
-/// falls straight out. Both projections initialize (skip the null/error check).
+/// A plain struct/array is already the base and falls straight out. Both
+/// projections initialize (skip the null/error check).
 fn evalOptEuBasePtrInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const ip = sema.intern_pool;
@@ -8220,7 +8102,7 @@ fn evalOptEuBasePtrInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// every field not written must get its default value, or -- if it has none --
 /// be a "missing field" error. The body is the list of `struct_init_field_ptr`
 /// instructions (one per explicit field), whose names give the set that was
-/// initialized. Mirrors zirValidatePtrStructInit -> validateStructInit.
+/// initialized.
 fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const datas = sema.zir.instructions.items(.data);
@@ -8235,7 +8117,7 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     // A union's single field-pointer store already set the active tag, so there is
     // nothing to default; more than one initializer is the "multiple active fields"
-    // error. Mirrors `validateUnionInit`.
+    // error.
     if (ip.indexToKey(struct_ty) == .union_type) {
         if (body.len != 1) {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "cannot initialize multiple union fields at once; unions can only have one active field", .{});
@@ -8252,8 +8134,7 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         n.* = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(fp.field_name_start));
     }
 
-    // Fill each declared field the init omitted with its default, as
-    // `finishStructInit` does.
+    // Fill each declared field the init omitted with its default.
     const count = try sema.structFieldCount(struct_ty);
     var i: u32 = 0;
     while (i < count) : (i += 1) {
@@ -8271,9 +8152,9 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// `validate_struct_init_ty` / `validate_struct_init_result_ty`: check that the
 /// named type accepts `T{ ... }` init syntax; the following `struct_init` builds
-/// the value. Returns void. Mirrors zirValidateStructInitTy -- a struct or union
-/// passes (the same ZIR drives `T{ .a = x }` for both). The result-ty form peels
-/// optional/error-union wrappers first, so `@as(?S, .{...})` validates against `S`.
+/// the value. Returns void. A struct or union passes (the same ZIR drives
+/// `T{ .a = x }` for both). The result-ty form peels optional/error-union
+/// wrappers first, so `@as(?S, .{...})` validates against `S`.
 fn evalValidateStructInitTy(sema: *Sema, inst: Zir.Inst.Index, comptime is_result_ty: bool) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const ty = (try sema.resolveRef(un_node.operand)).index;
@@ -8287,9 +8168,9 @@ fn evalValidateStructInitTy(sema: *Sema, inst: Zir.Inst.Index, comptime is_resul
 }
 
 /// `struct_init_field_type`: the type of `container_type`'s field `name`, used
-/// to coerce that field's init expression. Mirrors zirStructInitFieldType, which
-/// peels optional/error-union wrappers off `container_type` before resolving the
-/// field against the payload struct or union.
+/// to coerce that field's init expression. Peels optional/error-union wrappers
+/// off `container_type` before resolving the field against the payload struct or
+/// union.
 fn evalStructInitFieldType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const datas = sema.zir.instructions.items(.data);
     const ft = sema.zir.extraData(Zir.Inst.FieldType, datas[@intFromEnum(inst)].pl_node.payload_index).data;
@@ -8311,9 +8192,8 @@ fn evalStructInitFieldType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// returning the value directly. Each item pairs a `struct_init_field_type`
 /// instruction (naming the container type and field) with an init expression;
 /// the struct type is read from the first item. Fields left unwritten take their
-/// declared default, or are a missing-field error. Mirrors zirStructInit's
-/// struct arm + finishStructInit; the union arm builds a union value from the
-/// single initialized field. `struct_init_ref` (`is_ref`) is `struct_init` +
+/// declared default, or are a missing-field error. The union arm builds a union
+/// value from the single initialized field. `struct_init_ref` (`is_ref`) is `struct_init` +
 /// `ref`: a pointer to the fresh value. The `.{ ... }` result-location form goes
 /// through `validate_ptr_struct_init`.
 fn evalStructInit(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Error!?Value {
@@ -8361,8 +8241,7 @@ fn evalStructInit(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Erro
 /// `struct_init`'s union arm: `U{ .a = x }` builds a union value. A union init
 /// names exactly one field; the tag is that field's `enum_tag` in the union's tag
 /// enum (looked up by name, so a `union(E)` uses `E`'s value for the field), the
-/// payload the coerced init. Mirrors zirStructInit's union branch: unionFieldIndex
-/// -> enumValueFieldIndex tag -> internUnion.
+/// payload the coerced init.
 fn evalStructInitUnion(sema: *Sema, union_ty: InternPool.Index, result_ty: InternPool.Index, inst: Zir.Inst.Index, comptime is_ref: bool) Error!Value {
     const ip = sema.intern_pool;
     const datas = sema.zir.instructions.items(.data);
@@ -8385,7 +8264,7 @@ fn evalStructInitUnion(sema: *Sema, union_ty: InternPool.Index, result_ty: Inter
         return sema.failBadMemberAccess(tag_enum, name);
     // A `union(E)` requires its fields to match `E`'s in order and count; the
     // active-field check reads the tag's position, so a mismatch would misreport
-    // it. Mirrors the compiler's union/tag field-order validation.
+    // it.
     if (tag_index != field.index) {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "union field order does not match tag enum field order", .{});
     }
@@ -8399,8 +8278,8 @@ fn evalStructInitUnion(sema: *Sema, union_ty: InternPool.Index, result_ty: Inter
 }
 
 /// `struct_init_empty`: `T{}` -- every field takes its default. Just the
-/// zero-explicit-field case of `struct_init`. Mirrors zirStructInitEmpty's
-/// struct arm (array/vector/union arms not built here).
+/// zero-explicit-field case of `struct_init`. Only the struct arm is built here
+/// (array/vector/union forms are not).
 fn evalStructInitEmpty(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const struct_ty = (try sema.resolveRef(un_node.operand)).index;
@@ -8411,9 +8290,8 @@ fn evalStructInitEmpty(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// The value of `T{}` for a struct: every field takes its declared default (or a
-/// missing-field error). Mirrors the compiler's `structInitEmpty`; shared by the
-/// typed (`struct_init_empty`) and result-typed (`struct_init_empty_result`)
-/// forms.
+/// missing-field error). Shared by the typed (`struct_init_empty`) and
+/// result-typed (`struct_init_empty_result`) forms.
 fn structInitEmpty(sema: *Sema, struct_ty: InternPool.Index) Error!Value {
     const count = try sema.structFieldCount(struct_ty);
     const elems = try sema.gpa.alloc(InternPool.Index, count);
@@ -8426,8 +8304,8 @@ fn structInitEmpty(sema: *Sema, struct_ty: InternPool.Index) Error!Value {
 /// comes from the surrounding result type. An untyped (generic-poison) operand --
 /// `.{}` bound to an `anytype` parameter -- is the empty tuple; a concrete struct
 /// fills its defaults. The result type may wrap the container in `?`/`E!` (from
-/// `@as(?S, .{})`), so build against the peeled base and coerce back. Mirrors
-/// zirStructInitEmptyResult; the `is_ref` variant returns a `*const` to the value.
+/// `@as(?S, .{})`), so build against the peeled base and coerce back. The
+/// `is_ref` variant returns a `*const` to the value.
 fn evalStructInitEmptyResult(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const init_ty = try sema.resolveDestType(un_node.operand, "struct init");
@@ -8451,7 +8329,7 @@ fn evalStructInitEmptyResult(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref:
 }
 
 /// The value of `T{}` for an array or vector: valid only at length 0, yielding the
-/// empty aggregate. Mirrors the compiler's `arrayInitEmpty`.
+/// empty aggregate.
 fn arrayInitEmpty(sema: *Sema, obj_ty: InternPool.Index) Error!Value {
     const key = sema.intern_pool.indexToKey(obj_ty);
     const arr_len = switch (key) {
@@ -8470,8 +8348,8 @@ fn arrayInitEmpty(sema: *Sema, obj_ty: InternPool.Index) Error!Value {
 /// missing-field error, then intern the aggregate. The value is built at the
 /// peeled `struct_ty` and coerced to `result_ty` -- identical unless the result
 /// type wraps the struct in `?`/`E!`, where the coercion re-wraps it. `is_ref`
-/// returns a `*const` pointer to the finished (wrapped) value. The
-/// finishStructInit analog shared by both the explicit-field and empty forms.
+/// returns a `*const` pointer to the finished (wrapped) value. Shared by both the
+/// explicit-field and empty forms.
 fn finishStructInit(sema: *Sema, struct_ty: InternPool.Index, result_ty: InternPool.Index, elems: []InternPool.Index, comptime is_ref: bool) Error!Value {
     const ip = sema.intern_pool;
     // Each unwritten field takes its declared default, resolved by the same pass
@@ -8511,8 +8389,7 @@ fn evalRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// constness and alignment). The pointee is already interned, so bake it into a
 /// `.uav` (anonymous-decl) pointer rather than an ephemeral `comptime_allocs`
 /// slot: unlike a `.comptime_alloc` pointer, a uav survives past the line that
-/// created it, since `comptime_allocs` is reset each analysis. Mirrors the
-/// compiler storing an unnamed constant as an anon decl.
+/// created it, since `comptime_allocs` is reset each analysis.
 fn materializeConstPtr(sema: *Sema, value: Value) Error!Value {
     const ip = sema.intern_pool;
     const ptr_ty = try ip.internPtrType(.{
@@ -8538,7 +8415,7 @@ fn evalElemPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// `elem_ptr_node lhs, rhs`: a pointer to element `rhs` of the array behind `lhs`
 /// (`&arr[i]`, and the pointer AstGen forms for `arr[i].f`). Builds an `.arr_elem`
-/// projection, as the compiler's `elemPtr` does. Mirrors zirElemPtrNode -> elemPtr.
+/// projection.
 fn evalElemPtrNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const bin = sema.binData(inst);
     const array_ptr = try sema.resolveRef(bin.lhs);
@@ -8548,7 +8425,7 @@ fn evalElemPtrNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// `array_init_elem_ptr`: the pointer to element `index` (an immediate) of the
 /// array being initialized by a `.{ ... }` result-location init; each is a
-/// `store_node` target. Mirrors zirArrayInitElemPtr -> elemPtrArray.
+/// `store_node` target.
 fn evalArrayInitElemPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const datas = sema.zir.instructions.items(.data);
     const extra = sema.zir.extraData(Zir.Inst.ElemPtrImm, datas[@intFromEnum(inst)].pl_node.payload_index).data;
@@ -8559,7 +8436,6 @@ fn evalArrayInitElemPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// Build a single-element pointer to element `index` of the array behind
 /// `array_ptr` (an `.arr_elem` projection into the no-layout aggregate). Shared by
 /// `elem_ptr_node` (`&a[i]`) and `array_init_elem_ptr` (a `.{...}` store target).
-/// Mirrors the compiler's `elemPtrArray`.
 fn elemPtr(sema: *Sema, array_ptr: Value, index: u64) Error!Value {
     const ip = sema.intern_pool;
     const parent_ty = ip.indexToKey(array_ptr.index).ptr.ty;
@@ -8591,8 +8467,7 @@ fn elemPtr(sema: *Sema, array_ptr: Value, index: u64) Error!Value {
 /// `slice_ptr` (whose pointee type is `slice_ty`). The slice's `ptr` field is a
 /// many-pointer into a backing array; the element pointer is an `.arr_elem` into
 /// that array at `start + index`, where `start` is the sub-slice offset the many-
-/// pointer already carries (`a[start..]`). Mirrors the compiler's `elemPtrSlice` /
-/// `Value.ptrElem`. Bounds-checks against the slice's own `len`.
+/// pointer already carries (`a[start..]`). Bounds-checks against the slice's own `len`.
 fn elemPtrSlice(sema: *Sema, slice_ptr: Value, index: u64, slice_ty: InternPool.Index) Error!Value {
     const ip = sema.intern_pool;
     const slice_val = try sema.loadValue(slice_ptr);
@@ -8631,8 +8506,7 @@ fn indexableInfo(ip: *const InternPool, ty: InternPool.Index) ?IndexableInfo {
 
 /// `validate_ptr_array_init`: after a `.{ ... }` array init's element stores,
 /// check the number of initialized elements equals the array length. The body is
-/// the list of `array_init_elem_ptr` instructions. Mirrors zirValidatePtrArrayInit's
-/// array arm (sentinel handling deferred).
+/// the list of `array_init_elem_ptr` instructions. Sentinel handling deferred.
 fn evalValidatePtrArrayInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const datas = sema.zir.instructions.items(.data);
@@ -8667,8 +8541,7 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
     var elem_ty: InternPool.Index = undefined;
     var is_const: bool = undefined;
     var ptr_sentinel: InternPool.Index = .none;
-    // The out-of-bounds message names the operand as an array or a slice, matching
-    // the compiler's two `analyzeSlice` diagnostics.
+    // The out-of-bounds message names the operand as an array or a slice.
     var operand_is_slice = false;
     switch (ip.indexToKey(ptr_ptr_child)) {
         // `*[N]T`: slice the array directly.
@@ -8805,7 +8678,6 @@ fn evalSliceLength(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// coerced to -- AstGen emits it as the `coerced_ty` result type of the sentinel
 /// expression. The operand is the lvalue (a double pointer if it was already a
 /// pointer), so peel one pointer, then take the element type per operand kind.
-/// Mirrors zirSliceSentinelTy.
 fn evalSliceSentinelTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const datas = sema.zir.instructions.items(.data);
@@ -8881,8 +8753,7 @@ fn aggregateElementByIndex(sema: *Sema, array_value: Value, index: u64) Error!Va
     }
     // Deref a pointer operand to the aggregate it addresses. A string literal is a
     // `*const [N:0]u8`, and taking its address (`ref` before an index) nests one
-    // more pointer, so follow the chain -- the compiler's elem access auto-derefs
-    // a single-pointer-to-array the same way.
+    // more pointer, so follow the chain.
     while (ip.indexToKey(agg.index) == .ptr) agg = try sema.loadValue(agg);
     const agg_key = ip.indexToKey(agg.index);
     if (agg_key != .aggregate) {
@@ -8896,9 +8767,9 @@ fn aggregateElementByIndex(sema: *Sema, array_value: Value, index: u64) Error!Va
 }
 
 /// A `@memcpy` operand must be an indexable pointer -- a slice, many/C pointer, or
-/// pointer to an array. Mirrors `checkMemOperand`; returns the operand's type, or
-/// null (with no diagnostic) so the caller emits the "not an indexable pointer"
-/// error against the specific operand.
+/// pointer to an array. Returns the operand's type, or null (with no diagnostic)
+/// so the caller emits the "not an indexable pointer" error against the specific
+/// operand.
 fn memOperandType(sema: *Sema, value: Value) ?Type {
     const ip = sema.intern_pool;
     const ty = value.typeOf(ip);
@@ -8917,8 +8788,7 @@ fn failMemOperand(sema: *Sema, ty: Type) Error {
 }
 
 /// The element count of a `@memcpy` operand, or null for many/C pointers (which
-/// carry no length). Mirrors `indexablePtrLenOrNone`: a slice's own `len`, or a
-/// pointer-to-array's array length.
+/// carry no length): a slice's own `len`, or a pointer-to-array's array length.
 fn indexableMemLen(sema: *Sema, value: Value) Error!?u64 {
     const ip = sema.intern_pool;
     switch (ip.indexToKey(value.index)) {
@@ -8953,11 +8823,10 @@ fn memBacking(sema: *Sema, value: Value) struct { ptr: InternPool.Index, start: 
     }
 }
 
-/// Whether two `@memcpy` operands alias over `elem_count` elements. Mirrors
-/// `Value.doPointersOverlap`'s comptime-only branch -- compare the backing storage
-/// identity and the element-index distance. The compiler's other branch keys on
-/// byte offsets, which collapse to element indices in the REPL's no-layout model,
-/// so this single comparison covers both.
+/// Whether two `@memcpy` operands alias over `elem_count` elements: compare the
+/// backing storage identity and the element-index distance. The compiler's other
+/// branch keys on byte offsets, which collapse to element indices in the REPL's
+/// no-layout model, so this single comparison covers both.
 fn doPointersOverlap(sema: *Sema, a: Value, b: Value, elem_count: u64) bool {
     const a_back = sema.memBacking(a);
     const b_back = sema.memBacking(b);
@@ -8966,10 +8835,7 @@ fn doPointersOverlap(sema: *Sema, a: Value, b: Value, elem_count: u64) bool {
     return diff < elem_count;
 }
 
-/// `memcpy` (`@memcpy(dest, src)`): copy `src`'s elements into `dest`. Mirrors
-/// zirMemcpy's comptime path -- indexable-operand + element-coercion + const-dest +
-/// matching-length + aliasing checks, then the single `[len]elem` array load/store
-/// (`pointerDeref` + `storePtrVal`). Returns void.
+/// `memcpy` (`@memcpy(dest, src)`): copy `src`'s elements into `dest`. Returns void.
 fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const bin = sema.binData(inst);
@@ -9009,19 +8875,16 @@ fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     if (len == 0) return null;
 
     // A zero-bit element type (e.g. `void`, `u0`) copies nothing and cannot alias,
-    // so it is done here -- before the aliasing check, as zirMemcpy's `zero_bit`
-    // block returns early. A comptime-only element still copies. `abiSize == 0`
-    // stands in for the compiler's `hasRuntimeBits`.
+    // so it is done here -- before the aliasing check. A comptime-only element still
+    // copies. `abiSize == 0` stands in for the compiler's `hasRuntimeBits`.
     if (!src_elem.comptimeOnly(ip) and (src_elem.abiSize(ip) orelse 0) == 0) return null;
 
     if (sema.doPointersOverlap(dest, src, len)) {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@memcpy: arguments alias", .{});
     }
 
-    // Copy as one array load and one array store, as zirMemcpy does: upgrade each
-    // operand's backing pointer to `*[len]elem` and move the `[len]elem` value
-    // whole. `loadValue`/`storePointee` handle the pointer-to-array projection --
-    // `pointerDeref` and `storePtrVal` in the compiler.
+    // Copy as one array load and one array store: upgrade each operand's backing
+    // pointer to `*[len]elem` and move the `[len]elem` value whole.
     const src_back = sema.memBacking(src);
     const dest_back = sema.memBacking(dest);
     const src_arr_ptr = try ip.internPtr(.{
@@ -9053,8 +8916,8 @@ fn resolveArrayLen(sema: *Sema, ref: Zir.Inst.Ref, op_name: []const u8) Error!u6
     return sema.resolveUsizeInt(try sema.resolveRef(ref), op_name);
 }
 
-/// Coerce `value` to the integer type `ty` and read it as a `u64`. Mirrors the
-/// compiler's `resolveInt`; `resolveUsizeInt` is the `.usize_type` case.
+/// Coerce `value` to the integer type `ty` and read it as a `u64`.
+/// `resolveUsizeInt` is the `.usize_type` case.
 fn resolveInt(sema: *Sema, value: Value, ty: InternPool.Index, op_name: []const u8) Error!u64 {
     const coerced = try sema.coerceValueToType(value, ty, op_name);
     const key = sema.intern_pool.indexToKey(coerced.index);
@@ -9086,9 +8949,8 @@ fn coerceToErrorUnion(
 
     // An error value of any error-set type coerces in by name --
     // the compiler verifies the name is a member of the destination
-    // error set. The current subset carries the name only;
-    // set-membership checking lands when error-union narrowing
-    // handlers do.
+    // error set. This subset carries the name only; set-membership
+    // is not verified.
     if (value_key == .err) {
         const idx = try ip.internErrorUnion(.{
             .ty = dest_ty,
@@ -9333,8 +9195,8 @@ fn lookupDecl(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error!?Dec
 /// interned name equals `name`. Each per-namespace lookup goes
 /// through `Namespace.lookupNav` (pub_decls then priv_decls);
 /// bounded by `max_namespace_chain` so a malformed parent cycle
-/// can't hang. Same shape as the compiler's `lookupIdentifier`
-/// (`src/Sema.zig:5920`).
+/// can't hang. Compiler reference: `src/Sema.zig:lookupIdentifier`
+/// (~5920).
 fn lookupName(
     sema: *Sema,
     ns_idx: InternPool.NamespaceIndex,
@@ -9354,12 +9216,10 @@ fn lookupName(
 const max_namespace_chain: u32 = 1024;
 
 /// Walk every top-level decl in the input's main_struct_inst and
-/// register each one in `sema.namespace`. Mirrors the compiler's
-/// per-decl analysis loop in `Zcu.PerThread.analyzeFile` collapsed
-/// to single-namespace eager evaluation. Idempotent against
-/// wrap-injected predecessors: a name already bound in the namespace
-/// is skipped (the injection appears in every line's ZIR so the user
-/// can reference prior decls).
+/// register each one in `sema.namespace` -- single-namespace eager
+/// evaluation. Idempotent against wrap-injected predecessors: a name
+/// already bound in the namespace is skipped (the injection appears in
+/// every line's ZIR so the user can reference prior decls).
 fn bindDecls(sema: *Sema) Error!void {
     assert(sema.namespace != null);
 
@@ -9375,8 +9235,7 @@ fn bindOneDecl(
     decl_inst: Zir.Inst.Index,
 ) Error!void {
     // Anchor source locations for this decl's bodies at its own node, so a `fail`
-    // here resolves against the right declaration. Mirrors the compiler analyzing
-    // each decl in a block whose `src_base_inst` is that decl.
+    // here resolves against the right declaration.
     sema.block.src_base_inst = decl_inst;
     const unwrapped = sema.zir.getDeclaration(decl_inst);
     if (unwrapped.kind == .@"comptime" or unwrapped.kind == .unnamed_test) {
@@ -9549,7 +9408,7 @@ fn evalErrorSetDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// is the error's identifier. We intern the name globally (shared
 /// across all sets containing it), build a singleton `error{Foo}`
 /// type for the most precise value type, and intern the `err` value
-/// pointing at it. Mirrors compiler `zirErrorValue` (~7578).
+/// pointing at it.
 fn evalErrorValue(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
@@ -9563,8 +9422,7 @@ fn evalErrorValue(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// `error_union_type`: `pl_node + Bin` whose lhs is the error-set
 /// type expression and rhs is the payload type expression. Both
-/// must resolve to types; `resolveDestType` enforces this. Mirrors
-/// the compiler's handler (`src/Sema.zig:zirErrorUnionType`).
+/// must resolve to types; `resolveDestType` enforces this.
 fn evalErrorUnionType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const bin = sema.binData(inst);
     assert(bin.lhs != .none);
@@ -9583,8 +9441,8 @@ fn evalErrorUnionType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// `err_union_code operand`: extract the error code from an error
 /// union value. The operand must be an `error_union` Key whose
 /// variant is `.err_name`. The result is an `err` value of the
-/// union's error-set type. Mirrors the compiler's
-/// `zirErrUnionCode` / `analyzeErrUnionCode` (`src/Sema.zig:8247`).
+/// union's error-set type. Compiler reference:
+/// `src/Sema.zig:zirErrUnionCode` / `analyzeErrUnionCode` (~8247).
 /// On a `.payload` operand the compiler emits `unreachable_value`
 /// at compile time; we surface a diagnostic since hitting it via
 /// REPL input means the AstGen lowering guaranteed the wrong shape.
@@ -9596,8 +9454,7 @@ fn evalErrUnionCode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// `err_union_code_ptr operand`: the error code from a pointer to an error union
-/// (`*E!T`) -- load it, then extract. Mirrors `zirErrUnionCodePtr`
-/// (`analyzeLoad` -> `analyzeErrUnionCode`).
+/// (`*E!T`) -- load it, then extract.
 fn evalErrUnionCodePtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
@@ -9606,7 +9463,7 @@ fn evalErrUnionCodePtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// The error code of an error-union value whose active variant is `.err_name`,
-/// as an `err` of the union's error-set type. Mirrors `analyzeErrUnionCode`.
+/// as an `err` of the union's error-set type.
 fn errUnionCodeVal(sema: *Sema, operand_value: Value) Error!Value {
     const ip = sema.intern_pool;
     const operand_key = ip.indexToKey(operand_value.index);
@@ -9624,8 +9481,8 @@ fn errUnionCodeVal(sema: *Sema, operand_value: Value) Error!Value {
 
 /// `err_union_payload_unsafe_ptr operand`: given a pointer to an error union
 /// (`*E!T`), yield a pointer to its payload (`*T`) as an `.eu_payload` projection
-/// keeping the source pointer's flags. Mirrors `analyzeErrUnionPayloadPtr`'s
-/// comptime path (`initializing = false`, so a comptime-known error is rejected).
+/// keeping the source pointer's flags. Runs with `initializing = false`, so a
+/// comptime-known error is rejected.
 fn evalErrUnionPayloadUnsafePtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
@@ -9637,8 +9494,7 @@ fn evalErrUnionPayloadUnsafePtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value 
 /// (`*T`) as an `.eu_payload` projection keeping the source pointer's flags. When
 /// `initializing` (a result-location `*E!T` about to be written), the payload is
 /// being created, so skip the error check; otherwise a comptime-known error is the
-/// "caught unreachable"/error-return-trace case. The `optPayloadPtr` analog for
-/// error unions -- mirrors `analyzeErrUnionPayloadPtr`.
+/// "caught unreachable"/error-return-trace case.
 fn errUnionPayloadPtr(sema: *Sema, eu_ptr: Value, comptime initializing: bool) Error!Value {
     const ip = sema.intern_pool;
     const ptr_type = ip.indexToKey(eu_ptr.typeOf(ip).toIndex()).ptr_type;
@@ -9662,8 +9518,8 @@ fn errUnionPayloadPtr(sema: *Sema, eu_ptr: Value, comptime initializing: bool) E
 
 /// `try operand` (`try x`): if `x` is a payload, yield it; if an error, run the
 /// error branch `body` (a `ret_node` that propagates the error out of the
-/// enclosing function). Mirrors `zirTry`: the operand is comptime-known, so the
-/// branch is chosen directly rather than emitted as runtime control flow.
+/// enclosing function). The operand is comptime-known, so the branch is chosen
+/// directly rather than emitted as runtime control flow.
 fn evalTry(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const ip = sema.intern_pool;
@@ -9685,7 +9541,7 @@ fn evalTry(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// `try_ptr operand` (`try p.*` on an addressable error union): the pointer form
 /// of `try`. Load the union behind `operand` (`*E!T`); on a payload yield a `*T`
-/// (`eu_payload` projection), on an error run the error branch. Mirrors `zirTryPtr`.
+/// (`eu_payload` projection), on an error run the error branch.
 fn evalTryPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const ip = sema.intern_pool;
@@ -9705,8 +9561,8 @@ fn evalTryPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// `ensure_err_union_payload_void operand`: reject a discarded non-void error-union
-/// payload (`errfn();` without capturing the payload). Returns void. Mirrors
-/// `zirEnsureErrUnionPayloadVoid`; the operand may be the union or a pointer to it.
+/// payload (`errfn();` without capturing the payload). Returns void. The operand
+/// may be the union or a pointer to it.
 fn evalEnsureErrUnionPayloadVoid(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const ip = sema.intern_pool;
@@ -9727,8 +9583,8 @@ fn evalEnsureErrUnionPayloadVoid(sema: *Sema, inst: Zir.Inst.Index) Error!?Value
 /// in the compiler means "the runtime safety check was already done
 /// by an earlier branch"; at REPL eval time we work with concrete
 /// values and can surface a diagnostic if the variant is `.err_name`
-/// rather than crashing. Mirrors `zirErrUnionPayload`
-/// (`src/Sema.zig:8092`).
+/// rather than crashing. Compiler reference:
+/// `src/Sema.zig:zirErrUnionPayload` (~8092).
 fn evalErrUnionPayloadUnsafe(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
@@ -9751,8 +9607,8 @@ fn evalErrUnionPayloadUnsafe(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 /// `is_non_err operand`: boolean predicate, true IFF the union's
 /// variant is `.payload`. Used by AstGen-lowered control flow
-/// (`if (x) |v| ... else |e| ...` and friends). Mirrors
-/// `zirIsNonErr` (`src/Sema.zig:17225`).
+/// (`if (x) |v| ... else |e| ...` and friends). Compiler reference:
+/// `src/Sema.zig:zirIsNonErr` (~17225).
 fn evalIsNonErr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
@@ -9761,7 +9617,7 @@ fn evalIsNonErr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// `ret_is_non_err operand`: the same non-error predicate as `is_non_err`, emitted
-/// where a `return`-position `try`/`catch` needs it. Mirrors `zirRetIsNonErr`.
+/// where a `return`-position `try`/`catch` needs it.
 fn evalRetIsNonErr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
@@ -9770,8 +9626,7 @@ fn evalRetIsNonErr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// `is_non_err_ptr operand`: the non-error predicate on a pointer to an error
-/// union (`*E!T`) -- load it, then test. Mirrors `zirIsNonErrPtr`
-/// (`analyzeLoad` -> `analyzeIsNonErr`).
+/// union (`*E!T`) -- load it, then test.
 fn evalIsNonErrPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
@@ -9780,7 +9635,7 @@ fn evalIsNonErrPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 /// The non-error predicate on an error-union value: `true` iff the variant is
-/// `.payload`. Mirrors `analyzeIsNonErr` (the operand is comptime-known here).
+/// `.payload`. The operand is comptime-known here.
 fn isNonErrVal(sema: *Sema, operand_value: Value) Error!Value {
     const operand_key = sema.intern_pool.indexToKey(operand_value.index);
     if (operand_key != .error_union) {
@@ -9796,8 +9651,8 @@ fn isNonErrVal(sema: *Sema, operand_value: Value) Error!Value {
 /// slice, delegate to `evalBody`. The body itself terminates via a
 /// `break_inline` whose target is this loop instruction (returning
 /// the loop's value) or via `repeat` (handled internally by
-/// `evalBody`'s i=0 restart). Mirrors the compiler's `zirLoop`
-/// (`src/Sema.zig:5102`).
+/// `evalBody`'s i=0 restart). Compiler reference:
+/// `src/Sema.zig:zirLoop` (~5102).
 fn evalLoop(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
@@ -9810,9 +9665,9 @@ fn evalLoop(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// `for_len`: the iteration count of a `for` loop -- the length shared by its
 /// inputs. The `MultiOp` operands are pairs: `[start, end]` for a range,
 /// `[indexable, .none]` for an array/slice (its element count). All inputs are
-/// comptime-known here; mismatched lengths are rejected, as the compiler does.
-/// The rest of the for loop desugars to primitives already handled (the `|i|`
-/// capture is just a `load` of the index counter). Mirrors zirForLen.
+/// comptime-known here; mismatched lengths are rejected. The rest of the for loop
+/// desugars to primitives already handled (the `|i|` capture is just a `load` of
+/// the index counter).
 fn evalForLen(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
@@ -9828,7 +9683,7 @@ fn evalForLen(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         const arg_len: u64 = if (pair[1] == .none) blk: {
             // The indexable's element count: an array/vector/tuple aggregate, a
             // slice's `len`, or a pointer to any of those (`for (&arr)`), which
-            // auto-derefs. Mirrors the compiler resolving each input's length.
+            // auto-derefs.
             var obj = try sema.resolveRef(pair[0]);
             const ip = sema.intern_pool;
             if (ip.indexToKey(obj.index) == .slice)
@@ -9937,9 +9792,8 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         };
 
     // A tagged union switches on its active tag; the operand's payload is what a
-    // prong capture (`.a => |v|`) binds. Mirrors `switchCond` coercing a union to
-    // its tag enum, with an untagged union rejected. The tag is already an
-    // `enum_tag`, so the enum-literal matching below is unchanged.
+    // prong capture (`.a => |v|`) binds. An untagged union is rejected. The tag is
+    // already an `enum_tag`, so the enum-literal matching below is unchanged.
     var cond = operand;
     var union_operand: ?InternPool.Key.Union = null;
     if (sema.intern_pool.indexToKey(operand.index) == .un) {
@@ -10050,7 +9904,7 @@ const SwitchRangeSet = struct {
     }
 
     /// Add `[lo, hi]`; returns true if it overlaps an existing range (a duplicate
-    /// switch value), mirroring `RangeSet.addAssumeCapacity`.
+    /// switch value).
     fn add(set: *SwitchRangeSet, gpa: std.mem.Allocator, lo: i128, hi: i128) Error!bool {
         for (set.ranges.items) |r| {
             if (hi >= r[0] and lo <= r[1]) return true;
@@ -10060,8 +9914,7 @@ const SwitchRangeSet = struct {
     }
 
     /// Whether the ranges exactly cover `[min, max]` with no gaps. Ranges never
-    /// overlap (`add` rejects that), so sort and check strict adjacency, mirroring
-    /// `RangeSet.spans`.
+    /// overlap (`add` rejects that), so sort and check strict adjacency.
     fn spans(set: *SwitchRangeSet, min: i128, max: i128) bool {
         const items = set.ranges.items;
         if (items.len == 0) return false;
@@ -10095,7 +9948,7 @@ fn intTypeBounds(ip: *const InternPool, item_ty: InternPool.Index) ?[2]i128 {
 }
 
 /// Mark enum field `index` as seen; returns true if it was already seen (a
-/// duplicate). Mirrors writing `seen_enum_fields[field_index]`.
+/// duplicate).
 fn markSwitchEnumField(seen: []bool, index: u32) bool {
     if (index >= seen.len) return false;
     if (seen[index]) return true;
@@ -10104,9 +9957,7 @@ fn markSwitchEnumField(seen: []bool, index: u32) bool {
 }
 
 /// Record a resolved (computed) case item value against the collector for its
-/// type, returning true on a duplicate. Mirrors `validateSwitchItemOrRange`'s
-/// per-type arms; `type_tag` selects the collector as the compiler's `zigTypeTag`
-/// switch does.
+/// type, returning true on a duplicate. `type_tag` selects the collector.
 fn validateSwitchItemValue(
     sema: *Sema,
     type_tag: SwitchTypeTag,
@@ -10155,16 +10006,10 @@ fn validateSwitchItemValue(
     }
 }
 
-/// Mirror of the compiler's `validateSwitchBlock`: reject a non-switchable operand
-/// ("switch on type '{f}'"), collect every case's items/ranges into the same
-/// per-type sets the compiler keeps (`seen_enum_fields`, `seen_errors`,
-/// `seen_sparse_values`, a `range_set`, and true/false/void seen), rejecting a
-/// duplicate item ("duplicate switch value"), a stray range on a non-int, and a
-/// `_` prong, then check exhaustiveness per `item_ty`'s tag: all values handled or
-/// an `else` ("switch must handle all possibilities"), an unbounded domain needs
-/// an else ("else prong required when switching on type '{f}'"), and a
-/// fully-covered switch's else is redundant ("unreachable else prong; all cases
-/// already handled").
+/// Reject a non-switchable operand, duplicate-check every case's items/ranges, and
+/// check exhaustiveness per `item_ty`'s tag: all values handled or an `else`, an
+/// unbounded domain requires an `else`, and a fully-covered switch's `else` is
+/// redundant.
 ///
 /// REPL deltas: no source locations, so duplicate/coverage errors are single-line
 /// without the compiler's "previous value here" / per-field notes; and `_` is
@@ -10286,10 +10131,6 @@ fn validateSwitchBlock(sema: *Sema, inst: Zir.Inst.Index, item_ty: InternPool.In
 /// it through. AstGen uses the `switch_block` instruction itself as the first
 /// (payload) capture ref, falling back to a separate placeholder only for a
 /// second (tag) capture; so the capture inst is `payload_capture_placeholder`
-/// Bind a matched prong's capture (`|v|`) to the instruction the prong body reads
-/// it through. AstGen uses the `switch_block` instruction itself as the first
-/// (payload) capture ref, falling back to a separate placeholder only for a
-/// second (tag) capture; so the capture inst is `payload_capture_placeholder`
 /// when present, else the switch inst. Only a tagged union's payload capture is
 /// modeled: `by_val` binds the active payload, `by_ref` a `*const` to it.
 fn bindSwitchCapture(
@@ -10376,9 +10217,7 @@ fn matchSwitchItems(
                     if (item == opn) hit = true;
                 }
             },
-            // A `.tag` prong on an enum switch. The compiler resolves each item via
-            // `analyzeDeclLiteral` against the operand type (`resolveSwitchItem`);
-            // `enumTagByName` is that same tag lookup. Compare by identity -- interned
+            // A `.tag` prong on an enum switch. Compare by identity -- interned
             // tags are canonical. Like the other item kinds, an item in a prong the
             // operand never reaches is not evaluated (the evaluator returns on the
             // first matching prong), so a bad tag there is not caught, unlike the
@@ -10505,18 +10344,6 @@ fn evalRetType(sema: *Sema) Error!?Value {
     return .{ .index = sema.fn_ret_ty };
 }
 
-/// `.func` / `.func_inferred` / `.func_fancy`: build the Func
-/// type from the drained `params` + the resolved return
-/// type, intern both, return the Func value. Uses stdlib's
-/// `getFnInfo` to abstract the three Inst layouts. Compiler
-/// reference: src/Sema.zig:zirFunc ~8321 + funcCommon ~8896.
-///
-/// CC defaults to `.auto` here regardless of `func_fancy`'s
-/// cc_ref / cc_body -- same minimal calling-convention storage
-/// documented at the FuncType storage site (FFI widens). The inferred-
-/// error-set flag (`.func_inferred`) is observed via `getFnInfo`
-/// but doesn't affect the FuncType encoding today; it'll matter
-/// when error-set inference moves out of the per-fn analysis.
 /// Resolve a function's declared return type from its ZIR: a pre-interned
 /// `ret_ty_ref` (e.g. `i32`), else a computed `ret_ty_body` (e.g. `u23`),
 /// else `void`. `break_target` is the func inst the body breaks to. For a
@@ -10563,8 +10390,7 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // A generic signature's return type depends on a comptime argument
     // (`fn make(comptime T: type) T`): its ref/body points at a param that
     // has no value until a call binds one. Store the poison marker now;
-    // `evalCall` re-resolves the concrete type per instantiation. Mirrors
-    // funcCommon (src/Sema.zig), which interns generic_poison_type here.
+    // `evalCall` re-resolves the concrete type per instantiation.
     const ret_ty: InternPool.Index = if (info.ret_ty_is_generic)
         .generic_poison_type
     else
@@ -10590,9 +10416,7 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     });
     // No body -> this is a fn TYPE expression (`fn () void`),
     // not a fn declaration. Return the FuncType Index directly
-    // as the type-of-type value. Mirrors the compiler's
-    // funcCommon at src/Sema.zig:9004 which interns just the
-    // FuncType when `has_body == false`.
+    // as the type-of-type value.
     if (info.body.len == 0) return Value{ .index = fn_ty };
 
     const func_idx = try sema.intern_pool.internFunc(.{
@@ -10608,23 +10432,8 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return Value{ .index = func_idx };
 }
 
-/// `.call` / `.field_call`: invoke a comptime-resolvable function
-/// value with args. Mirrors src/Sema.zig:zirCall ~6125 +
-/// analyzeCall ~6539 for the comptime slice:
-///
-///   1. Resolve the callee Value; require Key.func.
-///   2. Read args_len from Inst.Call's Flags.
-///   3. Walk per-arg bodies (stride table at extra[end..],
-///      first args_len entries are end-offsets) and evaluate
-///      each via resolveInlineBody (break_target = call inst).
-///   4. Coerce each arg to its FuncType param type.
-///   5. Get fn body via getFnInfo; filter param_body for .param
-///      tags to obtain the param inst indices.
-///   6. Pre-populate sema.results so the fn body's references to
-///      param insts resolve to the bound arg values.
-///   7. Evaluate fn body via resolveInlineBody.
-///   8. Remove the param-binding entries from results so other
-///      callers of the same func get a clean slate.
+/// `.call` / `.field_call`: invoke a comptime-resolvable function value with args.
+/// Compiler reference: src/Sema.zig:zirCall ~6125 + analyzeCall ~6539.
 ///
 /// `.field_call` (`obj.f(x)`) resolves `f` in the object: a struct-type object
 /// (`P.decl(x)`) calls the namespace declaration; a struct-value object
@@ -10634,8 +10443,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
 
     // Bound recursion as the compiler does: every call is a backward branch
     // against `branch_quota` (`analyzeCall` -> `emitBackwardBranch`), which
-    // also catches runaway non-recursive evaluation. Raise via
-    // `@setEvalBranchQuota` once that builtin lands.
+    // also catches runaway non-recursive evaluation.
     try sema.emitBackwardBranch();
 
     // Resolve the callee, an optional bound receiver, and the argument bodies.
@@ -10665,7 +10473,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
             const object_ptr = try sema.resolveRef(extra.data.obj_ptr);
             const object = try sema.loadValue(object_ptr);
             const args_slice: []const Zir.Inst.Index = @ptrCast(sema.zir.extra[extra.end..]);
-            // Mirror `fieldCallBind`: a type object (`T.decl(x)`) resolves the
+            // A type object (`T.decl(x)`) resolves the
             // declaration in T's namespace with no receiver; a value object
             // (`v.method(x)`) binds the value and resolves the method in its type's
             // namespace. `containerDeclByName` (the REPL's `getNamespace` lookup)
@@ -10676,8 +10484,8 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
             const lookup_ty = if (is_type) object.index else object.typeOf(sema.intern_pool).toIndex();
             const callee = (try sema.containerDeclByName(lookup_ty, name)) orelse
                 return sema.failBadMemberAccess(lookup_ty, name);
-            // Bind the value method's receiver from `m`'s first parameter, as
-            // `fieldCallBind` does: a `*T` receiver -- a single/C pointer to the
+            // Bind the value method's receiver from `m`'s first parameter:
+            // a `*T` receiver -- a single/C pointer to the
             // value's type -- or an `anytype` first parameter takes the object
             // pointer (so the method reads or mutates through it); a by-value `T`
             // takes the loaded value.
@@ -10741,8 +10549,6 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     const frame = try sema.enterSourceZir(func.source_zir_id, "call");
     defer frame.restore(sema);
 
-    // Extract the body + param insts via getFnInfo on the
-    // possibly-swapped sema.zir.
     const info = sema.zir.getFnInfo(func.zir_body_inst);
     const param_insts = try sema.collectParamInsts(info, args_len);
     defer sema.gpa.free(param_insts);
@@ -10896,10 +10702,6 @@ fn evalTypeof(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return Value{ .index = Value.typeOf(operand, sema.intern_pool).index };
 }
 
-/// `typeof_peer`: `@TypeOf(a, b, ...)` -- the peer-resolved type of several
-/// operands. AstGen puts the operand expressions in a body (evaluated for its
-/// instruction results) followed by their refs. Mirrors `src/Sema.zig`
-/// zirTypeofPeer: run the body, then fold peer resolution across the operands.
 /// `@This()` (extended `this`): the enclosing container type. Mirrors zirThis,
 /// which returns the block namespace's owner type; here it is the struct set by
 /// `containerDeclByName` around a member's evaluation.
@@ -11045,7 +10847,7 @@ fn evalTypeofPeer(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
     const extra = sema.zir.extraData(Zir.Inst.TypeOfPeer, extended.operand);
     const body = sema.zir.bodySlice(extra.data.body_index, extra.data.body_len);
     // Evaluate the operand expressions; the body's break value is unused (we
-    // read the operands by ref below, as the compiler does).
+    // read the operands by ref below).
     _ = try sema.resolveInlineBody(body, inst);
 
     const args = sema.zir.refSlice(extra.end, extended.small);
@@ -11095,22 +10897,6 @@ fn evalTypeofBuiltin(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return Value{ .index = Value.typeOf(operand, sema.intern_pool).index };
 }
 
-/// Sub-dispatcher for the `.extended` ZIR tag. The data union arm
-/// carries `(opcode, small, operand)`; each `Zir.Inst.Extended`
-/// opcode names a distinct builtin / construct. Mirrors the
-/// compiler's `.extended => ext: { switch (opcode) ... }` at
-/// src/Sema.zig:1382. Implemented today:
-///
-///   * `dbg_empty_stmt`, `breakpoint`, `disable_instrumentation`,
-///     `disable_intrinsics`, `branch_hint`, `set_float_mode`,
-///     `restore_err_ret_index` -- no-ops at our level (no AIR, no
-///     instrumentation, no error-return-trace machinery yet).
-///   * `in_comptime` -- honest `false`; we have no comptime/runtime
-///     bifurcation so the spec branch is the runtime one.
-///   * `tuple_decl` -- a positional struct type (`struct { i32, f128 }`).
-///   * `struct_decl` -- a named struct type (`struct { x: i32 }`).
-///
-/// Every other opcode surfaces a structured
 /// `@intFromError(e)`: the error's global integer. Mirrors `zirIntFromError`
 /// reduced to the comptime case -- the operand's value is always known, so the
 /// runtime/inferred-error-set paths drop away.
@@ -11424,7 +11210,6 @@ test "onePossibleValue: every type-kind branch" {
     try expectOpv(s, .fromIndex(try pool.internArrayType(.{ .len = 3, .child = .u0_type })), true);
     try expectOpv(s, .fromIndex(try pool.internArrayType(.{ .len = 3, .child = .u8_type })), false);
     try expectOpv(s, .fromIndex(try pool.internArrayType(.{ .len = 0, .child = .u8_type })), true);
-    // vector.
     try expectOpv(s, .fromIndex(try pool.internVectorType(.{ .len = 3, .child = .u0_type })), true);
     try expectOpv(s, .fromIndex(try pool.internVectorType(.{ .len = 3, .child = .u8_type })), false);
     // optional: `?noreturn` is OPV (only null); `?u8` is not.

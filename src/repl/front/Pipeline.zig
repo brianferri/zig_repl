@@ -54,10 +54,7 @@ pub const Result = struct {
 
 /// Translates wrapped-source positions back into the user's frame.
 /// All wrap-shape knowledge lives here so the diagnostic renderer
-/// can treat positions opaquely. When the instruction-history
-/// extension lands, the prefix-anchored case grows from "skip" to
-/// "render with prior-input source"; call sites stay unchanged
-/// because they only see `translate -> ?Ast.Span` and `findLoc`.
+/// can treat positions opaquely.
 pub const UserView = struct {
     text: []const u8,
     offset_in_source: u32,
