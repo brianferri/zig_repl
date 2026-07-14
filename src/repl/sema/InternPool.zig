@@ -3919,10 +3919,7 @@ fn emitEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!void {
 }
 
 /// The resolved fields of an enum type, borrowing into `extra`. Mirrors the
-/// compiler's `LoadedEnumType` field data (names + values + `int_tag_type`); the
-/// per-name/value lookup maps are omitted -- the REPL scans linearly. `values` is
-/// empty for an auto-numbered enum (tag value == field index), as the compiler
-/// leaves `field_values` empty (see `enumValueFieldIndex`).
+/// comptime-relevant part of `LoadedEnumType`.
 pub const EnumFields = struct {
     int_tag_type: Index,
     nonexhaustive: bool,
@@ -4021,10 +4018,8 @@ pub fn setEnumFields(
 }
 
 /// The resolved fields of a reified struct, borrowing into `extra`. Mirrors the
-/// comptime-relevant part of `LoadedStructType` (the runtime layout fields -- size,
-/// offsets, class -- are not modelled). `defaults`/`aligns` are empty when no field
-/// has one; `comptime_bits` (one bit per field, LSB-first within each u32) is empty
-/// when no field is comptime. Storage block layout: `[layout, backing_int,
+/// comptime-relevant part of `LoadedStructType`; the runtime layout fields (size,
+/// offsets, class) are not modelled. Storage block layout: `[layout, backing_int,
 /// fields_len, defaults_len, aligns_len, comptime_len, names..., types...,
 /// defaults..., aligns..., comptime_bits...]`.
 pub const StructFields = struct {
@@ -4032,8 +4027,11 @@ pub const StructFields = struct {
     packed_backing_int_type: Index,
     field_names: []const NullTerminatedString,
     field_types: []const Index,
+    /// Empty when no field has a default.
     field_defaults: []const Index,
+    /// Empty when no field has an explicit alignment.
     field_aligns: []const Index,
+    /// One bit per field, LSB-first within each u32; empty when no field is comptime.
     field_is_comptime_bits: []const u32,
     field_name_map: MapIndex,
 
@@ -4166,18 +4164,18 @@ fn emitUnionType(pool: *InternPool, ut: Key.UnionType) Allocator.Error!void {
 }
 
 /// The resolved fields of a reified union, borrowing into `extra`. Mirrors the
-/// comptime-relevant part of `LoadedUnionType`. `tag_type` is the explicit tag enum
-/// (`.none` for an untagged union); `backing_int` is the packed backing integer
-/// (`.none` unless a packed union); `aligns` is empty when no field has an explicit
-/// alignment. Union fields carry no comptime/default (unlike struct fields). Storage
-/// block layout: `[layout, tag_type, backing_int, fields_len, aligns_len, names...,
-/// types..., aligns...]`.
+/// comptime-relevant part of `LoadedUnionType`. Union fields carry no
+/// comptime/default (unlike struct fields). Storage block layout: `[layout,
+/// tag_type, backing_int, fields_len, aligns_len, names..., types..., aligns...]`.
 pub const UnionFields = struct {
     layout: std.lang.Type.ContainerLayout,
+    /// `.none` for an untagged union.
     enum_tag_type: Index,
+    /// `.none` unless a packed union.
     packed_backing_int_type: Index,
     field_names: []const NullTerminatedString,
     field_types: []const Index,
+    /// Empty when no field has an explicit alignment.
     field_aligns: []const Index,
     /// Field-name dedup map. The compiler has none on `LoadedUnionType`: it resolves
     /// a union's fields into its tag enum and validates names via that enum's

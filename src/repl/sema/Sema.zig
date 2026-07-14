@@ -4711,7 +4711,7 @@ fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.In
         .parent = sema.this_type,
     });
     try ip.setEnumFields(enum_ty, tag_ty, nonexhaustive, names, values);
-    // Populate and validate the name map, mirroring `src/Sema/type_resolution.zig`:
+    // Populate and validate the lookup maps, mirroring `src/Sema/type_resolution.zig`:
     // the field names came from the user (not AstGen), so duplicates are real errors.
     const fields = ip.enumFields(enum_ty).?;
     fields.field_name_map.get(ip).clearRetainingCapacity();
@@ -7398,9 +7398,6 @@ fn intAsI128(sema: *Sema, index: InternPool.Index) ?i128 {
     };
 }
 
-/// `enum_from_int lhs, rhs`: `@enumFromInt(n)` -- the enum tag whose integer value
-/// is `n`. `lhs` is the destination enum type, `rhs` the integer. A value with no
-/// matching tag is rejected as the compiler's `enumHasInt` check does.
 /// Whether the exhaustive enum `enum_ty` has a field whose tag value equals `int`.
 /// Verbatim from the compiler's `enumHasInt`: a value that does not fit the integer
 /// tag type names no field, so range-check first (non-failing), then key through

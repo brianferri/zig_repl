@@ -33,11 +33,12 @@ const ZirSummary = repl.render.ZirSummary;
 const UserView = Pipeline.UserView;
 
 /// Shift applied to a segment's emitted ids and spans when several segments
-/// share one outline (see `writeJson`): `id` moves the segment's AST node ids
-/// (and the ZIR `node` refs that key into them) past the previous segment's,
-/// and `byte` moves its spans to the segment's place in the full source.
+/// share one outline (see `writeJson`).
 const Offset = struct {
+    /// Moves the segment's AST node ids (and the ZIR `node` refs that key into
+    /// them) past the previous segment's.
     id: u32 = 0,
+    /// Moves the segment's spans to its place in the full source.
     byte: u32 = 0,
 };
 
