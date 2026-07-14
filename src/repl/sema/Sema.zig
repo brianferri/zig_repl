@@ -5273,10 +5273,10 @@ fn evalImport(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// reused by builtins that reach into std (e.g. `getStdLangType`) so they go
 /// through import semantics rather than a raw file load.
 fn importPath(sema: *Sema, path: []const u8) Error!InternPool.Index {
-    // `std` resolves to its root file; `builtin` is generated for the native target;
-    // `root` (the compilation's own root file) has no REPL equivalent.
+    // `std` resolves to its root file; `builtin` is generated for the native
+    // target; `root` is the session's top-level declarations.
     if (std.mem.eql(u8, path, "std")) return sema.loadModuleFile("std.zig");
-    if (std.mem.eql(u8, path, "root")) return sema.failUnloadedModule(path);
+    if (std.mem.eql(u8, path, "root")) return sema.rootModuleType();
     if (std.mem.eql(u8, path, "builtin")) return sema.loadBuiltinModule("builtin");
 
     // Any other string is a relative file (a named module dependency would need
@@ -5300,6 +5300,35 @@ fn importPath(sema: *Sema, path: []const u8) Error!InternPool.Index {
 
 fn failUnloadedModule(sema: *Sema, path: []const u8) Error {
     return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@import(\"{s}\"): module loading is not supported", .{path});
+}
+
+/// The container type for `@import("root")`: the session top level. The compiler
+/// returns `zcu.root_mod`'s file-root type; the REPL has no single root file, so
+/// this synthetic struct stands in and `containerDeclByName` routes its member
+/// lookups to `root_namespace` (where the top-level Navs live). Cached on the
+/// session so its identity is stable across imports.
+fn rootModuleType(sema: *Sema) Error!InternPool.Index {
+    const session = sema.session orelse return sema.failUnloadedModule("root");
+    if (session.root_type != .none) return session.root_type;
+    const ty = try sema.intern_pool.internStructType(.{
+        .name = try sema.intern_pool.getOrPutString(sema.gpa, "root"),
+        .id = .{ .declared = .{ .source_zir_id = sema.current_zir_id, .decl_inst = .main_struct_inst } },
+    });
+    session.root_type = ty;
+    return ty;
+}
+
+/// Resolve a member of the `@import("root")` container by name in the session-root
+/// namespace and return the bound Nav's value. The `namespaceLookup` step mirrors
+/// the compiler's `namespaceLookupVal`; resolving the Nav to its value stands in
+/// for `analyzeNavVal` (the REPL's session Navs are already evaluated). Null when
+/// unbound.
+fn rootDeclByName(sema: *Sema, name: InternPool.NullTerminatedString) Error!?Value {
+    const session = sema.session.?;
+    const nav_idx = (try sema.namespaceLookup(session.root_namespace, name)) orelse return null;
+    const resolved = sema.intern_pool.getNav(nav_idx).resolved orelse return null;
+    if (resolved.value == .none) return null;
+    return .{ .index = resolved.value };
 }
 
 /// The sub-path (relative to the source root) of the file being analysed, or
@@ -7561,6 +7590,11 @@ fn containerNamespace(sema: *Sema, container_ty: InternPool.Index) ?ContainerNam
 /// container -- struct, union, or enum -- since all share a decl namespace (the
 /// compiler's namespace lookup is container-kind agnostic).
 fn containerDeclByName(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
+    // The `@import("root")` container's decls are resolved Navs in the session
+    // namespace, not a walkable source ZIR, so resolve them by name there.
+    if (sema.session) |session| {
+        if (session.root_type != .none and container_ty == session.root_type) return sema.rootDeclByName(name);
+    }
     const ns = sema.containerNamespace(container_ty) orelse return null;
     // Decls are not stored on the type; intern each decl name as we scan and
     // compare interned handles against the query.
@@ -9191,12 +9225,12 @@ fn lookupDecl(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error!?Dec
     return null;
 }
 
-/// Walk `ns_idx`'s parent chain and return the first Nav.Index whose
-/// interned name equals `name`. Each per-namespace lookup goes
-/// through `Namespace.lookupNav` (pub_decls then priv_decls);
-/// bounded by `max_namespace_chain` so a malformed parent cycle
-/// can't hang. Compiler reference: `src/Sema.zig:lookupIdentifier`
-/// (~5920).
+/// Walk `ns_idx`'s parent chain and return the first Nav.Index whose interned
+/// name equals `name`, or null. Bounded by `max_namespace_chain` so a malformed
+/// parent cycle can't hang. Compiler reference: `src/Sema.zig:lookupIdentifier`,
+/// which walks `block.namespace`'s parents through `lookupInNamespace`; that one
+/// asserts the identifier is found, while this stays `null`-tolerant for
+/// duplicate-decl detection.
 fn lookupName(
     sema: *Sema,
     ns_idx: InternPool.NamespaceIndex,
@@ -9206,9 +9240,49 @@ fn lookupName(
     var depth: u32 = 0;
     while (current) |idx| : (depth += 1) {
         assert(depth < max_namespace_chain);
-        const ns = sema.intern_pool.namespacePtr(idx);
-        if (ns.lookupNav(sema.intern_pool, name)) |nav_idx| return nav_idx;
-        current = ns.parent.unwrap();
+        if (sema.lookupInNamespace(idx, name)) |lookup| return lookup.nav;
+        current = sema.intern_pool.namespacePtr(idx).parent.unwrap();
+    }
+    return null;
+}
+
+/// This looks up a member of a specific namespace. Mirrors the compiler's
+/// `lookupInNamespace` (`src/Sema.zig`); the incremental `ensureNamespaceUpToDate`
+/// / `declareDependency` steps have no REPL analog.
+fn lookupInNamespace(
+    sema: *Sema,
+    namespace_index: InternPool.NamespaceIndex,
+    ident_name: InternPool.NullTerminatedString,
+) ?struct {
+    nav: InternPool.Nav.Index,
+    /// If `false`, the declaration is in a different file and is not `pub`.
+    accessible: bool,
+} {
+    const ip = sema.intern_pool;
+    const namespace = ip.namespacePtr(namespace_index);
+    const adapter: InternPool.Namespace.NameAdapter = .{ .pool = ip };
+    const src_file = if (sema.namespace) |cur| ip.namespacePtr(cur).file_scope else .none;
+    if (namespace.pub_decls.getKeyAdapted(ident_name, adapter)) |nav_index| {
+        return .{ .nav = nav_index, .accessible = true };
+    } else if (namespace.priv_decls.getKeyAdapted(ident_name, adapter)) |nav_index| {
+        return .{ .nav = nav_index, .accessible = src_file == namespace.file_scope };
+    }
+    return null;
+}
+
+/// Look `decl_name` up in `namespace`, erroring if it resolves to a private
+/// declaration in another file. Mirrors the compiler's `namespaceLookup`.
+fn namespaceLookup(
+    sema: *Sema,
+    namespace: InternPool.NamespaceIndex,
+    decl_name: InternPool.NullTerminatedString,
+) Error!?InternPool.Nav.Index {
+    if (sema.lookupInNamespace(namespace, decl_name)) |lookup| {
+        if (!lookup.accessible) {
+            const msg = try sema.errMsg(sema.block.nodeOffset(.zero), "'{f}' is not marked 'pub'", .{decl_name.fmt(sema.intern_pool)});
+            return sema.failWithOwnedErrorMsg(sema.block, msg);
+        }
+        return lookup.nav;
     }
     return null;
 }

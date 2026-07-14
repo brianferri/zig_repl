@@ -163,6 +163,7 @@ test {
     _ = @import("diagnostics_test.zig");
     _ = @import("enum_test.zig");
     _ = @import("error_test.zig");
+    _ = @import("import_test.zig");
     _ = @import("fn_test.zig");
     _ = @import("module_test.zig");
     _ = @import("optional_test.zig");
