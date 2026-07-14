@@ -107,24 +107,27 @@ fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !O
     };
 
     const value = Sema.analyze(session, line_index, diag) catch |err| {
-        // Render the source-anchored caret for a Sema failure. Sema stored the
-        // (unresolved) error in `failed_analysis`; resolve its `LazySrcLoc` against
-        // this file's ZIR and Ast -- both now owned by the `File` (so `result`'s
-        // handles alias live memory).
+        // Render the source-anchored caret for a Sema failure. Resolve the error's
+        // `LazySrcLoc` against the file it was raised in (`em.file`) -- usually the
+        // current line, but a prior line when the error is inside a called
+        // function's body. Every committed `File` retains its ZIR/AST/wrapped
+        // source, so a prior line's are available here.
         if (session.failed_analysis) |em| {
             defer {
                 em.destroy(session.gpa);
                 session.failed_analysis = null;
             }
-            if (session.files.items[line_index].zir) |file_zir| {
+            const err_file = &session.files.items[em.file];
+            if (err_file.zir) |file_zir| if (err_file.tree) |tree| if (err_file.wrapped) |*wrapped| {
                 const node = em.src_loc.resolveNode(file_zir);
                 var notes_buf: [16]Diagnostic.Note = undefined;
                 const n = @min(em.notes.len, notes_buf.len);
                 for (notes_buf[0..n], em.notes[0..n]) |*dst, note| {
                     dst.* = .{ .node = note.src_loc.resolveNode(file_zir), .msg = note.msg };
                 }
-                Diagnostic.renderSemaError(session.gpa, result.tree, result.userView(), node, em.msg, notes_buf[0..n], diag) catch {};
-            }
+                const view: Pipeline.UserView = .{ .text = wrapped.userText(), .offset_in_source = wrapped.user_offset };
+                Diagnostic.renderSemaError(session.gpa, tree, view, node, em.msg, notes_buf[0..n], diag) catch {};
+            };
         }
         // Tombstone the failed line: free its ZIR but keep the `File` slot (and
         // any modules it loaded, at later indices) so `File.Index` values stay

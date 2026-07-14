@@ -872,7 +872,12 @@ fn intFittingRange(sema: *Sema, min: Value, max: Value) Error!Type {
 /// session's `failed_analysis` for the driver to render after this `Sema` is gone.
 fn errMsg(sema: *Sema, src: LazySrcLoc, comptime format: []const u8, args: anytype) Allocator.Error!*ErrorMsg {
     assert(src.offset != .unneeded);
-    return ErrorMsg.create(sema.gpa, src, format, args);
+    const em = try ErrorMsg.create(sema.gpa, src, format, args);
+    // Carry the file the `src` base belongs to (the file under analysis now), so
+    // the driver resolves the node against it rather than the current line -- the
+    // REPL's stand-in for the compiler's file-carrying `TrackedInst` base.
+    em.file = sema.current_zir_id;
+    return em;
 }
 
 /// Mirrors the compiler's `Zcu.errNote` (reached via `Sema.errNote`): append a

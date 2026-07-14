@@ -90,4 +90,10 @@ test "survives adversarial multi-line sequences" {
         "@as(S, .{ .a = 1 })",
         "@as(S, .{ .a = 2 }).a",
     });
+    // An error raised inside a called function's body: its diagnostic must resolve
+    // against the function's file (a prior line), not the calling line's tree.
+    harness.runSession(gpa, &.{
+        "fn f(n: u32) u32 { return !n + 1; }",
+        "f(40)",
+    });
 }

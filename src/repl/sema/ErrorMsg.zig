@@ -93,6 +93,15 @@ pub const ErrorMsg = struct {
     src_loc: LazySrcLoc,
     msg: []const u8,
     notes: []ErrorMsg = &.{},
+    /// The file (`Session.File.Index`) the `src_loc`'s `base_node_inst` belongs
+    /// to. The compiler's `LazySrcLoc.base_node_inst` is a cross-file
+    /// `TrackedInst.Index` that names its own file; the REPL's is a bare, fileless
+    /// `Zir.Inst.Index`, so the file it was raised in is carried here instead --
+    /// stamped when the error is built -- and the driver resolves the node against
+    /// that file's ZIR/AST rather than the current line's. Without it, an error
+    /// inside a called function (whose body lives on an earlier line) resolves
+    /// against the calling line's tree and reads out of bounds.
+    file: u32 = 0,
 
     pub fn create(gpa: Allocator, src_loc: LazySrcLoc, comptime format: []const u8, args: anytype) !*ErrorMsg {
         assert(src_loc.offset != .unneeded);
