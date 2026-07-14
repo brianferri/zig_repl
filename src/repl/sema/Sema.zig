@@ -8304,7 +8304,10 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// wrappers first, so `@as(?S, .{...})` validates against `S`.
 fn evalValidateStructInitTy(sema: *Sema, inst: Zir.Inst.Index, comptime is_result_ty: bool) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
-    const ty = (try sema.resolveRef(un_node.operand)).index;
+    // Resolve the operand *as a type* (the compiler's `resolveTypeOrPoison`), so a
+    // non-type like `@as(4, .{...})` fails here instead of reaching `optEuBaseType`
+    // -> `zigTypeTag` on a value, which is `unreachable`.
+    const ty = try sema.resolveDestType(un_node.operand, "struct init");
     const struct_ty = if (is_result_ty) Type.fromIndex(ty).optEuBaseType(sema.intern_pool).index else ty;
     switch (sema.intern_pool.indexToKey(struct_ty)) {
         .struct_type, .union_type => return null,

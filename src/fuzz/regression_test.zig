@@ -47,6 +47,10 @@ test "survives adversarial single-line inputs" {
         "@field(1, 2)",
         "@Type(.{})",
         "@memcpy()",
+        // A non-type where a type is required: rejected before type methods run
+        // (`@as(4, .{...})` must not reach `zigTypeTag` on a value).
+        "@as(4, .{ .a = 3 }).a",
+        "@as(0, .{})",
         // Bitwise operators on non-integer operands: a type error, not a panic
         // (`bitwiseBin`'s `else => unreachable` assumes validated operands).
         "3.5 & 3",
