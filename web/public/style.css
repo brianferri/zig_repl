@@ -1,17 +1,19 @@
+/* Zig-themed palette: the signature Zig orange (#f7a41d, the logo colour) as the
+   dominant accent over warm-neutral darks. */
 :root {
-    --base: #1e1e2e;
-    --mantle: #181825;
-    --crust: #11111b;
-    --surface0: #313244;
-    --surface1: #45475a;
-    --text: #cdd6f4;
-    --subtext: #a6adc8;
-    --overlay: #6c7086;
-    --blue: #89b4fa;
-    --green: #a6e3a1;
-    --red: #f38ba8;
-    --mauve: #cba6f7;
-    --yellow: #f9e2af;
+    --base: #1b1a17;
+    --mantle: #151412;
+    --crust: #100f0d;
+    --surface0: #2a2825;
+    --surface1: #3b3833;
+    --text: #eae6df;
+    --subtext: #b6b0a6;
+    --overlay: #746f66;
+    --accent: #f7a41d;
+    --accent-dim: #e0982e;
+    --green: #9bb556;
+    --red: #e5534b;
+    --yellow: #f5c542;
 }
 
 * {
@@ -35,7 +37,7 @@ body {
 }
 
 /* Force both colors so selected text stays legible -- the default highlight
-   leaves the nav's blue/mauve text low-contrast on its own background. */
+   leaves the nav's accent text low-contrast on its own background. */
 ::selection {
     background: var(--surface1);
     color: var(--text);
@@ -53,7 +55,7 @@ nav {
 }
 
 nav .brand {
-    color: var(--mauve);
+    color: var(--accent);
     font-weight: 700;
     margin-right: 1rem;
 }
@@ -74,8 +76,8 @@ nav button:hover {
 }
 
 nav button.active {
-    color: var(--blue);
-    border-bottom-color: var(--blue);
+    color: var(--accent-dim);
+    border-bottom-color: var(--accent-dim);
 }
 
 main {
@@ -105,7 +107,7 @@ main {
 }
 
 #repl-output .echo {
-    color: var(--blue);
+    color: var(--accent-dim);
 }
 
 #repl-form {
@@ -117,7 +119,7 @@ main {
 
 #repl-form .prompt {
     padding: 0.7rem 0.5rem 0 1rem;
-    color: var(--blue);
+    color: var(--accent-dim);
 }
 
 /* Auto-grows with its content (height set from scrollHeight in app.js) up to a
@@ -278,7 +280,7 @@ main {
 }
 
 .node .tag {
-    color: var(--mauve);
+    color: var(--accent);
     font-size: 11px;
     min-width: 8rem;
 }
@@ -306,7 +308,7 @@ main {
 }
 
 .node.active {
-    background: var(--blue);
+    background: var(--accent-dim);
 }
 
 .node.active .tag,
