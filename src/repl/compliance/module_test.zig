@@ -325,6 +325,9 @@ test "reify constructors: value paths and rejected inputs" {
         .{ .src = "@Union(.@\"packed\", null, &.{\"a\"}, &.{u8}, &.{.{ .@\"align\" = 4 }})", .needle = "packed union fields cannot be aligned" },
         .{ .src = "(@Struct(.auto, null, &.{\"a\"}, &.{u8}, &.{.{}}){ .a = 1 }).b", .needle = "no field named 'b'" },
         .{ .src = "@Enum(u8, .exhaustive, &.{\"a\"}, &.{0}).zzz", .needle = "has no member named 'zzz'" },
+        .{ .src = "@Struct(.auto, null, &.{ \"a\", \"a\" }, &.{ u8, u16 }, &.{ .{}, .{} })", .needle = "duplicate struct field 'a' at index '1" },
+        .{ .src = "@Enum(u8, .exhaustive, &.{ \"x\", \"x\" }, &.{ 0, 1 })", .needle = "duplicate enum field 'x' at index '1'" },
+        .{ .src = "@Union(.auto, null, &.{ \"u\", \"u\" }, &.{ u8, u16 }, &.{ .{}, .{} })", .needle = "duplicate union field 'u' at index '1" },
     };
     for (rejected) |p| {
         var diag: std.Io.Writer.Allocating = .init(gpa);

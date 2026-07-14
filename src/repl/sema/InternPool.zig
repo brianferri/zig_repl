@@ -2031,6 +2031,11 @@ const StructTypeRepr = extern struct {
     /// creation; a declared struct reads its fields from ZIR, so this stays unset.
     /// Not part of identity, like `EnumTypeRepr.field_data`.
     field_data: u32,
+    /// Field-name dedup map (`OptionalMapIndex`), or `.none` for a declared struct
+    /// (whose fields resolve lazily from ZIR). Filled by `setStructFields` alongside
+    /// `field_data`; drives `LoadedStructType.nameIndex`-style lookups. Not part of
+    /// identity -- the compiler's `LoadedStructType.field_name_map`.
+    field_name_map: u32,
     captures_len: u32,
     /// This container's declaration namespace (`OptionalNamespaceIndex`), or
     /// `.none` until `getNamespaceIndex` scans it. Filled after creation, so not
@@ -2049,6 +2054,8 @@ const EnumTypeRepr = extern struct {
     /// identity -- filled after creation, so it is excluded from the dedup Key
     /// (`enumTypeFromExtra` does not read it).
     field_data: u32,
+    /// Field-name dedup map (`OptionalMapIndex`); see `StructTypeRepr.field_name_map`.
+    field_name_map: u32,
     captures_len: u32,
     namespace: u32,
 };
@@ -2075,6 +2082,10 @@ const UnionTypeRepr = extern struct {
     /// `unionFields`), or `fields_unresolved`. Filled by a reified union; a declared
     /// union reads its fields from ZIR. Not part of identity.
     field_data: u32,
+    /// Field-name dedup map (`OptionalMapIndex`); see `UnionFields.field_name_map`
+    /// for why the map lives on the union here rather than on its tag enum as in the
+    /// compiler.
+    field_name_map: u32,
     captures_len: u32,
     namespace: u32,
 };
@@ -3879,6 +3890,7 @@ fn emitStructType(pool: *InternPool, st: Key.StructType) Allocator.Error!void {
         .name = @intFromEnum(st.name),
         .parent = @intFromEnum(st.parent),
         .field_data = fields_unresolved,
+        .field_name_map = @intFromEnum(OptionalMapIndex.none),
         .captures_len = containerCapturesLen(st.id),
         .namespace = @intFromEnum(st.namespace),
     });
@@ -3893,6 +3905,7 @@ fn emitEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!void {
         .name = @intFromEnum(et.name),
         .parent = @intFromEnum(et.parent),
         .field_data = fields_unresolved,
+        .field_name_map = @intFromEnum(OptionalMapIndex.none),
         .captures_len = containerCapturesLen(et.id),
         .namespace = @intFromEnum(et.namespace),
     });
@@ -3910,6 +3923,15 @@ pub const EnumFields = struct {
     nonexhaustive: bool,
     field_names: []const NullTerminatedString,
     field_values: []const Index,
+    field_name_map: MapIndex,
+
+    /// Field index for `name`, or null. Mirrors `LoadedEnumType.nameIndex`.
+    pub fn nameIndex(fields: EnumFields, pool: *const InternPool, name: NullTerminatedString) ?u32 {
+        const map = fields.field_name_map.get(pool);
+        const adapter: NullTerminatedString.Adapter = .{ .strings = fields.field_names };
+        const field_index = map.getIndexAdapted(name, adapter) orelse return null;
+        return @intCast(field_index);
+    }
 };
 
 /// This enum's resolved fields, or null if not resolved yet. A generated-union tag
@@ -3928,6 +3950,7 @@ pub fn enumFields(pool: *const InternPool, enum_ty: Index) ?EnumFields {
         .nonexhaustive = pool.extra.items[off + 1] != 0,
         .field_names = @ptrCast(pool.extra.items[off + 4 ..][0..names_len]),
         .field_values = @ptrCast(pool.extra.items[off + 4 + names_len ..][0..values_len]),
+        .field_name_map = @enumFromInt(pool.extra.items[item.data + @offsetOf(EnumTypeRepr, "field_name_map") / 4]),
     };
 }
 
@@ -3949,6 +3972,8 @@ pub fn setEnumFields(
     assert(item.tag == .type_enum);
     const slot = item.data + @offsetOf(EnumTypeRepr, "field_data") / 4;
     if (pool.extra.items[slot] != fields_unresolved) return;
+    // Empty field-name map, populated by Sema when it resolves the fields.
+    pool.extra.items[item.data + @offsetOf(EnumTypeRepr, "field_name_map") / 4] = @intFromEnum(try pool.addMap(pool.gpa, names.len));
     const off: u32 = @intCast(pool.extra.items.len);
     try pool.extra.ensureUnusedCapacity(pool.gpa, 4 + names.len + values.len);
     pool.extra.appendAssumeCapacity(@intFromEnum(int_tag_type));
@@ -3975,6 +4000,15 @@ pub const StructFields = struct {
     field_defaults: []const Index,
     field_aligns: []const Index,
     field_is_comptime_bits: []const u32,
+    field_name_map: MapIndex,
+
+    /// Field index for `name`, or null. Mirrors `LoadedStructType.nameIndex`.
+    pub fn nameIndex(fields: StructFields, pool: *const InternPool, name: NullTerminatedString) ?u32 {
+        const map = fields.field_name_map.get(pool);
+        const adapter: NullTerminatedString.Adapter = .{ .strings = fields.field_names };
+        const field_index = map.getIndexAdapted(name, adapter) orelse return null;
+        return @intCast(field_index);
+    }
 };
 
 /// This struct's resolved fields, or null if it stores none (a declared struct,
@@ -4005,6 +4039,7 @@ pub fn structFields(pool: *const InternPool, struct_ty: Index) ?StructFields {
         .field_defaults = defaults,
         .field_aligns = aligns,
         .field_is_comptime_bits = pool.extra.items[base..][0..comptime_len],
+        .field_name_map = @enumFromInt(pool.extra.items[item.data + @offsetOf(StructTypeRepr, "field_name_map") / 4]),
     };
 }
 
@@ -4030,6 +4065,8 @@ pub fn setStructFields(
     assert(item.tag == .type_struct);
     const slot = item.data + @offsetOf(StructTypeRepr, "field_data") / 4;
     if (pool.extra.items[slot] != fields_unresolved) return;
+    // Empty field-name map, populated by Sema when it resolves the fields.
+    pool.extra.items[item.data + @offsetOf(StructTypeRepr, "field_name_map") / 4] = @intFromEnum(try pool.addMap(pool.gpa, names.len));
     const off: u32 = @intCast(pool.extra.items.len);
     try pool.extra.ensureUnusedCapacity(pool.gpa, 6 + names.len + types.len + defaults.len + aligns.len + comptime_bits.len);
     pool.extra.appendAssumeCapacity(@intFromEnum(layout));
@@ -4085,6 +4122,7 @@ fn emitUnionType(pool: *InternPool, ut: Key.UnionType) Allocator.Error!void {
         .name = @intFromEnum(ut.name),
         .parent = @intFromEnum(ut.parent),
         .field_data = fields_unresolved,
+        .field_name_map = @intFromEnum(OptionalMapIndex.none),
         .captures_len = containerCapturesLen(ut.id),
         .namespace = @intFromEnum(ut.namespace),
     });
@@ -4106,6 +4144,13 @@ pub const UnionFields = struct {
     field_names: []const NullTerminatedString,
     field_types: []const Index,
     field_aligns: []const Index,
+    /// Field-name dedup map. The compiler has none on `LoadedUnionType`: it resolves
+    /// a union's fields into its tag enum and validates names via that enum's
+    /// `field_name_map`. The REPL's generated tag enum is a lazy shell that reads
+    /// fields from the union, so the names -- and their map -- live on the union
+    /// instead. Populated for duplicate detection; drives no lookup (a union field is
+    /// resolved through the tag enum, per `unionFieldIndex`).
+    field_name_map: MapIndex,
 };
 
 /// This union's resolved fields, or null if it stores none (a declared union, which
@@ -4129,6 +4174,7 @@ pub fn unionFields(pool: *const InternPool, union_ty: Index) ?UnionFields {
         .field_names = names,
         .field_types = types,
         .field_aligns = @ptrCast(pool.extra.items[base..][0..aligns_len]),
+        .field_name_map = @enumFromInt(pool.extra.items[item.data + @offsetOf(UnionTypeRepr, "field_name_map") / 4]),
     };
 }
 
@@ -4151,6 +4197,8 @@ pub fn setUnionFields(
     assert(item.tag == .type_union);
     const slot = item.data + @offsetOf(UnionTypeRepr, "field_data") / 4;
     if (pool.extra.items[slot] != fields_unresolved) return;
+    // Empty field-name map, populated by Sema when it resolves the fields.
+    pool.extra.items[item.data + @offsetOf(UnionTypeRepr, "field_name_map") / 4] = @intFromEnum(try pool.addMap(pool.gpa, names.len));
     const off: u32 = @intCast(pool.extra.items.len);
     try pool.extra.ensureUnusedCapacity(pool.gpa, 5 + names.len + types.len + aligns.len);
     pool.extra.appendAssumeCapacity(@intFromEnum(layout));

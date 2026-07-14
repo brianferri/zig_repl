@@ -4711,6 +4711,21 @@ fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.In
         .parent = sema.this_type,
     });
     try ip.setEnumFields(enum_ty, tag_ty, nonexhaustive, names, values);
+    // Populate and validate the name map, mirroring `src/Sema/type_resolution.zig`:
+    // the field names came from the user (not AstGen), so duplicates are real errors.
+    const fields = ip.enumFields(enum_ty).?;
+    fields.field_name_map.get(ip).clearRetainingCapacity();
+    for (names, 0..) |field_name, field_index| {
+        if (ip.addFieldName(names, fields.field_name_map, field_name)) |prev_field_index| {
+            return sema.failWithOwnedErrorMsg(sema.block, msg: {
+                const src = sema.block.builtinCallArgSrc(sema.srcNodeOffset(inst), 2);
+                const msg = try sema.errMsg(src, "duplicate enum field '{f}' at index '{d}'", .{ field_name.fmt(ip), field_index });
+                errdefer msg.destroy(sema.gpa);
+                try sema.errNote(src, msg, "previous field at index '{d}'", .{prev_field_index});
+                break :msg msg;
+            });
+        }
+    }
     return .{ .index = enum_ty };
 }
 
@@ -4855,6 +4870,19 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
         if (any_aligns) aligns else &.{},
         if (any_comptime) comptime_words else &.{},
     );
+    const fields = ip.structFields(struct_ty).?;
+    fields.field_name_map.get(ip).clearRetainingCapacity();
+    for (names, 0..) |field_name, field_index| {
+        if (ip.addFieldName(names, fields.field_name_map, field_name)) |prev_field_index| {
+            return sema.failWithOwnedErrorMsg(sema.block, msg: {
+                const src = sema.block.builtinCallArgSrc(sema.srcNodeOffset(inst), 2);
+                const msg = try sema.errMsg(src, "duplicate struct field '{f}' at index '{d}", .{ field_name.fmt(ip), field_index });
+                errdefer msg.destroy(sema.gpa);
+                try sema.errNote(src, msg, "previous field at index '{d}'", .{prev_field_index});
+                break :msg msg;
+            });
+        }
+    }
     return .{ .index = struct_ty };
 }
 
@@ -4967,6 +4995,24 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
         .parent = sema.this_type,
     });
     try ip.setUnionFields(union_ty, layout, tag_type, backing_int, names, types, if (any_aligns) aligns else &.{});
+    // The compiler validates a union's field names through its tag enum's
+    // `field_name_map`, because it resolves the union's fields into that enum. The
+    // REPL's generated tag enum is a lazy shell that reads fields from the union, so
+    // the union keeps its own names and its own map; the `addFieldName` mechanism is
+    // otherwise identical to `src/Sema/type_resolution.zig`.
+    const fields = ip.unionFields(union_ty).?;
+    fields.field_name_map.get(ip).clearRetainingCapacity();
+    for (names, 0..) |field_name, field_index| {
+        if (ip.addFieldName(names, fields.field_name_map, field_name)) |prev_field_index| {
+            return sema.failWithOwnedErrorMsg(sema.block, msg: {
+                const src = sema.block.builtinCallArgSrc(sema.srcNodeOffset(inst), 2);
+                const msg = try sema.errMsg(src, "duplicate union field '{f}' at index '{d}", .{ field_name.fmt(ip), field_index });
+                errdefer msg.destroy(sema.gpa);
+                try sema.errNote(src, msg, "previous field at index '{d}'", .{prev_field_index});
+                break :msg msg;
+            });
+        }
+    }
     return .{ .index = union_ty };
 }
 
@@ -6726,18 +6772,16 @@ pub fn structFieldByName(
     name: InternPool.NullTerminatedString,
 ) Error!?FieldInfo {
     const ip = sema.intern_pool;
-    // A reified struct has no ZIR; its fields are read from storage.
+    // A reified struct has no ZIR; its fields are read from storage, keyed through
+    // the field-name map like the compiler's `LoadedStructType.nameIndex`.
     if (ip.structFields(struct_ty)) |f| {
-        for (f.field_names, 0..) |n, i| {
-            if (n != name) continue;
-            return .{
-                .index = @intCast(i),
-                .ty = f.field_types[i],
-                .is_comptime = structFieldIsComptime(f, i),
-                .align_bytes = structFieldAlign(sema, f, i),
-            };
-        }
-        return null;
+        const i = f.nameIndex(ip, name) orelse return null;
+        return .{
+            .index = i,
+            .ty = f.field_types[i],
+            .is_comptime = structFieldIsComptime(f, i),
+            .align_bytes = structFieldAlign(sema, f, i),
+        };
     }
     // Intern each ZIR field name as we scan and compare interned handles against
     // the (already interned) query -- the compiler resolves struct fields lazily
@@ -6779,11 +6823,8 @@ pub fn structFieldDefault(
     const ip = sema.intern_pool;
     // A reified struct has no ZIR; its defaults are stored (`.none` if none).
     if (ip.structFields(struct_ty)) |f| {
-        for (f.field_names, 0..) |n, i| {
-            if (n != name) continue;
-            return if (f.field_defaults.len == 0) .none else f.field_defaults[i];
-        }
-        return .none;
+        const i = f.nameIndex(ip, name) orelse return .none;
+        return if (f.field_defaults.len == 0) .none else f.field_defaults[i];
     }
     const cf = try sema.enterContainer(struct_ty, "struct field default");
     defer cf.restore(sema);
@@ -7110,6 +7151,14 @@ fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error
     if (et.id.generatedUnion() != .none) return try sema.generatedTagScan(enum_ty, match);
 
     const fields = try sema.resolveEnumFields(enum_ty);
+    // A by-name lookup keys through the field-name map, like the compiler's
+    // `LoadedEnumType.nameIndex`; by-value/by-index still walk (the REPL models a
+    // lookup value as an `i128`, not an interned tag as `tagValueIndex` expects).
+    if (match == .name) {
+        const pos = fields.nameIndex(ip, match.name) orelse return null;
+        const cur: i128 = if (fields.field_values.len == 0) @intCast(pos) else sema.intAsI128(fields.field_values[pos]).?;
+        return try sema.matchEnumField(enum_ty, fields.int_tag_type, match, fields.field_names[pos], @intCast(pos), cur);
+    }
     for (fields.field_names, 0..) |field_name, pos| {
         // An auto-numbered enum stores no values; the tag value is the field index.
         const cur: i128 = if (fields.field_values.len == 0) @intCast(pos) else sema.intAsI128(fields.field_values[pos]).?;
@@ -7156,6 +7205,11 @@ fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.En
         try values.append(sema.gpa, try sema.enumTagIntValue(tag_ty, cur));
     }
     try ip.setEnumFields(enum_ty, tag_ty, decl.nonexhaustive, names.items, values.items);
+    const fields = ip.enumFields(enum_ty).?;
+    // AstGen validated the field names, so the name map cannot collide (the compiler
+    // likewise asserts in `src/Sema/type_resolution.zig`).
+    fields.field_name_map.get(ip).clearRetainingCapacity();
+    for (names.items) |field_name| assert(ip.addFieldName(names.items, fields.field_name_map, field_name) == null);
     return ip.enumFields(enum_ty).?;
 }
 
@@ -11350,6 +11404,9 @@ fn opvEnum(sema: *Sema, hash: u64, names: []const []const u8) !Type {
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
     });
     try pool.setEnumFields(enum_ty, tag_ty, false, handles, &.{});
+    const f = pool.enumFields(enum_ty).?;
+    f.field_name_map.get(pool).clearRetainingCapacity();
+    for (handles) |name| assert(pool.addFieldName(handles, f.field_name_map, name) == null);
     return .fromIndex(enum_ty);
 }
 
@@ -11361,6 +11418,9 @@ fn opvStruct(sema: *Sema, hash: u64, names: []const []const u8, types: []const I
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
     });
     try pool.setStructFields(struct_ty, .auto, .none, handles, types, &.{}, &.{}, &.{});
+    const f = pool.structFields(struct_ty).?;
+    f.field_name_map.get(pool).clearRetainingCapacity();
+    for (handles) |name| assert(pool.addFieldName(handles, f.field_name_map, name) == null);
     return .fromIndex(struct_ty);
 }
 
@@ -11373,6 +11433,9 @@ fn opvUnion(sema: *Sema, hash: u64, tag_hash: u64, names: []const []const u8, ty
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
     });
     try pool.setUnionFields(union_ty, .auto, tag_enum.index, .none, handles, types, &.{});
+    const f = pool.unionFields(union_ty).?;
+    f.field_name_map.get(pool).clearRetainingCapacity();
+    for (handles) |name| assert(pool.addFieldName(handles, f.field_name_map, name) == null);
     return .fromIndex(union_ty);
 }
 
