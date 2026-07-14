@@ -7661,6 +7661,11 @@ fn analyzeNavVal(sema: *Sema, nav_idx: InternPool.Nav.Index) Error!Value {
     const saved_this = sema.this_type;
     sema.this_type = container_ty;
     defer sema.this_type = saved_this;
+    // Name any type defined in this decl's body after the decl (`const Os = struct
+    // {...}` -> the struct is named `Os`), as `bindValueDecl` does for session decls.
+    const saved_ctx = sema.type_name_ctx;
+    sema.type_name_ctx = ip.getNav(nav_idx).fqn;
+    defer sema.type_name_ctx = saved_ctx;
     const saved_params = sema.block.params;
     sema.block.params = .empty;
     defer {

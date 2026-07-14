@@ -6,6 +6,7 @@ const assert = std.debug.assert;
 const InternPool = @import("../sema/InternPool.zig");
 const Value = @import("../sema/Value.zig");
 const Type = @import("../sema/Type.zig");
+const Session = @import("../Session.zig");
 
 /// Error union for renderers: `Writer.Error` for the I/O path, plus
 /// `Allocator.Error` because the type-name path (`Type.print`) allocates to
@@ -21,7 +22,7 @@ pub const Formatter = struct {
     value: Value,
     pool: *const InternPool,
     pub fn format(self: Formatter, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        render(self.value, self.pool, writer) catch |err| switch (err) {
+        render(self.value, self.pool, null, writer) catch |err| switch (err) {
             error.WriteFailed => return error.WriteFailed,
             else => try writer.writeAll("<value>"),
         };
@@ -38,6 +39,7 @@ pub fn fmt(value: Value, pool: *const InternPool) Formatter {
 pub fn render(
     value: Value,
     pool: *const InternPool,
+    session: ?*const Session,
     writer: *std.Io.Writer,
 ) Error!void {
     assert(value.index != .none);
@@ -55,7 +57,7 @@ pub fn render(
         .opt => |o| if (o.val == .none)
             writer.writeAll("null")
         else
-            render(.{ .index = o.val }, pool, writer),
+            render(.{ .index = o.val }, pool, session, writer),
         .ptr => |p| writer.print("ptr@{d}+{d}", .{ @intFromEnum(p.ty), p.byte_offset }),
         // The elements live behind the slice's `ptr` in a Sema comptime alloc the
         // renderer cannot reach (like struct fields), so render just the length.
@@ -65,16 +67,11 @@ pub fn render(
             break :blk writer.print("slice[{f}]", .{len});
         },
         .err => |e| writer.print("error.{s}", .{pool.stringSlice(e.name)}),
-        .error_union => |eu| renderErrorUnion(eu, pool, writer),
+        .error_union => |eu| renderErrorUnion(eu, pool, session, writer),
         .func => |f| writer.print("fn@{d}", .{@intFromEnum(f.zir_body_inst)}),
-        .aggregate => |agg| renderAggregate(agg, pool, writer),
-        // The tag name lives in the enum's ZIR, which the renderer cannot reach
-        // (same limit as struct field names). Render the underlying integer tag --
-        // what `@intFromEnum` yields -- until a ZIR-aware rendering path exists.
-        .enum_tag => |et| render(.{ .index = et.int }, pool, writer),
-        // The active field's name lives in the union's ZIR (unreachable here, same
-        // limit as struct fields/enum tags); render the active payload value.
-        .un => |uv| render(.{ .index = uv.val }, pool, writer),
+        .aggregate => |agg| renderAggregate(agg, pool, session, writer),
+        .enum_tag => |et| renderEnumTag(et, pool, session, writer),
+        .un => |uv| renderUnion(uv, pool, session, writer),
         // A bare type Key viewed as a value identifies the type itself
         // (Sema's value-of-type-type convention; see Value.typeOf). The
         // value Keys above are exhaustive, so the assert turns a future
@@ -86,19 +83,26 @@ pub fn render(
     };
 }
 
-/// Render an aggregate as `{ e0, e1, e2, ... }`, each element through `render`.
+/// Render an aggregate. A struct with a `session` to read its field names prints
+/// shaped -- `.{ .field = val, ... }`; a tuple `.{ v0, v1, ... }`; an array or
+/// vector, or a struct with no name source, positionally `{ v0, v1, ... }`.
 fn renderAggregate(
     agg: InternPool.Key.Aggregate,
     pool: *const InternPool,
+    session: ?*const Session,
     writer: *std.Io.Writer,
 ) Error!void {
-    if (pool.indexToKey(agg.ty) == .tuple_type) try writer.writeByte('.');
+    const ty_key = pool.indexToKey(agg.ty);
+    const shaped = ty_key == .struct_type and session != null;
+    // A named struct prints `TypeName{ ... }`; a tuple `.{ ... }`; an array or
+    // vector positionally `{ ... }`.
+    if (shaped) try renderTypeRef(agg.ty, pool, writer) else if (ty_key == .tuple_type) try writer.writeByte('.');
     try writer.writeAll("{ ");
     // Arrays and vectors display their declared length, which excludes the
     // sentinel slot the aggregate stores (`printAggregate` iterates `arrayLen`, not
     // `arrayLenIncludingSentinel`). Structs/tuples carry no such count in the type,
     // so fall back to the storage length (`.repeated_elem` reads it from the type).
-    const count: u64 = switch (pool.indexToKey(agg.ty)) {
+    const count: u64 = switch (ty_key) {
         .array_type => |at| at.len,
         .vector_type => |vt| vt.len,
         else => switch (agg.storage) {
@@ -109,23 +113,112 @@ fn renderAggregate(
     var i: u64 = 0;
     while (i < count) : (i += 1) {
         if (i > 0) try writer.writeAll(", ");
+        if (shaped) {
+            if (structFieldName(pool, session.?, agg.ty, @intCast(i))) |name|
+                try writer.print(".{s} = ", .{name});
+        }
         const elem_idx: InternPool.Index = switch (agg.storage) {
             .repeated_elem => |e| e,
             .elems => |es| es[@intCast(i)],
         };
-        try render(.{ .index = elem_idx }, pool, writer);
+        try render(.{ .index = elem_idx }, pool, session, writer);
     }
     try writer.writeAll(" }");
+}
+
+/// The name of struct field `index` -- stored for a reified struct, read from the
+/// declaring ZIR for a declared one. Null if unavailable (the caller falls back to
+/// positional). The read-only analogue of `Sema.structFieldNameAt`.
+fn structFieldName(pool: *const InternPool, session: *const Session, struct_ty: InternPool.Index, index: u32) ?[]const u8 {
+    if (pool.structFields(struct_ty)) |f| return if (index < f.names.len) pool.stringSlice(f.names[index]) else null;
+    const d = switch (pool.indexToKey(struct_ty).struct_type.id) {
+        .declared => |dd| dd,
+        else => return null,
+    };
+    if (d.source_zir_id >= session.files.items.len) return null;
+    const zir = session.files.items[d.source_zir_id].zir orelse return null;
+    var it = zir.getStructDecl(d.decl_inst).iterateFields();
+    while (it.next()) |field| {
+        if (field.idx == index) return zir.nullTerminatedString(field.name);
+    }
+    return null;
+}
+
+/// The name of union field `index` -- stored for a reified union, read from the
+/// declaring ZIR for a declared one. The read-only analogue of `Sema.unionFieldNameAt`.
+fn unionFieldName(pool: *const InternPool, session: *const Session, union_ty: InternPool.Index, index: u32) ?[]const u8 {
+    if (pool.unionFields(union_ty)) |f| return if (index < f.names.len) pool.stringSlice(f.names[index]) else null;
+    const d = switch (pool.indexToKey(union_ty).union_type.id) {
+        .declared => |dd| dd,
+        else => return null,
+    };
+    if (d.source_zir_id >= session.files.items.len) return null;
+    const zir = session.files.items[d.source_zir_id].zir orelse return null;
+    var it = zir.getUnionDecl(d.decl_inst).iterateFields();
+    while (it.next()) |field| {
+        if (field.idx == index) return zir.nullTerminatedString(field.name);
+    }
+    return null;
+}
+
+/// The i128 value of an `int` Key, or null if `idx` is not an integer or overflows.
+fn intOf(pool: *const InternPool, idx: InternPool.Index) ?i128 {
+    const key = pool.indexToKey(idx);
+    if (key != .int) return null;
+    return switch (key.int.storage) {
+        .u64 => |v| @intCast(v),
+        .i64 => |v| @intCast(v),
+        .big_int => |b| b.toInt(i128) catch null,
+    };
+}
+
+/// The field name an `enum_tag` selects: for a generated union-tag enum, the
+/// union's field at the tag index; otherwise the enum's resolved fields (cached
+/// once a value of the enum was produced) -- an auto enum indexes by the tag, an
+/// explicit one matches the tag value. Null if the fields are not resolved.
+fn enumTagName(pool: *const InternPool, session: *const Session, enum_ty: InternPool.Index, int_idx: InternPool.Index) ?[]const u8 {
+    const tag = intOf(pool, int_idx) orelse return null;
+    const gen = pool.indexToKey(enum_ty).enum_type.id.generatedUnion();
+    if (gen != .none) return if (tag >= 0) unionFieldName(pool, session, gen, @intCast(tag)) else null;
+    const f = pool.enumFields(enum_ty) orelse return null;
+    if (f.values.len == 0) return if (tag >= 0 and tag < f.names.len) pool.stringSlice(f.names[@intCast(tag)]) else null;
+    for (f.values, 0..) |v, pos| {
+        if (intOf(pool, v)) |vv| if (vv == tag) return pool.stringSlice(f.names[pos]);
+    }
+    return null;
+}
+
+/// `.tag` when the tag name resolves, else the underlying integer.
+fn renderEnumTag(et: InternPool.Key.EnumTag, pool: *const InternPool, session: ?*const Session, writer: *std.Io.Writer) Error!void {
+    if (session) |s| if (enumTagName(pool, s, et.ty, et.int)) |name| return writer.print(".{s}", .{name});
+    return render(.{ .index = et.int }, pool, session, writer);
+}
+
+/// `.{ .field = payload }` when the active field name resolves, else the payload.
+fn renderUnion(uv: InternPool.Key.Union, pool: *const InternPool, session: ?*const Session, writer: *std.Io.Writer) Error!void {
+    if (session) |s| {
+        const tag_key = pool.indexToKey(uv.tag);
+        if (tag_key == .enum_tag) if (intOf(pool, tag_key.enum_tag.int)) |idx| {
+            if (idx >= 0) if (unionFieldName(pool, s, uv.ty, @intCast(idx))) |name| {
+                try renderTypeRef(uv.ty, pool, writer);
+                try writer.print("{{ .{s} = ", .{name});
+                try render(.{ .index = uv.val }, pool, session, writer);
+                return writer.writeAll(" }");
+            };
+        };
+    }
+    return render(.{ .index = uv.val }, pool, session, writer);
 }
 
 fn renderErrorUnion(
     eu: InternPool.Key.ErrorUnion,
     pool: *const InternPool,
+    session: ?*const Session,
     writer: *std.Io.Writer,
 ) Error!void {
     switch (eu.val) {
         .err_name => |name| try writer.print("error.{s}", .{pool.stringSlice(name)}),
-        .payload => |idx| try render(.{ .index = idx }, pool, writer),
+        .payload => |idx| try render(.{ .index = idx }, pool, session, writer),
     }
 }
 

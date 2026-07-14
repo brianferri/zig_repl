@@ -78,7 +78,7 @@ fn expectReplValue(session: *Session, source: []const u8, expected: []const u8) 
     const value = (try eval.run(session, source, &diag.writer)).value orelse return error.NoValue;
     var buf: [256]u8 = undefined;
     var w = Io.Writer.fixed(&buf);
-    try render.render(value, session.intern_pool, &w);
+    try render.render(value, session.intern_pool, null, &w);
     try testing.expectEqualStrings(expected, std.mem.trimEnd(u8, w.buffered(), "\n"));
 }
 
@@ -340,5 +340,57 @@ test "reify constructors: value paths and rejected inputs" {
             std.debug.print("diagnostic for '{s}' did not contain '{s}':\n{s}\n", .{ p.src, p.needle, diag.written() });
             return error.TestDiagnosticMismatch;
         }
+    }
+}
+
+test "render: a struct value prints TypeName{ .field = val }" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+
+    var diag: std.Io.Writer.Allocating = .init(gpa);
+    defer diag.deinit();
+    _ = try eval.run(&session, "const P = struct { x: u8, y: u8 };", &diag.writer);
+    const value = (try eval.run(&session, "P{ .x = 3, .y = 7 }", &diag.writer)).value.?;
+
+    var buf: [256]u8 = undefined;
+    var w = Io.Writer.fixed(&buf);
+    // With the session, the struct prints shaped and named (a type defined in a
+    // decl body takes the decl's name -- the `type_name_ctx` set in `analyzeNavVal`);
+    // without it, positionally.
+    try render.render(value, &pool, &session, &w);
+    try testing.expectEqualStrings("repl.P{ .x = 3, .y = 7 }", w.buffered());
+
+    var buf2: [256]u8 = undefined;
+    var w2 = Io.Writer.fixed(&buf2);
+    try render.render(value, &pool, null, &w2);
+    try testing.expectEqualStrings("{ 3, 7 }", w2.buffered());
+}
+
+test "render: enum and union values print their names" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+    var diag: std.Io.Writer.Allocating = .init(gpa);
+    defer diag.deinit();
+
+    const cases = [_]struct { decl: []const u8, expr: []const u8, want: []const u8 }{
+        .{ .decl = "const E1 = enum { a, b, c };", .expr = "E1.b", .want = ".b" },
+        .{ .decl = "const E2 = enum(u8) { a = 10, b = 20 };", .expr = "E2.b", .want = ".b" },
+        .{ .decl = "const U = union(enum) { a: u8, b: bool };", .expr = "U{ .b = true }", .want = "repl.U{ .b = true }" },
+    };
+    for (cases) |c| {
+        _ = try eval.run(&session, c.decl, &diag.writer);
+        const value = (try eval.run(&session, c.expr, &diag.writer)).value.?;
+        var buf: [128]u8 = undefined;
+        var w = Io.Writer.fixed(&buf);
+        try render.render(value, &pool, &session, &w);
+        try testing.expectEqualStrings(c.want, w.buffered());
     }
 }

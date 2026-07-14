@@ -80,7 +80,7 @@ fn dispatch(input: []const u8) !void {
 
 fn evaluate(input: []const u8, w: *std.Io.Writer) !void {
     if (try eval.report(&session, input, w)) |value| {
-        try render_value.render(value, session.intern_pool, w);
+        try render_value.render(value, session.intern_pool, &session, w);
         try w.writeByte('\n');
     }
 }
@@ -129,7 +129,7 @@ fn preview(input: []const u8) !void {
         return;
     };
     try w.writeAll("=> ");
-    try render_value.render(value, preview_session.intern_pool, w);
+    try render_value.render(value, preview_session.intern_pool, &preview_session, w);
     try w.writeAll("   type: ");
     try Type.print(value.typeOf(preview_session.intern_pool), preview_session.intern_pool, w);
     try w.writeByte('\n');

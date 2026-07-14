@@ -960,7 +960,7 @@ fn expectEvalTypeName(
 
     var render_buf: [256]u8 = undefined;
     var render_writer = std.Io.Writer.fixed(&render_buf);
-    try @import("render/Value.zig").render(value, intern_pool, &render_writer);
+    try @import("render/Value.zig").render(value, intern_pool, null, &render_writer);
 
     const rendered_raw = render_writer.buffered();
     const rendered = std.mem.trimEnd(u8, rendered_raw, "\n");

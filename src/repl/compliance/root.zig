@@ -145,7 +145,7 @@ fn replRun(gpa: std.mem.Allocator, inputs: []const []const u8) ![]u8 {
 
     var out_buf: [4096]u8 = undefined;
     var out_writer = Io.Writer.fixed(&out_buf);
-    try render.render(value, &pool, &out_writer);
+    try render.render(value, &pool, null, &out_writer);
     return gpa.dupe(u8, std.mem.trimEnd(u8, out_writer.buffered(), "\n"));
 }
 
