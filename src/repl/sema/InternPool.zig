@@ -216,6 +216,24 @@ pub const Index = enum(u32) {
         const raw = @intFromEnum(index);
         return raw >= @intFromEnum(first_value) and raw <= @intFromEnum(last_value);
     }
+
+    /// Adapts an interned `Index` key to a `FieldMap` whose insertion index selects
+    /// the value in `indexes` -- the tag-value analogue of `NullTerminatedString.Adapter`.
+    /// Two enum fields share a tag value iff their interned value Indexes are equal
+    /// (interning is content-addressed), so hashing the handle alone is exact.
+    const Adapter = struct {
+        indexes: []const Index,
+
+        pub fn eql(ctx: @This(), a: Index, b_void: void, b_map_index: usize) bool {
+            _ = b_void;
+            return a == ctx.indexes[b_map_index];
+        }
+
+        pub fn hash(ctx: @This(), a: Index) u32 {
+            _ = ctx;
+            return std.hash.int(@intFromEnum(a));
+        }
+    };
 };
 
 const first_dynamic_index: u32 = @intFromEnum(Index.empty_tuple) + 1;
@@ -257,6 +275,24 @@ pub const NullTerminatedString = enum(u32) {
         if (std.mem.indexOfScalar(u8, slice, '_')) |_| return null;
         return std.fmt.parseUnsigned(u32, slice, 10) catch null;
     }
+
+    /// Adapts a `NullTerminatedString` key to a `FieldMap` whose entries are
+    /// `void` and whose insertion index selects the name in `strings`. The hash
+    /// is over the interned handle's integer alone (distinct handles never alias
+    /// a string, so identity hashing suffices); equality compares handles.
+    const Adapter = struct {
+        strings: []const NullTerminatedString,
+
+        pub fn eql(ctx: @This(), a: NullTerminatedString, b_void: void, b_map_index: usize) bool {
+            _ = b_void;
+            return a == ctx.strings[b_map_index];
+        }
+
+        pub fn hash(ctx: @This(), a: NullTerminatedString) u32 {
+            _ = ctx;
+            return std.hash.int(@intFromEnum(a));
+        }
+    };
 
     const FormatData = struct {
         string: NullTerminatedString,
@@ -2225,6 +2261,38 @@ pub const Float128 = extern struct {
     }
 };
 
+/// Field-name dedup map for a container type. Keys are `void` (the canonical
+/// key is a `NullTerminatedString` recovered via `Adapter` from the type's
+/// stored name slice); `store_hash` is `false` because the adapter's hash is a
+/// cheap integer hash. Mirrors the compiler's `FieldMap`.
+const FieldMap = std.array_hash_map.Custom(void, void, std.array_hash_map.AutoContext(void), false);
+
+/// An index into `maps` which might be `none`.
+pub const OptionalMapIndex = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+
+    pub fn unwrap(oi: OptionalMapIndex) ?MapIndex {
+        if (oi == .none) return null;
+        return @enumFromInt(@intFromEnum(oi));
+    }
+};
+
+/// An index into `maps`.
+pub const MapIndex = enum(u32) {
+    _,
+
+    /// Single-shard equivalent of the compiler's `MapIndex.get` (which resolves
+    /// a thread-local shard); the REPL keeps one `maps` list.
+    pub fn get(map_index: MapIndex, ip: *const InternPool) *FieldMap {
+        return &ip.maps.items[@intFromEnum(map_index)];
+    }
+
+    pub fn toOptional(i: MapIndex) OptionalMapIndex {
+        return @enumFromInt(@intFromEnum(i));
+    }
+};
+
 gpa: Allocator,
 items: std.MultiArrayList(Item),
 extra: std.ArrayListUnmanaged(u32),
@@ -2265,6 +2333,9 @@ string_map: std.AutoArrayHashMapUnmanaged(void, void),
 navs: std.ArrayListUnmanaged(Nav),
 /// Backing store for `NamespaceIndex`. Append-only.
 namespaces: std.ArrayListUnmanaged(Namespace),
+/// Backing store for `MapIndex`: a container type's field-name dedup map,
+/// created lazily by `addMap` when the type's fields are populated.
+maps: std.ArrayListUnmanaged(FieldMap),
 /// Backing store for `ComptimeUnit.Id`. Append-only.
 comptime_units: std.ArrayListUnmanaged(ComptimeUnit),
 /// Every error name that has been assigned a global integer, in assignment
@@ -2320,6 +2391,7 @@ pub fn init(gpa: Allocator) Allocator.Error!InternPool {
         .string_map = .empty,
         .navs = .empty,
         .namespaces = .empty,
+        .maps = .empty,
         .comptime_units = .empty,
         .global_error_set = .empty,
     };
@@ -2348,11 +2420,64 @@ pub fn deinit(pool: *InternPool) void {
         ns.comptime_decls.deinit(pool.gpa);
     }
     pool.namespaces.deinit(pool.gpa);
+    for (pool.maps.items) |*m| m.deinit(pool.gpa);
+    pool.maps.deinit(pool.gpa);
     pool.comptime_units.deinit(pool.gpa);
     pool.navs.deinit(pool.gpa);
     pool.big_int_limbs.deinit(pool.gpa);
     pool.map.deinit(pool.gpa);
     pool.* = undefined;
+}
+
+/// Append a fresh, empty field-name map with room for `cap` entries and return
+/// its index. Single-shard equivalent of the compiler's `addMap` (no `tid`/`io`).
+fn addMap(pool: *InternPool, gpa: Allocator, cap: usize) Allocator.Error!MapIndex {
+    const index: MapIndex = @enumFromInt(pool.maps.items.len);
+    const ptr = try pool.maps.addOne(gpa);
+    errdefer pool.maps.items.len -= 1;
+    ptr.* = .{};
+    try ptr.ensureTotalCapacity(gpa, cap);
+    return index;
+}
+
+/// Puts `name` into `names` at the next index (the current length of `map`) and
+/// inserts it into `map`. If a field with this name already exists its index is
+/// returned; otherwise `null`. Verbatim from the compiler's `addFieldName`, with
+/// `names` a plain slice (the REPL fills a local names array at reify time rather
+/// than the compiler's pool-backed `NullTerminatedString.Slice`).
+pub fn addFieldName(
+    pool: *InternPool,
+    names: []NullTerminatedString,
+    map: MapIndex,
+    name: NullTerminatedString,
+) ?u32 {
+    const m = map.get(pool);
+    const field_idx = m.count();
+    names[field_idx] = name;
+    const adapter: NullTerminatedString.Adapter = .{ .strings = names[0..field_idx] };
+    const gop = m.getOrPutAssumeCapacityAdapted(name, adapter);
+    if (gop.found_existing) return @intCast(gop.index);
+    assert(gop.index == field_idx);
+    return null;
+}
+
+/// Like `addFieldName`, but for an enum's tag values: puts `value` into `values`
+/// at the next index and inserts it into `map`, returning the index of an existing
+/// field with the same value, or null. Verbatim from the compiler's `addFieldTagValue`.
+pub fn addFieldTagValue(
+    pool: *InternPool,
+    values: []Index,
+    map: MapIndex,
+    value: Index,
+) ?u32 {
+    const m = map.get(pool);
+    const field_idx = m.count();
+    values[field_idx] = value;
+    const adapter: Index.Adapter = .{ .indexes = values[0..field_idx] };
+    const gop = m.getOrPutAssumeCapacityAdapted(value, adapter);
+    if (gop.found_existing) return @intCast(gop.index);
+    assert(gop.index == field_idx);
+    return null;
 }
 
 /// The global integer for error `name`, assigning the next one if unseen. The
