@@ -254,6 +254,8 @@ main {
 
 #pane-result > pre {
     font-size: 15px;
+    white-space: pre-wrap;
+    word-break: break-word;
 }
 
 .nodes {
