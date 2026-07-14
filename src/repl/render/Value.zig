@@ -86,9 +86,7 @@ pub fn render(
     };
 }
 
-/// Render an aggregate as `{ e0, e1, e2, ... }`. Each element is
-/// printed inline without the trailing newline that the top-level
-/// `render` would add -- the brace-list is itself one value.
+/// Render an aggregate as `{ e0, e1, e2, ... }`, each element through `render`.
 fn renderAggregate(
     agg: InternPool.Key.Aggregate,
     pool: *const InternPool,
@@ -115,31 +113,9 @@ fn renderAggregate(
             .repeated_elem => |e| e,
             .elems => |es| es[@intCast(i)],
         };
-        try renderElemInline(elem_idx, pool, writer);
+        try render(.{ .index = elem_idx }, pool, writer);
     }
     try writer.writeAll(" }");
-}
-
-/// Inline-print a value: like `render` but without a trailing newline, so
-/// element values compose into the parent brace-list. Unsupported keys
-/// render as `<elem>` rather than recurse.
-fn renderElemInline(
-    elem_idx: InternPool.Index,
-    pool: *const InternPool,
-    writer: *std.Io.Writer,
-) Error!void {
-    const key = pool.indexToKey(elem_idx);
-    switch (key) {
-        .int => |iv| {
-            var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-            const big = iv.storage.toBigInt(&space);
-            try writer.print("{f}", .{big});
-        },
-        .float => |fv| try renderFloat(fv, writer),
-        .simple_value => |sv| try writer.writeAll(simpleValueText(sv)),
-        .undef => try writer.writeAll("undefined"),
-        else => try writer.writeAll("<elem>"),
-    }
 }
 
 fn renderErrorUnion(
