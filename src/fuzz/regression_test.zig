@@ -47,6 +47,19 @@ test "survives adversarial single-line inputs" {
         "@field(1, 2)",
         "@Type(.{})",
         "@memcpy()",
+        // Bitwise operators on non-integer operands: a type error, not a panic
+        // (`bitwiseBin`'s `else => unreachable` assumes validated operands).
+        "3.5 & 3",
+        "1.0 | 2",
+        "2.5 ^ 1",
+        "true & 1.0",
+        // Wrapping / saturating operators reject floats (integer-only), rather
+        // than reaching the kernels' `else => unreachable`.
+        "@as(u4, 15) *% @as(f64, @floatFromInt(7))",
+        "3.0 +% 1",
+        "2.5 -% 1",
+        "1.0 *| 2",
+        "3.5 +| 1",
     };
     for (cases) |input| harness.runLine(gpa, input);
 }

@@ -979,6 +979,10 @@ fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?
     const lhs = try sema.coerceValueToType(lhs_val, resolved_type.index, op_name);
     const rhs = try sema.coerceValueToType(rhs_val, resolved_type.index, op_name);
 
+    const pool = sema.intern_pool;
+    const scalar_tag = resolved_type.scalarType(pool).zigTypeTag(pool);
+    try sema.checkArithmeticOp(scalar_tag, Value.typeOf(lhs_val, pool).zigTypeTag(pool), Value.typeOf(rhs_val, pool).zigTypeTag(pool), tag);
+
     return switch (tag) {
         .add, .add_unsafe => try arith.add(sema, resolved_type, lhs, rhs),
         .addwrap => try arith.addWrap(sema, resolved_type, lhs, rhs),
@@ -1962,6 +1966,30 @@ fn evalShift(
 /// type. For comptime_int operands, the bignum result is canonical.
 ///
 /// Compiler reference: src/Sema.zig:zirBitBinOp -> src/Sema/arith.zig.
+/// Reject operand types an arithmetic operator does not accept: everything needs
+/// an integer scalar, and only the non-wrapping/non-saturating operators also
+/// accept floats. Mirrors `checkArithmeticOp`; the kernels in `arith.zig` assume
+/// this has run (their `else => unreachable` covers the rejected tags).
+fn checkArithmeticOp(sema: *Sema, scalar_tag: std.lang.TypeId, lhs_zig_ty_tag: std.lang.TypeId, rhs_zig_ty_tag: std.lang.TypeId, tag: Zir.Inst.Tag) Error!void {
+    const is_int = scalar_tag == .int or scalar_tag == .comptime_int;
+    const is_float = scalar_tag == .float or scalar_tag == .comptime_float;
+    if (!is_int and !(is_float and floatOpAllowed(tag))) {
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "invalid operands to binary expression: '{s}' and '{s}'", .{
+            @tagName(lhs_zig_ty_tag), @tagName(rhs_zig_ty_tag),
+        });
+    }
+}
+
+/// Whether `tag` accepts float operands. The wrapping (`*%`) and saturating (`*|`)
+/// operators are integer-only. Mirrors `floatOpAllowed`; `.add_unsafe` joins
+/// `.add` because `evalBinaryArith` routes both to the same kernel.
+fn floatOpAllowed(tag: Zir.Inst.Tag) bool {
+    return switch (tag) {
+        .add, .add_unsafe, .sub, .mul, .div, .div_exact, .div_trunc, .div_floor, .mod, .rem, .mod_rem => true,
+        else => false,
+    };
+}
+
 fn evalBitwise(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
     const bin = sema.binData(inst);
     assert(bin.lhs != .none);
@@ -1974,6 +2002,16 @@ fn evalBitwise(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Valu
     const resolved_type = try sema.resolveArithPeerType(lhs_value, rhs_value, op_name);
     const lhs = try sema.coerceValueToType(lhs_value, resolved_type.index, op_name);
     const rhs = try sema.coerceValueToType(rhs_value, resolved_type.index, op_name);
+
+    const pool = sema.intern_pool;
+    const scalar_tag = resolved_type.scalarType(pool).zigTypeTag(pool);
+    const is_int_or_bool = scalar_tag == .int or scalar_tag == .comptime_int or scalar_tag == .bool;
+    if (!is_int_or_bool) {
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "invalid operands to binary bitwise expression: '{s}' and '{s}'", .{
+            @tagName(Value.typeOf(lhs_value, pool).zigTypeTag(pool)),
+            @tagName(Value.typeOf(rhs_value, pool).zigTypeTag(pool)),
+        });
+    }
 
     return switch (tag) {
         .bit_and => try arith.bitwiseBin(sema, resolved_type, lhs, rhs, .@"and"),
