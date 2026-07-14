@@ -5,10 +5,11 @@ const a = std.testing.allocator;
 
 test "compliance: @typeName and @errorName produce string values" {
     try compliance.check(a, .{
-        .{ .src = &.{"@typeName(u32).*"}, .want = @typeName(u32).* },
-        .{ .src = &.{"@typeName(?u8).*"}, .want = @typeName(?u8).* },
+        // A `[N:0]u8` value renders as a string, not `{any}`'s byte list.
+        .{ .src = &.{"@typeName(u32).*"}, .rendered = "\"u32\".*" },
+        .{ .src = &.{"@typeName(?u8).*"}, .rendered = "\"?u8\".*" },
         .{ .src = &.{"@typeName(u32)[1]"}, .want = @typeName(u32)[1] },
-        .{ .src = &.{"@errorName(error.Foo).*"}, .want = @errorName(error.Foo).* },
+        .{ .src = &.{"@errorName(error.Foo).*"}, .rendered = "\"Foo\".*" },
         .{ .src = &.{"@errorName(error.Boom)[0]"}, .want = @errorName(error.Boom)[0] },
     });
 }

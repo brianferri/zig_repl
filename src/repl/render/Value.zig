@@ -58,13 +58,24 @@ pub fn render(
             writer.writeAll("null")
         else
             render(.{ .index = o.val }, pool, session, writer),
-        .ptr => |p| writer.print("ptr@{d}+{d}", .{ @intFromEnum(p.ty), p.byte_offset }),
-        // The elements live behind the slice's `ptr` in a Sema comptime alloc the
-        // renderer cannot reach (like struct fields), so render just the length.
-        .slice => |s| blk: {
+        // A single-item pointer to a `[N]u8` const ref is a string literal
+        // (`&"..."`): show the pointee bytes as a string, not the raw address.
+        // Mirrors src/print_value.zig printPtr's `.uav` aggregate shortcut.
+        .ptr => |p| {
+            if (p.base_addr == .uav) {
+                const pointee = pool.indexToKey(p.base_addr.uav.val);
+                if (pointee == .aggregate)
+                    if (try renderBytes(pool, writer, pointee.aggregate, .ref)) return;
+            }
+            return writer.print("ptr@{d}+{d}", .{ @intFromEnum(p.ty), p.byte_offset });
+        },
+        .slice => |s| {
+            if (try renderByteSlice(pool, writer, s)) return;
+            // Otherwise the elements live behind the slice's `ptr` in a Sema
+            // comptime alloc the renderer cannot reach, so render just the length.
             var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
             const len = pool.indexToKey(s.len).int.storage.toBigInt(&space);
-            break :blk writer.print("slice[{f}]", .{len});
+            return writer.print("slice[{f}]", .{len});
         },
         .err => |e| writer.print("error.{s}", .{pool.stringSlice(e.name)}),
         .error_union => |eu| renderErrorUnion(eu, pool, session, writer),
@@ -92,6 +103,8 @@ fn renderAggregate(
     session: ?*const Session,
     writer: *std.Io.Writer,
 ) Error!void {
+    // A by-value `[N]u8` array prints as a string (`"...".*`), like any bytes ref.
+    if (try renderBytes(pool, writer, agg, .value)) return;
     const ty_key = pool.indexToKey(agg.ty);
     const shaped = ty_key == .struct_type and session != null;
     // A named struct prints `TypeName{ ... }`; a tuple `.{ ... }`; an array or
@@ -170,6 +183,103 @@ fn intOf(pool: *const InternPool, idx: InternPool.Index) ?i128 {
         .i64 => |v| @intCast(v),
         .big_int => |b| b.toInt(i128) catch null,
     };
+}
+
+/// The concrete byte of an interned element, or null if it is `undefined` or not
+/// a `u8`-range integer -- either of which disqualifies a u8 array from string
+/// form (the compiler's `.bytes` storage encodes neither; src/print_value.zig).
+fn byteValue(pool: *const InternPool, elem: InternPool.Index) ?u8 {
+    const v = intOf(pool, elem) orelse return null;
+    if (v < 0 or v > 255) return null;
+    return @intCast(v);
+}
+
+fn aggElem(agg: InternPool.Key.Aggregate, i: u64) InternPool.Index {
+    return switch (agg.storage) {
+        .repeated_elem => |e| e,
+        .elems => |es| es[@intCast(i)],
+    };
+}
+
+/// Whether an interned value is the `.ref` (pointer to the array) or `.value`
+/// (the array itself) form of a bytes container -- the compiler's `is_ref`
+/// distinction, which decides the trailing `.*` (src/print_value.zig
+/// printAggregate).
+const BytesForm = enum { ref, value };
+
+/// Render aggregate `agg` as a quoted Zig string when it is an all-concrete-byte
+/// `[N]u8` array, stripping one trailing `0` as the compiler does, appending `.*`
+/// for the `.value` form. Returns false without writing otherwise, so the caller
+/// renders positionally. The REPL interns each byte as its own `u8` slot rather
+/// than the compiler's packed `.bytes` storage, so string form keys on the
+/// element type and concreteness: a single `undefined` element falls back to the
+/// positional `{ ... }`, mirroring that `.bytes` cannot encode undef.
+fn renderBytes(pool: *const InternPool, writer: *std.Io.Writer, agg: InternPool.Key.Aggregate, form: BytesForm) Error!bool {
+    const ty_key = pool.indexToKey(agg.ty);
+    if (ty_key != .array_type or ty_key.array_type.child != .u8_type) return false;
+    var count = ty_key.array_type.lenIncludingSentinel();
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        if (byteValue(pool, aggElem(agg, i)) == null) return false;
+    }
+    if (count > 0 and byteValue(pool, aggElem(agg, count - 1)).? == 0) count -= 1;
+    try writer.writeByte('"');
+    i = 0;
+    while (i < count) : (i += 1) {
+        try std.zig.stringEscape(&.{byteValue(pool, aggElem(agg, i)).?}, writer);
+    }
+    try writer.writeByte('"');
+    if (form == .value) try writer.writeAll(".*");
+    return true;
+}
+
+/// The backing array and start element for a slice's pointer when it is a
+/// self-contained const ref the read-only renderer can follow: a `.uav` (the
+/// whole array) or an `.arr_elem` into one (the `arr[0..]` shape `coerceToSlice`
+/// builds). Null for `comptime_alloc`/`nav`/`field` bases, whose storage lives in
+/// Sema out of the renderer's reach.
+fn sliceBacking(pool: *const InternPool, slice: InternPool.Key.Slice) ?struct { array: InternPool.Index, start: u64 } {
+    if (pool.indexToKey(slice.ptr) != .ptr) return null;
+    switch (pool.indexToKey(slice.ptr).ptr.base_addr) {
+        .uav => |u| return .{ .array = u.val, .start = 0 },
+        .arr_elem => |ae| {
+            if (pool.indexToKey(ae.base) != .ptr) return null;
+            const base = pool.indexToKey(ae.base).ptr.base_addr;
+            if (base != .uav) return null;
+            return .{ .array = base.uav.val, .start = ae.index };
+        },
+        else => return null,
+    }
+}
+
+/// Render a `[]u8`/`[:0]u8` slice as a quoted string when its backing array is a
+/// reachable const ref of concrete bytes over the sliced range; false (no output)
+/// otherwise, so the caller falls back to the length placeholder.
+fn renderByteSlice(pool: *const InternPool, writer: *std.Io.Writer, slice: InternPool.Key.Slice) Error!bool {
+    const slice_ty = pool.indexToKey(slice.ty);
+    if (slice_ty != .ptr_type or slice_ty.ptr_type.child != .u8_type) return false;
+    const backing = sliceBacking(pool, slice) orelse return false;
+    const len_i = intOf(pool, slice.len) orelse return false;
+    if (len_i < 0) return false;
+    const len: u64 = @intCast(len_i);
+    if (pool.indexToKey(backing.array) != .aggregate) return false;
+    const agg = pool.indexToKey(backing.array).aggregate;
+    const total: u64 = switch (agg.storage) {
+        .elems => |es| es.len,
+        .repeated_elem => std.math.maxInt(u64),
+    };
+    if (backing.start + len > total) return false;
+    var i: u64 = 0;
+    while (i < len) : (i += 1) {
+        if (byteValue(pool, aggElem(agg, backing.start + i)) == null) return false;
+    }
+    try writer.writeByte('"');
+    i = 0;
+    while (i < len) : (i += 1) {
+        try std.zig.stringEscape(&.{byteValue(pool, aggElem(agg, backing.start + i)).?}, writer);
+    }
+    try writer.writeByte('"');
+    return true;
 }
 
 /// The field name an `enum_tag` selects: for a generated union-tag enum, the

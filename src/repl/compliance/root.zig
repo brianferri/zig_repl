@@ -172,6 +172,7 @@ test {
     _ = @import("repl_test.zig");
     _ = @import("sad_paths_test.zig");
     _ = @import("slice_test.zig");
+    _ = @import("string_render_test.zig");
     _ = @import("struct_test.zig");
     _ = @import("switch_test.zig");
     _ = @import("typeof_test.zig");
