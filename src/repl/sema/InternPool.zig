@@ -1024,6 +1024,10 @@ pub const Key = union(enum) {
         /// unqualified enclosing decl. Not part of identity (a decl site has one
         /// parent, fixed by its zir position).
         parent: Index = .none,
+        /// This container's declaration namespace, or `.none` until scanned. Not
+        /// part of identity -- filled after creation. Mirrors the compiler's
+        /// `struct_type.namespace`.
+        namespace: OptionalNamespaceIndex = .none,
     };
 
     /// A named enum type. Nominal like `StructType`; field names / tag type /
@@ -1034,6 +1038,8 @@ pub const Key = union(enum) {
         id: ContainerId,
         /// Enclosing container, or `.none`. See `StructType.parent`.
         parent: Index = .none,
+        /// Declaration namespace, or `.none` until scanned. See `StructType.namespace`.
+        namespace: OptionalNamespaceIndex = .none,
     };
 
     /// A named union type. Nominal like `EnumType`; field names/types resolved on
@@ -1043,6 +1049,8 @@ pub const Key = union(enum) {
         id: ContainerId,
         /// Enclosing container, or `.none`. See `StructType.parent`.
         parent: Index = .none,
+        /// Declaration namespace, or `.none` until scanned. See `StructType.namespace`.
+        namespace: OptionalNamespaceIndex = .none,
     };
 
     /// A union value: the union type, the active field's tag (its integer index),
@@ -1988,6 +1996,10 @@ const StructTypeRepr = extern struct {
     /// Not part of identity, like `EnumTypeRepr.field_data`.
     field_data: u32,
     captures_len: u32,
+    /// This container's declaration namespace (`OptionalNamespaceIndex`), or
+    /// `.none` until `getNamespaceIndex` scans it. Filled after creation, so not
+    /// part of identity -- the compiler's `struct_type.namespace`.
+    namespace: u32,
 };
 
 /// Extra-arena payload for `Item.Tag.type_enum`. Like `StructTypeRepr` plus
@@ -2002,6 +2014,7 @@ const EnumTypeRepr = extern struct {
     /// (`enumTypeFromExtra` does not read it).
     field_data: u32,
     captures_len: u32,
+    namespace: u32,
 };
 
 /// Sentinel `EnumTypeRepr.field_data` value meaning the enum's fields have not been
@@ -2027,6 +2040,7 @@ const UnionTypeRepr = extern struct {
     /// union reads its fields from ZIR. Not part of identity.
     field_data: u32,
     captures_len: u32,
+    namespace: u32,
 };
 
 /// Extra-arena payload for `Item.Tag.union_value`. Three u32 slots: union type,
@@ -2499,11 +2513,12 @@ pub fn namespacePtr(pool: *InternPool, index: NamespaceIndex) *Namespace {
 pub const root_namespace_name = "repl";
 
 /// A container type's name, used to qualify the names of its members.
-/// Only declared containers own namespaces, so only they reach here.
 fn containerTypeName(pool: *const InternPool, ty: Index) NullTerminatedString {
     return switch (pool.indexToKey(ty)) {
         .struct_type => |st| st.name,
-        else => unreachable, // only declared containers own a namespace
+        .enum_type => |et| et.name,
+        .union_type => |ut| ut.name,
+        else => unreachable, // only named containers own a namespace
     };
 }
 
@@ -3129,6 +3144,7 @@ fn structTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
             .name = @enumFromInt(r.name),
             .id = readContainerId(pool, r.captures_len, id_at),
             .parent = @enumFromInt(r.parent),
+            .namespace = @enumFromInt(r.namespace),
         },
     };
 }
@@ -3140,6 +3156,7 @@ fn enumTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .name = @enumFromInt(r.name),
         .id = readContainerId(pool, r.captures_len, id_at),
         .parent = @enumFromInt(r.parent),
+        .namespace = @enumFromInt(r.namespace),
     } };
 }
 
@@ -3160,6 +3177,7 @@ fn unionTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .name = @enumFromInt(r.name),
         .id = readContainerId(pool, r.captures_len, id_at),
         .parent = @enumFromInt(r.parent),
+        .namespace = @enumFromInt(r.namespace),
     } };
 }
 
@@ -3737,6 +3755,7 @@ fn emitStructType(pool: *InternPool, st: Key.StructType) Allocator.Error!void {
         .parent = @intFromEnum(st.parent),
         .field_data = fields_unresolved,
         .captures_len = containerCapturesLen(st.id),
+        .namespace = @intFromEnum(st.namespace),
     });
     try pool.appendContainerId(st.id);
     pool.items.appendAssumeCapacity(.{ .tag = .type_struct, .data = extra_index });
@@ -3750,6 +3769,7 @@ fn emitEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!void {
         .parent = @intFromEnum(et.parent),
         .field_data = fields_unresolved,
         .captures_len = containerCapturesLen(et.id),
+        .namespace = @intFromEnum(et.namespace),
     });
     try pool.appendContainerId(et.id);
     pool.items.appendAssumeCapacity(.{ .tag = .type_enum, .data = extra_index });
@@ -3901,6 +3921,30 @@ pub fn setStructFields(
     pool.extra.items[slot] = off;
 }
 
+/// The declaration namespace stored on a container type, or `.none` for a
+/// non-container or an as-yet-unscanned container. Mirrors `Type.getNamespace`.
+pub fn typeNamespace(pool: *const InternPool, ty: Index) OptionalNamespaceIndex {
+    return switch (pool.indexToKey(ty)) {
+        .struct_type => |st| st.namespace,
+        .enum_type => |et| et.namespace,
+        .union_type => |ut| ut.namespace,
+        else => .none,
+    };
+}
+
+/// Store `ns` as the container type's declaration namespace. The slot mirrors
+/// `setStructFields`'s `field_data` mutation -- non-hashed, filled once.
+pub fn setNamespace(pool: *InternPool, ty: Index, ns: NamespaceIndex) void {
+    const item = pool.items.get(@intFromEnum(ty));
+    const slot = switch (item.tag) {
+        .type_struct => item.data + @offsetOf(StructTypeRepr, "namespace") / 4,
+        .type_enum => item.data + @offsetOf(EnumTypeRepr, "namespace") / 4,
+        .type_union => item.data + @offsetOf(UnionTypeRepr, "namespace") / 4,
+        else => unreachable,
+    };
+    pool.extra.items[slot] = @intFromEnum(OptionalNamespaceIndex.init(ns));
+}
+
 fn emitEnumTag(pool: *InternPool, et: Key.EnumTag) Allocator.Error!void {
     const extra_index = try pool.addExtra(EnumTagRepr{
         .ty = @intFromEnum(et.ty),
@@ -3917,6 +3961,7 @@ fn emitUnionType(pool: *InternPool, ut: Key.UnionType) Allocator.Error!void {
         .parent = @intFromEnum(ut.parent),
         .field_data = fields_unresolved,
         .captures_len = containerCapturesLen(ut.id),
+        .namespace = @intFromEnum(ut.namespace),
     });
     try pool.appendContainerId(ut.id);
     pool.items.appendAssumeCapacity(.{ .tag = .type_union, .data = extra_index });

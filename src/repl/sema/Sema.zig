@@ -5304,8 +5304,9 @@ fn failUnloadedModule(sema: *Sema, path: []const u8) Error {
 
 /// The container type for `@import("root")`: the session top level. The compiler
 /// returns `zcu.root_mod`'s file-root type; the REPL has no single root file, so
-/// this synthetic struct stands in and `containerDeclByName` routes its member
-/// lookups to `root_namespace` (where the top-level Navs live). Cached on the
+/// this synthetic struct stands in, with its stored namespace set to the already
+/// eagerly-populated `root_namespace` -- so it resolves members through the same
+/// `getNamespaceIndex` path as any container, no special-casing. Cached on the
 /// session so its identity is stable across imports.
 fn rootModuleType(sema: *Sema) Error!InternPool.Index {
     const session = sema.session orelse return sema.failUnloadedModule("root");
@@ -5314,21 +5315,9 @@ fn rootModuleType(sema: *Sema) Error!InternPool.Index {
         .name = try sema.intern_pool.getOrPutString(sema.gpa, "root"),
         .id = .{ .declared = .{ .source_zir_id = sema.current_zir_id, .decl_inst = .main_struct_inst } },
     });
+    sema.intern_pool.setNamespace(ty, session.root_namespace);
     session.root_type = ty;
     return ty;
-}
-
-/// Resolve a member of the `@import("root")` container by name in the session-root
-/// namespace and return the bound Nav's value. The `namespaceLookup` step mirrors
-/// the compiler's `namespaceLookupVal`; resolving the Nav to its value stands in
-/// for `analyzeNavVal` (the REPL's session Navs are already evaluated). Null when
-/// unbound.
-fn rootDeclByName(sema: *Sema, name: InternPool.NullTerminatedString) Error!?Value {
-    const session = sema.session.?;
-    const nav_idx = (try sema.namespaceLookup(session.root_namespace, name)) orelse return null;
-    const resolved = sema.intern_pool.getNav(nav_idx).resolved orelse return null;
-    if (resolved.value == .none) return null;
-    return .{ .index = resolved.value };
 }
 
 /// The sub-path (relative to the source root) of the file being analysed, or
@@ -7582,70 +7571,141 @@ fn containerNamespace(sema: *Sema, container_ty: InternPool.Index) ?ContainerNam
     };
 }
 
-/// Look up a member declaration by name in a container type's namespace (`P.id`)
-/// and return its evaluated value. Iterates the container decl's declarations in
-/// its source ZIR (swapped in for a cross-line type, as `structFieldByName`
-/// does), matching by name. Returns null if no declaration matches. Unnamed
-/// members (`comptime` blocks, tests) are skipped. Works for any nominal
-/// container -- struct, union, or enum -- since all share a decl namespace (the
-/// compiler's namespace lookup is container-kind agnostic).
-fn containerDeclByName(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
-    // The `@import("root")` container's decls are resolved Navs in the session
-    // namespace, not a walkable source ZIR, so resolve them by name there.
-    if (sema.session) |session| {
-        if (session.root_type != .none and container_ty == session.root_type) return sema.rootDeclByName(name);
-    }
-    const ns = sema.containerNamespace(container_ty) orelse return null;
-    // Decls are not stored on the type; intern each decl name as we scan and
-    // compare interned handles against the query.
-    const frame = try sema.enterSourceZir(ns.source_zir_id, "container decl");
+/// The declaration namespace of container type `ty`, scanning its decls into lazy
+/// Navs on first request and caching it on the type. Mirrors
+/// `Type.getNamespaceIndex`; the compiler creates and `scanNamespace`s at type
+/// creation, done lazily here. Null for a reified/non-container type (no decls).
+fn getNamespaceIndex(sema: *Sema, ty: InternPool.Index) Error!?InternPool.NamespaceIndex {
+    const ip = sema.intern_pool;
+    if (ip.typeNamespace(ty).unwrap()) |ns| return ns;
+    const cn = sema.containerNamespace(ty) orelse return null;
+    const ns = try ip.createNamespace(sema.gpa, .none);
+    const ns_ptr = ip.namespacePtr(ns);
+    ns_ptr.owner_type = ty;
+    ns_ptr.file_scope = sema.namespaceFileScope(cn.source_zir_id);
+    ip.setNamespace(ty, ns);
+    try sema.scanNamespace(ns, ty);
+    return ns;
+}
+
+/// A container declared in a session line shares the session scope (`.none`, like
+/// `root_namespace`) so its decls stay mutually accessible across lines; one from a
+/// loaded module keeps that module's file so its private decls stay inaccessible.
+fn namespaceFileScope(sema: *Sema, source_zir_id: u32) InternPool.OptionalFileIndex {
+    const session = sema.session orelse return .none;
+    if (source_zir_id >= session.files.items.len) return .none;
+    if (session.files.items[source_zir_id].sub_file_path == null) return .none;
+    return InternPool.OptionalFileIndex.init(@enumFromInt(source_zir_id));
+}
+
+/// Populate `ns` with a lazy `Nav` per named declaration of container `ty` --
+/// `analysis` set (its namespace + decl instruction), `resolved` null until
+/// `analyzeNavVal`. Mirrors the compiler's `scanNamespace`/`scanDecl`; only
+/// `const`/`var` decls are name-referenceable, so comptime blocks and tests are
+/// skipped (the compiler routes them to `comptime_decls`/`test_decls`).
+fn scanNamespace(sema: *Sema, ns: InternPool.NamespaceIndex, ty: InternPool.Index) Error!void {
+    const ip = sema.intern_pool;
+    const cn = sema.containerNamespace(ty).?;
+    const frame = try sema.enterSourceZir(cn.source_zir_id, "scan namespace");
     defer frame.restore(sema);
-    for (sema.zir.typeDecls(ns.decl_inst)) |decl_inst| {
+    for (sema.zir.typeDecls(cn.decl_inst)) |decl_inst| {
         const unwrapped = sema.zir.getDeclaration(decl_inst);
-        if (unwrapped.name == .empty) continue;
-        if ((try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(unwrapped.name))) != name) continue;
-        const value_body = unwrapped.value_body orelse return null;
-        // Evaluate the member with this container as `@This()` (e.g. a method's
-        // `self: @This()` parameter type resolves to it).
-        const saved_this = sema.this_type;
-        sema.this_type = container_ty;
-        defer sema.this_type = saved_this;
-        // A member function collects its parameters into `block.params`, which
-        // the enclosing evaluation may itself be filling (a parameter type that
-        // calls another function, `fn use(b: dep(u8))`). Give this member a fresh
-        // list so its `func` drains only its own params; restore the caller's.
-        const saved_params = sema.block.params;
-        sema.block.params = .empty;
-        defer {
-            sema.block.params.deinit(sema.gpa);
-            sema.block.params = saved_params;
-        }
-        // `results` is keyed by bare instruction index, so a decl body in another
-        // file collides with the caller's in-flight instructions at the same index.
-        // Evaluate it against a fresh map, as `evalCall` does for a function body.
-        const saved_results = sema.results;
-        sema.results = .empty;
-        defer {
-            sema.results.deinit(sema.gpa);
-            sema.results = saved_results;
-        }
-        // Resolve the type annotation (`const x: T = ...`) before the value and
-        // bind it to the declaration instruction, then coerce, exactly as
-        // `bindValueDecl` does: a result-located init -- a `decl_literal` like
-        // `.gnu`, whose `coerced_ty` AstGen sets to `decl_inst.toRef()` -- reads
-        // `%decl` for its type. Both bodies break to the declaration instruction.
-        const declared_type: ?InternPool.Index = if (unwrapped.type_body) |tb| blk: {
-            const t = (try sema.resolveInlineBody(tb, decl_inst)).index;
-            try sema.results.put(sema.gpa, decl_inst, .{ .index = t });
-            break :blk t;
-        } else null;
-        const raw_value = try sema.resolveInlineBody(value_body, decl_inst);
-        return if (declared_type) |dest_ty|
-            try sema.coerceValueToType(raw_value, dest_ty, "decl")
-        else
-            raw_value;
+        if (unwrapped.kind != .@"const" and unwrapped.kind != .@"var") continue;
+        const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(unwrapped.name));
+        const fqn = try ip.fullyQualifiedName(sema.gpa, ns, name);
+        const nav = try ip.createNav(sema.gpa, name, fqn);
+        ip.navPtr(nav).analysis = .{ .namespace = ns, .zir_index = decl_inst, .wanted = false };
+        const ns_ptr = ip.namespacePtr(ns);
+        const ctx: InternPool.Namespace.NavNameContext = .{ .pool = ip };
+        const target = if (unwrapped.is_pub) &ns_ptr.pub_decls else &ns_ptr.priv_decls;
+        _ = try target.getOrPutContext(sema.gpa, nav, ctx);
     }
-    return null;
+}
+
+/// Resolve a `Nav`'s value, caching it. A Nav bound eagerly (`resolved` set by
+/// `bindValueDecl`) returns at once; one from `scanNamespace` (`analysis` set)
+/// evaluates its declaration body now, with the owning container as `@This()`.
+/// Mirrors the compiler's `analyzeNavVal`.
+fn analyzeNavVal(sema: *Sema, nav_idx: InternPool.Nav.Index) Error!Value {
+    const ip = sema.intern_pool;
+    if (ip.getNav(nav_idx).resolved) |r| return .{ .index = r.value };
+    const analysis = ip.getNav(nav_idx).analysis.?;
+    const container_ty = ip.namespacePtr(analysis.namespace).owner_type;
+    const cn = sema.containerNamespace(container_ty).?;
+    const frame = try sema.enterSourceZir(cn.source_zir_id, "analyze nav");
+    defer frame.restore(sema);
+    const decl_inst = analysis.zir_index;
+    const unwrapped = sema.zir.getDeclaration(decl_inst);
+    const value_body = unwrapped.value_body orelse
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "decl '{s}': no value_body (extern decl)", .{ip.stringSlice(ip.getNav(nav_idx).name)});
+
+    // Evaluate the member in its own namespace (so a sibling private decl resolves
+    // as same-file) with this container as `@This()`. A member function collects its
+    // parameters into a fresh `block.params` so its `func` drains only its own;
+    // `results` is keyed by bare instruction index, so a decl body in another file
+    // needs a fresh map to avoid colliding with in-flight work. Mirrors the compiler
+    // setting `block.namespace = nav.analysis.namespace`.
+    const saved_namespace = sema.namespace;
+    sema.namespace = analysis.namespace;
+    defer sema.namespace = saved_namespace;
+    const saved_this = sema.this_type;
+    sema.this_type = container_ty;
+    defer sema.this_type = saved_this;
+    const saved_params = sema.block.params;
+    sema.block.params = .empty;
+    defer {
+        sema.block.params.deinit(sema.gpa);
+        sema.block.params = saved_params;
+    }
+    const saved_results = sema.results;
+    sema.results = .empty;
+    defer {
+        sema.results.deinit(sema.gpa);
+        sema.results = saved_results;
+    }
+    // Resolve the type annotation before the value and bind it to the declaration
+    // instruction (a result-located init reads `%decl` for its type), then coerce.
+    const declared_type: ?InternPool.Index = if (unwrapped.type_body) |tb| blk: {
+        const t = (try sema.resolveInlineBody(tb, decl_inst)).index;
+        try sema.results.put(sema.gpa, decl_inst, .{ .index = t });
+        break :blk t;
+    } else null;
+    const raw_value = try sema.resolveInlineBody(value_body, decl_inst);
+    const value = if (declared_type) |dest_ty| try sema.coerceValueToType(raw_value, dest_ty, "decl") else raw_value;
+
+    ip.navPtr(nav_idx).resolved = .{
+        .type = declared_type orelse Value.typeOf(value, ip).index,
+        .@"align" = .none,
+        .@"linksection" = .none,
+        .@"addrspace" = .generic,
+        .@"const" = unwrapped.kind == .@"const",
+        .@"threadlocal" = unwrapped.is_threadlocal,
+        .is_extern_decl = unwrapped.linkage == .@"extern",
+        .value = value.index,
+    };
+    return value;
+}
+
+/// Look up a member declaration by name in a container type's namespace and return
+/// its value -- uniform for every container: `getNamespaceIndex` (scans the decls
+/// into Navs on first use), `namespaceLookup`, then `analyzeNavVal`. Mirrors the
+/// compiler's `namespaceLookupVal`; used for qualified access (`X.foo`), so it
+/// enforces pub-visibility.
+fn containerDeclByName(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
+    const ns = (try sema.getNamespaceIndex(container_ty)) orelse return null;
+    const nav = (try sema.namespaceLookup(ns, name)) orelse return null;
+    return try sema.analyzeNavVal(nav);
+}
+
+/// Resolve a member as a *bare identifier* -- no pub-visibility check, since a name
+/// in scope is always accessible (the compiler's `lookupIdentifier` asserts, rather
+/// than errors, on `.accessible`). Used to resolve a sibling name in an enclosing
+/// container's scope, where `containerDeclByName`'s qualified-access check does not
+/// apply.
+fn containerDeclNav(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
+    const ns = (try sema.getNamespaceIndex(container_ty)) orelse return null;
+    const lookup = sema.lookupInNamespace(ns, name) orelse return null;
+    return try sema.analyzeNavVal(lookup.nav);
 }
 
 /// `field_ptr_load`: read `object.field` -- a struct field when `object` is a
@@ -9145,7 +9205,7 @@ fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         // as `lookupIdentifier` walks `namespace.parent`, before the session scope.
         var container = sema.this_type;
         while (container != .none) : (container = sema.containerParent(container)) {
-            if (try sema.containerDeclByName(container, name)) |val| return val;
+            if (try sema.containerDeclNav(container, name)) |val| return val;
         }
     }
     if (try sema.lookupDecl(inst, "decl_val")) |found| {
@@ -9170,7 +9230,7 @@ fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir));
         var container = sema.this_type;
         while (container != .none) : (container = sema.containerParent(container)) {
-            if (try sema.containerDeclByName(container, name)) |val| return try sema.materializeConstPtr(val);
+            if (try sema.containerDeclNav(container, name)) |val| return try sema.materializeConstPtr(val);
         }
     }
     const found = (try sema.lookupDecl(inst, "decl_ref")) orelse {

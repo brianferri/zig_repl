@@ -24,3 +24,19 @@ test "compliance: @import(\"root\") reaches the session's top-level decls" {
         .{ .src = &.{"@import(\"root\").nope"}, .reject = {} },
     });
 }
+
+test "compliance: pub-visibility on qualified member access" {
+    try compliance.check(a, .{
+        // Same-file (session) private decl is accessible, qualified.
+        .{ .src = &.{"blk: { const S = struct { const x: u8 = 5; }; break :blk S.x; }"}, .want = blk: {
+            const S = struct {
+                const x: u8 = 5;
+            };
+            break :blk S.x;
+        } },
+        // Cross-module private decl is rejected: `std` is a private decl of the
+        // generated `builtin` module.
+        .{ .src = &.{"@import(\"builtin\").std"}, .reject = {} },
+    });
+    try compliance.expectDiagnostic(a, &.{"@import(\"builtin\").std"}, "not marked 'pub'");
+}
