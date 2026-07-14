@@ -4726,6 +4726,20 @@ fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.In
             });
         }
     }
+    if (fields.field_value_map.unwrap()) |value_map| {
+        value_map.get(ip).clearRetainingCapacity();
+        for (values, 0..) |field_value, field_index| {
+            if (ip.addFieldTagValue(values, value_map, field_value)) |prev_field_index| {
+                return sema.failWithOwnedErrorMsg(sema.block, msg: {
+                    const src = sema.block.builtinCallArgSrc(sema.srcNodeOffset(inst), 3);
+                    const msg = try sema.errMsg(src, "enum tag value '{f}' for field '{f}' already taken", .{ render_value.fmt(.{ .index = field_value }, ip), names[field_index].fmt(ip) });
+                    errdefer msg.destroy(sema.gpa);
+                    try sema.errNote(src, msg, "previous occurrence in field '{f}'", .{names[prev_field_index].fmt(ip)});
+                    break :msg msg;
+                });
+            }
+        }
+    }
     return .{ .index = enum_ty };
 }
 
@@ -7210,6 +7224,21 @@ fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.En
     // likewise asserts in `src/Sema/type_resolution.zig`).
     fields.field_name_map.get(ip).clearRetainingCapacity();
     for (names.items) |field_name| assert(ip.addFieldName(names.items, fields.field_name_map, field_name) == null);
+    // Tag values are not AstGen-checked, so a duplicate value is a real user error.
+    if (fields.field_value_map.unwrap()) |value_map| {
+        value_map.get(ip).clearRetainingCapacity();
+        for (values.items, 0..) |field_value, field_index| {
+            if (ip.addFieldTagValue(values.items, value_map, field_value)) |prev_field_index| {
+                return sema.failWithOwnedErrorMsg(sema.block, msg: {
+                    const src = sema.block.nodeOffset(.zero);
+                    const msg = try sema.errMsg(src, "enum tag value '{f}' for field '{f}' already taken", .{ render_value.fmt(.{ .index = field_value }, ip), names.items[field_index].fmt(ip) });
+                    errdefer msg.destroy(sema.gpa);
+                    try sema.errNote(src, msg, "previous occurrence in field '{f}'", .{names.items[prev_field_index].fmt(ip)});
+                    break :msg msg;
+                });
+            }
+        }
+    }
     return ip.enumFields(enum_ty).?;
 }
 
@@ -7372,6 +7401,24 @@ fn intAsI128(sema: *Sema, index: InternPool.Index) ?i128 {
 /// `enum_from_int lhs, rhs`: `@enumFromInt(n)` -- the enum tag whose integer value
 /// is `n`. `lhs` is the destination enum type, `rhs` the integer. A value with no
 /// matching tag is rejected as the compiler's `enumHasInt` check does.
+/// Whether the exhaustive enum `enum_ty` has a field whose tag value equals `int`.
+/// Verbatim from the compiler's `enumHasInt`: a value that does not fit the integer
+/// tag type names no field, so range-check first (non-failing), then key through
+/// `tagValueIndex`.
+fn enumHasInt(sema: *Sema, enum_ty: InternPool.Index, int: Value) Error!bool {
+    const ip = sema.intern_pool;
+    const fields = try sema.resolveEnumFields(enum_ty);
+    assert(!fields.nonexhaustive);
+    const int_tag_ty = fields.int_tag_type;
+    if (!sema.intFitsInType(int, Type.fromIndex(int_tag_ty))) return false;
+    const int_coerced = try sema.coerceValueToType(int, int_tag_ty, "enum tag");
+    return fields.tagValueIndex(ip, int_coerced.index) != null;
+}
+
+/// `enum_from_int lhs, rhs`: `@enumFromInt(n)` -- the enum tag whose integer value
+/// is `n`. `lhs` is the destination enum type, `rhs` the integer. Mirrors the
+/// comptime path of the compiler's `zirEnumFromInt`: a non-exhaustive enum admits
+/// any in-range value, an exhaustive one requires a named tag (`enumHasInt`).
 fn evalEnumFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
@@ -7381,15 +7428,22 @@ fn evalEnumFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@enumFromInt: destination is not an enum", .{});
     }
     const operand = try sema.resolveRef(bin.rhs);
-    const value = sema.intAsI128(operand.index) orelse {
+    if (ip.indexToKey(operand.index) == .undef) {
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
+    }
+    if (sema.intAsI128(operand.index) == null) {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@enumFromInt: operand is not an integer", .{});
-    };
-    // The value must name a field (`tagValueIndex`), then take that field's
-    // canonical tag (`enumValueFieldIndex`).
-    if (try sema.enumTagFieldIndex(dest_ty, operand)) |field_index|
-        return (try sema.enumValueFieldIndex(dest_ty, field_index)).?;
-    const name = ip.stringSlice(ip.indexToKey(dest_ty).enum_type.name);
-    return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "enum '{s}' has no tag with value '{d}'", .{ name, value });
+    }
+    const int_tag_ty = try sema.enumIntTagTypeOf(dest_ty);
+    if (try sema.enumNonexhaustive(dest_ty)) {
+        if (!sema.intFitsInType(operand, Type.fromIndex(int_tag_ty))) {
+            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "int value '{f}' out of range of non-exhaustive enum '{f}'", .{ render_value.fmt(operand, ip), Type.fromIndex(dest_ty).fmt(ip) });
+        }
+    } else if (!try sema.enumHasInt(dest_ty, operand)) {
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "enum '{f}' has no tag with value '{f}'", .{ Type.fromIndex(dest_ty).fmt(ip), render_value.fmt(operand, ip) });
+    }
+    const int_coerced = try sema.coerceValueToType(operand, int_tag_ty, "enum tag");
+    return .{ .index = try ip.internEnumTag(.{ .ty = dest_ty, .int = int_coerced.index }) };
 }
 
 /// `int_from_bool` (`@intFromBool(b)`): `false` -> `0`, `true` -> `1`, as `u1`.

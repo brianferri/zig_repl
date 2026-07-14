@@ -2056,6 +2056,10 @@ const EnumTypeRepr = extern struct {
     field_data: u32,
     /// Field-name dedup map (`OptionalMapIndex`); see `StructTypeRepr.field_name_map`.
     field_name_map: u32,
+    /// Tag-value dedup/lookup map (`OptionalMapIndex`), or `.none` for an
+    /// auto-numbered enum (tag value == field index, computed arithmetically).
+    /// Mirrors `LoadedEnumType.field_value_map`; drives `EnumFields.tagValueIndex`.
+    field_value_map: u32,
     captures_len: u32,
     namespace: u32,
 };
@@ -3906,6 +3910,7 @@ fn emitEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!void {
         .parent = @intFromEnum(et.parent),
         .field_data = fields_unresolved,
         .field_name_map = @intFromEnum(OptionalMapIndex.none),
+        .field_value_map = @intFromEnum(OptionalMapIndex.none),
         .captures_len = containerCapturesLen(et.id),
         .namespace = @intFromEnum(et.namespace),
     });
@@ -3922,8 +3927,12 @@ pub const EnumFields = struct {
     int_tag_type: Index,
     nonexhaustive: bool,
     field_names: []const NullTerminatedString,
+    /// Empty for an auto-numbered enum, whose tag value is its field index (the
+    /// compiler likewise leaves `field_values` empty; see `enumValueFieldIndex`).
     field_values: []const Index,
     field_name_map: MapIndex,
+    /// `.none` for an auto-numbered enum, whose tag maps to an index arithmetically.
+    field_value_map: OptionalMapIndex,
 
     /// Field index for `name`, or null. Mirrors `LoadedEnumType.nameIndex`.
     pub fn nameIndex(fields: EnumFields, pool: *const InternPool, name: NullTerminatedString) ?u32 {
@@ -3931,6 +3940,26 @@ pub const EnumFields = struct {
         const adapter: NullTerminatedString.Adapter = .{ .strings = fields.field_names };
         const field_index = map.getIndexAdapted(name, adapter) orelse return null;
         return @intCast(field_index);
+    }
+
+    /// Field index for tag value `tag_val`, or null. Mirrors
+    /// `LoadedEnumType.tagValueIndex`: an explicit-value enum consults
+    /// `field_value_map`; an auto-numbered one converts the value to an index
+    /// arithmetically. (The compiler's `typeOf` assert is dropped -- the REPL
+    /// models `typeOf` on `Value`, not `InternPool`.)
+    pub fn tagValueIndex(fields: EnumFields, pool: *const InternPool, tag_val: Index) ?u32 {
+        assert(pool.indexToKey(tag_val) == .int);
+        if (fields.field_value_map.unwrap()) |field_value_map| {
+            const map = field_value_map.get(pool);
+            const adapter: Index.Adapter = .{ .indexes = fields.field_values };
+            const field_index = map.getIndexAdapted(tag_val, adapter) orelse return null;
+            return @intCast(field_index);
+        }
+        const field_index = switch (pool.indexToKey(tag_val).int.storage) {
+            inline .u64, .i64 => |x| std.math.cast(u32, x) orelse return null,
+            .big_int => |x| x.toInt(u32) catch return null,
+        };
+        return if (field_index < fields.field_names.len) field_index else null;
     }
 };
 
@@ -3951,6 +3980,7 @@ pub fn enumFields(pool: *const InternPool, enum_ty: Index) ?EnumFields {
         .field_names = @ptrCast(pool.extra.items[off + 4 ..][0..names_len]),
         .field_values = @ptrCast(pool.extra.items[off + 4 + names_len ..][0..values_len]),
         .field_name_map = @enumFromInt(pool.extra.items[item.data + @offsetOf(EnumTypeRepr, "field_name_map") / 4]),
+        .field_value_map = @enumFromInt(pool.extra.items[item.data + @offsetOf(EnumTypeRepr, "field_value_map") / 4]),
     };
 }
 
@@ -3972,8 +4002,13 @@ pub fn setEnumFields(
     assert(item.tag == .type_enum);
     const slot = item.data + @offsetOf(EnumTypeRepr, "field_data") / 4;
     if (pool.extra.items[slot] != fields_unresolved) return;
-    // Empty field-name map, populated by Sema when it resolves the fields.
+    // Create the (empty) lookup maps, as `getReifiedEnumType` does; Sema populates
+    // and validates them when it resolves the fields. An auto-numbered enum stores
+    // no explicit values, so it needs no value map (tag value == field index).
     pool.extra.items[item.data + @offsetOf(EnumTypeRepr, "field_name_map") / 4] = @intFromEnum(try pool.addMap(pool.gpa, names.len));
+    if (values.len != 0) {
+        pool.extra.items[item.data + @offsetOf(EnumTypeRepr, "field_value_map") / 4] = @intFromEnum((try pool.addMap(pool.gpa, values.len)).toOptional());
+    }
     const off: u32 = @intCast(pool.extra.items.len);
     try pool.extra.ensureUnusedCapacity(pool.gpa, 4 + names.len + values.len);
     pool.extra.appendAssumeCapacity(@intFromEnum(int_tag_type));

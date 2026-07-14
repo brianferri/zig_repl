@@ -327,6 +327,7 @@ test "reify constructors: value paths and rejected inputs" {
         .{ .src = "@Enum(u8, .exhaustive, &.{\"a\"}, &.{0}).zzz", .needle = "has no member named 'zzz'" },
         .{ .src = "@Struct(.auto, null, &.{ \"a\", \"a\" }, &.{ u8, u16 }, &.{ .{}, .{} })", .needle = "duplicate struct field 'a' at index '1" },
         .{ .src = "@Enum(u8, .exhaustive, &.{ \"x\", \"x\" }, &.{ 0, 1 })", .needle = "duplicate enum field 'x' at index '1'" },
+        .{ .src = "@Enum(u8, .exhaustive, &.{ \"a\", \"b\" }, &.{ 1, 1 })", .needle = "enum tag value '1' for field 'b' already taken" },
         .{ .src = "@Union(.auto, null, &.{ \"u\", \"u\" }, &.{ u8, u16 }, &.{ .{}, .{} })", .needle = "duplicate union field 'u' at index '1" },
     };
     for (rejected) |p| {
