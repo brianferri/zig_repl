@@ -143,7 +143,7 @@ fn renderAggregate(
 /// declaring ZIR for a declared one. Null if unavailable (the caller falls back to
 /// positional). The read-only analogue of `Sema.structFieldNameAt`.
 fn structFieldName(pool: *const InternPool, session: *const Session, struct_ty: InternPool.Index, index: u32) ?[]const u8 {
-    if (pool.structFields(struct_ty)) |f| return if (index < f.names.len) pool.stringSlice(f.names[index]) else null;
+    if (pool.structFields(struct_ty)) |f| return if (index < f.field_names.len) pool.stringSlice(f.field_names[index]) else null;
     const d = switch (pool.indexToKey(struct_ty).struct_type.id) {
         .declared => |dd| dd,
         else => return null,
@@ -160,7 +160,7 @@ fn structFieldName(pool: *const InternPool, session: *const Session, struct_ty: 
 /// The name of union field `index` -- stored for a reified union, read from the
 /// declaring ZIR for a declared one. The read-only analogue of `Sema.unionFieldNameAt`.
 fn unionFieldName(pool: *const InternPool, session: *const Session, union_ty: InternPool.Index, index: u32) ?[]const u8 {
-    if (pool.unionFields(union_ty)) |f| return if (index < f.names.len) pool.stringSlice(f.names[index]) else null;
+    if (pool.unionFields(union_ty)) |f| return if (index < f.field_names.len) pool.stringSlice(f.field_names[index]) else null;
     const d = switch (pool.indexToKey(union_ty).union_type.id) {
         .declared => |dd| dd,
         else => return null,
@@ -291,9 +291,9 @@ fn enumTagName(pool: *const InternPool, session: *const Session, enum_ty: Intern
     const gen = pool.indexToKey(enum_ty).enum_type.id.generatedUnion();
     if (gen != .none) return if (tag >= 0) unionFieldName(pool, session, gen, @intCast(tag)) else null;
     const f = pool.enumFields(enum_ty) orelse return null;
-    if (f.values.len == 0) return if (tag >= 0 and tag < f.names.len) pool.stringSlice(f.names[@intCast(tag)]) else null;
-    for (f.values, 0..) |v, pos| {
-        if (intOf(pool, v)) |vv| if (vv == tag) return pool.stringSlice(f.names[pos]);
+    if (f.field_values.len == 0) return if (tag >= 0 and tag < f.field_names.len) pool.stringSlice(f.field_names[@intCast(tag)]) else null;
+    for (f.field_values, 0..) |v, pos| {
+        if (intOf(pool, v)) |vv| if (vv == tag) return pool.stringSlice(f.field_names[pos]);
     }
     return null;
 }

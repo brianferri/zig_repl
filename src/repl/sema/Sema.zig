@@ -5773,7 +5773,7 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const layout = if (uf) |f| f.layout else .auto;
             const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(layout))).?;
             const tag_type_val = try sema.optTypeValue(if (try sema.unionIsTagged(ty)) try sema.unionTagEnumType(ty) else .none);
-            const backing_integer_val = try sema.optTypeValue(if (uf) |f| f.backing_int else .none);
+            const backing_integer_val = try sema.optTypeValue(if (uf) |f| f.packed_backing_int_type else .none);
 
             var elems = [_]InternPool.Index{ layout_val.index, tag_type_val, backing_integer_val, field_names_val, field_types_val, field_attrs_val, decl_names_val };
             return try sema.typeInfoUnion(type_info_ty, tag_enum, "union", try ip.internAggregate(.{ .ty = union_std_ty, .storage = .{ .elems = &elems } }));
@@ -5841,7 +5841,7 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const sf: ?InternPool.StructFields = if (tuple_types == null) ip.structFields(ty) else null;
             const layout = if (sf) |f| f.layout else .auto;
             const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(layout))).?;
-            const backing_integer_val = try sema.optTypeValue(if (sf) |f| f.backing_int else .none);
+            const backing_integer_val = try sema.optTypeValue(if (sf) |f| f.packed_backing_int_type else .none);
 
             var elems = [_]InternPool.Index{ if (tuple_types != null) .bool_true else .bool_false, layout_val.index, backing_integer_val, field_names_val, field_types_val, field_attrs_val, decl_names_val };
             return try sema.typeInfoUnion(type_info_ty, tag_enum, "struct", try ip.internAggregate(.{ .ty = struct_std_ty, .storage = .{ .elems = &elems } }));
@@ -6702,15 +6702,15 @@ pub const FieldInfo = struct {
 /// Field `i`'s `comptime` bit from a reified struct's stored `comptime_bits`
 /// (empty when no field is comptime, LSB-first within each u32).
 fn structFieldIsComptime(f: InternPool.StructFields, i: usize) bool {
-    if (f.comptime_bits.len == 0) return false;
-    return f.comptime_bits[i / 32] >> @intCast(i % 32) & 1 != 0;
+    if (f.field_is_comptime_bits.len == 0) return false;
+    return f.field_is_comptime_bits[i / 32] >> @intCast(i % 32) & 1 != 0;
 }
 
 /// Field `i`'s explicit alignment (bytes) from a reified struct's stored `aligns`,
 /// or null for the natural alignment (no `aligns` slice, or a `.none` entry).
 fn structFieldAlign(sema: *Sema, f: InternPool.StructFields, i: usize) ?u64 {
-    if (f.aligns.len == 0 or f.aligns[i] == .none) return null;
-    return @intCast(sema.intAsI128(f.aligns[i]).?);
+    if (f.field_aligns.len == 0 or f.field_aligns[i] == .none) return null;
+    return @intCast(sema.intAsI128(f.field_aligns[i]).?);
 }
 
 /// Resolve a struct field by name to its index and type. Iterates the struct
@@ -6728,11 +6728,11 @@ pub fn structFieldByName(
     const ip = sema.intern_pool;
     // A reified struct has no ZIR; its fields are read from storage.
     if (ip.structFields(struct_ty)) |f| {
-        for (f.names, 0..) |n, i| {
+        for (f.field_names, 0..) |n, i| {
             if (n != name) continue;
             return .{
                 .index = @intCast(i),
-                .ty = f.types[i],
+                .ty = f.field_types[i],
                 .is_comptime = structFieldIsComptime(f, i),
                 .align_bytes = structFieldAlign(sema, f, i),
             };
@@ -6779,9 +6779,9 @@ pub fn structFieldDefault(
     const ip = sema.intern_pool;
     // A reified struct has no ZIR; its defaults are stored (`.none` if none).
     if (ip.structFields(struct_ty)) |f| {
-        for (f.names, 0..) |n, i| {
+        for (f.field_names, 0..) |n, i| {
             if (n != name) continue;
-            return if (f.defaults.len == 0) .none else f.defaults[i];
+            return if (f.field_defaults.len == 0) .none else f.field_defaults[i];
         }
         return .none;
     }
@@ -6837,12 +6837,12 @@ pub fn unionFieldByName(
     const ip = sema.intern_pool;
     // A reified union has no ZIR; its fields are read from storage.
     if (ip.unionFields(union_ty)) |f| {
-        for (f.names, 0..) |n, i| {
+        for (f.field_names, 0..) |n, i| {
             if (n != name) continue;
             return .{
                 .index = @intCast(i),
-                .ty = f.types[i],
-                .align_bytes = if (f.aligns.len == 0 or f.aligns[i] == .none) null else @intCast(sema.intAsI128(f.aligns[i]).?),
+                .ty = f.field_types[i],
+                .align_bytes = if (f.field_aligns.len == 0 or f.field_aligns[i] == .none) null else @intCast(sema.intAsI128(f.field_aligns[i]).?),
             };
         }
         return null;
@@ -6919,7 +6919,7 @@ fn callConvValue(sema: *Sema, cc: std.lang.CallingConvention) Error!InternPool.I
 pub fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
     const ip = sema.intern_pool;
     // A reified struct has no ZIR; its field names are stored.
-    if (ip.structFields(struct_ty)) |f| return if (index < f.names.len) f.names[index] else null;
+    if (ip.structFields(struct_ty)) |f| return if (index < f.field_names.len) f.field_names[index] else null;
     const cf = try sema.enterContainer(struct_ty, "struct field name");
     defer cf.restore(sema);
     var it = sema.zir.getStructDecl(cf.decl_inst).iterateFields();
@@ -6933,7 +6933,7 @@ pub fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) E
 /// A union type's declared field count, read from its source ZIR.
 pub fn unionFieldCount(sema: *Sema, union_ty: InternPool.Index) Error!u32 {
     // A reified union has no ZIR; its field count comes from stored fields.
-    if (sema.intern_pool.unionFields(union_ty)) |f| return @intCast(f.names.len);
+    if (sema.intern_pool.unionFields(union_ty)) |f| return @intCast(f.field_names.len);
     const cf = try sema.enterContainer(union_ty, "union field count");
     defer cf.restore(sema);
     return @intCast(sema.zir.getUnionDecl(cf.decl_inst).field_names.len);
@@ -6945,7 +6945,7 @@ pub fn unionFieldCount(sema: *Sema, union_ty: InternPool.Index) Error!u32 {
 pub fn unionFieldNameAt(sema: *Sema, union_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
     const ip = sema.intern_pool;
     // A reified union has no ZIR; its field names are stored.
-    if (ip.unionFields(union_ty)) |f| return if (index < f.names.len) f.names[index] else null;
+    if (ip.unionFields(union_ty)) |f| return if (index < f.field_names.len) f.field_names[index] else null;
     const cf = try sema.enterContainer(union_ty, "union field name");
     defer cf.restore(sema);
     var it = sema.zir.getUnionDecl(cf.decl_inst).iterateFields();
@@ -7032,7 +7032,7 @@ pub fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPoo
     // generated tag enum keyed on the union (auto-numbered), like a declared bare
     // union -- so its values still carry a tag.
     if (ip.unionFields(union_ty)) |f| {
-        if (f.tag_type != .none) return f.tag_type;
+        if (f.enum_tag_type != .none) return f.enum_tag_type;
         return try ip.internEnumType(.{
             .name = ip.indexToKey(union_ty).union_type.name,
             .id = .{ .generated_union_tag = union_ty },
@@ -7068,7 +7068,7 @@ fn enumFieldCount(sema: *Sema, enum_ty: InternPool.Index) Error!u32 {
     const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
     if (et.id.generatedUnion() != .none) return try sema.unionFieldCount(et.id.generatedUnion());
     // A reified enum has no ZIR; its field count comes from stored fields.
-    if (sema.intern_pool.enumFields(enum_ty)) |f| return @intCast(f.names.len);
+    if (sema.intern_pool.enumFields(enum_ty)) |f| return @intCast(f.field_names.len);
     const cf = try sema.enterContainer(enum_ty, "enum field count");
     defer cf.restore(sema);
     return @intCast(sema.zir.getEnumDecl(cf.decl_inst).field_names.len);
@@ -7110,9 +7110,9 @@ fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error
     if (et.id.generatedUnion() != .none) return try sema.generatedTagScan(enum_ty, match);
 
     const fields = try sema.resolveEnumFields(enum_ty);
-    for (fields.names, 0..) |field_name, pos| {
+    for (fields.field_names, 0..) |field_name, pos| {
         // An auto-numbered enum stores no values; the tag value is the field index.
-        const cur: i128 = if (fields.values.len == 0) @intCast(pos) else sema.intAsI128(fields.values[pos]).?;
+        const cur: i128 = if (fields.field_values.len == 0) @intCast(pos) else sema.intAsI128(fields.field_values[pos]).?;
         if (try sema.matchEnumField(enum_ty, fields.int_tag_type, match, field_name, @intCast(pos), cur)) |m| return m;
     }
     return null;
@@ -7169,7 +7169,7 @@ fn generatedTagScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Er
     // A generated tag enum is auto-numbered, so each tag value equals its position.
     const owner = ip.indexToKey(enum_ty).enum_type.id.generatedUnion();
     if (ip.unionFields(owner)) |f| {
-        for (f.names, 0..) |field_name, idx| {
+        for (f.field_names, 0..) |field_name, idx| {
             if (try sema.matchEnumField(enum_ty, tag_ty, match, field_name, @intCast(idx), @intCast(idx))) |m| return m;
         }
         return null;
@@ -7460,7 +7460,7 @@ fn evalTagName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// Read from the union decl's ZIR `kind`. Auto/extern/packed unions are untagged.
 fn unionIsTagged(sema: *Sema, union_ty: InternPool.Index) Error!bool {
     // A reified union has no ZIR; it is tagged iff it stores an explicit tag enum.
-    if (sema.intern_pool.unionFields(union_ty)) |f| return f.tag_type != .none;
+    if (sema.intern_pool.unionFields(union_ty)) |f| return f.enum_tag_type != .none;
     const ut = sema.intern_pool.indexToKey(union_ty).union_type;
     const frame = try sema.enterSourceZir(ut.id.sourceZirId(), "union kind");
     defer frame.restore(sema);
@@ -7474,7 +7474,7 @@ fn unionIsTagged(sema: *Sema, union_ty: InternPool.Index) Error!bool {
 /// `field_names`; no field bodies are evaluated).
 pub fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
     // A reified struct has no ZIR; its field count comes from stored fields.
-    if (sema.intern_pool.structFields(struct_ty)) |f| return @intCast(f.names.len);
+    if (sema.intern_pool.structFields(struct_ty)) |f| return @intCast(f.field_names.len);
     const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
     const decl_inst = st.id.declInst();
     const frame = try sema.enterSourceZir(st.id.sourceZirId(), "struct field count");

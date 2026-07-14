@@ -3908,8 +3908,8 @@ fn emitEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!void {
 pub const EnumFields = struct {
     int_tag_type: Index,
     nonexhaustive: bool,
-    names: []const NullTerminatedString,
-    values: []const Index,
+    field_names: []const NullTerminatedString,
+    field_values: []const Index,
 };
 
 /// This enum's resolved fields, or null if not resolved yet. A generated-union tag
@@ -3926,8 +3926,8 @@ pub fn enumFields(pool: *const InternPool, enum_ty: Index) ?EnumFields {
     return .{
         .int_tag_type = @enumFromInt(pool.extra.items[off]),
         .nonexhaustive = pool.extra.items[off + 1] != 0,
-        .names = @ptrCast(pool.extra.items[off + 4 ..][0..names_len]),
-        .values = @ptrCast(pool.extra.items[off + 4 + names_len ..][0..values_len]),
+        .field_names = @ptrCast(pool.extra.items[off + 4 ..][0..names_len]),
+        .field_values = @ptrCast(pool.extra.items[off + 4 + names_len ..][0..values_len]),
     };
 }
 
@@ -3969,12 +3969,12 @@ pub fn setEnumFields(
 /// defaults..., aligns..., comptime_bits...]`.
 pub const StructFields = struct {
     layout: std.lang.Type.ContainerLayout,
-    backing_int: Index,
-    names: []const NullTerminatedString,
-    types: []const Index,
-    defaults: []const Index,
-    aligns: []const Index,
-    comptime_bits: []const u32,
+    packed_backing_int_type: Index,
+    field_names: []const NullTerminatedString,
+    field_types: []const Index,
+    field_defaults: []const Index,
+    field_aligns: []const Index,
+    field_is_comptime_bits: []const u32,
 };
 
 /// This struct's resolved fields, or null if it stores none (a declared struct,
@@ -3999,12 +3999,12 @@ pub fn structFields(pool: *const InternPool, struct_ty: Index) ?StructFields {
     base += aligns_len;
     return .{
         .layout = @enumFromInt(pool.extra.items[off]),
-        .backing_int = @enumFromInt(pool.extra.items[off + 1]),
-        .names = names,
-        .types = types,
-        .defaults = defaults,
-        .aligns = aligns,
-        .comptime_bits = pool.extra.items[base..][0..comptime_len],
+        .packed_backing_int_type = @enumFromInt(pool.extra.items[off + 1]),
+        .field_names = names,
+        .field_types = types,
+        .field_defaults = defaults,
+        .field_aligns = aligns,
+        .field_is_comptime_bits = pool.extra.items[base..][0..comptime_len],
     };
 }
 
@@ -4101,11 +4101,11 @@ fn emitUnionType(pool: *InternPool, ut: Key.UnionType) Allocator.Error!void {
 /// types..., aligns...]`.
 pub const UnionFields = struct {
     layout: std.lang.Type.ContainerLayout,
-    tag_type: Index,
-    backing_int: Index,
-    names: []const NullTerminatedString,
-    types: []const Index,
-    aligns: []const Index,
+    enum_tag_type: Index,
+    packed_backing_int_type: Index,
+    field_names: []const NullTerminatedString,
+    field_types: []const Index,
+    field_aligns: []const Index,
 };
 
 /// This union's resolved fields, or null if it stores none (a declared union, which
@@ -4124,11 +4124,11 @@ pub fn unionFields(pool: *const InternPool, union_ty: Index) ?UnionFields {
     base += fields_len;
     return .{
         .layout = @enumFromInt(pool.extra.items[off]),
-        .tag_type = @enumFromInt(pool.extra.items[off + 1]),
-        .backing_int = @enumFromInt(pool.extra.items[off + 2]),
-        .names = names,
-        .types = types,
-        .aligns = @ptrCast(pool.extra.items[base..][0..aligns_len]),
+        .enum_tag_type = @enumFromInt(pool.extra.items[off + 1]),
+        .packed_backing_int_type = @enumFromInt(pool.extra.items[off + 2]),
+        .field_names = names,
+        .field_types = types,
+        .field_aligns = @ptrCast(pool.extra.items[base..][0..aligns_len]),
     };
 }
 
