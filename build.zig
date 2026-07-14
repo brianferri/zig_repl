@@ -110,6 +110,19 @@ pub fn build(b: *std.Build) void {
     wasm.rdynamic = true;
     wasm.entry = .disabled;
 
+    const pack_tool = b.addExecutable(.{
+        .name = "tar_gz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/tar_gz.zig"),
+            .target = b.resolveTargetQuery(.{}),
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const pack_std = b.addRunArtifact(pack_tool);
+    pack_std.addArg(zigStdDir(b));
+    const std_targz = pack_std.addOutputFileArg("std.tar.gz");
+    wasm.root_module.addAnonymousImport("embedded_std", .{ .root_source_file = std_targz });
+
     const install_wasm = b.addInstallArtifact(wasm, .{
         .dest_dir = .{ .override = .{
             .custom = "web",

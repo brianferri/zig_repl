@@ -23,7 +23,7 @@ const Session = @import("../Session.zig");
 const InternPool = @import("../sema/InternPool.zig");
 const Value = @import("../sema/Value.zig");
 const render = @import("../render/Value.zig");
-const NativeModuleSource = @import("../NativeModuleSource.zig");
+const NativeModuleSource = @import("../module/Native.zig");
 
 /// Assert each case's interpreter output matches zig's comptime rendering of its
 /// `.want` expression (or that the interpreter rejects a `.reject` case).

@@ -26,8 +26,13 @@ const Commands = drivers_wasm.commands;
 // `memory.buffer` -- the page re-reads it after every call that allocates.
 const gpa = std.heap.wasm_allocator;
 
+// The standard library, gzip-tarred into the binary by `build.zig`. Freestanding
+// wasm has no filesystem, so this is how `@import("std")` resolves here.
+const embedded_std = @embedFile("embedded_std");
+
 var pool: InternPool = undefined;
 var session: Session = undefined;
+var module_source: repl.module.Buffer = undefined;
 var output: std.Io.Writer.Allocating = undefined;
 var ready = false;
 
@@ -38,6 +43,8 @@ export fn replInit() bool {
     pool = InternPool.init(gpa) catch return false;
     const root_namespace = pool.createNamespace(gpa, .none) catch return false;
     session = Session.init(gpa, &pool, root_namespace);
+    module_source = repl.module.Buffer.init(gpa, embedded_std) catch return false;
+    session.module_source = &module_source.interface;
     output = .init(gpa);
     ready = true;
     return true;
@@ -90,6 +97,7 @@ fn evaluate(input: []const u8, w: *std.Io.Writer) !void {
 /// before it (eval.run injects them) without persisting anything into the
 /// live REPL session -- the explorer re-runs this on every keystroke.
 export fn replPreview(ptr: [*]u8, len: usize) void {
+    if (!ready and !replInit()) return;
     defer gpa.free(ptr[0..len]);
     output.clearRetainingCapacity();
     preview(ptr[0..len]) catch |err| {
@@ -106,6 +114,7 @@ fn preview(input: []const u8) !void {
     defer preview_pool.deinit();
     const root_namespace = try preview_pool.createNamespace(gpa, .none);
     var preview_session = Session.init(gpa, &preview_pool, root_namespace);
+    preview_session.module_source = &module_source.interface;
     defer preview_session.deinit();
 
     // For "declarations; trailing expression", bind the declarations into
@@ -161,6 +170,7 @@ fn buildOutline(input: []const u8) !void {
     defer preview_pool.deinit();
     const root_namespace = try preview_pool.createNamespace(gpa, .none);
     var preview_session = Session.init(gpa, &preview_pool, root_namespace);
+    preview_session.module_source = &module_source.interface;
     defer preview_session.deinit();
 
     try outline.writeJson(&preview_session, trimmed, w);

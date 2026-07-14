@@ -8,8 +8,8 @@ const Session = @import("../Session.zig");
 const InternPool = @import("../sema/InternPool.zig");
 const Value = @import("../sema/Value.zig");
 const render = @import("../render/Value.zig");
-const ModuleSource = @import("../ModuleSource.zig");
-const NativeModuleSource = @import("../NativeModuleSource.zig");
+const ModuleSource = @import("../module/Source.zig");
+const NativeModuleSource = @import("../module/Native.zig");
 
 /// A bool as the string `render` prints it, for comptime-derived `.want` values.
 fn comptimeBool(comptime b: bool) []const u8 {

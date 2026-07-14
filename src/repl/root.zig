@@ -7,13 +7,11 @@ pub const eval = @import("eval.zig");
 pub const sema = @import("sema/root.zig");
 pub const front = @import("front/root.zig");
 pub const render = @import("render/root.zig");
-/// The source-provider interface `@import` resolves against; `NativeModuleSource`
-/// is the on-disk implementation.
-pub const ModuleSource = @import("ModuleSource.zig");
-/// A `ModuleSource` reading a real directory. Native frontends wire it to the
-/// system standard library so `@import("std")` resolves; locating that directory
-/// is the frontend's job (the core opens no files itself).
-pub const NativeModuleSource = @import("NativeModuleSource.zig");
+/// Module sources: where `@import` obtains bytes. `module.Source` is the
+/// interface; `module.Native` reads the on-disk standard library, `module.Buffer`
+/// an archive packed into the binary for targets with no filesystem. Locating or
+/// embedding that source is the frontend's job (the core opens no files itself).
+pub const module = @import("module/root.zig");
 /// Generic command framework (`:name` dispatch). Frontends register their own
 /// command set with `commands.Registry`; the frontend-specific
 /// commands live in the frontend modules.
@@ -23,7 +21,7 @@ pub const commands = @import("drivers/commands/root.zig");
 // root. The tty driver's files are forced from its own module root.
 test {
     _ = @import("Session.zig");
-    _ = @import("NativeModuleSource.zig");
+    _ = @import("module/root.zig");
     _ = @import("eval.zig");
     _ = @import("drivers/commands/Command.zig");
     _ = @import("drivers/commands/registry.zig");

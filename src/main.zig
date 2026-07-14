@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
     // both outlive the session, which only borrows the interface pointer.
     var std_root = openSystemStd(init.gpa, init.io, init.environ_map);
     defer if (std_root) |*d| d.close(init.io);
-    var source: repl.NativeModuleSource = undefined;
+    var source: repl.module.Native = undefined;
     if (std_root) |root| {
         source = .{ .io = init.io, .root = root };
         session.module_source = &source.interface;

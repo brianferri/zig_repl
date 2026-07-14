@@ -9,7 +9,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const InternPool = @import("sema/InternPool.zig");
-const ModuleSource = @import("ModuleSource.zig");
+const ModuleSource = @import("module/Source.zig");
 const ErrorMsg = @import("sema/ErrorMsg.zig").ErrorMsg;
 const InputShape = @import("front/InputShape.zig");
 
