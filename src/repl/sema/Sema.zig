@@ -5310,13 +5310,23 @@ fn failUnloadedModule(sema: *Sema, path: []const u8) Error {
 /// session so its identity is stable across imports.
 fn rootModuleType(sema: *Sema) Error!InternPool.Index {
     const session = sema.session orelse return sema.failUnloadedModule("root");
-    if (session.root_type != .none) return session.root_type;
+    if (session.root_file) |file_index| return session.files.items[file_index].root_type;
+    // A container's identity is `(source_zir_id, decl_inst)`. Anchoring root to
+    // `sema.current_zir_id` aliases it with whatever file first reaches
+    // `@import("root")` -- and std's own code imports root, so the mint can land
+    // while std is the current file, yielding `(std_file, main_struct_inst)` ==
+    // std's own identity and overwriting std's namespace on intern. Like the
+    // compiler's `zcu.root_mod`, root gets its own permanent `File.Index`; its
+    // type then lives in that file's `root_type` slot, as for every other file.
+    const file_index: Session.Index = @intCast(session.files.items.len);
+    try session.files.append(sema.gpa, .{ .zir = null, .tree = null, .wrapped = null, .sub_file_path = null });
     const ty = try sema.intern_pool.internStructType(.{
         .name = try sema.intern_pool.getOrPutString(sema.gpa, "root"),
-        .id = .{ .declared = .{ .source_zir_id = sema.current_zir_id, .decl_inst = .main_struct_inst } },
+        .id = .{ .declared = .{ .source_zir_id = file_index, .decl_inst = .main_struct_inst } },
     });
     sema.intern_pool.setNamespace(ty, session.root_namespace);
-    session.root_type = ty;
+    session.files.items[file_index].root_type = ty;
+    session.root_file = file_index;
     return ty;
 }
 

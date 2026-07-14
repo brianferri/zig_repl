@@ -27,11 +27,14 @@ intern_pool: *InternPool,
 /// compiler's per-file-root namespace; modules hang their own
 /// namespaces off this root via the `parent` chain.
 root_namespace: InternPool.NamespaceIndex,
-/// The container type `@import("root")` yields. The root's decls live in
-/// `root_namespace` as resolved Navs spread across line files, not one walkable
-/// container, so this synthetic struct is minted on first use and cached to keep
-/// its identity stable. `.none` until then.
-root_type: InternPool.Index = .none,
+/// The file that backs `@import("root")` -- the REPL's `Zcu.root_mod`. The root's
+/// decls live in `root_namespace` as resolved Navs spread across line files, not
+/// one walkable container, so root has no ZIR of its own; this reserves an empty
+/// `File` purely to give root a permanent, distinct `File.Index`, so its container
+/// identity `(file_index, main_struct_inst)` can never alias a line or module.
+/// Root's type lives in that file's `root_type` slot, read back via `fileRootType`
+/// like any file. `null` until first `@import("root")`.
+root_file: ?Index = null,
 /// Every source file the session has lowered to ZIR: each committed REPL line
 /// and each loaded module (`std` and the files it imports). Mirrors the
 /// compiler's `Zcu.File` collection; `source_zir_id` (on a Func or a container
