@@ -142,6 +142,11 @@ pub fn build(b: *std.Build) void {
     // `repl` (exe/tty/docs) never carries a build-machine path.
     const test_options = b.addOptions();
     test_options.addOption([]const u8, "zig_std_dir", zigStdDir(b));
+    // Knobs for the randomized stress suite (src/fuzz). Deterministic per
+    // seed, so a failure reproduces with the same `-Dfuzz-seed`; `-Dfuzz-iterations`
+    // scales a run from a quick pass to an overnight soak.
+    test_options.addOption(usize, "fuzz_iterations", b.option(usize, "fuzz-iterations", "Randomized stress iterations (default 256; raise for a real fuzzing run)") orelse 256);
+    test_options.addOption(u64, "fuzz_seed", b.option(u64, "fuzz-seed", "Seed for the randomized stress suite (default 0)") orelse 0);
     const repl_test_module = b.createModule(.{
         .root_source_file = b.path("src/repl/root.zig"),
         .target = target,
@@ -159,6 +164,23 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     test_step.dependOn(&b.addRunArtifact(device_tests).step);
     test_step.dependOn(&b.addRunArtifact(terminal_tests).step);
+
+    // The fuzz suite is a standalone module that imports `repl` by name, so it is
+    // fully decoupled from the interpreter's internals. It runs as its own step
+    // only because the pinned toolchain's `--fuzz` runtime segfaults (see
+    // src/fuzz/root.zig); to fold it into `test` once that is fixed, drop this
+    // step and `test_step.dependOn(&b.addRunArtifact(fuzz_tests).step)` -- no code
+    // change. Scale with `-Dfuzz-iterations`; reproduce a failure with `-Dfuzz-seed`.
+    const fuzz_module = b.createModule(.{
+        .root_source_file = b.path("src/fuzz/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "repl", .module = repl }},
+    });
+    fuzz_module.addOptions("build_options", test_options);
+    const fuzz_tests = b.addTest(.{ .root_module = fuzz_module });
+    const fuzz_step = b.step("fuzz", "Stress-test the interpreter (scale with -Dfuzz-iterations, reproduce with -Dfuzz-seed)");
+    fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 }
 
 /// The running compiler's `std` source directory. Reuses the compiler's own
