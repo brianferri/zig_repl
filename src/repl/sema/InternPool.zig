@@ -2020,6 +2020,56 @@ fn readContainerId(pool: *const InternPool, captures_len: u32, off: u32) Key.Con
     } };
 }
 
+/// A type's value/comptime class. Mirrors the compiler's `Type.Class`
+/// (`src/Type.zig`): drives the size-0 cases (`no_possible_value`) and the
+/// comptime-only `@sizeOf` rejection. Stored in `TypeStruct.Flags`.
+pub const TypeClass = enum(u3) {
+    no_possible_value,
+    one_possible_value,
+    runtime,
+    partially_comptime,
+    fully_comptime,
+};
+
+/// Extra-arena payload for `Item.Tag.type_struct`, mirroring the compiler's
+/// `Tag.TypeStruct` (`src/InternPool.zig`). Trailing after this fixed header, in
+/// order: the container identity (`appendContainerId`, its flavor selected by
+/// `captures_len`); then per field `field_name` and `field_type`; then, when the
+/// matching `flags` bit is set, `field_default`, `field_align` (packed 4/u32),
+/// `field_is_comptime_bits` (packed 32/u32), `field_runtime_order` (`.auto` only);
+/// then `field_offset` per field. Field/layout slots are reserved at creation and
+/// filled by field and layout resolution (`size`/`alignment`/`class`/offsets start
+/// at their unresolved sentinels and are mutated in place).
+///
+/// REPL deviations from the compiler's `TypeStruct`: no `zir_index`/`name_nav` (no
+/// `TrackedInst`/`Nav`; identity is `(source_zir_id, decl_inst)` in the trailing and
+/// `parent` is the namespace-parent stand-in), and `captures_len` carries the
+/// identity flavor that the compiler keeps in `flags.any_captures`. `packed` structs
+/// use a separate `TypeStructPacked` repr, as in the compiler.
+const TypeStruct = struct {
+    name: NullTerminatedString,
+    parent: Index,
+    namespace: OptionalNamespaceIndex,
+    fields_len: u32,
+    field_name_map: OptionalMapIndex,
+    /// Size in bytes of the whole struct. 0 until layout resolved.
+    size: u32,
+    captures_len: u32,
+    flags: Flags,
+
+    const Flags = packed struct(u32) {
+        layout: enum(u1) { auto, @"extern" },
+        any_comptime_fields: bool,
+        any_field_defaults: bool,
+        any_field_aligns: bool,
+        class: TypeClass,
+        /// Alignment of the whole struct. `.none` until layout resolved.
+        alignment: Alignment,
+        want_layout: bool,
+        _: u18 = 0,
+    };
+};
+
 /// Extra-arena payload for `Item.Tag.type_struct`: the interned name, the enclosing
 /// `parent`, and the container identity's flavor/capture count, with the identity
 /// trailing data following (see `appendContainerId`).
@@ -3502,28 +3552,58 @@ fn ptrBaseIndexFromExtra(pool: *const InternPool, extra_index: u32, is_arr_elem:
 /// field to u32 -- Index/enum via `@intFromEnum`, u64 split into lo/hi, flag
 /// packs bitcast at the call site -- so each field maps to exactly one slot; the
 /// comptime `field.type == u32` check pins that contract. Pairs with `addExtra`.
+/// One `u32` extra slot back into its typed field value. Mirrors the per-field
+/// conversion in the compiler's `extraData`: an enum handle from its integer, a
+/// `packed struct(u32)` (a `Flags`/`Bits` field) by bitcast, a plain `u32`/`i32`
+/// as-is.
+fn extraField(comptime T: type, slot: u32) T {
+    return switch (@typeInfo(T)) {
+        .int => @bitCast(slot),
+        .@"enum" => @enumFromInt(slot),
+        .@"struct" => @bitCast(slot),
+        else => @compileError("extraData: unsupported field type " ++ @typeName(T)),
+    };
+}
+
+/// One typed field value into its `u32` extra slot -- the inverse of `extraField`.
+fn fieldSlot(value: anytype) u32 {
+    return switch (@typeInfo(@TypeOf(value))) {
+        .int => @bitCast(value),
+        .@"enum" => @intFromEnum(value),
+        .@"struct" => @bitCast(value),
+        else => @compileError("addExtra: unsupported field type " ++ @typeName(@TypeOf(value))),
+    };
+}
+
 fn extraData(pool: *const InternPool, comptime T: type, extra_index: u32) T {
     const info = @typeInfo(T).@"struct";
     assert(extra_index + info.field_names.len <= pool.extra.items.len);
     var result: T = undefined;
     inline for (info.field_names, info.field_types, 0..) |name, field_type, i| {
-        comptime assert(field_type == u32);
-        @field(result, name) = pool.extra.items[extra_index + i];
+        @field(result, name) = extraField(field_type, pool.extra.items[extra_index + i]);
     }
     return result;
 }
 
-/// Append an all-u32 extra-arena payload `repr` and return its start index --
-/// the write side of `extraData`. Each field is one slot in declaration order,
-/// so layout lives in the struct definition alone (no hand-synced slot counts
-/// between emit and read).
+/// Like `extraData`, but also returns the index one past the fixed header --
+/// where a type's trailing data (captures, field arrays) begins. Mirrors the
+/// compiler's `extraDataTrail`.
+fn extraDataTrail(pool: *const InternPool, comptime T: type, extra_index: u32) struct { data: T, end: u32 } {
+    const info = @typeInfo(T).@"struct";
+    return .{ .data = extraData(pool, T, extra_index), .end = extra_index + info.field_names.len };
+}
+
+/// Append a fixed extra-arena payload `repr` (each field one `u32` slot in
+/// declaration order) and return its start index -- the write side of `extraData`.
+/// Layout lives in the struct definition alone (no hand-synced slot counts between
+/// emit and read). Typed fields (enum handles, `packed struct(u32)` flags) are
+/// converted per `fieldSlot`, mirroring the compiler's `addExtra`.
 fn addExtra(pool: *InternPool, repr: anytype) Allocator.Error!u32 {
     const info = @typeInfo(@TypeOf(repr)).@"struct";
     const index: u32 = @intCast(pool.extra.items.len);
     try pool.extra.ensureUnusedCapacity(pool.gpa, info.field_names.len);
-    inline for (info.field_names, info.field_types) |name, field_type| {
-        comptime assert(field_type == u32);
-        pool.extra.appendAssumeCapacity(@field(repr, name));
+    inline for (info.field_names) |name| {
+        pool.extra.appendAssumeCapacity(fieldSlot(@field(repr, name)));
     }
     return index;
 }
