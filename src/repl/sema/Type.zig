@@ -252,6 +252,9 @@ pub fn abiAlignment(ty: Type, pool: *const InternPool) ?InternPool.Alignment {
             // An internal generic-return marker, never a real `@alignOf` operand.
             .generic_poison => unreachable,
         },
+        // An enum's alignment is its integer tag type's, once resolved (the caller
+        // runs `ensureLayoutResolved` first). Mirrors `Type.abiAlignment`'s enum arm.
+        .enum_type => if (pool.enumFields(ty.index)) |f| abiAlignment(fromIndex(f.int_tag_type), pool) else null,
         else => null,
     };
 }
@@ -293,6 +296,9 @@ pub fn abiSize(ty: Type, pool: *const InternPool) ?u64 {
             .f128 => 16,
             .generic_poison => unreachable,
         },
+        // An enum's size is its integer tag type's, once resolved (the caller runs
+        // `ensureLayoutResolved` first). Mirrors `Type.abiSize`'s enum arm.
+        .enum_type => if (pool.enumFields(ty.index)) |f| abiSize(fromIndex(f.int_tag_type), pool) else null,
         else => null,
     };
 }

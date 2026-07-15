@@ -78,6 +78,32 @@ test "compliance: @enumFromInt and result-typed enum literals" {
     });
 }
 
+test "compliance: enum @sizeOf / @alignOf are the integer tag type's" {
+    try compliance.check(a, .{
+        .{
+            .src = &.{"blk: { const E = enum(u16) { a, b }; break :blk @sizeOf(E); }"},
+            .want = blk: {
+                const E = enum(u16) { a, b };
+                break :blk @sizeOf(E);
+            },
+        },
+        .{
+            .src = &.{"blk: { const E = enum(u16) { a, b }; break :blk @alignOf(E); }"},
+            .want = blk: {
+                const E = enum(u16) { a, b };
+                break :blk @alignOf(E);
+            },
+        },
+        .{
+            .src = &.{"blk: { const E = enum { a, b, c }; break :blk @sizeOf(E); }"},
+            .want = blk: {
+                const E = enum { a, b, c };
+                break :blk @sizeOf(E);
+            },
+        },
+    });
+}
+
 test "compliance: explicit enum tag types and values" {
     try compliance.check(a, .{
         .{

@@ -2673,6 +2673,33 @@ fn alignmentFromValue(sema: *Sema, value: Value, op_name: []const u8) Error!Inte
     return InternPool.Alignment.fromByteUnits(bytes);
 }
 
+/// Resolve `ty`'s layout so `abiSize` / `abiAlignment` can read it, mirroring the
+/// compiler's `ensureLayoutResolved` (`src/Sema/type_resolution.zig`): recurse into
+/// wrapper types, resolve a container's fields. The REPL drops the incremental
+/// dependency tracking (single-shot). Struct/union layout resolution is not modelled
+/// yet, so those are inert; an enum resolves its fields here, fixing the integer tag
+/// type `abiSize` reads (a generated tag enum resolves through its owner union).
+fn ensureLayoutResolved(sema: *Sema, ty: InternPool.Index) Error!void {
+    const ip = sema.intern_pool;
+    switch (ip.indexToKey(ty)) {
+        .int_type, .ptr_type, .anyframe_type, .simple_type, .error_set_type => {},
+        .array_type => |arr| return sema.ensureLayoutResolved(arr.child),
+        .vector_type => |vec| return sema.ensureLayoutResolved(vec.child),
+        .opt_type => |child| return sema.ensureLayoutResolved(child),
+        .error_union_type => |eu| return sema.ensureLayoutResolved(eu.payload_type),
+        .tuple_type => |tuple| for (tuple.types) |field_ty| try sema.ensureLayoutResolved(field_ty),
+        .func_type => |ft| {
+            for (ft.param_types) |param_ty| try sema.ensureLayoutResolved(param_ty);
+            try sema.ensureLayoutResolved(ft.return_type);
+        },
+        .enum_type => |et| if (et.id.generatedUnion() == .none) {
+            _ = try sema.resolveEnumFields(ty);
+        },
+        .struct_type, .union_type => {},
+        .simple_value, .enum_literal, .int, .float, .undef, .ptr, .slice, .err, .error_union, .func, .opt, .aggregate, .enum_tag, .un => unreachable,
+    }
+}
+
 /// `@alignOf(T)`: the host ABI alignment of `T`, as a `comptime_int`. Mirrors
 /// zirAlignOf -- only `noreturn` is rejected (uninstantiable); every other
 /// modelled type yields its alignment (a comptime-only type yields 1).
@@ -2684,6 +2711,7 @@ fn evalAlignOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     if (ty == .noreturn_type) {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@alignOf: no align available for uninstantiable type 'noreturn'", .{});
     }
+    try sema.ensureLayoutResolved(ty);
     const alignment = Type.fromIndex(ty).abiAlignment(sema.intern_pool) orelse {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@alignOf: type not yet supported", .{});
     };
@@ -2702,6 +2730,7 @@ fn evalSizeOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const ty = try sema.resolveDestType(un_node.operand, "@sizeOf");
+    try sema.ensureLayoutResolved(ty);
     const key = sema.intern_pool.indexToKey(ty);
     // noreturn is uninstantiable; comptime-only types (and opaque) have no
     // runtime size. zirSizeOf rejects all of these before measuring; we reject
