@@ -290,7 +290,7 @@ fn enumTagName(pool: *const InternPool, session: *const Session, enum_ty: Intern
     const tag = intOf(pool, int_idx) orelse return null;
     const gen = pool.indexToKey(enum_ty).enum_type.id.generatedUnion();
     if (gen != .none) return if (tag >= 0) unionFieldName(pool, session, gen, @intCast(tag)) else null;
-    const f = pool.enumFields(enum_ty) orelse return null;
+    const f = pool.loadEnumType(enum_ty) orelse return null;
     if (f.field_values.len == 0) return if (tag >= 0 and tag < f.field_names.len) pool.stringSlice(f.field_names[@intCast(tag)]) else null;
     for (f.field_values, 0..) |v, pos| {
         if (intOf(pool, v)) |vv| if (vv == tag) return pool.stringSlice(f.field_names[pos]);

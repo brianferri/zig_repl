@@ -4742,7 +4742,7 @@ fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.In
     try ip.setEnumFields(enum_ty, tag_ty, nonexhaustive, names, values);
     // Populate and validate the lookup maps, mirroring `src/Sema/type_resolution.zig`:
     // the field names came from the user (not AstGen), so duplicates are real errors.
-    const fields = ip.enumFields(enum_ty).?;
+    const fields = ip.loadEnumType(enum_ty).?;
     fields.field_name_map.get(ip).clearRetainingCapacity();
     for (names, 0..) |field_name, field_index| {
         if (ip.addFieldName(names, fields.field_name_map, field_name)) |prev_field_index| {
@@ -7147,7 +7147,7 @@ fn enumFieldCount(sema: *Sema, enum_ty: InternPool.Index) Error!u32 {
     const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
     if (et.id.generatedUnion() != .none) return try sema.unionFieldCount(et.id.generatedUnion());
     // A reified enum has no ZIR; its field count comes from stored fields.
-    if (sema.intern_pool.enumFields(enum_ty)) |f| return @intCast(f.field_names.len);
+    if (sema.intern_pool.loadEnumType(enum_ty)) |f| return @intCast(f.field_names.len);
     const cf = try sema.enterContainer(enum_ty, "enum field count");
     defer cf.restore(sema);
     return @intCast(sema.zir.getEnumDecl(cf.decl_inst).field_names.len);
@@ -7209,9 +7209,9 @@ fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error
 /// return the stored view. The tag type and each field's name and (auto or
 /// explicit) value are read in the enum's own ZIR frame; subsequent calls read the
 /// cache.
-fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.EnumFields {
+fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.LoadedEnumType {
     const ip = sema.intern_pool;
-    if (ip.enumFields(enum_ty)) |f| return f;
+    if (ip.loadEnumType(enum_ty)) |f| return f;
 
     const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
     const cf = try sema.enterContainer(enum_ty, "enum field");
@@ -7243,7 +7243,7 @@ fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.En
         try values.append(sema.gpa, try sema.enumTagIntValue(tag_ty, cur));
     }
     try ip.setEnumFields(enum_ty, tag_ty, decl.nonexhaustive, names.items, values.items);
-    const fields = ip.enumFields(enum_ty).?;
+    const fields = ip.loadEnumType(enum_ty).?;
     // AstGen validated the field names, so the name map cannot collide (the compiler
     // likewise asserts in `src/Sema/type_resolution.zig`).
     fields.field_name_map.get(ip).clearRetainingCapacity();
@@ -7263,7 +7263,7 @@ fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.En
             }
         }
     }
-    return ip.enumFields(enum_ty).?;
+    return ip.loadEnumType(enum_ty).?;
 }
 
 /// `enumFieldScan` for a union's generated tag enum: the fields are the union's,
@@ -7303,7 +7303,7 @@ pub fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool
     const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
     // A reified enum has no ZIR; its tag type is stored. (A declared enum's fields
     // are not yet resolved when this is called during resolution, so it reads ZIR.)
-    if (sema.intern_pool.enumFields(enum_ty)) |f| return f.int_tag_type;
+    if (sema.intern_pool.loadEnumType(enum_ty)) |f| return f.int_tag_type;
     // The generated tag enum of a reified union is auto-numbered (the union has no
     // ZIR, and a reified union carries no explicit int tag type).
     const gu = et.id.generatedUnion();
@@ -7334,7 +7334,7 @@ fn enumNonexhaustive(sema: *Sema, enum_ty: InternPool.Index) Error!bool {
     const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
     if (et.id.generatedUnion() != .none) return false;
     // A reified enum has no ZIR; its mode is stored.
-    if (sema.intern_pool.enumFields(enum_ty)) |f| return f.nonexhaustive;
+    if (sema.intern_pool.loadEnumType(enum_ty)) |f| return f.nonexhaustive;
     const cf = try sema.enterContainer(enum_ty, "enum mode");
     defer cf.restore(sema);
     return sema.zir.getEnumDecl(cf.decl_inst).nonexhaustive;
@@ -11479,7 +11479,7 @@ fn opvEnum(sema: *Sema, hash: u64, names: []const []const u8) !Type {
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
     });
     try pool.setEnumFields(enum_ty, tag_ty, false, handles, &.{});
-    const f = pool.enumFields(enum_ty).?;
+    const f = pool.loadEnumType(enum_ty).?;
     f.field_name_map.get(pool).clearRetainingCapacity();
     for (handles) |name| assert(pool.addFieldName(handles, f.field_name_map, name) == null);
     return .fromIndex(enum_ty);

@@ -3967,7 +3967,7 @@ fn emitEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!void {
 
 /// The resolved fields of an enum type, borrowing into `extra`. Mirrors the
 /// comptime-relevant part of `LoadedEnumType`.
-pub const EnumFields = struct {
+pub const LoadedEnumType = struct {
     int_tag_type: Index,
     nonexhaustive: bool,
     field_names: []const NullTerminatedString,
@@ -3979,7 +3979,7 @@ pub const EnumFields = struct {
     field_value_map: OptionalMapIndex,
 
     /// Field index for `name`, or null. Mirrors `LoadedEnumType.nameIndex`.
-    pub fn nameIndex(fields: EnumFields, pool: *const InternPool, name: NullTerminatedString) ?u32 {
+    pub fn nameIndex(fields: LoadedEnumType, pool: *const InternPool, name: NullTerminatedString) ?u32 {
         const map = fields.field_name_map.get(pool);
         const adapter: NullTerminatedString.Adapter = .{ .strings = fields.field_names };
         const field_index = map.getIndexAdapted(name, adapter) orelse return null;
@@ -3991,7 +3991,7 @@ pub const EnumFields = struct {
     /// `field_value_map`; an auto-numbered one converts the value to an index
     /// arithmetically. (The compiler's `typeOf` assert is dropped -- the REPL
     /// models `typeOf` on `Value`, not `InternPool`.)
-    pub fn tagValueIndex(fields: EnumFields, pool: *const InternPool, tag_val: Index) ?u32 {
+    pub fn tagValueIndex(fields: LoadedEnumType, pool: *const InternPool, tag_val: Index) ?u32 {
         assert(pool.indexToKey(tag_val) == .int);
         if (fields.field_value_map.unwrap()) |field_value_map| {
             const map = field_value_map.get(pool);
@@ -4011,7 +4011,7 @@ pub const EnumFields = struct {
 /// enum never stores fields (its fields are the union's, read through the union).
 /// Storage block layout: `[int_tag_type, nonexhaustive, names_len, values_len,
 /// names..., values...]`.
-pub fn enumFields(pool: *const InternPool, enum_ty: Index) ?EnumFields {
+pub fn loadEnumType(pool: *const InternPool, enum_ty: Index) ?LoadedEnumType {
     const item = pool.items.get(@intFromEnum(enum_ty));
     assert(item.tag == .type_enum);
     const off = pool.extra.items[item.data + @offsetOf(EnumTypeRepr, "field_data") / 4];

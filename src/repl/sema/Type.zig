@@ -254,7 +254,7 @@ pub fn abiAlignment(ty: Type, pool: *const InternPool) ?InternPool.Alignment {
         },
         // An enum's alignment is its integer tag type's, once resolved (the caller
         // runs `ensureLayoutResolved` first). Mirrors `Type.abiAlignment`'s enum arm.
-        .enum_type => if (pool.enumFields(ty.index)) |f| abiAlignment(fromIndex(f.int_tag_type), pool) else null,
+        .enum_type => if (pool.loadEnumType(ty.index)) |f| abiAlignment(fromIndex(f.int_tag_type), pool) else null,
         else => null,
     };
 }
@@ -298,7 +298,7 @@ pub fn abiSize(ty: Type, pool: *const InternPool) ?u64 {
         },
         // An enum's size is its integer tag type's, once resolved (the caller runs
         // `ensureLayoutResolved` first). Mirrors `Type.abiSize`'s enum arm.
-        .enum_type => if (pool.enumFields(ty.index)) |f| abiSize(fromIndex(f.int_tag_type), pool) else null,
+        .enum_type => if (pool.loadEnumType(ty.index)) |f| abiSize(fromIndex(f.int_tag_type), pool) else null,
         else => null,
     };
 }
@@ -370,7 +370,7 @@ pub fn intInfo(starting_ty: Type, pool: *const InternPool) ?std.lang.Type.Int {
         .c_ulonglong_type => return .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ulonglong) },
         else => switch (pool.indexToKey(ty.index)) {
             .int_type => |it| return it,
-            .enum_type => ty = .fromIndex(pool.enumFields(ty.index).?.int_tag_type),
+            .enum_type => ty = .fromIndex(pool.loadEnumType(ty.index).?.int_tag_type),
             .vector_type => |vector_type| ty = .fromIndex(vector_type.child),
             else => return null,
         },
