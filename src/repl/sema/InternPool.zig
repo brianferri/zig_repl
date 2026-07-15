@@ -2052,13 +2052,17 @@ const TypeStruct = struct {
     namespace: OptionalNamespaceIndex,
     fields_len: u32,
     field_name_map: OptionalMapIndex,
+    /// Packed backing integer for a `packed` struct, else `.none`. The compiler keeps
+    /// this in a separate `TypeStructPacked` repr; the REPL unifies all three layouts
+    /// in `TypeStruct` (packed-split is the remaining 1:1 gap).
+    backing_int: Index,
     /// Size in bytes of the whole struct. 0 until layout resolved.
     size: u32,
     captures_len: u32,
     flags: Flags,
 
     const Flags = packed struct(u32) {
-        layout: enum(u1) { auto, @"extern" },
+        layout: enum(u2) { auto, @"extern", @"packed" },
         any_comptime_fields: bool,
         any_field_defaults: bool,
         any_field_aligns: bool,
@@ -2066,31 +2070,8 @@ const TypeStruct = struct {
         /// Alignment of the whole struct. `.none` until layout resolved.
         alignment: Alignment,
         want_layout: bool,
-        _: u18 = 0,
+        _: u17 = 0,
     };
-};
-
-/// Extra-arena payload for `Item.Tag.type_struct`: the interned name, the enclosing
-/// `parent`, and the container identity's flavor/capture count, with the identity
-/// trailing data following (see `appendContainerId`).
-const StructTypeRepr = extern struct {
-    name: u32,
-    parent: u32,
-    /// Offset into `extra` of this struct's resolved field storage (see
-    /// `structFields`), or `fields_unresolved`. A reified struct fills it at
-    /// creation; a declared struct reads its fields from ZIR, so this stays unset.
-    /// Not part of identity, like `EnumTypeRepr.field_data`.
-    field_data: u32,
-    /// Field-name dedup map (`OptionalMapIndex`), or `.none` for a declared struct
-    /// (whose fields resolve lazily from ZIR). Filled by `setStructFields` alongside
-    /// `field_data`; drives `LoadedStructType.nameIndex`-style lookups. Not part of
-    /// identity -- the compiler's `LoadedStructType.field_name_map`.
-    field_name_map: u32,
-    captures_len: u32,
-    /// This container's declaration namespace (`OptionalNamespaceIndex`), or
-    /// `.none` until `getNamespaceIndex` scans it. Filled after creation, so not
-    /// part of identity -- the compiler's `struct_type.namespace`.
-    namespace: u32,
 };
 
 /// Extra-arena payload for `Item.Tag.type_enum`. Like `StructTypeRepr` plus
@@ -3009,7 +2990,9 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .slice => |s| try emitSlice(pool, s),
         .error_set_type => |es| try emitErrorSetType(pool, es),
         .tuple_type => |tt| try emitTupleType(pool, tt),
-        .struct_type => |st| try emitStructType(pool, st),
+        // Structs are created via `getDeclaredStructType`/`getReifiedStructType`
+        // (which need `fields_len` up front); `get` is never reached for one.
+        .struct_type => unreachable,
         .enum_type => |et| try emitEnumType(pool, et),
         .enum_tag => |et| try emitEnumTag(pool, et),
         .union_type => |ut| try emitUnionType(pool, ut),
@@ -3327,14 +3310,13 @@ fn tupleTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
 }
 
 fn structTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(StructTypeRepr, extra_index);
-    const id_at = extra_index + @sizeOf(StructTypeRepr) / 4;
+    const trail = pool.extraDataTrail(TypeStruct, extra_index);
     return .{
         .struct_type = .{
-            .name = @enumFromInt(r.name),
-            .id = readContainerId(pool, r.captures_len, id_at),
-            .parent = @enumFromInt(r.parent),
-            .namespace = @enumFromInt(r.namespace),
+            .name = trail.data.name,
+            .id = readContainerId(pool, trail.data.captures_len, trail.end),
+            .parent = trail.data.parent,
+            .namespace = trail.data.namespace,
         },
     };
 }
@@ -3590,7 +3572,7 @@ fn extraData(pool: *const InternPool, comptime T: type, extra_index: u32) T {
 /// compiler's `extraDataTrail`.
 fn extraDataTrail(pool: *const InternPool, comptime T: type, extra_index: u32) struct { data: T, end: u32 } {
     const info = @typeInfo(T).@"struct";
-    return .{ .data = extraData(pool, T, extra_index), .end = extra_index + info.field_names.len };
+    return .{ .data = extraData(pool, T, extra_index), .end = extra_index + @as(u32, info.field_names.len) };
 }
 
 /// Append a fixed extra-arena payload `repr` (each field one `u32` slot in
@@ -3967,21 +3949,6 @@ fn emitTupleType(pool: *InternPool, tt: Key.TupleType) Allocator.Error!void {
     pool.items.appendAssumeCapacity(.{ .tag = .type_tuple, .data = extra_index });
 }
 
-/// Emit a `type_struct` Item: the fixed `StructTypeRepr` then the container
-/// identity's trailing data (see `appendContainerId`).
-fn emitStructType(pool: *InternPool, st: Key.StructType) Allocator.Error!void {
-    const extra_index = try pool.addExtra(StructTypeRepr{
-        .name = @intFromEnum(st.name),
-        .parent = @intFromEnum(st.parent),
-        .field_data = fields_unresolved,
-        .field_name_map = @intFromEnum(OptionalMapIndex.none),
-        .captures_len = containerCapturesLen(st.id),
-        .namespace = @intFromEnum(st.namespace),
-    });
-    try pool.appendContainerId(st.id);
-    pool.items.appendAssumeCapacity(.{ .tag = .type_struct, .data = extra_index });
-}
-
 /// Emit a `type_enum` Item. Same layout as `type_struct` (fixed repr + trailing
 /// identity data).
 fn emitEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!void {
@@ -4125,75 +4092,40 @@ pub const LoadedStructType = struct {
 };
 
 /// This struct's resolved fields, or null if it stores none (a declared struct,
-/// which reads its fields from ZIR).
+/// which reads its fields from ZIR). Reads the `TypeStruct` trailing: the reified
+/// identity (4 slots) then `field_names`/`field_types`, then the optional
+/// `field_defaults`/`field_aligns`/`field_is_comptime_bits` per the header flags.
 pub fn loadStructType(pool: *const InternPool, struct_ty: Index) ?LoadedStructType {
     const item = pool.items.get(@intFromEnum(struct_ty));
     assert(item.tag == .type_struct);
-    const off = pool.extra.items[item.data + @offsetOf(StructTypeRepr, "field_data") / 4];
-    if (off == fields_unresolved) return null;
-    const fields_len = pool.extra.items[off + 2];
-    const defaults_len = pool.extra.items[off + 3];
-    const aligns_len = pool.extra.items[off + 4];
-    const comptime_len = pool.extra.items[off + 5];
-    var base = off + 6;
+    const trail = pool.extraDataTrail(TypeStruct, item.data);
+    const r = trail.data;
+    if (r.captures_len != captures_len_reified) return null;
+    const fields_len = r.fields_len;
+    var base = trail.end + 4;
     const names: []const NullTerminatedString = @ptrCast(pool.extra.items[base..][0..fields_len]);
     base += fields_len;
     const types: []const Index = @ptrCast(pool.extra.items[base..][0..fields_len]);
     base += fields_len;
-    const defaults: []const Index = @ptrCast(pool.extra.items[base..][0..defaults_len]);
-    base += defaults_len;
-    const aligns: []const Index = @ptrCast(pool.extra.items[base..][0..aligns_len]);
-    base += aligns_len;
+    const defaults: []const Index = if (r.flags.any_field_defaults) @ptrCast(pool.extra.items[base..][0..fields_len]) else &.{};
+    base += if (r.flags.any_field_defaults) fields_len else 0;
+    const aligns: []const Index = if (r.flags.any_field_aligns) @ptrCast(pool.extra.items[base..][0..fields_len]) else &.{};
+    base += if (r.flags.any_field_aligns) fields_len else 0;
+    const comptime_len: u32 = if (r.flags.any_comptime_fields) (fields_len + 31) / 32 else 0;
     return .{
-        .layout = @enumFromInt(pool.extra.items[off]),
-        .packed_backing_int_type = @enumFromInt(pool.extra.items[off + 1]),
+        .layout = switch (r.flags.layout) {
+            .auto => .auto,
+            .@"extern" => .@"extern",
+            .@"packed" => .@"packed",
+        },
+        .packed_backing_int_type = r.backing_int,
         .field_names = names,
         .field_types = types,
         .field_defaults = defaults,
         .field_aligns = aligns,
         .field_is_comptime_bits = pool.extra.items[base..][0..comptime_len],
-        .field_name_map = @enumFromInt(pool.extra.items[item.data + @offsetOf(StructTypeRepr, "field_name_map") / 4]),
+        .field_name_map = r.field_name_map.unwrap().?,
     };
-}
-
-/// Store a reified struct's resolved fields (idempotent -- a no-op once set). Each
-/// `defaults[i]`/`aligns[i]` is `.none` for a field without that attribute; the
-/// slice is empty when no field has one. The identity Key is unchanged; only the
-/// `field_data` slot is filled, in place.
-pub fn setStructFields(
-    pool: *InternPool,
-    struct_ty: Index,
-    layout: std.lang.Type.ContainerLayout,
-    backing_int: Index,
-    names: []const NullTerminatedString,
-    types: []const Index,
-    defaults: []const Index,
-    aligns: []const Index,
-    comptime_bits: []const u32,
-) Allocator.Error!void {
-    assert(types.len == names.len);
-    assert(defaults.len == 0 or defaults.len == names.len);
-    assert(aligns.len == 0 or aligns.len == names.len);
-    const item = pool.items.get(@intFromEnum(struct_ty));
-    assert(item.tag == .type_struct);
-    const slot = item.data + @offsetOf(StructTypeRepr, "field_data") / 4;
-    if (pool.extra.items[slot] != fields_unresolved) return;
-    // Empty field-name map, populated by Sema when it resolves the fields.
-    pool.extra.items[item.data + @offsetOf(StructTypeRepr, "field_name_map") / 4] = @intFromEnum(try pool.addMap(pool.gpa, names.len));
-    const off: u32 = @intCast(pool.extra.items.len);
-    try pool.extra.ensureUnusedCapacity(pool.gpa, 6 + names.len + types.len + defaults.len + aligns.len + comptime_bits.len);
-    pool.extra.appendAssumeCapacity(@intFromEnum(layout));
-    pool.extra.appendAssumeCapacity(@intFromEnum(backing_int));
-    pool.extra.appendAssumeCapacity(@intCast(names.len));
-    pool.extra.appendAssumeCapacity(@intCast(defaults.len));
-    pool.extra.appendAssumeCapacity(@intCast(aligns.len));
-    pool.extra.appendAssumeCapacity(@intCast(comptime_bits.len));
-    for (names) |n| pool.extra.appendAssumeCapacity(@intFromEnum(n));
-    for (types) |t| pool.extra.appendAssumeCapacity(@intFromEnum(t));
-    for (defaults) |d| pool.extra.appendAssumeCapacity(@intFromEnum(d));
-    for (aligns) |a| pool.extra.appendAssumeCapacity(@intFromEnum(a));
-    for (comptime_bits) |b| pool.extra.appendAssumeCapacity(b);
-    pool.extra.items[slot] = off;
 }
 
 /// The declaration namespace stored on a container type, or `.none` for a
@@ -4212,7 +4144,9 @@ pub fn typeNamespace(pool: *const InternPool, ty: Index) OptionalNamespaceIndex 
 pub fn setNamespace(pool: *InternPool, ty: Index, ns: NamespaceIndex) void {
     const item = pool.items.get(@intFromEnum(ty));
     const slot = switch (item.tag) {
-        .type_struct => item.data + @offsetOf(StructTypeRepr, "namespace") / 4,
+        // `TypeStruct` is not an `extern` struct, so the slot is the field's position
+        // (`addExtra` writes one slot per field in declaration order), not `@offsetOf/4`.
+        .type_struct => item.data + std.meta.fieldIndex(TypeStruct, "namespace").?,
         .type_enum => item.data + @offsetOf(EnumTypeRepr, "namespace") / 4,
         .type_union => item.data + @offsetOf(UnionTypeRepr, "namespace") / 4,
         else => unreachable,
@@ -4531,8 +4465,106 @@ pub fn internTupleType(pool: *InternPool, types: []const Index) Allocator.Error!
     return pool.get(.{ .tuple_type = .{ .types = types } });
 }
 
-pub fn internStructType(pool: *InternPool, st: Key.StructType) Allocator.Error!Index {
-    return pool.get(.{ .struct_type = st });
+/// The dedup + item-append boilerplate shared by the container creators, mirroring
+/// the tail of `get`: look the identity `key` up, and on a miss return the fresh
+/// item index (the caller writes the extra payload then appends the item).
+fn getOrPutContainer(pool: *InternPool, key: Key) Allocator.Error!struct { existing: ?Index, index: u32 } {
+    const adapter: KeyAdapter = .{ .pool = pool };
+    const gop = try pool.map.getOrPutAdapted(pool.gpa, key, adapter);
+    if (gop.found_existing) return .{ .existing = @enumFromInt(@as(u32, @intCast(gop.index))), .index = 0 };
+    assert(gop.index == pool.items.len);
+    try pool.items.ensureUnusedCapacity(pool.gpa, 1);
+    return .{ .existing = null, .index = @intCast(gop.index) };
+}
+
+/// Create (or dedup) a declared struct type: just the `TypeStruct` header and the
+/// identity trailing. A declared struct's fields are read lazily from ZIR, so
+/// `loadStructType` returns null for it -- no field arrays are stored. Mirrors the
+/// compiler's `getDeclaredStructType` shell (the REPL fills fields lazily from ZIR
+/// rather than reserving+resolving them).
+pub fn getDeclaredStructType(pool: *InternPool, name: NullTerminatedString, id: Key.ContainerId, parent: Index) Allocator.Error!Index {
+    const gop = try pool.getOrPutContainer(.{ .struct_type = .{ .name = name, .id = id, .parent = parent } });
+    if (gop.existing) |e| return e;
+    const extra_index = try pool.addExtra(TypeStruct{
+        .name = name,
+        .parent = parent,
+        .namespace = .none,
+        .fields_len = 0,
+        .field_name_map = .none,
+        .backing_int = .none,
+        .size = 0,
+        .captures_len = containerCapturesLen(id),
+        .flags = .{ .layout = .auto, .any_comptime_fields = false, .any_field_defaults = false, .any_field_aligns = false, .class = .no_possible_value, .alignment = .none, .want_layout = false },
+    });
+    try pool.appendContainerId(id);
+    pool.items.appendAssumeCapacity(.{ .tag = .type_struct, .data = extra_index });
+    return @enumFromInt(gop.index);
+}
+
+/// Create (or dedup) a reified struct type, reserving and filling the whole
+/// `TypeStruct` header + trailing in one shot (the compiler's
+/// `getReifiedStructType`): identity, then `field_names`/`field_types`, then
+/// `field_defaults`/`field_aligns`/`field_is_comptime_bits` when present, then
+/// reserved `field_runtime_order` (`.auto`) and `field_offsets` slots (filled by
+/// layout resolution). `field_name_map` is `.none`; Sema populates it.
+pub fn getReifiedStructType(pool: *InternPool, ini: struct {
+    name: NullTerminatedString,
+    id: Key.ContainerId,
+    parent: Index,
+    layout: std.lang.Type.ContainerLayout,
+    backing_int: Index,
+    names: []const NullTerminatedString,
+    types: []const Index,
+    defaults: []const Index,
+    aligns: []const Index,
+    comptime_bits: []const u32,
+}) Allocator.Error!Index {
+    assert(ini.types.len == ini.names.len);
+    const gop = try pool.getOrPutContainer(.{ .struct_type = .{ .name = ini.name, .id = ini.id, .parent = ini.parent } });
+    if (gop.existing) |e| return e;
+    const fields_len: u32 = @intCast(ini.names.len);
+    const any_defaults = ini.defaults.len != 0;
+    const any_aligns = ini.aligns.len != 0;
+    const any_comptime = ini.comptime_bits.len != 0;
+    const runtime_order_len: u32 = if (ini.layout == .auto) fields_len else 0;
+    // The name map exists from creation (empty); Sema populates it.
+    const field_name_map = try pool.addMap(pool.gpa, fields_len);
+    const extra_index = try pool.addExtra(TypeStruct{
+        .name = ini.name,
+        .parent = ini.parent,
+        .namespace = .none,
+        .fields_len = fields_len,
+        .field_name_map = field_name_map.toOptional(),
+        .backing_int = ini.backing_int,
+        .size = 0,
+        .captures_len = containerCapturesLen(ini.id),
+        .flags = .{
+            .layout = switch (ini.layout) {
+                .auto => .auto,
+                .@"extern" => .@"extern",
+                .@"packed" => .@"packed",
+            },
+            .any_comptime_fields = any_comptime,
+            .any_field_defaults = any_defaults,
+            .any_field_aligns = any_aligns,
+            .class = .no_possible_value,
+            .alignment = .none,
+            .want_layout = false,
+        },
+    });
+    try pool.appendContainerId(ini.id);
+    try pool.extra.ensureUnusedCapacity(pool.gpa, fields_len + fields_len +
+        (if (any_defaults) fields_len else 0) + (if (any_aligns) fields_len else 0) +
+        @as(u32, @intCast(ini.comptime_bits.len)) + runtime_order_len + fields_len);
+    for (ini.names) |n| pool.extra.appendAssumeCapacity(@intFromEnum(n));
+    for (ini.types) |t| pool.extra.appendAssumeCapacity(@intFromEnum(t));
+    if (any_defaults) for (ini.defaults) |d| pool.extra.appendAssumeCapacity(@intFromEnum(d));
+    if (any_aligns) for (ini.aligns) |a| pool.extra.appendAssumeCapacity(@intFromEnum(a));
+    if (any_comptime) for (ini.comptime_bits) |b| pool.extra.appendAssumeCapacity(b);
+    pool.extra.appendNTimesAssumeCapacity(0, runtime_order_len);
+    pool.extra.appendNTimesAssumeCapacity(0, fields_len);
+    pool.items.appendAssumeCapacity(.{ .tag = .type_struct, .data = extra_index });
+    return @enumFromInt(gop.index);
 }
 
 pub fn internEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!Index {
@@ -5454,10 +5486,11 @@ test "fullyQualifiedName: a member of a named container nests under it" {
     // A namespace owned by a struct type named `repl.Outer`; its members
     // qualify under that name. This exercises the owner-type recursion
     // (`containerTypeName`) that activates once a container owns a scope.
-    const outer = try pool.internStructType(.{
-        .name = try pool.getOrPutString(pool.gpa, "repl.Outer"),
-        .id = .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(1) } },
-    });
+    const outer = try pool.getDeclaredStructType(
+        try pool.getOrPutString(pool.gpa, "repl.Outer"),
+        .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(1) } },
+        .none,
+    );
     const ns = try pool.createNamespace(pool.gpa, .none);
     pool.namespacePtr(ns).owner_type = outer;
 

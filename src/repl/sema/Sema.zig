@@ -4898,21 +4898,18 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
         },
     };
 
-    const struct_ty = try ip.internStructType(.{
+    const struct_ty = try ip.getReifiedStructType(.{
         .name = name,
         .id = .{ .reified = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst, .type_hash = hasher.final() } },
         .parent = sema.this_type,
+        .layout = layout,
+        .backing_int = backing_int,
+        .names = names,
+        .types = types,
+        .defaults = if (any_defaults) defaults else &.{},
+        .aligns = if (any_aligns) aligns else &.{},
+        .comptime_bits = if (any_comptime) comptime_words else &.{},
     });
-    try ip.setStructFields(
-        struct_ty,
-        layout,
-        backing_int,
-        names,
-        types,
-        if (any_defaults) defaults else &.{},
-        if (any_aligns) aligns else &.{},
-        if (any_comptime) comptime_words else &.{},
-    );
     const fields = ip.loadStructType(struct_ty).?;
     fields.field_name_map.get(ip).clearRetainingCapacity();
     for (names, 0..) |field_name, field_index| {
@@ -5380,11 +5377,11 @@ fn evalStructInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ctx = ip.stringSlice(sema.type_name_ctx);
     const name_text = try std.fmt.allocPrint(sema.gpa, "{s}__struct_{d}", .{ ctx, @intFromEnum(inst) });
     defer sema.gpa.free(name_text);
-    const struct_ty = try ip.internStructType(.{
-        .name = try ip.getOrPutString(sema.gpa, name_text),
-        .id = .{ .declared = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst } },
-        .parent = sema.this_type,
-    });
+    const struct_ty = try ip.getDeclaredStructType(
+        try ip.getOrPutString(sema.gpa, name_text),
+        .{ .declared = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst } },
+        sema.this_type,
+    );
     return .{ .index = try ip.internAggregate(.{ .ty = struct_ty, .storage = .{ .elems = values } }) };
 }
 
@@ -5452,10 +5449,11 @@ fn rootModuleType(sema: *Sema) Error!InternPool.Index {
     // type then lives in that file's `root_type` slot, as for every other file.
     const file_index: Session.Index = @intCast(session.files.items.len);
     try session.files.append(sema.gpa, .{ .zir = null, .tree = null, .wrapped = null, .sub_file_path = null });
-    const ty = try sema.intern_pool.internStructType(.{
-        .name = try sema.intern_pool.getOrPutString(sema.gpa, "root"),
-        .id = .{ .declared = .{ .source_zir_id = file_index, .decl_inst = .main_struct_inst } },
-    });
+    const ty = try sema.intern_pool.getDeclaredStructType(
+        try sema.intern_pool.getOrPutString(sema.gpa, "root"),
+        .{ .declared = .{ .source_zir_id = file_index, .decl_inst = .main_struct_inst } },
+        .none,
+    );
     sema.intern_pool.setNamespace(ty, session.root_namespace);
     session.files.items[file_index].root_type = ty;
     session.root_file = file_index;
@@ -5522,11 +5520,11 @@ fn lowerModule(sema: *Sema, canonical: []const u8, bytes: [:0]const u8) Error!In
     const file_index: Session.Index = @intCast(session.files.items.len - 1);
     try session.import_table.put(sema.gpa, sub_path, file_index);
 
-    const root_type = try sema.intern_pool.internStructType(.{
-        .name = try sema.moduleTypeName(canonical),
-        .id = .{ .declared = .{ .source_zir_id = file_index, .decl_inst = .main_struct_inst } },
-        .parent = .none,
-    });
+    const root_type = try sema.intern_pool.getDeclaredStructType(
+        try sema.moduleTypeName(canonical),
+        .{ .declared = .{ .source_zir_id = file_index, .decl_inst = .main_struct_inst } },
+        .none,
+    );
     session.files.items[file_index].root_type = root_type;
     return root_type;
 }
@@ -6535,17 +6533,14 @@ fn evalStructDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     defer sema.gpa.free(captures);
 
     return .{
-        .index = try sema.intern_pool.internStructType(.{
-            .name = name,
-            .id = .{ .declared = .{
-                .source_zir_id = sema.current_zir_id,
-                .decl_inst = inst,
-                .captures = captures,
-            } },
-            // The container being evaluated is the enclosing one; record it so an
-            // unqualified decl reference resolves outward (the compiler's namespace parent).
-            .parent = sema.this_type,
-        }),
+        // The container being evaluated is the enclosing one (`sema.this_type`); record
+        // it so an unqualified decl reference resolves outward (the compiler's namespace
+        // parent).
+        .index = try sema.intern_pool.getDeclaredStructType(name, .{ .declared = .{
+            .source_zir_id = sema.current_zir_id,
+            .decl_inst = inst,
+            .captures = captures,
+        } }, sema.this_type),
     };
 }
 
@@ -11493,11 +11488,18 @@ fn opvEnum(sema: *Sema, hash: u64, names: []const []const u8) !Type {
 fn opvStruct(sema: *Sema, hash: u64, names: []const []const u8, types: []const InternPool.Index) !Type {
     const pool = sema.intern_pool;
     const handles = try opvNames(sema, names);
-    const struct_ty = try pool.internStructType(.{
+    const struct_ty = try pool.getReifiedStructType(.{
         .name = try pool.getOrPutString(sema.gpa, "S"),
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
+        .parent = .none,
+        .layout = .auto,
+        .backing_int = .none,
+        .names = handles,
+        .types = types,
+        .defaults = &.{},
+        .aligns = &.{},
+        .comptime_bits = &.{},
     });
-    try pool.setStructFields(struct_ty, .auto, .none, handles, types, &.{}, &.{}, &.{});
     const f = pool.loadStructType(struct_ty).?;
     f.field_name_map.get(pool).clearRetainingCapacity();
     for (handles) |name| assert(pool.addFieldName(handles, f.field_name_map, name) == null);
