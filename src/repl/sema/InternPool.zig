@@ -4102,7 +4102,7 @@ pub fn setEnumFields(
 /// offsets, class) are not modelled. Storage block layout: `[layout, backing_int,
 /// fields_len, defaults_len, aligns_len, comptime_len, names..., types...,
 /// defaults..., aligns..., comptime_bits...]`.
-pub const StructFields = struct {
+pub const LoadedStructType = struct {
     layout: std.lang.Type.ContainerLayout,
     packed_backing_int_type: Index,
     field_names: []const NullTerminatedString,
@@ -4116,7 +4116,7 @@ pub const StructFields = struct {
     field_name_map: MapIndex,
 
     /// Field index for `name`, or null. Mirrors `LoadedStructType.nameIndex`.
-    pub fn nameIndex(fields: StructFields, pool: *const InternPool, name: NullTerminatedString) ?u32 {
+    pub fn nameIndex(fields: LoadedStructType, pool: *const InternPool, name: NullTerminatedString) ?u32 {
         const map = fields.field_name_map.get(pool);
         const adapter: NullTerminatedString.Adapter = .{ .strings = fields.field_names };
         const field_index = map.getIndexAdapted(name, adapter) orelse return null;
@@ -4126,7 +4126,7 @@ pub const StructFields = struct {
 
 /// This struct's resolved fields, or null if it stores none (a declared struct,
 /// which reads its fields from ZIR).
-pub fn structFields(pool: *const InternPool, struct_ty: Index) ?StructFields {
+pub fn loadStructType(pool: *const InternPool, struct_ty: Index) ?LoadedStructType {
     const item = pool.items.get(@intFromEnum(struct_ty));
     assert(item.tag == .type_struct);
     const off = pool.extra.items[item.data + @offsetOf(StructTypeRepr, "field_data") / 4];

@@ -143,7 +143,7 @@ fn renderAggregate(
 /// declaring ZIR for a declared one. Null if unavailable (the caller falls back to
 /// positional). The read-only analogue of `Sema.structFieldNameAt`.
 fn structFieldName(pool: *const InternPool, session: *const Session, struct_ty: InternPool.Index, index: u32) ?[]const u8 {
-    if (pool.structFields(struct_ty)) |f| return if (index < f.field_names.len) pool.stringSlice(f.field_names[index]) else null;
+    if (pool.loadStructType(struct_ty)) |f| return if (index < f.field_names.len) pool.stringSlice(f.field_names[index]) else null;
     const d = switch (pool.indexToKey(struct_ty).struct_type.id) {
         .declared => |dd| dd,
         else => return null,

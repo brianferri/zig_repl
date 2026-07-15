@@ -4913,7 +4913,7 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
         if (any_aligns) aligns else &.{},
         if (any_comptime) comptime_words else &.{},
     );
-    const fields = ip.structFields(struct_ty).?;
+    const fields = ip.loadStructType(struct_ty).?;
     fields.field_name_map.get(ip).clearRetainingCapacity();
     for (names, 0..) |field_name, field_index| {
         if (ip.addFieldName(names, fields.field_name_map, field_name)) |prev_field_index| {
@@ -5927,7 +5927,7 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             // A reified struct stores its layout and packed backing integer; a
             // declared struct (or a tuple) has none modelled, so it reports `.auto`
             // and a null backing integer.
-            const sf: ?InternPool.StructFields = if (tuple_types == null) ip.structFields(ty) else null;
+            const sf: ?InternPool.LoadedStructType = if (tuple_types == null) ip.loadStructType(ty) else null;
             const layout = if (sf) |f| f.layout else .auto;
             const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(layout))).?;
             const backing_integer_val = try sema.optTypeValue(if (sf) |f| f.packed_backing_int_type else .none);
@@ -6790,14 +6790,14 @@ pub const FieldInfo = struct {
 
 /// Field `i`'s `comptime` bit from a reified struct's stored `comptime_bits`
 /// (empty when no field is comptime, LSB-first within each u32).
-fn structFieldIsComptime(f: InternPool.StructFields, i: usize) bool {
+fn structFieldIsComptime(f: InternPool.LoadedStructType, i: usize) bool {
     if (f.field_is_comptime_bits.len == 0) return false;
     return f.field_is_comptime_bits[i / 32] >> @intCast(i % 32) & 1 != 0;
 }
 
 /// Field `i`'s explicit alignment (bytes) from a reified struct's stored `aligns`,
 /// or null for the natural alignment (no `aligns` slice, or a `.none` entry).
-fn structFieldAlign(sema: *Sema, f: InternPool.StructFields, i: usize) ?u64 {
+fn structFieldAlign(sema: *Sema, f: InternPool.LoadedStructType, i: usize) ?u64 {
     if (f.field_aligns.len == 0 or f.field_aligns[i] == .none) return null;
     return @intCast(sema.intAsI128(f.field_aligns[i]).?);
 }
@@ -6817,7 +6817,7 @@ pub fn structFieldByName(
     const ip = sema.intern_pool;
     // A reified struct has no ZIR; its fields are read from storage, keyed through
     // the field-name map like the compiler's `LoadedStructType.nameIndex`.
-    if (ip.structFields(struct_ty)) |f| {
+    if (ip.loadStructType(struct_ty)) |f| {
         const i = f.nameIndex(ip, name) orelse return null;
         return .{
             .index = i,
@@ -6865,7 +6865,7 @@ pub fn structFieldDefault(
 ) Error!InternPool.Index {
     const ip = sema.intern_pool;
     // A reified struct has no ZIR; its defaults are stored (`.none` if none).
-    if (ip.structFields(struct_ty)) |f| {
+    if (ip.loadStructType(struct_ty)) |f| {
         const i = f.nameIndex(ip, name) orelse return .none;
         return if (f.field_defaults.len == 0) .none else f.field_defaults[i];
     }
@@ -7003,7 +7003,7 @@ fn callConvValue(sema: *Sema, cc: std.lang.CallingConvention) Error!InternPool.I
 pub fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
     const ip = sema.intern_pool;
     // A reified struct has no ZIR; its field names are stored.
-    if (ip.structFields(struct_ty)) |f| return if (index < f.field_names.len) f.field_names[index] else null;
+    if (ip.loadStructType(struct_ty)) |f| return if (index < f.field_names.len) f.field_names[index] else null;
     const cf = try sema.enterContainer(struct_ty, "struct field name");
     defer cf.restore(sema);
     var it = sema.zir.getStructDecl(cf.decl_inst).iterateFields();
@@ -7608,7 +7608,7 @@ fn unionIsTagged(sema: *Sema, union_ty: InternPool.Index) Error!bool {
 /// `field_names`; no field bodies are evaluated).
 pub fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
     // A reified struct has no ZIR; its field count comes from stored fields.
-    if (sema.intern_pool.structFields(struct_ty)) |f| return @intCast(f.field_names.len);
+    if (sema.intern_pool.loadStructType(struct_ty)) |f| return @intCast(f.field_names.len);
     const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
     const decl_inst = st.id.declInst();
     const frame = try sema.enterSourceZir(st.id.sourceZirId(), "struct field count");
@@ -11498,7 +11498,7 @@ fn opvStruct(sema: *Sema, hash: u64, names: []const []const u8, types: []const I
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
     });
     try pool.setStructFields(struct_ty, .auto, .none, handles, types, &.{}, &.{}, &.{});
-    const f = pool.structFields(struct_ty).?;
+    const f = pool.loadStructType(struct_ty).?;
     f.field_name_map.get(pool).clearRetainingCapacity();
     for (handles) |name| assert(pool.addFieldName(handles, f.field_name_map, name) == null);
     return .fromIndex(struct_ty);
