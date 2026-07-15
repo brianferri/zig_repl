@@ -1104,7 +1104,7 @@ test "struct_type: nominal identity keys on (source_zir_id, decl_inst)" {
     // distinct type even with an identical shape (nominal, not structural).
     try testing.expectEqual(a1, a2);
     try testing.expect(a1 != b);
-    try testing.expectEqualStrings("repl.A", pool.stringSlice(pool.indexToKey(a1).struct_type.name));
+    try testing.expectEqualStrings("repl.A", pool.stringSlice(pool.typeName(a1)));
 }
 
 test "coercion: void and non-void types do not coerce into each other" {
@@ -1458,7 +1458,7 @@ test "struct_decl: `const P = struct {...}` evaluates to a struct_type named aft
     const key = pool.indexToKey(value.index);
     try testing.expect(key == .struct_type);
     // `.parent` name strategy: qualified with the session marker.
-    try testing.expectEqualStrings("repl.P", pool.stringSlice(key.struct_type.name));
+    try testing.expectEqualStrings("repl.P", pool.stringSlice(pool.typeName(value.index)));
 }
 
 test "decl: top-level const binds and is readable on the next line" {

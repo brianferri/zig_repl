@@ -774,17 +774,22 @@ pub const Key = union(enum) {
     /// mirroring `getDeclaredStructType` (identity only) before lazy
     /// `resolveStructFieldTypes`: field names/types are resolved on
     /// demand from the decl's ZIR, not stored here.
-    struct_type: StructType,
+    struct_type: ContainerType,
     /// A named enum type (`enum { a, b }`). Nominal, like `struct_type`:
     /// identity is `(source_zir_id, decl_inst, captures)`. Field names, the
     /// integer tag type, and per-field values are resolved on demand from the
     /// decl's ZIR (`enumFieldByName`), not stored here. Mirrors the compiler's
     /// `LoadedEnumType` shell before its fields are resolved.
-    enum_type: EnumType,
+    enum_type: ContainerType,
     /// A named union type (`union(enum) { a: u8, b: u16 }`). Nominal like
     /// `enum_type`: identity is `(source_zir_id, decl_inst, captures)`; field
     /// names and types are resolved on demand from the decl's ZIR.
-    union_type: UnionType,
+    union_type: ContainerType,
+    /// A named opaque type (`opaque {}`). Nominal like the other containers, but
+    /// with no fields -- only a name and a declaration namespace. Identity is
+    /// `(source_zir_id, decl_inst, captures)`, exactly as the compiler keys its
+    /// `opaque_type` (also a `ContainerType`).
+    opaque_type: ContainerType,
     /// An aggregate value (array, vector, struct -- the type
     /// determines which). Storage is either an N-element slice or a
     /// single-element repetition. Mirrors compiler `Key.Aggregate`
@@ -982,7 +987,7 @@ pub const Key = union(enum) {
 
     /// The identity of a container type (struct/enum/union), mirroring the
     /// compiler's `ContainerType`. A container is one of three flavors and is
-    /// hashed/compared per flavor (see `hashContainerId`/`eqlContainerId`):
+    /// hashed/compared per flavor (see `hashContainerType`/`eqlContainerType`):
     ///  - `declared`: from source ZIR, identified by its instruction plus captures;
     ///  - `reified`: from `@Enum`/`@Struct`/`@Union` or an anonymous init,
     ///    identified by its instruction plus a `type_hash` that Sema computes over
@@ -993,7 +998,7 @@ pub const Key = union(enum) {
     /// The REPL's instruction token is `(source_zir_id, decl_inst)` where the
     /// compiler uses one `TrackedInst.Index`; captures are a flat `[]const Index`
     /// rather than the compiler's owned/external split.
-    pub const ContainerId = union(enum) {
+    pub const ContainerType = union(enum) {
         declared: Declared,
         reified: Reified,
         generated_union_tag: Index,
@@ -1017,14 +1022,14 @@ pub const Key = union(enum) {
 
         /// The source-ZIR instruction token. A generated tag enum has none -- it
         /// resolves through its owner union, which is unwrapped before this is read.
-        pub fn sourceZirId(self: ContainerId) u32 {
+        pub fn sourceZirId(self: ContainerType) u32 {
             return switch (self) {
                 .declared => |d| d.source_zir_id,
                 .reified => |r| r.source_zir_id,
                 .generated_union_tag => unreachable,
             };
         }
-        pub fn declInst(self: ContainerId) std.zig.Zir.Inst.Index {
+        pub fn declInst(self: ContainerType) std.zig.Zir.Inst.Index {
             return switch (self) {
                 .declared => |d| d.decl_inst,
                 .reified => |r| r.decl_inst,
@@ -1032,14 +1037,14 @@ pub const Key = union(enum) {
             };
         }
         /// Captures live only on a declared type; reified/generated have none.
-        pub fn captures(self: ContainerId) []const Index {
+        pub fn captures(self: ContainerType) []const Index {
             return switch (self) {
                 .declared => |d| d.captures,
                 else => &.{},
             };
         }
         /// The owner union of a generated tag enum, or `.none` for other flavors.
-        pub fn generatedUnion(self: ContainerId) Index {
+        pub fn generatedUnion(self: ContainerType) Index {
             return switch (self) {
                 .generated_union_tag => |idx| idx,
                 else => .none,
@@ -1047,47 +1052,6 @@ pub const Key = union(enum) {
         }
     };
 
-    /// Named struct type. `id` is the nominal identity; `name` is the
-    /// fully-qualified name (e.g. `repl.P`). Fields are not stored on a declared
-    /// struct -- they are resolved on demand from the decl's ZIR (see the
-    /// `struct_type` Key doc).
-    pub const StructType = struct {
-        name: NullTerminatedString,
-        id: ContainerId,
-        /// The enclosing container this type is declared in, or `.none` at the
-        /// session/file top level. The REPL's stand-in for `Namespace.parent`:
-        /// `evalDeclVal` walks it outward so a nested container resolves an
-        /// unqualified enclosing decl. Not part of identity (a decl site has one
-        /// parent, fixed by its zir position).
-        parent: Index = .none,
-        /// This container's declaration namespace, or `.none` until scanned. Not
-        /// part of identity -- filled after creation. Mirrors the compiler's
-        /// `struct_type.namespace`.
-        namespace: OptionalNamespaceIndex = .none,
-    };
-
-    /// A named enum type. Nominal like `StructType`; field names / tag type /
-    /// values are resolved on demand from the decl's ZIR for a declared enum, or
-    /// stored at creation for a reified one. Mirrors `getDeclaredEnumType`'s shell.
-    pub const EnumType = struct {
-        name: NullTerminatedString,
-        id: ContainerId,
-        /// Enclosing container, or `.none`. See `StructType.parent`.
-        parent: Index = .none,
-        /// Declaration namespace, or `.none` until scanned. See `StructType.namespace`.
-        namespace: OptionalNamespaceIndex = .none,
-    };
-
-    /// A named union type. Nominal like `EnumType`; field names/types resolved on
-    /// demand from the decl's ZIR. Mirrors `getDeclaredUnionType`'s shell.
-    pub const UnionType = struct {
-        name: NullTerminatedString,
-        id: ContainerId,
-        /// Enclosing container, or `.none`. See `StructType.parent`.
-        parent: Index = .none,
-        /// Declaration namespace, or `.none` until scanned. See `StructType.namespace`.
-        namespace: OptionalNamespaceIndex = .none,
-    };
 
     /// A union value: the union type, the active field's tag (its integer index),
     /// and the payload. Mirrors compiler `Key.Union {ty, tag, val}`.
@@ -1356,13 +1320,14 @@ pub const Key = union(enum) {
             // Nominal: identity is the container flavor and its per-flavor data
             // (`name` is derived from the site, so it is excluded here and in
             // `eql`). One helper covers struct/enum/union alike.
-            .struct_type => |st| hashContainerId(&hasher, st.id),
-            .enum_type => |et| hashContainerId(&hasher, et.id),
+            .struct_type => |ct| hashContainerType(&hasher, ct),
+            .enum_type => |ct| hashContainerType(&hasher, ct),
             .enum_tag => |et| {
                 std.hash.autoHash(&hasher, et.ty);
                 std.hash.autoHash(&hasher, et.int);
             },
-            .union_type => |ut| hashContainerId(&hasher, ut.id),
+            .union_type => |ct| hashContainerType(&hasher, ct),
+            .opaque_type => |ct| hashContainerType(&hasher, ct),
             .un => |uv| {
                 std.hash.autoHash(&hasher, uv.ty);
                 std.hash.autoHash(&hasher, uv.tag);
@@ -1509,13 +1474,14 @@ pub const Key = union(enum) {
             },
             .error_set_type => |x| std.mem.eql(NullTerminatedString, x.names, b.error_set_type.names),
             .tuple_type => |x| std.mem.eql(Index, x.types, b.tuple_type.types),
-            .struct_type => |x| eqlContainerId(x.id, b.struct_type.id),
-            .enum_type => |x| eqlContainerId(x.id, b.enum_type.id),
+            .struct_type => |x| eqlContainerType(x, b.struct_type),
+            .enum_type => |x| eqlContainerType(x, b.enum_type),
             .enum_tag => |x| blk: {
                 const y = b.enum_tag;
                 break :blk x.ty == y.ty and x.int == y.int;
             },
-            .union_type => |x| eqlContainerId(x.id, b.union_type.id),
+            .union_type => |x| eqlContainerType(x, b.union_type),
+            .opaque_type => |x| eqlContainerType(x, b.opaque_type),
             .un => |x| blk: {
                 const y = b.un;
                 break :blk x.ty == y.ty and x.tag == y.tag and x.val == y.val;
@@ -1621,6 +1587,7 @@ pub const Key = union(enum) {
             .struct_type,
             .enum_type,
             .union_type,
+            .opaque_type,
             => true,
             .simple_value,
             .enum_literal,
@@ -1645,9 +1612,9 @@ pub const Key = union(enum) {
 /// a `declared` and a `reified` type sharing an instruction never collide. Captures
 /// (declared) and the Sema-computed `type_hash` (reified) are part of identity; a
 /// generated tag enum is identified by its owner union alone. `name` is derived
-/// from the site, so it is excluded (as in `eqlContainerId`).
-fn hashContainerId(hasher: *std.hash.Wyhash, id: Key.ContainerId) void {
-    std.hash.autoHash(hasher, @as(std.meta.Tag(Key.ContainerId), id));
+/// from the site, so it is excluded (as in `eqlContainerType`).
+fn hashContainerType(hasher: *std.hash.Wyhash, id: Key.ContainerType) void {
+    std.hash.autoHash(hasher, @as(std.meta.Tag(Key.ContainerType), id));
     switch (id) {
         .declared => |d| {
             std.hash.autoHash(hasher, d.source_zir_id);
@@ -1663,10 +1630,10 @@ fn hashContainerId(hasher: *std.hash.Wyhash, id: Key.ContainerId) void {
     }
 }
 
-/// Container identity equality, the counterpart to `hashContainerId`: different
+/// Container identity equality, the counterpart to `hashContainerType`: different
 /// flavors are never equal, and each flavor compares its own identity data.
-fn eqlContainerId(x: Key.ContainerId, y: Key.ContainerId) bool {
-    if (@as(std.meta.Tag(Key.ContainerId), x) != @as(std.meta.Tag(Key.ContainerId), y)) return false;
+fn eqlContainerType(x: Key.ContainerType, y: Key.ContainerType) bool {
+    if (@as(std.meta.Tag(Key.ContainerType), x) != @as(std.meta.Tag(Key.ContainerType), y)) return false;
     return switch (x) {
         .declared => |xd| xd.source_zir_id == y.declared.source_zir_id and
             xd.decl_inst == y.declared.decl_inst and
@@ -1700,7 +1667,7 @@ const Item = struct {
         int_comptime_int_u32, // ty = .comptime_int_type; data = u32 value (positive)
         int_comptime_int_i32, // ty = .comptime_int_type; data = i32 value (bit-cast)
         // Fallback for typed `u64` values whose type isn't covered by a
-        // specialised tag above. data = extra index of IntSmall.
+        // specialised tag above. data = extra index of 2 slots: ty, value.
         int_small,
         // Arbitrary-precision integer. Sign is in the tag; the packed `Int`
         // header (ty + limbs_len) lives at `big_int_limbs[data]` and
@@ -1724,24 +1691,20 @@ const Item = struct {
         float_c_longdouble_f128, // ty = .c_longdouble_type; storage f128, data = extra index of Float128
         float_comptime_float, // ty = .comptime_float_type; data = extra index of Float128
         undef, // data = Index of the value's type (`undefined_type` for untyped)
-        // Pointer type. data = extra index of PtrTypeRepr (3 u32 slots:
-        // child, sentinel, flags).
+        // Pointer type. data = extra index of a `TypePointer` (child, sentinel,
+        // flags).
         type_pointer,
-        // Pointer value with `BaseAddr.comptime_alloc`. data = extra
-        // index of PtrComptimeAllocRepr (4 u32 slots: ty,
-        // comptime_alloc index, byte_offset_lo, byte_offset_hi).
+        // Pointer value with `BaseAddr.comptime_alloc`. data = extra index of a
+        // `PtrComptimeAlloc`.
         ptr_comptime_alloc,
-        // Pointer value with `BaseAddr.nav`. data = extra index of a
-        // PtrNavRepr.
+        // Pointer value with `BaseAddr.nav`. data = extra index of a `PtrNav`.
         ptr_nav,
-        // Pointer value with `BaseAddr.uav`. data = extra index of a
-        // PtrUavRepr.
+        // Pointer value with `BaseAddr.uav`. data = extra index of a `PtrUav`.
         ptr_uav,
-        // Pointer value with `BaseAddr.field`. data = extra index of 6 u32
-        // slots: ty, base ptr Index, index_lo, index_hi, byte_offset_lo,
-        // byte_offset_hi.
+        // Pointer value with `BaseAddr.field`. data = extra index of a
+        // `PtrBaseIndex`.
         ptr_field,
-        // Pointer value with `BaseAddr.arr_elem`. Same PtrFieldRepr layout as
+        // Pointer value with `BaseAddr.arr_elem`. Same `PtrBaseIndex` layout as
         // `ptr_field`.
         ptr_arr_elem,
         // Pointer value with `BaseAddr.opt_payload`. data = extra index of
@@ -1750,8 +1713,7 @@ const Item = struct {
         // Pointer value with `BaseAddr.eu_payload`. Same `PtrBase` layout as
         // `ptr_opt_payload`.
         ptr_eu_payload,
-        // Slice value. data = extra index of SliceRepr (3 u32 slots: ty, ptr,
-        // len).
+        // Slice value. data = extra index of a `Key.Slice` (ty, ptr, len).
         ptr_slice,
         // Error set type. data = extra index of `[names_len, name0,
         // name1, ...]` -- one u32 length followed by `names_len`
@@ -1766,76 +1728,67 @@ const Item = struct {
         // slots: source_zir_id, decl_inst, name). Nominal identity; fields
         // are resolved from the decl's ZIR on demand, not stored.
         type_struct,
-        // Named enum type. data = extra index of EnumTypeRepr (4 u32 slots:
-        // source_zir_id, decl_inst, name, generated_union) then trailing captures,
-        // laid out like `type_struct`. Nominal identity; field names / tag type /
-        // values are resolved from the decl's ZIR on demand.
+        // Named enum type. data = extra index of a `TypeEnum` header then the
+        // identity trailing (`appendContainerType`) and reserved field arrays, laid out
+        // like `type_struct`. Field names / tag type / values are stored at creation
+        // for a reified enum, filled lazily from the decl's ZIR for a declared one.
         type_enum,
-        // Enum tag value. data = extra index of EnumTagRepr (2 u32 slots: ty,
-        // int).
+        // Enum tag value. data = extra index of a `Key.EnumTag` (ty, int).
         enum_tag,
-        // Named union type. data = extra index of UnionTypeRepr (3 u32 slots) then
-        // trailing captures, laid out exactly like `type_enum`.
+        // Named union type. data = extra index of a `TypeUnion` header then the
+        // identity trailing and (reified only) field arrays, laid out exactly like
+        // `type_struct`. A declared union reads its fields from ZIR.
         type_union,
-        // Union value. data = extra index of UnionValueRepr (3 u32 slots: ty, tag,
-        // val).
+        // Named opaque type (`opaque {}`). data = extra index of a `TypeOpaque`
+        // header then the identity trailing. Has no fields -- only a name and a
+        // declaration namespace.
+        type_opaque,
+        // Union value. data = extra index of a `Key.Union` (ty, tag, val).
         union_value,
-        // Error value. data = extra index of ErrRepr (2 u32 slots:
-        // ty, name).
+        // Error value. data = extra index of a `Key.Error` (ty, name).
         error_set_error,
-        // Error-union type (`E!T`). data = extra index of
-        // ErrorUnionTypeRepr (2 u32 slots: error_set, payload).
+        // Error-union type (`E!T`). data = extra index of a `Key.ErrorUnionType`
+        // (error_set_type, payload_type).
         type_error_union,
-        // Error-union value carrying an error. data = extra index of
-        // ErrorUnionErrRepr (2 u32 slots: ty, err_name).
+        // Error-union value carrying an error. data = extra index of an
+        // `ErrorUnionErrRepr` (ty, err_name).
         error_union_error,
-        // Error-union value carrying a payload. data = extra index of
-        // ErrorUnionPayloadRepr (2 u32 slots: ty, payload).
+        // Error-union value carrying a payload. data = extra index of an
+        // `ErrorUnionPayloadRepr` (ty, payload).
         error_union_payload,
-        // Function type. data = extra index of FuncTypeRepr (3 u32
-        // slots) plus trailing comptime_bits / noalias_bits (when
-        // present per flags) and `param_types[N]`.
+        // Function type. data = extra index of a `FuncTypeRepr` header plus
+        // trailing comptime_bits / noalias_bits (when present per flags) and
+        // `param_types[params_len]`.
         type_function,
-        // Function value at a declaration site. data = extra index
-        // of FuncDeclRepr (2 u32 slots: ty, zir_body_inst). Omits the
-        // compiler's incremental-compilation extras.
+        // Function value at a declaration site. data = extra index of a
+        // `FuncDeclRepr`. Omits the compiler's incremental-compilation extras.
         func_decl,
-        // Function value from a generic-fn instantiation. data =
-        // extra index of FuncInstanceRepr (3 u32 slots: ty,
-        // generic_owner, comptime_args_len) plus trailing
-        // `comptime_args[comptime_args_len]`. The tag exists so the
-        // dispatcher, hash, and eql paths cover the variant even
-        // before generics emit it.
+        // Function value from a generic-fn instantiation. data = extra index of a
+        // `FuncInstanceRepr` header plus trailing `comptime_args[comptime_args_len]`.
+        // The tag exists so the dispatcher, hash, and eql paths cover the variant
+        // even before generics emit it.
         func_instance,
-        // Function value coerced to a different fn type. data =
-        // extra index of FuncCoercedRepr (2 u32 slots: ty,
-        // inner_func). The inner index points at another
-        // func_decl / func_instance; `uncoerced_ty` derives from
-        // the inner's `ty`.
+        // Function value coerced to a different fn type. data = extra index of a
+        // `FuncCoercedRepr`. The inner index points at another func_decl /
+        // func_instance; `uncoerced_ty` derives from the inner's `ty`.
         func_coerced,
-        // `@Vector(len, child)`. data = extra index of VectorTypeRepr
-        // (2 u32 slots: len, child).
+        // `@Vector(len, child)`. data = extra index of a `Vector` (len, child).
         type_vector,
         // `?child` optional type. data = the child type Index.
         type_optional,
-        // Sentinel-free `[len]child` array type where len fits in
-        // u32. data = extra index of VectorTypeRepr (2 u32 slots:
-        // len, child), reusing the same `len, child` packing.
+        // Sentinel-free `[len]child` array type where len fits in u32. data = extra
+        // index of a `Vector` (len, child), reusing the same packing.
         type_array_small,
-        // Array type with a sentinel value OR with len >= 2^32.
-        // data = extra index of ArrayTypeBigRepr (4 u32 slots:
-        // len_lo, len_hi, child, sentinel).
+        // Array type with a sentinel value OR with len >= 2^32. data = extra index
+        // of an `Array` (len0, len1, child, sentinel).
         type_array_big,
-        // Aggregate value with one element per slot. data = extra
-        // index of AggregateRepr (1 u32 slot: ty) followed by
-        // `element_values[N]` where N = effective element count
-        // derived from `ty`.
+        // Aggregate value with one element per slot. data = extra index of 2 slots
+        // (ty, count) followed by `element_values[count]`.
         aggregate,
-        // Aggregate value with every slot equal. data = extra
-        // index of RepeatedRepr (2 u32 slots: ty, elem_val).
+        // Aggregate value with every slot equal. data = extra index of a `Repeated`
+        // (ty, elem_val).
         repeated,
-        // Non-null optional value. data = extra index of OptPayloadRepr
-        // (2 u32 slots: ty, val).
+        // Non-null optional value. data = extra index of a `Key.Opt` (ty, val).
         opt_payload,
         // Null optional value. data = the optional type Index.
         opt_null,
@@ -1847,28 +1800,22 @@ const Item = struct {
 /// tags. Stored as two consecutive `u32`s in `extra`: `ty` then `value`.
 /// Values that exceed `u32` skip this encoding and go straight to
 /// `int_positive` / `int_negative`.
-const IntSmall = extern struct {
-    ty: u32,
-    value: u32,
-};
-
-/// Extra-arena payload for `Item.Tag.type_pointer`. Three u32 slots:
-/// child, sentinel, and the bit-packed `Key.PtrType.Flags`. Narrower
-/// than the compiler's `Tag.TypePointer`, which also carries a
-/// `packed_offset` the REPL has no need for.
-const PtrTypeRepr = extern struct {
-    child: u32,
-    sentinel: u32,
-    flags: u32,
+/// Extra-arena payload for `Item.Tag.type_pointer`. Three slots: child, sentinel,
+/// and the bit-packed `Key.PtrType.Flags`. Narrower than the compiler's
+/// `Tag.TypePointer`, which also carries a `packed_offset` the REPL has no need for.
+const TypePointer = struct {
+    child: Index,
+    sentinel: Index,
+    flags: Key.PtrType.Flags,
 };
 
 /// Extra-arena header for `Item.Tag.type_function`. Three u32
 /// slots followed by optional `comptime_bits` / `noalias_bits`
 /// and `param_types[params_len]`.
-const FuncTypeRepr = extern struct {
+const FuncTypeRepr = struct {
     params_len: u32,
-    return_type: u32,
-    flags: u32,
+    return_type: Index,
+    flags: Flags,
 
     /// Minimal CC packing: `cc_tag` only. The compiler
     /// uses `PackedCallingConvention(u18)` which also carries
@@ -1891,21 +1838,21 @@ const FuncTypeRepr = extern struct {
 /// the source ZIR id (matches `Sema.current_zir_id` at intern time;
 /// a `File.Index` into `Session.files`), `ty`, and the ZIR
 /// func-instruction index within that file.
-const FuncDeclRepr = extern struct {
+const FuncDeclRepr = struct {
     source_zir_id: u32,
-    ty: u32,
-    zir_body_inst: u32,
-    parent: u32,
+    ty: Index,
+    zir_body_inst: std.zig.Zir.Inst.Index,
+    parent: Index,
 };
 
 /// Extra-arena header for `Item.Tag.func_instance`. Four u32
 /// slots followed by `comptime_args[comptime_args_len]`. The
 /// generic_owner index resolves through `indexToKey` to its
 /// `func_decl` and contributes the body inst + source_zir_id.
-const FuncInstanceRepr = extern struct {
+const FuncInstanceRepr = struct {
     source_zir_id: u32,
-    ty: u32,
-    generic_owner: u32,
+    ty: Index,
+    generic_owner: Index,
     comptime_args_len: u32,
 };
 
@@ -1914,64 +1861,50 @@ const FuncInstanceRepr = extern struct {
 /// `uncoerced_ty` becomes this Key.Func's `uncoerced_ty`. The
 /// source_zir_id is inherited from the inner func -- no extra
 /// slot needed since the inner-index chase recovers it.
-const FuncCoercedRepr = extern struct {
-    ty: u32,
-    inner_func: u32,
+const FuncCoercedRepr = struct {
+    ty: Index,
+    inner_func: Index,
 };
 
-/// Extra-arena payload for `Item.Tag.type_vector` -- `len` then
-/// `child`. `Item.Tag.type_array_small` reuses this same layout for
-/// sentinel-free arrays whose len fits in u32; the Tag, not the repr,
-/// is what `indexToKey` discriminates on.
-const VectorTypeRepr = extern struct {
+/// Extra-arena payload for `Item.Tag.type_vector`, mirroring the compiler's
+/// `Vector`. `Item.Tag.type_array_small` reuses this same layout for sentinel-free
+/// arrays whose len fits in u32; the Tag, not the repr, is what `indexToKey`
+/// discriminates on.
+const Vector = struct {
     len: u32,
-    child: u32,
+    child: Index,
 };
 
-/// Extra-arena payload for `Item.Tag.opt_payload` -- the optional type
-/// then the (non-none) payload value. `opt_null` needs no repr; it
-/// stores the optional type inline.
-const OptPayloadRepr = extern struct {
-    ty: u32,
-    val: u32,
+/// Extra-arena payload for `Item.Tag.type_array_big`, mirroring the compiler's
+/// `Array` (64-bit `len` split across `len0`/`len1`). Sentinel == `.none` is invalid
+/// here -- the dispatcher routes to `type_array_small` in that case.
+const Array = struct {
+    len0: u32,
+    len1: u32,
+    child: Index,
+    sentinel: Index,
+    fn getLength(a: Array) u64 {
+        return @as(u64, a.len1) << 32 | a.len0;
+    }
 };
 
-/// Extra-arena payload for `Item.Tag.type_array_big`. Four u32
-/// slots: `len_lo`, `len_hi`, `child`, `sentinel`. Sentinel == 0
-/// (`Index.none`) is invalid here -- the dispatcher routes to
-/// `type_array_small` in that case. The u32 pair holds the 64-bit length.
-const ArrayTypeBigRepr = extern struct {
-    len_lo: u32,
-    len_hi: u32,
-    child: u32,
-    sentinel: u32,
-};
-
-/// Extra-arena header for `Item.Tag.aggregate`. One u32 slot for
-/// the aggregate `ty`; the N element Indices follow inline. N is
-/// not stored -- it derives from the aggregate type's element
-/// count (`lenIncludingSentinel` for arrays).
-const AggregateRepr = extern struct {
-    ty: u32,
-};
-
-/// Extra-arena payload for `Item.Tag.repeated`. Two u32 slots:
-/// `ty` then `elem_val`.
-const RepeatedRepr = extern struct {
-    ty: u32,
-    elem_val: u32,
+/// Extra-arena payload for `Item.Tag.repeated`, mirroring the compiler's `Repeated`:
+/// the aggregate `ty` and the value repeated in every element.
+const Repeated = struct {
+    ty: Index,
+    elem_val: Index,
 };
 
 /// A container's identity flavor is folded onto its `captures_len` slot: a real
 /// value is a declared type's capture count; the sentinels select a reified or
 /// generated-tag type whose trailing data differs (see
-/// `appendContainerId`/`readContainerId`). Captures, `type_hash`, and
+/// `appendContainerType`/`readContainerType`). Captures, `type_hash`, and
 /// `owner_union` are mutually exclusive trailing data, so one word selects all of it.
 const captures_len_reified: u32 = std.math.maxInt(u32);
 const captures_len_generated_union_tag: u32 = std.math.maxInt(u32) - 1;
 
 /// The `captures_len` slot value for a container identity (see the sentinels above).
-fn containerCapturesLen(id: Key.ContainerId) u32 {
+fn containerCapturesLen(id: Key.ContainerType) u32 {
     return switch (id) {
         .declared => |d| @intCast(d.captures.len),
         .reified => captures_len_reified,
@@ -1983,7 +1916,7 @@ fn containerCapturesLen(id: Key.ContainerId) u32 {
 /// compiler's order (owner_union? / zir_index? / type_hash? / captures?). The fixed
 /// repr's `captures_len` slot (from `containerCapturesLen`) selects which are
 /// present; the REPL's zir token is the pair `(source_zir_id, decl_inst)`.
-fn appendContainerId(pool: *InternPool, id: Key.ContainerId) Allocator.Error!void {
+fn appendContainerType(pool: *InternPool, id: Key.ContainerType) Allocator.Error!void {
     switch (id) {
         .generated_union_tag => |owner_union| try pool.extra.append(pool.gpa, @intFromEnum(owner_union)),
         .declared => |d| {
@@ -2002,8 +1935,8 @@ fn appendContainerId(pool: *InternPool, id: Key.ContainerId) Allocator.Error!voi
 }
 
 /// Decode container identity trailing at `off`, the counterpart to
-/// `appendContainerId`. A declared type's captures borrow `extra`.
-fn readContainerId(pool: *const InternPool, captures_len: u32, off: u32) Key.ContainerId {
+/// `appendContainerType`. A declared type's captures borrow `extra`.
+fn readContainerType(pool: *const InternPool, captures_len: u32, off: u32) Key.ContainerType {
     if (captures_len == captures_len_generated_union_tag)
         return .{ .generated_union_tag = @enumFromInt(pool.extra.items[off]) };
     const source_zir_id = pool.extra.items[off];
@@ -2033,7 +1966,7 @@ pub const TypeClass = enum(u3) {
 
 /// Extra-arena payload for `Item.Tag.type_struct`, mirroring the compiler's
 /// `Tag.TypeStruct` (`src/InternPool.zig`). Trailing after this fixed header, in
-/// order: the container identity (`appendContainerId`, its flavor selected by
+/// order: the container identity (`appendContainerType`, its flavor selected by
 /// `captures_len`); then per field `field_name` and `field_type`; then, when the
 /// matching `flags` bit is set, `field_default`, `field_align` (packed 4/u32),
 /// `field_is_comptime_bits` (packed 32/u32), `field_runtime_order` (`.auto` only);
@@ -2076,149 +2009,195 @@ const TypeStruct = struct {
 
 /// Extra-arena payload for `Item.Tag.type_enum`. Like `StructTypeRepr` plus
 /// `field_data`.
-const EnumTypeRepr = extern struct {
-    name: u32,
-    parent: u32,
-    /// Offset into `extra` of this enum's resolved field storage
-    /// (`[int_tag_type, names_len, values_len, names..., values...]`, `values`
-    /// empty for an auto enum), or `fields_unresolved`. Not part of the type's
-    /// identity -- filled after creation, so it is excluded from the dedup Key
-    /// (`enumTypeFromExtra` does not read it).
-    field_data: u32,
-    /// Field-name dedup map (`OptionalMapIndex`); see `StructTypeRepr.field_name_map`.
-    field_name_map: u32,
-    /// Tag-value dedup/lookup map (`OptionalMapIndex`), or `.none` for an
-    /// auto-numbered enum (tag value == field index, computed arithmetically).
-    /// Mirrors `LoadedEnumType.field_value_map`; drives `EnumFields.tagValueIndex`.
-    field_value_map: u32,
+/// Slot count of the identity trailing `appendContainerType` writes, selected by the
+/// `captures_len` flavor: a generated union tag stores just its owner union; a
+/// reified type stores `(source_zir_id, decl_inst, type_hash)`; a declared type
+/// stores `(source_zir_id, decl_inst)` plus its captures.
+fn containerIdTrailingLen(captures_len: u32) u32 {
+    if (captures_len == captures_len_generated_union_tag) return 1;
+    if (captures_len == captures_len_reified) return 4;
+    return 2 + captures_len;
+}
+
+/// Extra-arena payload for `Item.Tag.type_enum`, mirroring the compiler's
+/// `Tag.TypeEnum`. Trailing: identity (`appendContainerType`), then `field_names`, then
+/// `field_values` (only when `flags.has_values`). Field slots are reserved at creation
+/// and filled by field resolution (`int_tag_type`/`field_name_map`/`field_value_map`
+/// mutated in place). Deviations from the compiler mirror `TypeStruct`'s (no
+/// `zir_index`/`name_nav`; `captures_len` flavor; `parent` stand-in). `fields_resolved`
+/// gates `loadEnumType` (declared enums resolve their fields lazily, like the compiler
+/// but tracked with this flag rather than a separate item tag).
+const TypeEnum = struct {
+    name: NullTerminatedString,
+    parent: Index,
+    namespace: OptionalNamespaceIndex,
+    /// The enum's integer tag type. `.none` until resolved (for a declared enum).
+    int_tag_type: Index,
+    fields_len: u32,
+    field_name_map: OptionalMapIndex,
+    /// `.none` for an auto-numbered enum (tag value == field index).
+    field_value_map: OptionalMapIndex,
     captures_len: u32,
-    namespace: u32,
+    flags: Flags,
+
+    const Flags = packed struct(u32) {
+        nonexhaustive: bool,
+        /// Whether `field_values` slots are reserved in the trailing (an explicit-value
+        /// or non-exhaustive enum), vs an auto-numbered enum with none.
+        has_values: bool,
+        /// Whether the field arrays are filled; `loadEnumType` returns null until then.
+        fields_resolved: bool,
+        want_layout: bool,
+        _: u28 = 0,
+    };
 };
 
-/// Sentinel `EnumTypeRepr.field_data` value meaning the enum's fields have not been
-/// resolved into storage yet (a declared enum resolves them lazily on first access;
-/// a reified enum sets them at creation).
-const fields_unresolved: u32 = std.math.maxInt(u32);
-
-/// Extra-arena payload for `Item.Tag.enum_tag`. Two u32 slots: the enum type and
-/// the integer tag value.
-const EnumTagRepr = extern struct {
-    ty: u32,
-    int: u32,
-};
-
-/// Extra-arena payload for `Item.Tag.type_union`. Same shape/trailing as
-/// `StructTypeRepr` (name + parent + `field_data` + identity, identity data
-/// trailing).
-const UnionTypeRepr = extern struct {
-    name: u32,
-    parent: u32,
-    /// Offset into `extra` of this union's resolved field storage (see
-    /// `unionFields`), or `fields_unresolved`. Filled by a reified union; a declared
-    /// union reads its fields from ZIR. Not part of identity.
-    field_data: u32,
-    /// Field-name dedup map (`OptionalMapIndex`); see `UnionFields.field_name_map`
-    /// for why the map lives on the union here rather than on its tag enum as in the
-    /// compiler.
-    field_name_map: u32,
+/// Extra-arena payload for `Item.Tag.type_union`, mirroring the compiler's
+/// `Tag.TypeUnion`. Trailing (reified only): identity (`appendContainerType`), then
+/// `field_names`, `field_types`, and `field_aligns` (when `flags.any_field_aligns`).
+/// A declared union reads its fields from ZIR, so it stores no field trailing and
+/// `unionFields` returns null for it -- exactly like `TypeStruct`. Deviations mirror
+/// `TypeStruct`'s (no `zir_index`/`name_nav`; `captures_len` flavor; `parent`
+/// stand-in; `field_name_map` on the union rather than its tag enum).
+const TypeUnion = struct {
+    name: NullTerminatedString,
+    parent: Index,
+    namespace: OptionalNamespaceIndex,
+    /// `.none` for an untagged union.
+    enum_tag_type: Index,
+    /// `.none` unless a packed union.
+    backing_int: Index,
+    fields_len: u32,
+    field_name_map: OptionalMapIndex,
     captures_len: u32,
-    namespace: u32,
+    flags: Flags,
+
+    const Flags = packed struct(u32) {
+        layout: enum(u2) { auto, @"extern", @"packed" },
+        any_field_aligns: bool,
+        want_layout: bool,
+        _: u28 = 0,
+    };
 };
 
-/// Extra-arena payload for `Item.Tag.union_value`. Three u32 slots: union type,
-/// tag, payload.
-const UnionValueRepr = extern struct {
-    ty: u32,
-    tag: u32,
-    val: u32,
+/// Extra-arena payload for `Item.Tag.type_opaque`. Trailing: identity
+/// (`appendContainerType`). An opaque type has no fields -- only a name and a
+/// declaration namespace -- so its header carries just the container-header prefix
+/// shared with `TypeStruct`/`TypeEnum`/`TypeUnion` plus `captures_len`.
+const TypeOpaque = struct {
+    name: NullTerminatedString,
+    parent: Index,
+    namespace: OptionalNamespaceIndex,
+    captures_len: u32,
 };
 
-/// Extra-arena payload for `Item.Tag.ptr_slice`. Three u32 slots: slice type,
-/// ptr value, len value.
-const SliceRepr = extern struct {
-    ty: u32,
-    ptr: u32,
-    len: u32,
+/// Extra-arena payload for `Item.Tag.ptr_comptime_alloc`, mirroring the compiler's
+/// `PtrComptimeAlloc`: a pointer to a Sema comptime alloc, offset by `byte_offset`
+/// (split high `_a` / low `_b`, like every `byte_offset` in the pool).
+const PtrComptimeAlloc = struct {
+    ty: Index,
+    index: Key.ComptimeAllocIndex,
+    byte_offset_a: u32,
+    byte_offset_b: u32,
+    fn init(ty: Index, index: Key.ComptimeAllocIndex, byte_offset: u64) PtrComptimeAlloc {
+        return .{ .ty = ty, .index = index, .byte_offset_a = @intCast(byte_offset >> 32), .byte_offset_b = @truncate(byte_offset) };
+    }
+    fn byteOffset(data: PtrComptimeAlloc) u64 {
+        return @as(u64, data.byte_offset_a) << 32 | data.byte_offset_b;
+    }
 };
 
-/// Extra-arena payload for `Item.Tag.ptr_comptime_alloc`. Four u32 slots: ty,
-/// comptime-alloc index, and the 64-bit byte_offset split into lo/hi u32s.
-/// An allocation born in Sema rather than backed by a declaration.
-const PtrComptimeAllocRepr = extern struct {
-    ty: u32,
-    alloc_index: u32,
-    byte_offset_lo: u32,
-    byte_offset_hi: u32,
+/// Extra-arena payload for `Item.Tag.ptr_nav`, mirroring the compiler's `PtrNav`: a
+/// pointer to a declaration's value, offset by `byte_offset`.
+const PtrNav = struct {
+    ty: Index,
+    nav: Nav.Index,
+    byte_offset_a: u32,
+    byte_offset_b: u32,
+    fn init(ty: Index, nav: Nav.Index, byte_offset: u64) PtrNav {
+        return .{ .ty = ty, .nav = nav, .byte_offset_a = @intCast(byte_offset >> 32), .byte_offset_b = @truncate(byte_offset) };
+    }
+    fn byteOffset(data: PtrNav) u64 {
+        return @as(u64, data.byte_offset_a) << 32 | data.byte_offset_b;
+    }
 };
 
-/// Extra-arena payload for `Item.Tag.ptr_nav`. Four u32 slots: ty, nav index,
-/// and the 64-bit byte_offset split into lo/hi u32s. A pointer backed by a
-/// declaration rather than a Sema alloc.
-const PtrNavRepr = extern struct {
-    ty: u32,
-    nav_index: u32,
-    byte_offset_lo: u32,
-    byte_offset_hi: u32,
+/// Extra-arena payload for `Item.Tag.ptr_uav`: a pointer to an anonymous decl whose
+/// pointee is stored inline. Merges the compiler's `PtrUav` and `PtrUavAligned` (it
+/// always stores `orig_ty`, where the compiler omits it via a separate tag when
+/// `orig_ty == ty`); `orig_ty` participates in identity, so it is always meaningful.
+const PtrUav = struct {
+    ty: Index,
+    val: Index,
+    orig_ty: Index,
+    byte_offset_a: u32,
+    byte_offset_b: u32,
+    fn init(ty: Index, val: Index, orig_ty: Index, byte_offset: u64) PtrUav {
+        return .{ .ty = ty, .val = val, .orig_ty = orig_ty, .byte_offset_a = @intCast(byte_offset >> 32), .byte_offset_b = @truncate(byte_offset) };
+    }
+    fn byteOffset(data: PtrUav) u64 {
+        return @as(u64, data.byte_offset_a) << 32 | data.byte_offset_b;
+    }
 };
 
-/// Extra-arena payload for `Item.Tag.ptr_uav`. Five u32 slots: ty, the inline
-/// pointee value, the canonical pointer type, and the 64-bit byte_offset split
-/// into lo/hi u32s. A pointer to an anonymous decl whose value is stored inline.
-const PtrUavRepr = extern struct {
-    ty: u32,
-    val: u32,
-    orig_ty: u32,
-    byte_offset_lo: u32,
-    byte_offset_hi: u32,
-};
-
-/// Extra-arena payload for `Item.Tag.ptr_field`. Six u32 slots: ty, the base
-/// pointer, the 64-bit field index (lo/hi), and byte_offset (lo/hi).
-const PtrFieldRepr = extern struct {
-    ty: u32,
-    base: u32,
-    index_lo: u32,
-    index_hi: u32,
-    byte_offset_lo: u32,
-    byte_offset_hi: u32,
+/// Extra-arena payload for `Item.Tag.ptr_field`/`ptr_elem`, mirroring the compiler's
+/// `PtrBaseIndex`: a pointer to a field/element of `base` at `index`. Unlike the
+/// compiler -- which interns `index` as a `usize` value and stores that `Index` (its
+/// `get` cancels and re-interns) -- the REPL stores the raw 64-bit `index` (`_a` high
+/// / `_b` low), because this evaluator's `get` does not re-enter interning mid-emit.
+const PtrBaseIndex = struct {
+    ty: Index,
+    base: Index,
+    index_a: u32,
+    index_b: u32,
+    byte_offset_a: u32,
+    byte_offset_b: u32,
+    fn init(ty: Index, base: Index, index: u64, byte_offset: u64) PtrBaseIndex {
+        return .{
+            .ty = ty,
+            .base = base,
+            .index_a = @intCast(index >> 32),
+            .index_b = @truncate(index),
+            .byte_offset_a = @intCast(byte_offset >> 32),
+            .byte_offset_b = @truncate(byte_offset),
+        };
+    }
+    fn indexValue(data: PtrBaseIndex) u64 {
+        return @as(u64, data.index_a) << 32 | data.index_b;
+    }
+    fn byteOffset(data: PtrBaseIndex) u64 {
+        return @as(u64, data.byte_offset_a) << 32 | data.byte_offset_b;
+    }
 };
 
 /// Extra-arena payload for base-plus-offset pointers -- `Item.Tag.ptr_opt_payload`
-/// and `ptr_eu_payload`. Four u32 slots: ty, the base pointer, and the 64-bit
-/// byte_offset split high (`_a`) then low (`_b`).
-const PtrBase = extern struct {
-    ty: u32,
-    base: u32,
+/// and `ptr_eu_payload`. Mirrors the compiler's `PtrBase`: `ty`, the base pointer,
+/// and the 64-bit `byte_offset` (high `_a` / low `_b`).
+const PtrBase = struct {
+    ty: Index,
+    base: Index,
     byte_offset_a: u32,
     byte_offset_b: u32,
+    fn init(ty: Index, base: Index, byte_offset: u64) PtrBase {
+        return .{ .ty = ty, .base = base, .byte_offset_a = @intCast(byte_offset >> 32), .byte_offset_b = @truncate(byte_offset) };
+    }
+    fn byteOffset(data: PtrBase) u64 {
+        return @as(u64, data.byte_offset_a) << 32 | data.byte_offset_b;
+    }
 };
 
-/// Extra-arena payload for `Item.Tag.error_set_error`. Two u32 slots: the
-/// error-set type Index and the interned error-name handle.
-const ErrRepr = extern struct {
-    ty: u32,
-    name: u32,
+/// Extra-arena payload for `Item.Tag.error_union_error`: the error-union type and
+/// the interned error name.
+const ErrorUnionErrRepr = struct {
+    ty: Index,
+    err_name: NullTerminatedString,
 };
 
-/// Extra-arena payload for `Item.Tag.type_error_union`. Two u32
-/// slots: the error-set type Index and the payload type Index.
-const ErrorUnionTypeRepr = extern struct {
-    error_set: u32,
-    payload: u32,
-};
-
-/// Extra-arena payload for `Item.Tag.error_union_error`. Two u32
-/// slots: the error-union type Index and the interned error name.
-const ErrorUnionErrRepr = extern struct {
-    ty: u32,
-    err_name: u32,
-};
-
-/// Extra-arena payload for `Item.Tag.error_union_payload`. Two u32
-/// slots: the error-union type Index and the payload value Index.
-const ErrorUnionPayloadRepr = extern struct {
-    ty: u32,
-    payload: u32,
+/// Extra-arena payload for `Item.Tag.error_union_payload`: the error-union type and
+/// the payload value.
+const ErrorUnionPayloadRepr = struct {
+    ty: Index,
+    payload: Index,
 };
 
 /// Header for `Item.Tag.int_positive` / `Item.Tag.int_negative`. Lives at
@@ -2234,7 +2213,7 @@ const IntBigHeader = packed struct {
 
 /// Extra-arena payload for `Item.Tag.float_f64`: the f64 bit-pattern split
 /// into two u32 pieces so it fits in the u32-typed `extra` array.
-pub const Float64 = extern struct {
+pub const Float64 = struct {
     piece0: u32,
     piece1: u32,
 
@@ -2255,7 +2234,7 @@ pub const Float64 = extern struct {
 /// Extra-arena payload for `Item.Tag.float_f80` and
 /// `Item.Tag.float_c_longdouble_f80`: the f80 bit-pattern split across two
 /// u32 pieces and one u16 piece (zero-padded to a u32 slot).
-pub const Float80 = extern struct {
+pub const Float80 = struct {
     piece0: u32,
     piece1: u32,
     /// Low u16 carries the high 16 bits of the f80; upper u16 is zero.
@@ -2282,7 +2261,7 @@ pub const Float80 = extern struct {
 /// `Item.Tag.float_c_longdouble_f128`, and
 /// `Item.Tag.float_comptime_float`: the f128 bit-pattern split into four
 /// u32 pieces.
-pub const Float128 = extern struct {
+pub const Float128 = struct {
     piece0: u32,
     piece1: u32,
     piece2: u32,
@@ -2683,16 +2662,6 @@ pub fn namespacePtr(pool: *InternPool, index: NamespaceIndex) *Namespace {
 /// every fully-qualified name bottoms out here instead.
 pub const root_namespace_name = "repl";
 
-/// A container type's name, used to qualify the names of its members.
-fn containerTypeName(pool: *const InternPool, ty: Index) NullTerminatedString {
-    return switch (pool.indexToKey(ty)) {
-        .struct_type => |st| st.name,
-        .enum_type => |et| et.name,
-        .union_type => |ut| ut.name,
-        else => unreachable, // only named containers own a namespace
-    };
-}
-
 /// A namespace's own name -- the prefix its members qualify under: its
 /// owner container's name, or the session root (`repl`) when nothing owns
 /// it. This is the base of the fully-qualified-name recursion and the
@@ -2704,7 +2673,7 @@ pub fn namespaceName(
 ) Allocator.Error!NullTerminatedString {
     const ns = pool.namespacePtr(ns_idx);
     if (ns.owner_type == .none) return pool.getOrPutString(gpa, root_namespace_name);
-    return containerTypeName(pool, ns.owner_type);
+    return pool.typeName(ns.owner_type);
 }
 
 /// Fully-qualified name of declaration `name` in `ns_idx`:
@@ -2993,9 +2962,15 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         // Structs are created via `getDeclaredStructType`/`getReifiedStructType`
         // (which need `fields_len` up front); `get` is never reached for one.
         .struct_type => unreachable,
-        .enum_type => |et| try emitEnumType(pool, et),
+        // Enums are created via `getDeclaredEnumType`/`getReifiedEnumType` (which
+        // reserve their field trailing up front); `get` is never reached for one.
+        .enum_type => unreachable,
         .enum_tag => |et| try emitEnumTag(pool, et),
-        .union_type => |ut| try emitUnionType(pool, ut),
+        // Unions are created via `getDeclaredUnionType`/`getReifiedUnionType` (which
+        // reserve their field trailing up front); `get` is never reached for one.
+        .union_type => unreachable,
+        // Opaque types are created via `getDeclaredOpaqueType`; `get` is never reached.
+        .opaque_type => unreachable,
         .un => |uv| try emitUnionValue(pool, uv),
         .err => |e| try emitErr(pool, e),
         .error_union_type => |eu| try emitErrorUnionType(pool, eu),
@@ -3172,9 +3147,26 @@ pub fn zigTypeTag(pool: *const InternPool, index: Index) std.lang.TypeId {
             .struct_type => .@"struct",
             .union_type => .@"union",
             .enum_type => .@"enum",
+            .opaque_type => .@"opaque",
             .func_type => .@"fn",
-            // A `simple_type` is always a well-known Index, handled above.
-            else => unreachable,
+            // A `simple_type` is always a well-known Index (handled above), never
+            // dynamically interned; the value Keys are not types, so none reach here.
+            .simple_type,
+            .simple_value,
+            .enum_literal,
+            .int,
+            .float,
+            .undef,
+            .ptr,
+            .slice,
+            .err,
+            .error_union,
+            .func,
+            .opt,
+            .aggregate,
+            .enum_tag,
+            .un,
+            => unreachable,
         },
     };
 }
@@ -3266,6 +3258,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .type_enum => enumTypeFromExtra(pool, item.data),
         .enum_tag => enumTagFromExtra(pool, item.data),
         .type_union => unionTypeFromExtra(pool, item.data),
+        .type_opaque => opaqueTypeFromExtra(pool, item.data),
         .union_value => unionValueFromExtra(pool, item.data),
         .error_set_error => errFromExtra(pool, item.data),
         .type_error_union => errorUnionTypeFromExtra(pool, item.data),
@@ -3287,11 +3280,11 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
 }
 
 fn ptrTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(PtrTypeRepr, extra_index);
+    const r = pool.extraData(TypePointer, extra_index);
     return .{ .ptr_type = .{
-        .child = @enumFromInt(r.child),
-        .sentinel = @enumFromInt(r.sentinel),
-        .flags = @bitCast(r.flags),
+        .child = r.child,
+        .sentinel = r.sentinel,
+        .flags = r.flags,
     } };
 }
 
@@ -3311,51 +3304,34 @@ fn tupleTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
 
 fn structTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
     const trail = pool.extraDataTrail(TypeStruct, extra_index);
-    return .{
-        .struct_type = .{
-            .name = trail.data.name,
-            .id = readContainerId(pool, trail.data.captures_len, trail.end),
-            .parent = trail.data.parent,
-            .namespace = trail.data.namespace,
-        },
-    };
+    return .{ .struct_type = readContainerType(pool, trail.data.captures_len, trail.end) };
 }
 
 fn enumTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(EnumTypeRepr, extra_index);
-    const id_at = extra_index + @sizeOf(EnumTypeRepr) / 4;
-    return .{ .enum_type = .{
-        .name = @enumFromInt(r.name),
-        .id = readContainerId(pool, r.captures_len, id_at),
-        .parent = @enumFromInt(r.parent),
-        .namespace = @enumFromInt(r.namespace),
-    } };
+    const trail = pool.extraDataTrail(TypeEnum, extra_index);
+    return .{ .enum_type = readContainerType(pool, trail.data.captures_len, trail.end) };
 }
 
 fn enumTagFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(EnumTagRepr, extra_index);
-    return .{ .enum_tag = .{ .ty = @enumFromInt(r.ty), .int = @enumFromInt(r.int) } };
+    return .{ .enum_tag = pool.extraData(Key.EnumTag, extra_index) };
 }
 
 fn sliceFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(SliceRepr, extra_index);
-    return .{ .slice = .{ .ty = @enumFromInt(r.ty), .ptr = @enumFromInt(r.ptr), .len = @enumFromInt(r.len) } };
+    return .{ .slice = pool.extraData(Key.Slice, extra_index) };
 }
 
 fn unionTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(UnionTypeRepr, extra_index);
-    const id_at = extra_index + @sizeOf(UnionTypeRepr) / 4;
-    return .{ .union_type = .{
-        .name = @enumFromInt(r.name),
-        .id = readContainerId(pool, r.captures_len, id_at),
-        .parent = @enumFromInt(r.parent),
-        .namespace = @enumFromInt(r.namespace),
-    } };
+    const trail = pool.extraDataTrail(TypeUnion, extra_index);
+    return .{ .union_type = readContainerType(pool, trail.data.captures_len, trail.end) };
+}
+
+fn opaqueTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const trail = pool.extraDataTrail(TypeOpaque, extra_index);
+    return .{ .opaque_type = readContainerType(pool, trail.data.captures_len, trail.end) };
 }
 
 fn unionValueFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(UnionValueRepr, extra_index);
-    return .{ .un = .{ .ty = @enumFromInt(r.ty), .tag = @enumFromInt(r.tag), .val = @enumFromInt(r.val) } };
+    return .{ .un = pool.extraData(Key.Union, extra_index) };
 }
 
 fn errorSetTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
@@ -3376,52 +3352,40 @@ fn errorSetTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
 }
 
 fn errFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(ErrRepr, extra_index);
-    return .{ .err = .{
-        .ty = @enumFromInt(r.ty),
-        .name = @enumFromInt(r.name),
-    } };
+    return .{ .err = pool.extraData(Key.Error, extra_index) };
 }
 
 fn errorUnionTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(ErrorUnionTypeRepr, extra_index);
-    return .{ .error_union_type = .{
-        .error_set_type = @enumFromInt(r.error_set),
-        .payload_type = @enumFromInt(r.payload),
-    } };
+    return .{ .error_union_type = pool.extraData(Key.ErrorUnionType, extra_index) };
 }
 
 fn arrayTypeSmallFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(VectorTypeRepr, extra_index);
+    const r = pool.extraData(Vector, extra_index);
     return .{ .array_type = .{
         .len = r.len,
-        .child = @enumFromInt(r.child),
+        .child = r.child,
         .sentinel = .none,
     } };
 }
 
 fn vectorTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(VectorTypeRepr, extra_index);
+    const r = pool.extraData(Vector, extra_index);
     return .{ .vector_type = .{
         .len = r.len,
-        .child = @enumFromInt(r.child),
+        .child = r.child,
     } };
 }
 
 fn optPayloadFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(OptPayloadRepr, extra_index);
-    return .{ .opt = .{
-        .ty = @enumFromInt(r.ty),
-        .val = @enumFromInt(r.val),
-    } };
+    return .{ .opt = pool.extraData(Key.Opt, extra_index) };
 }
 
 fn arrayTypeBigFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(ArrayTypeBigRepr, extra_index);
+    const r = pool.extraData(Array, extra_index);
     return .{ .array_type = .{
-        .len = (@as(u64, r.len_hi) << 32) | r.len_lo,
-        .child = @enumFromInt(r.child),
-        .sentinel = @enumFromInt(r.sentinel),
+        .len = r.getLength(),
+        .child = r.child,
+        .sentinel = r.sentinel,
     } };
 }
 
@@ -3446,53 +3410,47 @@ fn aggregateFromExtra(pool: *const InternPool, extra_index: u32) Key {
 }
 
 fn repeatedFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(RepeatedRepr, extra_index);
+    const r = pool.extraData(Repeated, extra_index);
     return .{ .aggregate = .{
-        .ty = @enumFromInt(r.ty),
-        .storage = .{ .repeated_elem = @enumFromInt(r.elem_val) },
+        .ty = r.ty,
+        .storage = .{ .repeated_elem = r.elem_val },
     } };
 }
 
 fn errorUnionErrFromExtra(pool: *const InternPool, extra_index: u32) Key {
     const r = pool.extraData(ErrorUnionErrRepr, extra_index);
-    return .{ .error_union = .{
-        .ty = @enumFromInt(r.ty),
-        .val = .{ .err_name = @enumFromInt(r.err_name) },
-    } };
+    return .{ .error_union = .{ .ty = r.ty, .val = .{ .err_name = r.err_name } } };
 }
 
 fn errorUnionPayloadFromExtra(pool: *const InternPool, extra_index: u32) Key {
     const r = pool.extraData(ErrorUnionPayloadRepr, extra_index);
-    return .{ .error_union = .{
-        .ty = @enumFromInt(r.ty),
-        .val = .{ .payload = @enumFromInt(r.payload) },
-    } };
+    return .{ .error_union = .{ .ty = r.ty, .val = .{ .payload = r.payload } } };
 }
 
 fn ptrComptimeAllocFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(PtrComptimeAllocRepr, extra_index);
+    const r = pool.extraData(PtrComptimeAlloc, extra_index);
     return .{ .ptr = .{
-        .ty = @enumFromInt(r.ty),
-        .base_addr = .{ .comptime_alloc = @enumFromInt(r.alloc_index) },
-        .byte_offset = (@as(u64, r.byte_offset_hi) << 32) | r.byte_offset_lo,
+        .ty = r.ty,
+        .base_addr = .{ .comptime_alloc = r.index },
+        .byte_offset = r.byteOffset(),
     } };
 }
 
 fn ptrNavFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(PtrNavRepr, extra_index);
+    const r = pool.extraData(PtrNav, extra_index);
     return .{ .ptr = .{
-        .ty = @enumFromInt(r.ty),
-        .base_addr = .{ .nav = @enumFromInt(r.nav_index) },
-        .byte_offset = (@as(u64, r.byte_offset_hi) << 32) | r.byte_offset_lo,
+        .ty = r.ty,
+        .base_addr = .{ .nav = r.nav },
+        .byte_offset = r.byteOffset(),
     } };
 }
 
 fn ptrUavFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    const r = pool.extraData(PtrUavRepr, extra_index);
+    const r = pool.extraData(PtrUav, extra_index);
     return .{ .ptr = .{
-        .ty = @enumFromInt(r.ty),
-        .base_addr = .{ .uav = .{ .val = @enumFromInt(r.val), .orig_ty = @enumFromInt(r.orig_ty) } },
-        .byte_offset = (@as(u64, r.byte_offset_hi) << 32) | r.byte_offset_lo,
+        .ty = r.ty,
+        .base_addr = .{ .uav = .{ .val = r.val, .orig_ty = r.orig_ty } },
+        .byte_offset = r.byteOffset(),
     } };
 }
 
@@ -3507,25 +3465,21 @@ fn ptrArrElemFromExtra(pool: *const InternPool, extra_index: u32) Key {
 /// Decode a `PtrBase` into an `.opt_payload` or `.eu_payload` ptr (identical layout).
 fn ptrOptPayloadFromExtra(pool: *const InternPool, extra_index: u32, is_eu: bool) Key {
     const r = pool.extraData(PtrBase, extra_index);
-    const base: Index = @enumFromInt(r.base);
     return .{ .ptr = .{
-        .ty = @enumFromInt(r.ty),
-        .base_addr = if (is_eu) .{ .eu_payload = base } else .{ .opt_payload = base },
-        .byte_offset = (@as(u64, r.byte_offset_a) << 32) | r.byte_offset_b,
+        .ty = r.ty,
+        .base_addr = if (is_eu) .{ .eu_payload = r.base } else .{ .opt_payload = r.base },
+        .byte_offset = r.byteOffset(),
     } };
 }
 
-/// Decode a `PtrFieldRepr` into a `.field` or `.arr_elem` ptr (identical layout).
+/// Decode a `PtrBaseIndex` into a `.field` or `.arr_elem` ptr (identical layout).
 fn ptrBaseIndexFromExtra(pool: *const InternPool, extra_index: u32, is_arr_elem: bool) Key {
-    const r = pool.extraData(PtrFieldRepr, extra_index);
-    const bi: Key.Ptr.BaseAddr.BaseIndex = .{
-        .base = @enumFromInt(r.base),
-        .index = (@as(u64, r.index_hi) << 32) | r.index_lo,
-    };
+    const r = pool.extraData(PtrBaseIndex, extra_index);
+    const bi: Key.Ptr.BaseAddr.BaseIndex = .{ .base = r.base, .index = r.indexValue() };
     return .{ .ptr = .{
-        .ty = @enumFromInt(r.ty),
+        .ty = r.ty,
         .base_addr = if (is_arr_elem) .{ .arr_elem = bi } else .{ .field = bi },
-        .byte_offset = (@as(u64, r.byte_offset_hi) << 32) | r.byte_offset_lo,
+        .byte_offset = r.byteOffset(),
     } };
 }
 
@@ -3538,56 +3492,83 @@ fn ptrBaseIndexFromExtra(pool: *const InternPool, extra_index: u32, is_arr_elem:
 /// conversion in the compiler's `extraData`: an enum handle from its integer, a
 /// `packed struct(u32)` (a `Flags`/`Bits` field) by bitcast, a plain `u32`/`i32`
 /// as-is.
-fn extraField(comptime T: type, slot: u32) T {
-    return switch (@typeInfo(T)) {
-        .int => @bitCast(slot),
-        .@"enum" => @enumFromInt(slot),
-        .@"struct" => @bitCast(slot),
-        else => @compileError("extraData: unsupported field type " ++ @typeName(T)),
-    };
-}
-
-/// One typed field value into its `u32` extra slot -- the inverse of `extraField`.
-fn fieldSlot(value: anytype) u32 {
-    return switch (@typeInfo(@TypeOf(value))) {
-        .int => @bitCast(value),
-        .@"enum" => @intFromEnum(value),
-        .@"struct" => @bitCast(value),
-        else => @compileError("addExtra: unsupported field type " ++ @typeName(@TypeOf(value))),
-    };
-}
-
-fn extraData(pool: *const InternPool, comptime T: type, extra_index: u32) T {
-    const info = @typeInfo(T).@"struct";
-    assert(extra_index + info.field_names.len <= pool.extra.items.len);
-    var result: T = undefined;
-    inline for (info.field_names, info.field_types, 0..) |name, field_type, i| {
-        @field(result, name) = extraField(field_type, pool.extra.items[extra_index + i]);
-    }
-    return result;
-}
-
-/// Like `extraData`, but also returns the index one past the fixed header --
-/// where a type's trailing data (captures, field arrays) begins. Mirrors the
-/// compiler's `extraDataTrail`.
-fn extraDataTrail(pool: *const InternPool, comptime T: type, extra_index: u32) struct { data: T, end: u32 } {
-    const info = @typeInfo(T).@"struct";
-    return .{ .data = extraData(pool, T, extra_index), .end = extra_index + @as(u32, info.field_names.len) };
-}
-
 /// Append a fixed extra-arena payload `repr` (each field one `u32` slot in
 /// declaration order) and return its start index -- the write side of `extraData`.
 /// Layout lives in the struct definition alone (no hand-synced slot counts between
-/// emit and read). Typed fields (enum handles, `packed struct(u32)` flags) are
-/// converted per `fieldSlot`, mirroring the compiler's `addExtra`.
-fn addExtra(pool: *InternPool, repr: anytype) Allocator.Error!u32 {
-    const info = @typeInfo(@TypeOf(repr)).@"struct";
+/// emit and read). Mirrors the compiler's `addExtra`: an explicit per-field-type
+/// switch, enum handles via `@intFromEnum` and `u32`/`i32`/`packed struct(u32)` flags
+/// via `@bitCast`, so an unexpected field type is a compile error naming it.
+fn addExtra(pool: *InternPool, item: anytype) Allocator.Error!u32 {
+    const info = @typeInfo(@TypeOf(item)).@"struct";
     const index: u32 = @intCast(pool.extra.items.len);
     try pool.extra.ensureUnusedCapacity(pool.gpa, info.field_names.len);
-    inline for (info.field_names) |name| {
-        pool.extra.appendAssumeCapacity(fieldSlot(@field(repr, name)));
+    inline for (info.field_types, info.field_names) |field_type, field_name| {
+        pool.extra.appendAssumeCapacity(switch (field_type) {
+            Index,
+            Nav.Index,
+            NamespaceIndex,
+            OptionalNamespaceIndex,
+            MapIndex,
+            OptionalMapIndex,
+            NullTerminatedString,
+            Key.ComptimeAllocIndex,
+            std.zig.Zir.Inst.Index,
+            => @intFromEnum(@field(item, field_name)),
+
+            u32,
+            i32,
+            Key.PtrType.Flags,
+            FuncTypeRepr.Flags,
+            TypeStruct.Flags,
+            TypeEnum.Flags,
+            TypeUnion.Flags,
+            => @bitCast(@field(item, field_name)),
+
+            else => @compileError("bad field type: " ++ @typeName(field_type)),
+        });
     }
     return index;
+}
+
+/// Read a fixed extra-arena payload `T` back and also return the index one past the
+/// header -- where a type's trailing data (captures, field arrays) begins. Mirrors
+/// the compiler's `extraDataTrail`, the inverse per-field-type switch of `addExtra`.
+fn extraDataTrail(pool: *const InternPool, comptime T: type, index: u32) struct { data: T, end: u32 } {
+    const field_names = @typeInfo(T).@"struct".field_names;
+    const field_types = @typeInfo(T).@"struct".field_types;
+    assert(index + field_names.len <= pool.extra.items.len);
+    var result: T = undefined;
+    inline for (field_names, field_types, index..) |field_name, field_type, extra_index| {
+        const extra_item = pool.extra.items[extra_index];
+        @field(result, field_name) = switch (field_type) {
+            Index,
+            Nav.Index,
+            NamespaceIndex,
+            OptionalNamespaceIndex,
+            MapIndex,
+            OptionalMapIndex,
+            NullTerminatedString,
+            Key.ComptimeAllocIndex,
+            std.zig.Zir.Inst.Index,
+            => @enumFromInt(extra_item),
+
+            u32,
+            i32,
+            Key.PtrType.Flags,
+            FuncTypeRepr.Flags,
+            TypeStruct.Flags,
+            TypeEnum.Flags,
+            TypeUnion.Flags,
+            => @bitCast(extra_item),
+
+            else => @compileError("bad field type: " ++ @typeName(field_type)),
+        };
+    }
+    return .{ .data = result, .end = @intCast(index + field_names.len) };
+}
+
+fn extraData(pool: *const InternPool, comptime T: type, index: u32) T {
+    return extraDataTrail(pool, T, index).data;
 }
 
 inline fn intKey(ty: Index, storage: Key.Int.Storage) Key {
@@ -3860,10 +3841,10 @@ pub fn internFloat(pool: *InternPool, float: Key.Float) Allocator.Error!Index {
 
 fn emitPtrType(pool: *InternPool, pt: Key.PtrType) Allocator.Error!void {
     assert(pt.child != .none);
-    const extra_index = try pool.addExtra(PtrTypeRepr{
-        .child = @intFromEnum(pt.child),
-        .sentinel = @intFromEnum(pt.sentinel),
-        .flags = @bitCast(pt.flags),
+    const extra_index = try pool.addExtra(TypePointer{
+        .child = pt.child,
+        .sentinel = pt.sentinel,
+        .flags = pt.flags,
     });
     pool.items.appendAssumeCapacity(.{ .tag = .type_pointer, .data = extra_index });
 }
@@ -3873,52 +3854,24 @@ fn emitPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!void {
     assert(p.ty != .none);
     switch (p.base_addr) {
         .comptime_alloc => |idx| {
-            const extra_index = try pool.addExtra(PtrComptimeAllocRepr{
-                .ty = @intFromEnum(p.ty),
-                .alloc_index = @intFromEnum(idx),
-                .byte_offset_lo = @truncate(p.byte_offset),
-                .byte_offset_hi = @truncate(p.byte_offset >> 32),
-            });
+            const extra_index = try pool.addExtra(PtrComptimeAlloc.init(p.ty, idx, p.byte_offset));
             pool.items.appendAssumeCapacity(.{ .tag = .ptr_comptime_alloc, .data = extra_index });
         },
         .nav => |nav| {
-            const extra_index = try pool.addExtra(PtrNavRepr{
-                .ty = @intFromEnum(p.ty),
-                .nav_index = @intFromEnum(nav),
-                .byte_offset_lo = @truncate(p.byte_offset),
-                .byte_offset_hi = @truncate(p.byte_offset >> 32),
-            });
+            const extra_index = try pool.addExtra(PtrNav.init(p.ty, nav, p.byte_offset));
             pool.items.appendAssumeCapacity(.{ .tag = .ptr_nav, .data = extra_index });
         },
         .uav => |uav| {
-            const extra_index = try pool.addExtra(PtrUavRepr{
-                .ty = @intFromEnum(p.ty),
-                .val = @intFromEnum(uav.val),
-                .orig_ty = @intFromEnum(uav.orig_ty),
-                .byte_offset_lo = @truncate(p.byte_offset),
-                .byte_offset_hi = @truncate(p.byte_offset >> 32),
-            });
+            const extra_index = try pool.addExtra(PtrUav.init(p.ty, uav.val, uav.orig_ty, p.byte_offset));
             pool.items.appendAssumeCapacity(.{ .tag = .ptr_uav, .data = extra_index });
         },
         .field, .arr_elem => |f| {
-            const extra_index = try pool.addExtra(PtrFieldRepr{
-                .ty = @intFromEnum(p.ty),
-                .base = @intFromEnum(f.base),
-                .index_lo = @truncate(f.index),
-                .index_hi = @truncate(f.index >> 32),
-                .byte_offset_lo = @truncate(p.byte_offset),
-                .byte_offset_hi = @truncate(p.byte_offset >> 32),
-            });
+            const extra_index = try pool.addExtra(PtrBaseIndex.init(p.ty, f.base, f.index, p.byte_offset));
             const tag: Item.Tag = if (p.base_addr == .field) .ptr_field else .ptr_arr_elem;
             pool.items.appendAssumeCapacity(.{ .tag = tag, .data = extra_index });
         },
         .opt_payload, .eu_payload => |base| {
-            const extra_index = try pool.addExtra(PtrBase{
-                .ty = @intFromEnum(p.ty),
-                .base = @intFromEnum(base),
-                .byte_offset_a = @truncate(p.byte_offset >> 32),
-                .byte_offset_b = @truncate(p.byte_offset),
-            });
+            const extra_index = try pool.addExtra(PtrBase.init(p.ty, base, p.byte_offset));
             const tag: Item.Tag = if (p.base_addr == .opt_payload) .ptr_opt_payload else .ptr_eu_payload;
             pool.items.appendAssumeCapacity(.{ .tag = tag, .data = extra_index });
         },
@@ -3947,22 +3900,6 @@ fn emitTupleType(pool: *InternPool, tt: Key.TupleType) Allocator.Error!void {
     pool.extra.appendAssumeCapacity(@intCast(tt.types.len));
     for (tt.types) |ty| pool.extra.appendAssumeCapacity(@intFromEnum(ty));
     pool.items.appendAssumeCapacity(.{ .tag = .type_tuple, .data = extra_index });
-}
-
-/// Emit a `type_enum` Item. Same layout as `type_struct` (fixed repr + trailing
-/// identity data).
-fn emitEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!void {
-    const extra_index = try pool.addExtra(EnumTypeRepr{
-        .name = @intFromEnum(et.name),
-        .parent = @intFromEnum(et.parent),
-        .field_data = fields_unresolved,
-        .field_name_map = @intFromEnum(OptionalMapIndex.none),
-        .field_value_map = @intFromEnum(OptionalMapIndex.none),
-        .captures_len = containerCapturesLen(et.id),
-        .namespace = @intFromEnum(et.namespace),
-    });
-    try pool.appendContainerId(et.id);
-    pool.items.appendAssumeCapacity(.{ .tag = .type_enum, .data = extra_index });
 }
 
 /// The resolved fields of an enum type, borrowing into `extra`. Mirrors the
@@ -4008,31 +3945,38 @@ pub const LoadedEnumType = struct {
 };
 
 /// This enum's resolved fields, or null if not resolved yet. A generated-union tag
-/// enum never stores fields (its fields are the union's, read through the union).
-/// Storage block layout: `[int_tag_type, nonexhaustive, names_len, values_len,
-/// names..., values...]`.
+/// enum never stores fields (its fields are the union's, read through the union), so
+/// it stays `!fields_resolved` and returns null here. Reads the `TypeEnum` trailing:
+/// the identity (`containerIdTrailingLen` slots) then `field_names`, then
+/// `field_values` when `flags.has_values`.
 pub fn loadEnumType(pool: *const InternPool, enum_ty: Index) ?LoadedEnumType {
     const item = pool.items.get(@intFromEnum(enum_ty));
     assert(item.tag == .type_enum);
-    const off = pool.extra.items[item.data + @offsetOf(EnumTypeRepr, "field_data") / 4];
-    if (off == fields_unresolved) return null;
-    const names_len = pool.extra.items[off + 2];
-    const values_len = pool.extra.items[off + 3];
+    const trail = pool.extraDataTrail(TypeEnum, item.data);
+    const r = trail.data;
+    if (!r.flags.fields_resolved) return null;
+    const fields_len = r.fields_len;
+    var base = trail.end + containerIdTrailingLen(r.captures_len);
+    const names: []const NullTerminatedString = @ptrCast(pool.extra.items[base..][0..fields_len]);
+    base += fields_len;
+    const values: []const Index = if (r.flags.has_values) @ptrCast(pool.extra.items[base..][0..fields_len]) else &.{};
     return .{
-        .int_tag_type = @enumFromInt(pool.extra.items[off]),
-        .nonexhaustive = pool.extra.items[off + 1] != 0,
-        .field_names = @ptrCast(pool.extra.items[off + 4 ..][0..names_len]),
-        .field_values = @ptrCast(pool.extra.items[off + 4 + names_len ..][0..values_len]),
-        .field_name_map = @enumFromInt(pool.extra.items[item.data + @offsetOf(EnumTypeRepr, "field_name_map") / 4]),
-        .field_value_map = @enumFromInt(pool.extra.items[item.data + @offsetOf(EnumTypeRepr, "field_value_map") / 4]),
+        .int_tag_type = r.int_tag_type,
+        .nonexhaustive = r.flags.nonexhaustive,
+        .field_names = names,
+        .field_values = values,
+        .field_name_map = r.field_name_map.unwrap().?,
+        .field_value_map = r.field_value_map,
     };
 }
 
-/// Store this enum's resolved fields (idempotent -- a no-op once set). `values` is
-/// empty for an auto-numbered enum (each tag value is its field index, as
-/// `enumValueFieldIndex` computes); otherwise `values[i]` is `names[i]`'s interned
-/// `int_tag_type` value. The identity Key is unchanged; only the `field_data` slot
-/// is filled, in place.
+/// Fill a declared enum's reserved field trailing in place (idempotent -- a no-op
+/// once `fields_resolved`). `getDeclaredEnumType` reserves the `field_names` and (when
+/// `has_values`) `field_values` slots; this writes them, sets `int_tag_type` and
+/// `nonexhaustive`, creates the (empty) lookup maps Sema then populates, and marks the
+/// fields resolved. `values` is empty for an auto-numbered enum (each tag value is its
+/// field index, as `enumValueFieldIndex` computes). A reified enum instead fills
+/// everything at creation in `getReifiedEnumType`.
 pub fn setEnumFields(
     pool: *InternPool,
     enum_ty: Index,
@@ -4044,24 +3988,24 @@ pub fn setEnumFields(
     assert(values.len == 0 or values.len == names.len);
     const item = pool.items.get(@intFromEnum(enum_ty));
     assert(item.tag == .type_enum);
-    const slot = item.data + @offsetOf(EnumTypeRepr, "field_data") / 4;
-    if (pool.extra.items[slot] != fields_unresolved) return;
-    // Create the (empty) lookup maps, as `getReifiedEnumType` does; Sema populates
-    // and validates them when it resolves the fields. An auto-numbered enum stores
-    // no explicit values, so it needs no value map (tag value == field index).
-    pool.extra.items[item.data + @offsetOf(EnumTypeRepr, "field_name_map") / 4] = @intFromEnum(try pool.addMap(pool.gpa, names.len));
-    if (values.len != 0) {
-        pool.extra.items[item.data + @offsetOf(EnumTypeRepr, "field_value_map") / 4] = @intFromEnum((try pool.addMap(pool.gpa, values.len)).toOptional());
-    }
-    const off: u32 = @intCast(pool.extra.items.len);
-    try pool.extra.ensureUnusedCapacity(pool.gpa, 4 + names.len + values.len);
-    pool.extra.appendAssumeCapacity(@intFromEnum(int_tag_type));
-    pool.extra.appendAssumeCapacity(@intFromBool(nonexhaustive));
-    pool.extra.appendAssumeCapacity(@intCast(names.len));
-    pool.extra.appendAssumeCapacity(@intCast(values.len));
-    for (names) |n| pool.extra.appendAssumeCapacity(@intFromEnum(n));
-    for (values) |v| pool.extra.appendAssumeCapacity(@intFromEnum(v));
-    pool.extra.items[slot] = off;
+    const trail = pool.extraDataTrail(TypeEnum, item.data);
+    const r = trail.data;
+    if (r.flags.fields_resolved) return;
+    assert(r.fields_len == names.len);
+    assert(r.flags.has_values == (values.len != 0));
+    var base = trail.end + containerIdTrailingLen(r.captures_len);
+    for (names, 0..) |n, i| pool.extra.items[base + i] = @intFromEnum(n);
+    base += r.fields_len;
+    for (values, 0..) |v, i| pool.extra.items[base + i] = @intFromEnum(v);
+    const name_map = try pool.addMap(pool.gpa, names.len);
+    const value_map: OptionalMapIndex = if (values.len != 0) (try pool.addMap(pool.gpa, values.len)).toOptional() else .none;
+    pool.extra.items[item.data + std.meta.fieldIndex(TypeEnum, "int_tag_type").?] = @intFromEnum(int_tag_type);
+    pool.extra.items[item.data + std.meta.fieldIndex(TypeEnum, "field_name_map").?] = @intFromEnum(name_map.toOptional());
+    pool.extra.items[item.data + std.meta.fieldIndex(TypeEnum, "field_value_map").?] = @intFromEnum(value_map);
+    var flags = r.flags;
+    flags.nonexhaustive = nonexhaustive;
+    flags.fields_resolved = true;
+    pool.extra.items[item.data + std.meta.fieldIndex(TypeEnum, "flags").?] = @bitCast(flags);
 }
 
 /// The resolved fields of a reified struct, borrowing into `extra`. Mirrors the
@@ -4128,13 +4072,43 @@ pub fn loadStructType(pool: *const InternPool, struct_ty: Index) ?LoadedStructTy
     };
 }
 
+/// This container type's fully-qualified name, read from its stored header. Name is
+/// not part of the identity Key (`struct_type`/`enum_type`/`union_type` carry only the
+/// `ContainerType`), so it is fetched here rather than off `indexToKey`.
+pub fn typeName(pool: *const InternPool, ty: Index) NullTerminatedString {
+    const item = pool.items.get(@intFromEnum(ty));
+    return switch (item.tag) {
+        .type_struct => pool.extraData(TypeStruct, item.data).name,
+        .type_enum => pool.extraData(TypeEnum, item.data).name,
+        .type_union => pool.extraData(TypeUnion, item.data).name,
+        .type_opaque => pool.extraData(TypeOpaque, item.data).name,
+        else => unreachable,
+    };
+}
+
+/// The enclosing container this type is declared in, or `.none`. The REPL's stand-in
+/// for `Namespace.parent`: `evalDeclVal` walks it outward so a nested container
+/// resolves an unqualified enclosing decl. Read from the stored header (non-identity).
+pub fn typeParent(pool: *const InternPool, ty: Index) Index {
+    const item = pool.items.get(@intFromEnum(ty));
+    return switch (item.tag) {
+        .type_struct => pool.extraData(TypeStruct, item.data).parent,
+        .type_enum => pool.extraData(TypeEnum, item.data).parent,
+        .type_union => pool.extraData(TypeUnion, item.data).parent,
+        .type_opaque => pool.extraData(TypeOpaque, item.data).parent,
+        else => .none,
+    };
+}
+
 /// The declaration namespace stored on a container type, or `.none` for a
 /// non-container or an as-yet-unscanned container. Mirrors `Type.getNamespace`.
 pub fn typeNamespace(pool: *const InternPool, ty: Index) OptionalNamespaceIndex {
-    return switch (pool.indexToKey(ty)) {
-        .struct_type => |st| st.namespace,
-        .enum_type => |et| et.namespace,
-        .union_type => |ut| ut.namespace,
+    const item = pool.items.get(@intFromEnum(ty));
+    return switch (item.tag) {
+        .type_struct => pool.extraData(TypeStruct, item.data).namespace,
+        .type_enum => pool.extraData(TypeEnum, item.data).namespace,
+        .type_union => pool.extraData(TypeUnion, item.data).namespace,
+        .type_opaque => pool.extraData(TypeOpaque, item.data).namespace,
         else => .none,
     };
 }
@@ -4147,40 +4121,22 @@ pub fn setNamespace(pool: *InternPool, ty: Index, ns: NamespaceIndex) void {
         // `TypeStruct` is not an `extern` struct, so the slot is the field's position
         // (`addExtra` writes one slot per field in declaration order), not `@offsetOf/4`.
         .type_struct => item.data + std.meta.fieldIndex(TypeStruct, "namespace").?,
-        .type_enum => item.data + @offsetOf(EnumTypeRepr, "namespace") / 4,
-        .type_union => item.data + @offsetOf(UnionTypeRepr, "namespace") / 4,
+        .type_enum => item.data + std.meta.fieldIndex(TypeEnum, "namespace").?,
+        .type_union => item.data + std.meta.fieldIndex(TypeUnion, "namespace").?,
+        .type_opaque => item.data + std.meta.fieldIndex(TypeOpaque, "namespace").?,
         else => unreachable,
     };
     pool.extra.items[slot] = @intFromEnum(OptionalNamespaceIndex.init(ns));
 }
 
 fn emitEnumTag(pool: *InternPool, et: Key.EnumTag) Allocator.Error!void {
-    const extra_index = try pool.addExtra(EnumTagRepr{
-        .ty = @intFromEnum(et.ty),
-        .int = @intFromEnum(et.int),
-    });
+    const extra_index = try pool.addExtra(et);
     pool.items.appendAssumeCapacity(.{ .tag = .enum_tag, .data = extra_index });
-}
-
-/// Emit a `type_union` Item. Same layout as `type_enum` (fixed repr + trailing
-/// identity data).
-fn emitUnionType(pool: *InternPool, ut: Key.UnionType) Allocator.Error!void {
-    const extra_index = try pool.addExtra(UnionTypeRepr{
-        .name = @intFromEnum(ut.name),
-        .parent = @intFromEnum(ut.parent),
-        .field_data = fields_unresolved,
-        .field_name_map = @intFromEnum(OptionalMapIndex.none),
-        .captures_len = containerCapturesLen(ut.id),
-        .namespace = @intFromEnum(ut.namespace),
-    });
-    try pool.appendContainerId(ut.id);
-    pool.items.appendAssumeCapacity(.{ .tag = .type_union, .data = extra_index });
 }
 
 /// The resolved fields of a reified union, borrowing into `extra`. Mirrors the
 /// comptime-relevant part of `LoadedUnionType`. Union fields carry no
-/// comptime/default (unlike struct fields). Storage block layout: `[layout,
-/// tag_type, backing_int, fields_len, aligns_len, names..., types..., aligns...]`.
+/// comptime/default (unlike struct fields).
 pub const UnionFields = struct {
     layout: std.lang.Type.ContainerLayout,
     /// `.none` for an untagged union.
@@ -4201,80 +4157,44 @@ pub const UnionFields = struct {
 };
 
 /// This union's resolved fields, or null if it stores none (a declared union, which
-/// reads its fields from ZIR).
+/// reads its fields from ZIR). Reads the `TypeUnion` trailing: the reified identity
+/// (4 slots) then `field_names`/`field_types`, then `field_aligns` when present.
 pub fn unionFields(pool: *const InternPool, union_ty: Index) ?UnionFields {
     const item = pool.items.get(@intFromEnum(union_ty));
     assert(item.tag == .type_union);
-    const off = pool.extra.items[item.data + @offsetOf(UnionTypeRepr, "field_data") / 4];
-    if (off == fields_unresolved) return null;
-    const fields_len = pool.extra.items[off + 3];
-    const aligns_len = pool.extra.items[off + 4];
-    var base = off + 5;
+    const trail = pool.extraDataTrail(TypeUnion, item.data);
+    const r = trail.data;
+    if (r.captures_len != captures_len_reified) return null;
+    const fields_len = r.fields_len;
+    var base = trail.end + 4;
     const names: []const NullTerminatedString = @ptrCast(pool.extra.items[base..][0..fields_len]);
     base += fields_len;
     const types: []const Index = @ptrCast(pool.extra.items[base..][0..fields_len]);
     base += fields_len;
+    const aligns: []const Index = if (r.flags.any_field_aligns) @ptrCast(pool.extra.items[base..][0..fields_len]) else &.{};
     return .{
-        .layout = @enumFromInt(pool.extra.items[off]),
-        .enum_tag_type = @enumFromInt(pool.extra.items[off + 1]),
-        .packed_backing_int_type = @enumFromInt(pool.extra.items[off + 2]),
+        .layout = switch (r.flags.layout) {
+            .auto => .auto,
+            .@"extern" => .@"extern",
+            .@"packed" => .@"packed",
+        },
+        .enum_tag_type = r.enum_tag_type,
+        .packed_backing_int_type = r.backing_int,
         .field_names = names,
         .field_types = types,
-        .field_aligns = @ptrCast(pool.extra.items[base..][0..aligns_len]),
-        .field_name_map = @enumFromInt(pool.extra.items[item.data + @offsetOf(UnionTypeRepr, "field_name_map") / 4]),
+        .field_aligns = aligns,
+        .field_name_map = r.field_name_map.unwrap().?,
     };
 }
 
-/// Store a reified union's resolved fields (idempotent -- a no-op once set). Each
-/// `aligns[i]` is `.none` for a field without an explicit alignment; the slice is
-/// empty when no field has one. Only the `field_data` slot is filled, in place.
-pub fn setUnionFields(
-    pool: *InternPool,
-    union_ty: Index,
-    layout: std.lang.Type.ContainerLayout,
-    tag_type: Index,
-    backing_int: Index,
-    names: []const NullTerminatedString,
-    types: []const Index,
-    aligns: []const Index,
-) Allocator.Error!void {
-    assert(types.len == names.len);
-    assert(aligns.len == 0 or aligns.len == names.len);
-    const item = pool.items.get(@intFromEnum(union_ty));
-    assert(item.tag == .type_union);
-    const slot = item.data + @offsetOf(UnionTypeRepr, "field_data") / 4;
-    if (pool.extra.items[slot] != fields_unresolved) return;
-    // Empty field-name map, populated by Sema when it resolves the fields.
-    pool.extra.items[item.data + @offsetOf(UnionTypeRepr, "field_name_map") / 4] = @intFromEnum(try pool.addMap(pool.gpa, names.len));
-    const off: u32 = @intCast(pool.extra.items.len);
-    try pool.extra.ensureUnusedCapacity(pool.gpa, 5 + names.len + types.len + aligns.len);
-    pool.extra.appendAssumeCapacity(@intFromEnum(layout));
-    pool.extra.appendAssumeCapacity(@intFromEnum(tag_type));
-    pool.extra.appendAssumeCapacity(@intFromEnum(backing_int));
-    pool.extra.appendAssumeCapacity(@intCast(names.len));
-    pool.extra.appendAssumeCapacity(@intCast(aligns.len));
-    for (names) |n| pool.extra.appendAssumeCapacity(@intFromEnum(n));
-    for (types) |t| pool.extra.appendAssumeCapacity(@intFromEnum(t));
-    for (aligns) |a| pool.extra.appendAssumeCapacity(@intFromEnum(a));
-    pool.extra.items[slot] = off;
-}
-
 fn emitUnionValue(pool: *InternPool, uv: Key.Union) Allocator.Error!void {
-    const extra_index = try pool.addExtra(UnionValueRepr{
-        .ty = @intFromEnum(uv.ty),
-        .tag = @intFromEnum(uv.tag),
-        .val = @intFromEnum(uv.val),
-    });
+    const extra_index = try pool.addExtra(uv);
     pool.items.appendAssumeCapacity(.{ .tag = .union_value, .data = extra_index });
 }
 
 /// Emit a `ptr_slice` Item.
 fn emitSlice(pool: *InternPool, s: Key.Slice) Allocator.Error!void {
-    const extra_index = try pool.addExtra(SliceRepr{
-        .ty = @intFromEnum(s.ty),
-        .ptr = @intFromEnum(s.ptr),
-        .len = @intFromEnum(s.len),
-    });
+    const extra_index = try pool.addExtra(s);
     pool.items.appendAssumeCapacity(.{ .tag = .ptr_slice, .data = extra_index });
 }
 
@@ -4282,10 +4202,7 @@ fn emitSlice(pool: *InternPool, s: Key.Slice) Allocator.Error!void {
 fn emitErr(pool: *InternPool, e: Key.Error) Allocator.Error!void {
     assert(e.ty != .none);
 
-    const extra_index = try pool.addExtra(ErrRepr{
-        .ty = @intFromEnum(e.ty),
-        .name = @intFromEnum(e.name),
-    });
+    const extra_index = try pool.addExtra(e);
     pool.items.appendAssumeCapacity(.{ .tag = .error_set_error, .data = extra_index });
 }
 
@@ -4338,10 +4255,7 @@ fn emitAggregate(pool: *InternPool, agg: Key.Aggregate) Allocator.Error!void {
     assert(agg.ty != .none);
     switch (agg.storage) {
         .repeated_elem => |elem| {
-            const extra_index = try pool.addExtra(RepeatedRepr{
-                .ty = @intFromEnum(agg.ty),
-                .elem_val = @intFromEnum(elem),
-            });
+            const extra_index = try pool.addExtra(Repeated{ .ty = agg.ty, .elem_val = elem });
             pool.items.appendAssumeCapacity(.{ .tag = .repeated, .data = extra_index });
         },
         .elems => |elems| {
@@ -4363,18 +4277,15 @@ fn emitAggregate(pool: *InternPool, agg: Key.Aggregate) Allocator.Error!void {
 fn emitArrayType(pool: *InternPool, at: Key.ArrayType) Allocator.Error!void {
     assert(at.child != .none);
     if (at.sentinel == .none and at.len <= std.math.maxInt(u32)) {
-        const extra_index = try pool.addExtra(VectorTypeRepr{
-            .len = @intCast(at.len),
-            .child = @intFromEnum(at.child),
-        });
+        const extra_index = try pool.addExtra(Vector{ .len = @intCast(at.len), .child = at.child });
         pool.items.appendAssumeCapacity(.{ .tag = .type_array_small, .data = extra_index });
         return;
     }
-    const extra_index = try pool.addExtra(ArrayTypeBigRepr{
-        .len_lo = @truncate(at.len),
-        .len_hi = @truncate(at.len >> 32),
-        .child = @intFromEnum(at.child),
-        .sentinel = @intFromEnum(at.sentinel),
+    const extra_index = try pool.addExtra(Array{
+        .len0 = @truncate(at.len),
+        .len1 = @truncate(at.len >> 32),
+        .child = at.child,
+        .sentinel = at.sentinel,
     });
     pool.items.appendAssumeCapacity(.{ .tag = .type_array_big, .data = extra_index });
 }
@@ -4382,10 +4293,7 @@ fn emitArrayType(pool: *InternPool, at: Key.ArrayType) Allocator.Error!void {
 /// Emit a `type_vector` Item. Two u32 slots: `len`, `child`.
 fn emitVectorType(pool: *InternPool, vt: Key.VectorType) Allocator.Error!void {
     assert(vt.child != .none);
-    const extra_index = try pool.addExtra(VectorTypeRepr{
-        .len = vt.len,
-        .child = @intFromEnum(vt.child),
-    });
+    const extra_index = try pool.addExtra(Vector{ .len = vt.len, .child = vt.child });
     pool.items.appendAssumeCapacity(.{ .tag = .type_vector, .data = extra_index });
 }
 
@@ -4411,10 +4319,7 @@ fn emitOpt(pool: *InternPool, o: Key.Opt) Allocator.Error!void {
         });
         return;
     }
-    const extra_index = try pool.addExtra(OptPayloadRepr{
-        .ty = @intFromEnum(o.ty),
-        .val = @intFromEnum(o.val),
-    });
+    const extra_index = try pool.addExtra(o);
     pool.items.appendAssumeCapacity(.{ .tag = .opt_payload, .data = extra_index });
 }
 
@@ -4423,10 +4328,7 @@ fn emitErrorUnionType(pool: *InternPool, eu: Key.ErrorUnionType) Allocator.Error
     assert(eu.error_set_type != .none);
     assert(eu.payload_type != .none);
 
-    const extra_index = try pool.addExtra(ErrorUnionTypeRepr{
-        .error_set = @intFromEnum(eu.error_set_type),
-        .payload = @intFromEnum(eu.payload_type),
-    });
+    const extra_index = try pool.addExtra(eu);
     pool.items.appendAssumeCapacity(.{ .tag = .type_error_union, .data = extra_index });
 }
 
@@ -4437,17 +4339,11 @@ fn emitErrorUnion(pool: *InternPool, eu: Key.ErrorUnion) Allocator.Error!void {
 
     switch (eu.val) {
         .err_name => |name| {
-            const extra_index = try pool.addExtra(ErrorUnionErrRepr{
-                .ty = @intFromEnum(eu.ty),
-                .err_name = @intFromEnum(name),
-            });
+            const extra_index = try pool.addExtra(ErrorUnionErrRepr{ .ty = eu.ty, .err_name = name });
             pool.items.appendAssumeCapacity(.{ .tag = .error_union_error, .data = extra_index });
         },
         .payload => |idx| {
-            const extra_index = try pool.addExtra(ErrorUnionPayloadRepr{
-                .ty = @intFromEnum(eu.ty),
-                .payload = @intFromEnum(idx),
-            });
+            const extra_index = try pool.addExtra(ErrorUnionPayloadRepr{ .ty = eu.ty, .payload = idx });
             pool.items.appendAssumeCapacity(.{ .tag = .error_union_payload, .data = extra_index });
         },
     }
@@ -4482,8 +4378,8 @@ fn getOrPutContainer(pool: *InternPool, key: Key) Allocator.Error!struct { exist
 /// `loadStructType` returns null for it -- no field arrays are stored. Mirrors the
 /// compiler's `getDeclaredStructType` shell (the REPL fills fields lazily from ZIR
 /// rather than reserving+resolving them).
-pub fn getDeclaredStructType(pool: *InternPool, name: NullTerminatedString, id: Key.ContainerId, parent: Index) Allocator.Error!Index {
-    const gop = try pool.getOrPutContainer(.{ .struct_type = .{ .name = name, .id = id, .parent = parent } });
+pub fn getDeclaredStructType(pool: *InternPool, name: NullTerminatedString, id: Key.ContainerType, parent: Index) Allocator.Error!Index {
+    const gop = try pool.getOrPutContainer(.{ .struct_type = id });
     if (gop.existing) |e| return e;
     const extra_index = try pool.addExtra(TypeStruct{
         .name = name,
@@ -4496,7 +4392,7 @@ pub fn getDeclaredStructType(pool: *InternPool, name: NullTerminatedString, id: 
         .captures_len = containerCapturesLen(id),
         .flags = .{ .layout = .auto, .any_comptime_fields = false, .any_field_defaults = false, .any_field_aligns = false, .class = .no_possible_value, .alignment = .none, .want_layout = false },
     });
-    try pool.appendContainerId(id);
+    try pool.appendContainerType(id);
     pool.items.appendAssumeCapacity(.{ .tag = .type_struct, .data = extra_index });
     return @enumFromInt(gop.index);
 }
@@ -4509,7 +4405,7 @@ pub fn getDeclaredStructType(pool: *InternPool, name: NullTerminatedString, id: 
 /// layout resolution). `field_name_map` is `.none`; Sema populates it.
 pub fn getReifiedStructType(pool: *InternPool, ini: struct {
     name: NullTerminatedString,
-    id: Key.ContainerId,
+    id: Key.ContainerType,
     parent: Index,
     layout: std.lang.Type.ContainerLayout,
     backing_int: Index,
@@ -4520,7 +4416,7 @@ pub fn getReifiedStructType(pool: *InternPool, ini: struct {
     comptime_bits: []const u32,
 }) Allocator.Error!Index {
     assert(ini.types.len == ini.names.len);
-    const gop = try pool.getOrPutContainer(.{ .struct_type = .{ .name = ini.name, .id = ini.id, .parent = ini.parent } });
+    const gop = try pool.getOrPutContainer(.{ .struct_type = ini.id });
     if (gop.existing) |e| return e;
     const fields_len: u32 = @intCast(ini.names.len);
     const any_defaults = ini.defaults.len != 0;
@@ -4552,7 +4448,7 @@ pub fn getReifiedStructType(pool: *InternPool, ini: struct {
             .want_layout = false,
         },
     });
-    try pool.appendContainerId(ini.id);
+    try pool.appendContainerType(ini.id);
     try pool.extra.ensureUnusedCapacity(pool.gpa, fields_len + fields_len +
         (if (any_defaults) fields_len else 0) + (if (any_aligns) fields_len else 0) +
         @as(u32, @intCast(ini.comptime_bits.len)) + runtime_order_len + fields_len);
@@ -4567,16 +4463,171 @@ pub fn getReifiedStructType(pool: *InternPool, ini: struct {
     return @enumFromInt(gop.index);
 }
 
-pub fn internEnumType(pool: *InternPool, et: Key.EnumType) Allocator.Error!Index {
-    return pool.get(.{ .enum_type = et });
+/// Create (or dedup) a declared enum type: the `TypeEnum` header, the identity
+/// trailing, then the reserved (zeroed) `field_names` and -- when `has_values` (an
+/// explicit-tag or non-exhaustive enum) -- `field_values` slots. `loadEnumType`
+/// returns null until field resolution fills them via `setEnumFields`. A generated
+/// union tag enum passes `fields_len == 0` (its fields are the union's): it stays
+/// unresolved and its callers key on `id.generatedUnion()` before consulting fields.
+pub fn getDeclaredEnumType(
+    pool: *InternPool,
+    name: NullTerminatedString,
+    id: Key.ContainerType,
+    parent: Index,
+    fields_len: u32,
+    has_values: bool,
+) Allocator.Error!Index {
+    const gop = try pool.getOrPutContainer(.{ .enum_type = id });
+    if (gop.existing) |e| return e;
+    const extra_index = try pool.addExtra(TypeEnum{
+        .name = name,
+        .parent = parent,
+        .namespace = .none,
+        .int_tag_type = .none,
+        .fields_len = fields_len,
+        .field_name_map = .none,
+        .field_value_map = .none,
+        .captures_len = containerCapturesLen(id),
+        .flags = .{ .nonexhaustive = false, .has_values = has_values, .fields_resolved = false, .want_layout = false },
+    });
+    try pool.appendContainerType(id);
+    const reserved = fields_len + if (has_values) fields_len else 0;
+    try pool.extra.ensureUnusedCapacity(pool.gpa, reserved);
+    pool.extra.appendNTimesAssumeCapacity(0, reserved);
+    pool.items.appendAssumeCapacity(.{ .tag = .type_enum, .data = extra_index });
+    return @enumFromInt(gop.index);
+}
+
+/// Create (or dedup) a reified enum type, reserving and filling the whole `TypeEnum`
+/// header + trailing in one shot: identity, then `field_names`, then `field_values`
+/// (when any). `int_tag_type`/`nonexhaustive` are known at creation; the lookup maps
+/// are created empty and Sema populates them (validating for duplicate names/values).
+pub fn getReifiedEnumType(pool: *InternPool, ini: struct {
+    name: NullTerminatedString,
+    id: Key.ContainerType,
+    parent: Index,
+    int_tag_type: Index,
+    nonexhaustive: bool,
+    names: []const NullTerminatedString,
+    values: []const Index,
+}) Allocator.Error!Index {
+    assert(ini.values.len == 0 or ini.values.len == ini.names.len);
+    const gop = try pool.getOrPutContainer(.{ .enum_type = ini.id });
+    if (gop.existing) |e| return e;
+    const fields_len: u32 = @intCast(ini.names.len);
+    const has_values = ini.values.len != 0;
+    const field_name_map = try pool.addMap(pool.gpa, fields_len);
+    const field_value_map: OptionalMapIndex = if (has_values) (try pool.addMap(pool.gpa, fields_len)).toOptional() else .none;
+    const extra_index = try pool.addExtra(TypeEnum{
+        .name = ini.name,
+        .parent = ini.parent,
+        .namespace = .none,
+        .int_tag_type = ini.int_tag_type,
+        .fields_len = fields_len,
+        .field_name_map = field_name_map.toOptional(),
+        .field_value_map = field_value_map,
+        .captures_len = containerCapturesLen(ini.id),
+        .flags = .{ .nonexhaustive = ini.nonexhaustive, .has_values = has_values, .fields_resolved = true, .want_layout = false },
+    });
+    try pool.appendContainerType(ini.id);
+    try pool.extra.ensureUnusedCapacity(pool.gpa, fields_len + if (has_values) fields_len else 0);
+    for (ini.names) |n| pool.extra.appendAssumeCapacity(@intFromEnum(n));
+    if (has_values) for (ini.values) |v| pool.extra.appendAssumeCapacity(@intFromEnum(v));
+    pool.items.appendAssumeCapacity(.{ .tag = .type_enum, .data = extra_index });
+    return @enumFromInt(gop.index);
 }
 
 pub fn internEnumTag(pool: *InternPool, et: Key.EnumTag) Allocator.Error!Index {
     return pool.get(.{ .enum_tag = et });
 }
 
-pub fn internUnionType(pool: *InternPool, ut: Key.UnionType) Allocator.Error!Index {
-    return pool.get(.{ .union_type = ut });
+/// Create (or dedup) a declared union type: just the `TypeUnion` header and the
+/// identity trailing. A declared union's fields are read lazily from ZIR, so
+/// `unionFields` returns null for it -- no field arrays are stored. Mirrors
+/// `getDeclaredStructType`.
+pub fn getDeclaredUnionType(pool: *InternPool, name: NullTerminatedString, id: Key.ContainerType, parent: Index) Allocator.Error!Index {
+    const gop = try pool.getOrPutContainer(.{ .union_type = id });
+    if (gop.existing) |e| return e;
+    const extra_index = try pool.addExtra(TypeUnion{
+        .name = name,
+        .parent = parent,
+        .namespace = .none,
+        .enum_tag_type = .none,
+        .backing_int = .none,
+        .fields_len = 0,
+        .field_name_map = .none,
+        .captures_len = containerCapturesLen(id),
+        .flags = .{ .layout = .auto, .any_field_aligns = false, .want_layout = false },
+    });
+    try pool.appendContainerType(id);
+    pool.items.appendAssumeCapacity(.{ .tag = .type_union, .data = extra_index });
+    return @enumFromInt(gop.index);
+}
+
+/// Create (or dedup) an opaque type: the `TypeOpaque` header and the identity
+/// trailing. An opaque type has no fields, so there is nothing further to store.
+pub fn getDeclaredOpaqueType(pool: *InternPool, name: NullTerminatedString, id: Key.ContainerType, parent: Index) Allocator.Error!Index {
+    const gop = try pool.getOrPutContainer(.{ .opaque_type = id });
+    if (gop.existing) |e| return e;
+    const extra_index = try pool.addExtra(TypeOpaque{
+        .name = name,
+        .parent = parent,
+        .namespace = .none,
+        .captures_len = containerCapturesLen(id),
+    });
+    try pool.appendContainerType(id);
+    pool.items.appendAssumeCapacity(.{ .tag = .type_opaque, .data = extra_index });
+    return @enumFromInt(gop.index);
+}
+
+/// Create (or dedup) a reified union type, reserving and filling the whole `TypeUnion`
+/// header + trailing in one shot (mirrors `getReifiedStructType`): identity, then
+/// `field_names`/`field_types`, then `field_aligns` when present. `field_name_map` is
+/// created empty; Sema populates it (validating for duplicate names).
+pub fn getReifiedUnionType(pool: *InternPool, ini: struct {
+    name: NullTerminatedString,
+    id: Key.ContainerType,
+    parent: Index,
+    layout: std.lang.Type.ContainerLayout,
+    enum_tag_type: Index,
+    backing_int: Index,
+    names: []const NullTerminatedString,
+    types: []const Index,
+    aligns: []const Index,
+}) Allocator.Error!Index {
+    assert(ini.types.len == ini.names.len);
+    assert(ini.aligns.len == 0 or ini.aligns.len == ini.names.len);
+    const gop = try pool.getOrPutContainer(.{ .union_type = ini.id });
+    if (gop.existing) |e| return e;
+    const fields_len: u32 = @intCast(ini.names.len);
+    const any_aligns = ini.aligns.len != 0;
+    const field_name_map = try pool.addMap(pool.gpa, fields_len);
+    const extra_index = try pool.addExtra(TypeUnion{
+        .name = ini.name,
+        .parent = ini.parent,
+        .namespace = .none,
+        .enum_tag_type = ini.enum_tag_type,
+        .backing_int = ini.backing_int,
+        .fields_len = fields_len,
+        .field_name_map = field_name_map.toOptional(),
+        .captures_len = containerCapturesLen(ini.id),
+        .flags = .{
+            .layout = switch (ini.layout) {
+                .auto => .auto,
+                .@"extern" => .@"extern",
+                .@"packed" => .@"packed",
+            },
+            .any_field_aligns = any_aligns,
+            .want_layout = false,
+        },
+    });
+    try pool.appendContainerType(ini.id);
+    try pool.extra.ensureUnusedCapacity(pool.gpa, fields_len + fields_len + if (any_aligns) fields_len else 0);
+    for (ini.names) |n| pool.extra.appendAssumeCapacity(@intFromEnum(n));
+    for (ini.types) |t| pool.extra.appendAssumeCapacity(@intFromEnum(t));
+    if (any_aligns) for (ini.aligns) |a| pool.extra.appendAssumeCapacity(@intFromEnum(a));
+    pool.items.appendAssumeCapacity(.{ .tag = .type_union, .data = extra_index });
+    return @enumFromInt(gop.index);
 }
 
 pub fn internUnion(pool: *InternPool, uv: Key.Union) Allocator.Error!Index {
@@ -4659,9 +4710,9 @@ pub fn internFunc(pool: *InternPool, f: Key.Func) Allocator.Error!Index {
     return pool.get(.{ .func = f });
 }
 
-/// Emit a `type_function` Item. Header is `FuncTypeRepr` (3 u32
-/// slots); trailing `comptime_bits` / `noalias_bits` slots appear
-/// only when the flags say so; then `param_types[params_len]`.
+/// Emit a `type_function` Item. Header is a `FuncTypeRepr`; trailing
+/// `comptime_bits` / `noalias_bits` slots appear only when the flags say so; then
+/// `param_types[params_len]`.
 fn emitFuncType(pool: *InternPool, ft: Key.FuncType) Allocator.Error!void {
     assert(ft.return_type != .none);
     assert(ft.param_types.len <= std.math.maxInt(u32));
@@ -4676,16 +4727,14 @@ fn emitFuncType(pool: *InternPool, ft: Key.FuncType) Allocator.Error!void {
         .has_noalias_bits = has_noalias_bits,
     };
 
-    const extra_index: u32 = @intCast(pool.extra.items.len);
-    const header_slots: u32 = 3;
+    const extra_index = try pool.addExtra(FuncTypeRepr{
+        .params_len = @intCast(ft.param_types.len),
+        .return_type = ft.return_type,
+        .flags = flags,
+    });
     const opt_slots: u32 = @as(u32, @intFromBool(has_comptime_bits)) +
         @as(u32, @intFromBool(has_noalias_bits));
-    const param_slots: u32 = @intCast(ft.param_types.len);
-    try pool.extra.ensureUnusedCapacity(pool.gpa, header_slots + opt_slots + param_slots);
-
-    pool.extra.appendAssumeCapacity(@intCast(ft.param_types.len));
-    pool.extra.appendAssumeCapacity(@intFromEnum(ft.return_type));
-    pool.extra.appendAssumeCapacity(@bitCast(flags));
+    try pool.extra.ensureUnusedCapacity(pool.gpa, opt_slots + @as(u32, @intCast(ft.param_types.len)));
     if (has_comptime_bits) pool.extra.appendAssumeCapacity(ft.comptime_bits);
     if (has_noalias_bits) pool.extra.appendAssumeCapacity(ft.noalias_bits);
     for (ft.param_types) |p| pool.extra.appendAssumeCapacity(@intFromEnum(p));
@@ -4700,13 +4749,14 @@ fn emitFunc(pool: *InternPool, f: Key.Func) Allocator.Error!void {
     assert(f.ty != .none);
     assert(f.uncoerced_ty != .none);
 
-    const extra_index: u32 = @intCast(pool.extra.items.len);
     if (f.generic_owner != .none) {
-        try pool.extra.ensureUnusedCapacity(pool.gpa, 4 + f.comptime_args.len);
-        pool.extra.appendAssumeCapacity(f.source_zir_id);
-        pool.extra.appendAssumeCapacity(@intFromEnum(f.ty));
-        pool.extra.appendAssumeCapacity(@intFromEnum(f.generic_owner));
-        pool.extra.appendAssumeCapacity(@intCast(f.comptime_args.len));
+        const extra_index = try pool.addExtra(FuncInstanceRepr{
+            .source_zir_id = f.source_zir_id,
+            .ty = f.ty,
+            .generic_owner = f.generic_owner,
+            .comptime_args_len = @intCast(f.comptime_args.len),
+        });
+        try pool.extra.ensureUnusedCapacity(pool.gpa, @intCast(f.comptime_args.len));
         for (f.comptime_args) |arg| pool.extra.appendAssumeCapacity(@intFromEnum(arg));
         pool.items.appendAssumeCapacity(.{ .tag = .func_instance, .data = extra_index });
         return;
@@ -4723,105 +4773,94 @@ fn emitFunc(pool: *InternPool, f: Key.Func) Allocator.Error!void {
             .zir_body_inst = f.zir_body_inst,
             .parent = f.parent,
         });
-        const coerced_extra: u32 = @intCast(pool.extra.items.len);
-        try pool.extra.appendSlice(pool.gpa, &.{
-            @intFromEnum(f.ty),
-            @intFromEnum(inner),
-        });
+        const coerced_extra = try pool.addExtra(FuncCoercedRepr{ .ty = f.ty, .inner_func = inner });
         pool.items.appendAssumeCapacity(.{ .tag = .func_coerced, .data = coerced_extra });
         return;
     }
-    try pool.extra.appendSlice(pool.gpa, &.{
-        f.source_zir_id,
-        @intFromEnum(f.ty),
-        @intFromEnum(f.zir_body_inst),
-        @intFromEnum(f.parent),
+    const extra_index = try pool.addExtra(FuncDeclRepr{
+        .source_zir_id = f.source_zir_id,
+        .ty = f.ty,
+        .zir_body_inst = f.zir_body_inst,
+        .parent = f.parent,
     });
     pool.items.appendAssumeCapacity(.{ .tag = .func_decl, .data = extra_index });
 }
 
 fn funcTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    assert(extra_index + 3 <= pool.extra.items.len);
-    const params_len = pool.extra.items[extra_index];
-    const return_type: Index = @enumFromInt(pool.extra.items[extra_index + 1]);
-    const flags: FuncTypeRepr.Flags = @bitCast(pool.extra.items[extra_index + 2]);
+    const trail = pool.extraDataTrail(FuncTypeRepr, extra_index);
+    const r = trail.data;
 
-    var trail: usize = extra_index + 3;
-    const comptime_bits: u32 = if (flags.has_comptime_bits) blk: {
-        const v = pool.extra.items[trail];
-        trail += 1;
+    var t: u32 = trail.end;
+    const comptime_bits: u32 = if (r.flags.has_comptime_bits) blk: {
+        const v = pool.extra.items[t];
+        t += 1;
         break :blk v;
     } else 0;
-    const noalias_bits: u32 = if (flags.has_noalias_bits) blk: {
-        const v = pool.extra.items[trail];
-        trail += 1;
+    const noalias_bits: u32 = if (r.flags.has_noalias_bits) blk: {
+        const v = pool.extra.items[t];
+        t += 1;
         break :blk v;
     } else 0;
-    assert(trail + params_len <= pool.extra.items.len);
+    assert(t + r.params_len <= pool.extra.items.len);
 
     // Park the param slice straight from `extra`. Lifetime matches
     // the pool's; callers should not retain across pool mutations
     // that may reallocate `extra` (same discipline as
     // `error_set_type.names`).
-    const param_slots = pool.extra.items[trail..][0..params_len];
+    const param_slots = pool.extra.items[t..][0..r.params_len];
     const param_types: []const Index = @ptrCast(param_slots);
 
     // Minimal calling-convention storage: reconstruct the CC variant
     // with a default-initialised payload (incoming_stack_alignment =
     // null for variants that carry one). FFI widens to full
     // `PackedCallingConvention` round-trip.
-    const cc: std.lang.CallingConvention = ccFromTag(flags.cc_tag);
+    const cc: std.lang.CallingConvention = ccFromTag(r.flags.cc_tag);
 
     return .{ .func_type = .{
         .param_types = param_types,
-        .return_type = return_type,
+        .return_type = r.return_type,
         .comptime_bits = comptime_bits,
         .noalias_bits = noalias_bits,
         .cc = cc,
-        .is_var_args = flags.is_var_args,
-        .is_noinline = flags.is_noinline,
+        .is_var_args = r.flags.is_var_args,
+        .is_noinline = r.flags.is_noinline,
     } };
 }
 
 fn funcDeclFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    assert(extra_index + 4 <= pool.extra.items.len);
-    const source_zir_id = pool.extra.items[extra_index];
-    const ty: Index = @enumFromInt(pool.extra.items[extra_index + 1]);
+    const r = pool.extraData(FuncDeclRepr, extra_index);
     return .{ .func = .{
-        .source_zir_id = source_zir_id,
-        .ty = ty,
-        .uncoerced_ty = ty,
-        .zir_body_inst = @enumFromInt(pool.extra.items[extra_index + 2]),
-        .parent = @enumFromInt(pool.extra.items[extra_index + 3]),
+        .source_zir_id = r.source_zir_id,
+        .ty = r.ty,
+        .uncoerced_ty = r.ty,
+        .zir_body_inst = r.zir_body_inst,
+        .parent = r.parent,
     } };
 }
 
 fn funcInstanceFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    assert(extra_index + 4 <= pool.extra.items.len);
-    const source_zir_id = pool.extra.items[extra_index];
-    const ty: Index = @enumFromInt(pool.extra.items[extra_index + 1]);
-    const generic_owner: Index = @enumFromInt(pool.extra.items[extra_index + 2]);
-    const args_len = pool.extra.items[extra_index + 3];
-    assert(extra_index + 4 + args_len <= pool.extra.items.len);
-    const args_slots = pool.extra.items[extra_index + 4 ..][0..args_len];
+    const trail = pool.extraDataTrail(FuncInstanceRepr, extra_index);
+    const r = trail.data;
+    assert(trail.end + r.comptime_args_len <= pool.extra.items.len);
+    const args_slots = pool.extra.items[trail.end..][0..r.comptime_args_len];
     const comptime_args: []const Index = @ptrCast(args_slots);
 
     // Body inst comes from the generic owner's func_decl.
-    const owner_key = pool.indexToKey(generic_owner).func;
+    const owner_key = pool.indexToKey(r.generic_owner).func;
     return .{ .func = .{
-        .source_zir_id = source_zir_id,
-        .ty = ty,
-        .uncoerced_ty = ty,
+        .source_zir_id = r.source_zir_id,
+        .ty = r.ty,
+        .uncoerced_ty = r.ty,
         .zir_body_inst = owner_key.zir_body_inst,
-        .generic_owner = generic_owner,
+        .generic_owner = r.generic_owner,
         .comptime_args = comptime_args,
     } };
 }
 
 fn funcCoercedFromExtra(pool: *const InternPool, extra_index: u32) Key {
-    assert(extra_index + 2 <= pool.extra.items.len);
-    const ty: Index = @enumFromInt(pool.extra.items[extra_index]);
-    const inner_index: Index = @enumFromInt(pool.extra.items[extra_index + 1]);
+    const r = pool.extraData(FuncCoercedRepr, extra_index);
+    const ty = r.ty;
+    const inner_index = r.inner_func;
     // Invariant: `inner_func` is always a flattened `func_decl` or
     // `func_instance` -- never another `func_coerced`. `emitFunc`
     // enforces this on the write side (it builds `inner` via a

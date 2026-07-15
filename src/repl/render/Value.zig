@@ -144,7 +144,7 @@ fn renderAggregate(
 /// positional). The read-only analogue of `Sema.structFieldNameAt`.
 fn structFieldName(pool: *const InternPool, session: *const Session, struct_ty: InternPool.Index, index: u32) ?[]const u8 {
     if (pool.loadStructType(struct_ty)) |f| return if (index < f.field_names.len) pool.stringSlice(f.field_names[index]) else null;
-    const d = switch (pool.indexToKey(struct_ty).struct_type.id) {
+    const d = switch (pool.indexToKey(struct_ty).struct_type) {
         .declared => |dd| dd,
         else => return null,
     };
@@ -161,7 +161,7 @@ fn structFieldName(pool: *const InternPool, session: *const Session, struct_ty: 
 /// declaring ZIR for a declared one. The read-only analogue of `Sema.unionFieldNameAt`.
 fn unionFieldName(pool: *const InternPool, session: *const Session, union_ty: InternPool.Index, index: u32) ?[]const u8 {
     if (pool.unionFields(union_ty)) |f| return if (index < f.field_names.len) pool.stringSlice(f.field_names[index]) else null;
-    const d = switch (pool.indexToKey(union_ty).union_type.id) {
+    const d = switch (pool.indexToKey(union_ty).union_type) {
         .declared => |dd| dd,
         else => return null,
     };
@@ -288,7 +288,7 @@ fn renderByteSlice(pool: *const InternPool, writer: *std.Io.Writer, slice: Inter
 /// explicit one matches the tag value. Null if the fields are not resolved.
 fn enumTagName(pool: *const InternPool, session: *const Session, enum_ty: InternPool.Index, int_idx: InternPool.Index) ?[]const u8 {
     const tag = intOf(pool, int_idx) orelse return null;
-    const gen = pool.indexToKey(enum_ty).enum_type.id.generatedUnion();
+    const gen = pool.indexToKey(enum_ty).enum_type.generatedUnion();
     if (gen != .none) return if (tag >= 0) unionFieldName(pool, session, gen, @intCast(tag)) else null;
     const f = pool.loadEnumType(enum_ty) orelse return null;
     if (f.field_values.len == 0) return if (tag >= 0 and tag < f.field_names.len) pool.stringSlice(f.field_names[@intCast(tag)]) else null;

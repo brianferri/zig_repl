@@ -79,6 +79,7 @@ pub fn onePossibleValue(ty: Type, sema: *Sema) Sema.Error!?Value {
         .func_type,
         .anyframe_type,
         .error_set_type,
+        .opaque_type,
         => null,
 
         .simple_type => |t| switch (t) {
@@ -722,10 +723,9 @@ pub fn print(ty: Type, pool: *const InternPool, writer: *std.Io.Writer) PrintErr
             try print(fromIndex(child), pool, writer);
         },
         .tuple_type => |tt| try printTuple(tt, pool, writer),
-        // Nominal types print their fully-qualified `name`, baked at creation.
-        .struct_type => |st| try writer.writeAll(pool.stringSlice(st.name)),
-        .enum_type => |et| try writer.writeAll(pool.stringSlice(et.name)),
-        .union_type => |ut| try writer.writeAll(pool.stringSlice(ut.name)),
+        // Nominal types print their fully-qualified `name`, baked at creation and
+        // stored in the container header (not the identity Key).
+        .struct_type, .enum_type, .union_type, .opaque_type => try writer.writeAll(pool.stringSlice(pool.typeName(ty.index))),
         // Unhandled *type* Keys (opaque, ...) aren't rendered yet. A value Key
         // reaching a type printer is a bug, so assert it's a type.
         else => |other| {

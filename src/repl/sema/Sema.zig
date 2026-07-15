@@ -2682,7 +2682,7 @@ fn alignmentFromValue(sema: *Sema, value: Value, op_name: []const u8) Error!Inte
 fn ensureLayoutResolved(sema: *Sema, ty: InternPool.Index) Error!void {
     const ip = sema.intern_pool;
     switch (ip.indexToKey(ty)) {
-        .int_type, .ptr_type, .anyframe_type, .simple_type, .error_set_type => {},
+        .int_type, .ptr_type, .anyframe_type, .simple_type, .error_set_type, .opaque_type => {},
         .array_type => |arr| return sema.ensureLayoutResolved(arr.child),
         .vector_type => |vec| return sema.ensureLayoutResolved(vec.child),
         .opt_type => |child| return sema.ensureLayoutResolved(child),
@@ -2692,7 +2692,7 @@ fn ensureLayoutResolved(sema: *Sema, ty: InternPool.Index) Error!void {
             for (ft.param_types) |param_ty| try sema.ensureLayoutResolved(param_ty);
             try sema.ensureLayoutResolved(ft.return_type);
         },
-        .enum_type => |et| if (et.id.generatedUnion() == .none) {
+        .enum_type => |et| if (et.generatedUnion() == .none) {
             _ = try sema.resolveEnumFields(ty);
         },
         .struct_type, .union_type => {},
@@ -4734,12 +4734,15 @@ fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.In
         },
     };
 
-    const enum_ty = try ip.internEnumType(.{
+    const enum_ty = try ip.getReifiedEnumType(.{
         .name = name,
         .id = .{ .reified = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst, .type_hash = hasher.final() } },
         .parent = sema.this_type,
+        .int_tag_type = tag_ty,
+        .nonexhaustive = nonexhaustive,
+        .names = names,
+        .values = values,
     });
-    try ip.setEnumFields(enum_ty, tag_ty, nonexhaustive, names, values);
     // Populate and validate the lookup maps, mirroring `src/Sema/type_resolution.zig`:
     // the field names came from the user (not AstGen), so duplicates are real errors.
     const fields = ip.loadEnumType(enum_ty).?;
@@ -5029,12 +5032,17 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
         },
     };
 
-    const union_ty = try ip.internUnionType(.{
+    const union_ty = try ip.getReifiedUnionType(.{
         .name = name,
         .id = .{ .reified = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst, .type_hash = hasher.final() } },
         .parent = sema.this_type,
+        .layout = layout,
+        .enum_tag_type = tag_type,
+        .backing_int = backing_int,
+        .names = names,
+        .types = types,
+        .aligns = if (any_aligns) aligns else &.{},
     });
-    try ip.setUnionFields(union_ty, layout, tag_type, backing_int, names, types, if (any_aligns) aligns else &.{});
     // The compiler validates a union's field names through its tag enum's
     // `field_name_map`, because it resolves the union's fields into that enum. The
     // REPL's generated tag enum is a lazy shell that reads fields from the union, so
@@ -6566,15 +6574,19 @@ fn evalEnumDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const captures = try sema.resolveCaptures(enum_decl.captures);
     defer sema.gpa.free(captures);
 
-    return .{ .index = try sema.intern_pool.internEnumType(.{
-        .name = name,
-        .id = .{ .declared = .{
+    return .{ .index = try sema.intern_pool.getDeclaredEnumType(
+        name,
+        .{ .declared = .{
             .source_zir_id = sema.current_zir_id,
             .decl_inst = inst,
             .captures = captures,
         } },
-        .parent = sema.this_type,
-    }) };
+        sema.this_type,
+        @intCast(enum_decl.field_names.len),
+        // The compiler reserves value slots only for an enum that needs them: an
+        // explicit tag type or a non-exhaustive enum (see `resolveEnumFields`).
+        enum_decl.nonexhaustive or enum_decl.tag_type_body != null,
+    ) };
 }
 
 /// `union_decl` (extended): a named union type (`union(enum) { a: u8, b: u16 }`).
@@ -6598,15 +6610,44 @@ fn evalUnionDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const captures = try sema.resolveCaptures(union_decl.captures);
     defer sema.gpa.free(captures);
 
-    return .{ .index = try sema.intern_pool.internUnionType(.{
-        .name = name,
-        .id = .{ .declared = .{
+    return .{ .index = try sema.intern_pool.getDeclaredUnionType(
+        name,
+        .{ .declared = .{
             .source_zir_id = sema.current_zir_id,
             .decl_inst = inst,
             .captures = captures,
         } },
-        .parent = sema.this_type,
-    }) };
+        sema.this_type,
+    ) };
+}
+
+/// `opaque_decl` (extended): a named opaque type (`opaque {}`). Interns a nominal
+/// `opaque_type` shell keyed on the declaration site, like `evalUnionDecl`. An opaque
+/// type has no fields; only its declaration namespace resolves on demand.
+fn evalOpaqueDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const opaque_decl = sema.zir.getOpaqueDecl(inst);
+    const name = switch (opaque_decl.name_strategy) {
+        .parent => sema.type_name_ctx,
+        .anon, .func, .dbg_var => blk: {
+            const ctx = sema.intern_pool.stringSlice(sema.type_name_ctx);
+            const text = try std.fmt.allocPrint(sema.gpa, "{s}__opaque_{d}", .{ ctx, @intFromEnum(inst) });
+            defer sema.gpa.free(text);
+            break :blk try sema.intern_pool.getOrPutString(sema.gpa, text);
+        },
+    };
+
+    const captures = try sema.resolveCaptures(opaque_decl.captures);
+    defer sema.gpa.free(captures);
+
+    return .{ .index = try sema.intern_pool.getDeclaredOpaqueType(
+        name,
+        .{ .declared = .{
+            .source_zir_id = sema.current_zir_id,
+            .decl_inst = inst,
+            .captures = captures,
+        } },
+        sema.this_type,
+    ) };
 }
 
 /// Resolve a struct decl's ZIR captures to their comptime values in the current
@@ -6623,7 +6664,7 @@ fn resolveCaptures(sema: *Sema, zir_captures: []const Zir.Inst.Capture) Error![]
         c.* = switch (zc.unwrap()) {
             .instruction => |i| (try sema.resolveRef(i.toRef())).index,
             .instruction_load => |i| (try sema.loadValue(try sema.resolveRef(i.toRef()))).index,
-            .nested => |idx| sema.intern_pool.indexToKey(sema.this_type).struct_type.id.captures()[idx],
+            .nested => |idx| sema.intern_pool.indexToKey(sema.this_type).struct_type.captures()[idx],
             .decl_val, .decl_ref => {
                 return sema.fail(sema.block, sema.block.nodeOffset(.zero), "closure capture: decl captures are not supported", .{});
             },
@@ -6686,7 +6727,7 @@ const ContainerFrame = struct {
 /// `owner_union`), so the owner is unwrapped here rather than at each call site.
 fn enterContainer(sema: *Sema, container_ty: InternPool.Index, ctx: []const u8) Error!ContainerFrame {
     const owner = switch (sema.intern_pool.indexToKey(container_ty)) {
-        .enum_type => |et| if (et.id.generatedUnion() != .none) et.id.generatedUnion() else container_ty,
+        .enum_type => |et| if (et.generatedUnion() != .none) et.generatedUnion() else container_ty,
         else => container_ty,
     };
     const ns = sema.containerNamespace(owner).?;
@@ -6699,10 +6740,10 @@ fn enterContainer(sema: *Sema, container_ty: InternPool.Index, ctx: []const u8) 
 /// The source of `container_ty`'s declaration, for a "declared here" note: a
 /// `LazySrcLoc` anchored at the container's decl inst.
 fn containerTypeSrc(sema: *Sema, container_ty: InternPool.Index) LazySrcLoc {
-    const id: InternPool.Key.ContainerId = switch (sema.intern_pool.indexToKey(container_ty)) {
-        .struct_type => |st| st.id,
-        .union_type => |ut| ut.id,
-        .enum_type => |et| et.id,
+    const id: InternPool.Key.ContainerType = switch (sema.intern_pool.indexToKey(container_ty)) {
+        .struct_type => |st| st,
+        .union_type => |ut| ut,
+        .enum_type => |et| et,
         else => return sema.block.nodeOffset(.zero),
     };
     return .{ .base_node_inst = id.declInst(), .offset = .{ .node_offset = .zero } };
@@ -6713,7 +6754,7 @@ fn containerTypeSrc(sema: *Sema, container_ty: InternPool.Index) LazySrcLoc {
 /// message keyed on the struct rather than a per-syntax context string.
 fn failBadStructFieldAccess(sema: *Sema, struct_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error {
     const ip = sema.intern_pool;
-    const st_name = ip.stringSlice(ip.indexToKey(struct_ty).struct_type.name);
+    const st_name = ip.stringSlice(ip.typeName(struct_ty));
     const msg = msg: {
         const msg = try sema.errMsg(sema.block.nodeOffset(.zero), "no field named '{s}' in struct '{s}'", .{ ip.stringSlice(name), st_name });
         errdefer msg.destroy(sema.gpa);
@@ -6727,7 +6768,7 @@ fn failBadStructFieldAccess(sema: *Sema, struct_ty: InternPool.Index, name: Inte
 /// on a union value/type.
 fn failBadUnionFieldAccess(sema: *Sema, union_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error {
     const ip = sema.intern_pool;
-    const un_name = ip.stringSlice(ip.indexToKey(union_ty).union_type.name);
+    const un_name = ip.stringSlice(ip.typeName(union_ty));
     const msg = msg: {
         const msg = try sema.errMsg(sema.block.nodeOffset(.zero), "no field named '{s}' in union '{s}'", .{ ip.stringSlice(name), un_name });
         errdefer msg.destroy(sema.gpa);
@@ -6755,11 +6796,11 @@ fn failBadMemberAccess(sema: *Sema, container_ty: InternPool.Index, name: Intern
     // A miss on the file-root struct reads "root source file struct".
     // `typeDeclInst` is null for a generated tag.
     const decl_inst: ?Zir.Inst.Index = switch (key) {
-        .struct_type => |st| st.id.declInst(),
-        .union_type => |ut| ut.id.declInst(),
-        .enum_type => |et| switch (et.id) {
+        .struct_type => |st| st.declInst(),
+        .union_type => |ut| ut.declInst(),
+        .enum_type => |et| switch (et) {
             .generated_union_tag => null,
-            else => et.id.declInst(),
+            else => et.declInst(),
         },
         else => unreachable,
     };
@@ -7112,12 +7153,14 @@ pub fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPoo
     // union -- so its values still carry a tag.
     if (ip.unionFields(union_ty)) |f| {
         if (f.enum_tag_type != .none) return f.enum_tag_type;
-        return try ip.internEnumType(.{
-            .name = ip.indexToKey(union_ty).union_type.name,
-            .id = .{ .generated_union_tag = union_ty },
-        });
+        return try ip.getDeclaredEnumType(
+            ip.typeName(union_ty),
+            .{ .generated_union_tag = union_ty },
+            .none,
+            0,
+            false,
+        );
     }
-    const ut = ip.indexToKey(union_ty).union_type;
     // `this_type` is the union, so a `closure_get` (a captured `E` / `T`) in the
     // tag-type body resolves.
     const cf = try sema.enterContainer(union_ty, "union tag type");
@@ -7133,19 +7176,16 @@ pub fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPoo
         }
         return ty;
     }
-    return try ip.internEnumType(.{
-        // A generated tag enum's identity is the owner union alone; field
-        // resolution goes through it. `name` still prints the tag type's name.
-        .name = ut.name,
-        .id = .{ .generated_union_tag = union_ty },
-    });
+    // A generated tag enum's identity is the owner union alone; field resolution goes
+    // through it. `name` still prints the tag type's name.
+    return try ip.getDeclaredEnumType(ip.typeName(union_ty), .{ .generated_union_tag = union_ty }, .none, 0, false);
 }
 
 /// An enum type's declared field count, read from its source ZIR. A union's
 /// generated tag enum defers to the union's field count.
 fn enumFieldCount(sema: *Sema, enum_ty: InternPool.Index) Error!u32 {
     const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
-    if (et.id.generatedUnion() != .none) return try sema.unionFieldCount(et.id.generatedUnion());
+    if (et.generatedUnion() != .none) return try sema.unionFieldCount(et.generatedUnion());
     // A reified enum has no ZIR; its field count comes from stored fields.
     if (sema.intern_pool.loadEnumType(enum_ty)) |f| return @intCast(f.field_names.len);
     const cf = try sema.enterContainer(enum_ty, "enum field count");
@@ -7186,7 +7226,7 @@ fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error
     const et = ip.indexToKey(enum_ty).enum_type;
     // A union's generated tag enum has no enum ZIR: its fields are the union's,
     // auto-numbered from 0 with no explicit values or tag type.
-    if (et.id.generatedUnion() != .none) return try sema.generatedTagScan(enum_ty, match);
+    if (et.generatedUnion() != .none) return try sema.generatedTagScan(enum_ty, match);
 
     const fields = try sema.resolveEnumFields(enum_ty);
     // A by-name lookup keys through the field-name map, like the compiler's
@@ -7274,7 +7314,7 @@ fn generatedTagScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Er
     const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
     // A reified union has no ZIR; its generated tag reads the union's stored fields.
     // A generated tag enum is auto-numbered, so each tag value equals its position.
-    const owner = ip.indexToKey(enum_ty).enum_type.id.generatedUnion();
+    const owner = ip.indexToKey(enum_ty).enum_type.generatedUnion();
     if (ip.unionFields(owner)) |f| {
         for (f.field_names, 0..) |field_name, idx| {
             if (try sema.matchEnumField(enum_ty, tag_ty, match, field_name, @intCast(idx), @intCast(idx))) |m| return m;
@@ -7306,7 +7346,7 @@ pub fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool
     if (sema.intern_pool.loadEnumType(enum_ty)) |f| return f.int_tag_type;
     // The generated tag enum of a reified union is auto-numbered (the union has no
     // ZIR, and a reified union carries no explicit int tag type).
-    const gu = et.id.generatedUnion();
+    const gu = et.generatedUnion();
     if (gu != .none and sema.intern_pool.unionFields(gu) != null) {
         return try sema.enumIntTagType(try sema.unionFieldCount(gu));
     }
@@ -7314,7 +7354,7 @@ pub fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool
     defer cf.restore(sema);
     // A generated tag enum reads its explicit `T` from the owner union's decl;
     // a declared enum reads its `enum(T)` backing from its own.
-    if (et.id.generatedUnion() != .none) {
+    if (et.generatedUnion() != .none) {
         const decl = sema.zir.getUnionDecl(cf.decl_inst);
         return if (decl.kind == .tagged_enum_explicit)
             (try sema.resolveInlineBody(decl.arg_type_body.?, cf.decl_inst)).index
@@ -7332,7 +7372,7 @@ pub fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool
 /// enum is always exhaustive.
 fn enumNonexhaustive(sema: *Sema, enum_ty: InternPool.Index) Error!bool {
     const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
-    if (et.id.generatedUnion() != .none) return false;
+    if (et.generatedUnion() != .none) return false;
     // A reified enum has no ZIR; its mode is stored.
     if (sema.intern_pool.loadEnumType(enum_ty)) |f| return f.nonexhaustive;
     const cf = try sema.enterContainer(enum_ty, "enum mode");
@@ -7535,7 +7575,7 @@ fn fieldValOnType(sema: *Sema, ty: InternPool.Index, name: InternPool.NullTermin
             if (try sema.enumTagByName(try sema.unionTagEnumType(ty), name)) |v| return v;
             return sema.failBadMemberAccess(ty, name);
         },
-        .struct_type => {
+        .struct_type, .opaque_type => {
             if (try sema.containerDeclByName(ty, name)) |v| return v;
             return sema.failBadMemberAccess(ty, name);
         },
@@ -7591,9 +7631,9 @@ fn unionIsTagged(sema: *Sema, union_ty: InternPool.Index) Error!bool {
     // A reified union has no ZIR; it is tagged iff it stores an explicit tag enum.
     if (sema.intern_pool.unionFields(union_ty)) |f| return f.enum_tag_type != .none;
     const ut = sema.intern_pool.indexToKey(union_ty).union_type;
-    const frame = try sema.enterSourceZir(ut.id.sourceZirId(), "union kind");
+    const frame = try sema.enterSourceZir(ut.sourceZirId(), "union kind");
     defer frame.restore(sema);
-    return switch (sema.zir.getUnionDecl(ut.id.declInst()).kind) {
+    return switch (sema.zir.getUnionDecl(ut.declInst()).kind) {
         .tagged_explicit, .tagged_enum, .tagged_enum_explicit => true,
         .auto, .@"extern", .@"packed", .packed_explicit => false,
     };
@@ -7605,8 +7645,8 @@ pub fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
     // A reified struct has no ZIR; its field count comes from stored fields.
     if (sema.intern_pool.loadStructType(struct_ty)) |f| return @intCast(f.field_names.len);
     const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
-    const decl_inst = st.id.declInst();
-    const frame = try sema.enterSourceZir(st.id.sourceZirId(), "struct field count");
+    const decl_inst = st.declInst();
+    const frame = try sema.enterSourceZir(st.sourceZirId(), "struct field count");
     defer frame.restore(sema);
     const zir = sema.zir;
     // An anonymous struct stores its field count on the `struct_init_anon` item.
@@ -7715,41 +7755,62 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
     }) };
 }
 
-/// The container a type is declared in (`.none` at the top level), the REPL's
-/// stand-in for `Namespace.parent`. Read from the container type's `parent` field.
-fn containerParent(sema: *Sema, container_ty: InternPool.Index) InternPool.Index {
-    return switch (sema.intern_pool.indexToKey(container_ty)) {
-        .struct_type => |st| st.parent,
-        .enum_type => |et| et.parent,
-        .union_type => |ut| ut.parent,
-        else => .none,
-    };
-}
-
 /// The ZIR coordinates of a container type's namespace (`struct`/`union`/`enum`),
 /// or null for a non-container. Shared by the decl-lookup walkers so the
 /// container-kind switch lives in one place.
 const ContainerNamespace = struct { source_zir_id: u32, decl_inst: Zir.Inst.Index };
 fn containerNamespace(sema: *Sema, container_ty: InternPool.Index) ?ContainerNamespace {
     return switch (sema.intern_pool.indexToKey(container_ty)) {
-        // A reified struct has an empty namespace (no source decls).
-        .struct_type => |st| switch (st.id) {
+        .struct_type => |st| switch (st) {
             .declared => |d| .{ .source_zir_id = d.source_zir_id, .decl_inst = d.decl_inst },
-            else => null,
+            // A reified struct has an empty namespace (no source decls); a struct is
+            // never a generated tag.
+            .reified, .generated_union_tag => null,
         },
-        // A reified union has an empty namespace (no source decls).
-        .union_type => |ut| switch (ut.id) {
+        .union_type => |ut| switch (ut) {
             .declared => |d| .{ .source_zir_id = d.source_zir_id, .decl_inst = d.decl_inst },
-            else => null,
+            // A reified union has an empty namespace (no source decls).
+            .reified, .generated_union_tag => null,
         },
-        // A generated tag enum resolves through the owner union's namespace; a
-        // reified enum has an empty namespace (no source decls).
-        .enum_type => |et| switch (et.id) {
+        .enum_type => |et| switch (et) {
             .declared => |d| .{ .source_zir_id = d.source_zir_id, .decl_inst = d.decl_inst },
+            // A generated tag enum resolves through the owner union's namespace; a
+            // reified enum has an empty namespace (no source decls).
             .generated_union_tag => |owner| sema.containerNamespace(owner),
             .reified => null,
         },
-        else => null,
+        .opaque_type => |ot| switch (ot) {
+            // An opaque type's decls resolve through its own `opaque_decl` namespace.
+            .declared => |d| .{ .source_zir_id = d.source_zir_id, .decl_inst = d.decl_inst },
+            .reified, .generated_union_tag => null,
+        },
+        // Non-container types own no namespace.
+        .simple_type,
+        .simple_value,
+        .enum_literal,
+        .int_type,
+        .anyframe_type,
+        .int,
+        .float,
+        .undef,
+        .ptr_type,
+        .ptr,
+        .slice,
+        .error_set_type,
+        .err,
+        .error_union_type,
+        .error_union,
+        .func_type,
+        .func,
+        .array_type,
+        .vector_type,
+        .opt_type,
+        .opt,
+        .tuple_type,
+        .aggregate,
+        .enum_tag,
+        .un,
+        => null,
     };
 }
 
@@ -7920,7 +7981,7 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
     // namespace. We look decls/tags up from the type's ZIR rather than a persistent
     // Namespace (no Zcu).
     switch (ip.indexToKey(object.index)) {
-        .struct_type, .union_type => {
+        .struct_type, .union_type, .opaque_type => {
             if (try sema.containerDeclByName(object.index, name)) |v| return v;
             return sema.failBadMemberAccess(object.index, name);
         },
@@ -7928,7 +7989,33 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
             if (try sema.enumTagByName(object.index, name)) |v| return v;
             return sema.failBadMemberAccess(object.index, name);
         },
-        else => {},
+        // Not a type used as a namespace; fall through to the data-value field access.
+        .simple_type,
+        .simple_value,
+        .enum_literal,
+        .int_type,
+        .anyframe_type,
+        .int,
+        .float,
+        .undef,
+        .ptr_type,
+        .ptr,
+        .slice,
+        .error_set_type,
+        .err,
+        .error_union_type,
+        .error_union,
+        .func_type,
+        .func,
+        .array_type,
+        .vector_type,
+        .opt_type,
+        .opt,
+        .tuple_type,
+        .aggregate,
+        .enum_tag,
+        .un,
+        => {},
     }
 
     // Otherwise `object` is a data value; dispatch on its (inner) type, auto-
@@ -7963,7 +8050,33 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
             }
             return sema.failNoMember(inner_ty, name);
         },
-        else => return sema.failNoMember(inner_ty, name),
+        // No other type has a value-level field.
+        .simple_type,
+        .simple_value,
+        .enum_literal,
+        .int_type,
+        .anyframe_type,
+        .int,
+        .float,
+        .undef,
+        .ptr,
+        .slice,
+        .error_set_type,
+        .err,
+        .error_union_type,
+        .error_union,
+        .func_type,
+        .func,
+        .vector_type,
+        .opt_type,
+        .opt,
+        .tuple_type,
+        .enum_type,
+        .opaque_type,
+        .aggregate,
+        .enum_tag,
+        .un,
+        => return sema.failNoMember(inner_ty, name),
     }
 }
 
@@ -9394,7 +9507,7 @@ fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         // Walk the enclosing-container chain (`this_type` -> its `parent` -> ...),
         // as `lookupIdentifier` walks `namespace.parent`, before the session scope.
         var container = sema.this_type;
-        while (container != .none) : (container = sema.containerParent(container)) {
+        while (container != .none) : (container = sema.intern_pool.typeParent(container)) {
             if (try sema.containerDeclNav(container, name)) |val| return val;
         }
     }
@@ -9419,7 +9532,7 @@ fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     if (sema.this_type != .none) {
         const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir));
         var container = sema.this_type;
-        while (container != .none) : (container = sema.containerParent(container)) {
+        while (container != .none) : (container = sema.intern_pool.typeParent(container)) {
             if (try sema.containerDeclNav(container, name)) |val| return try sema.materializeConstPtr(val);
         }
     }
@@ -11046,9 +11159,9 @@ fn evalClosureGet(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Valu
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "closure_get: no enclosing container", .{});
     }
     const captures = switch (sema.intern_pool.indexToKey(sema.this_type)) {
-        .struct_type => |st| st.id.captures(),
-        .union_type => |ut| ut.id.captures(),
-        .enum_type => |et| et.id.captures(),
+        .struct_type => |st| st.captures(),
+        .union_type => |ut| ut.captures(),
+        .enum_type => |et| et.captures(),
         else => unreachable,
     };
     assert(extended.small < captures.len);
@@ -11407,6 +11520,7 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .enum_decl => return sema.evalEnumDecl(inst),
         .union_decl => return sema.evalUnionDecl(inst),
         .struct_decl => return sema.evalStructDecl(inst),
+        .opaque_decl => return sema.evalOpaqueDecl(inst),
         .typeof_peer => return sema.evalTypeofPeer(extended, inst),
         .this => return sema.evalThis(),
         .closure_get => return sema.evalClosureGet(extended),
@@ -11474,11 +11588,15 @@ fn opvEnum(sema: *Sema, hash: u64, names: []const []const u8) !Type {
     const pool = sema.intern_pool;
     const handles = try opvNames(sema, names);
     const tag_ty = try sema.enumIntTagType(@intCast(names.len));
-    const enum_ty = try pool.internEnumType(.{
+    const enum_ty = try pool.getReifiedEnumType(.{
         .name = try pool.getOrPutString(sema.gpa, "E"),
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
+        .parent = .none,
+        .int_tag_type = tag_ty,
+        .nonexhaustive = false,
+        .names = handles,
+        .values = &.{},
     });
-    try pool.setEnumFields(enum_ty, tag_ty, false, handles, &.{});
     const f = pool.loadEnumType(enum_ty).?;
     f.field_name_map.get(pool).clearRetainingCapacity();
     for (handles) |name| assert(pool.addFieldName(handles, f.field_name_map, name) == null);
@@ -11510,11 +11628,17 @@ fn opvUnion(sema: *Sema, hash: u64, tag_hash: u64, names: []const []const u8, ty
     const pool = sema.intern_pool;
     const tag_enum = try opvEnum(sema, tag_hash, names);
     const handles = try opvNames(sema, names);
-    const union_ty = try pool.internUnionType(.{
+    const union_ty = try pool.getReifiedUnionType(.{
         .name = try pool.getOrPutString(sema.gpa, "U"),
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
+        .parent = .none,
+        .layout = .auto,
+        .enum_tag_type = tag_enum.index,
+        .backing_int = .none,
+        .names = handles,
+        .types = types,
+        .aligns = &.{},
     });
-    try pool.setUnionFields(union_ty, .auto, tag_enum.index, .none, handles, types, &.{});
     const f = pool.unionFields(union_ty).?;
     f.field_name_map.get(pool).clearRetainingCapacity();
     for (handles) |name| assert(pool.addFieldName(handles, f.field_name_map, name) == null);
