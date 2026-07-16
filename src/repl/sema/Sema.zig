@@ -636,6 +636,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .struct_init_empty_ref_result => sema.evalStructInitEmptyResult(inst, true),
         .import => sema.evalImport(inst),
         .type_info => sema.evalTypeInfo(inst),
+        .offset_of => sema.evalOffsetOf(inst),
         .array_init_elem_type => sema.evalArrayInitElemType(inst),
         .elem_type => sema.evalElemType(inst),
         .splat_op_result_ty => sema.evalSplatOpResultType(inst),
@@ -2675,10 +2676,128 @@ fn alignmentFromValue(sema: *Sema, value: Value, op_name: []const u8) Error!Inte
 
 /// Resolve `ty`'s layout so `abiSize` / `abiAlignment` can read it, mirroring the
 /// compiler's `ensureLayoutResolved` (`src/Sema/type_resolution.zig`): recurse into
+/// Sort context for `.auto` struct field reordering: strongest alignment first, with
+/// comptime-omitted fields pushed to the end. Mirrors the compiler's `AlignSortCtx`.
+const SortByAlignDesc = struct {
+    aligns: []const InternPool.Alignment,
+    fn lessThan(ctx: SortByAlignDesc, a: InternPool.RuntimeOrder, b: InternPool.RuntimeOrder) bool {
+        assert(a != .unresolved);
+        assert(b != .unresolved);
+        if (a == .omitted) return false;
+        if (b == .omitted) return true;
+        return ctx.aligns[@intFromEnum(a)].compare(.gt, ctx.aligns[@intFromEnum(b)]);
+    }
+};
+
+/// Resolve and store a struct type's ABI layout, mirroring the compiler's
+/// `resolveStructLayout` for an `.auto`/`.extern` layout. A declared struct's fields
+/// are first read from ZIR and stored (`fillDeclaredStructFields`); then each field's
+/// alignment is resolved, `.auto` fields are sorted by descending alignment to
+/// minimize padding (the host backend supports field reordering), and offsets are
+/// assigned walking the runtime order. Idempotent -- a no-op once `want_layout`.
+fn resolveStructLayout(sema: *Sema, struct_ty: InternPool.Index) Error!void {
+    const ip = sema.intern_pool;
+    assert(ip.indexToKey(struct_ty) == .struct_type);
+    if (ip.structLayoutResolved(struct_ty)) return;
+
+    // A declared struct's fields are not stored yet: read them from ZIR (interning as
+    // needed) into local buffers, then fill the reserved slots in one shot so no
+    // interning happens while the stored slices are held.
+    if (ip.loadStructType(struct_ty) == null) {
+        const count = try sema.structFieldCount(struct_ty);
+        const names = try sema.arena.alloc(InternPool.NullTerminatedString, count);
+        const types = try sema.arena.alloc(InternPool.Index, count);
+        const aligns = try sema.arena.alloc(InternPool.Index, count);
+        const comptime_bits = try sema.arena.alloc(u32, (count + 31) / 32);
+        @memset(comptime_bits, 0);
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const name = (try sema.structFieldNameAt(struct_ty, i)).?;
+            const field = (try sema.structFieldByName(struct_ty, name)).?;
+            names[i] = name;
+            types[i] = field.ty;
+            aligns[i] = if (field.align_bytes) |a| try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = a } }) else .none;
+            if (field.is_comptime) comptime_bits[i / 32] |= @as(u32, 1) << @intCast(i % 32);
+        }
+        try ip.fillDeclaredStructFields(struct_ty, names, types, aligns, comptime_bits);
+    }
+
+    // Resolve each field's layout first; this may realloc `extra`, so copy the field
+    // types out before recursing rather than holding a `loadStructType` slice.
+    const saved_field_types = blk: {
+        const f = ip.loadStructType(struct_ty).?;
+        break :blk try sema.arena.dupe(InternPool.Index, f.field_types);
+    };
+    for (saved_field_types) |field_ty| try sema.ensureLayoutResolved(field_ty);
+
+    // The stored fields are stable now (measuring interns nothing). Resolve per-field
+    // alignment, the value class, and the whole-struct alignment.
+    const f = ip.loadStructType(struct_ty).?;
+    const fields_len: u32 = @intCast(f.field_types.len);
+    const resolved_aligns = try sema.arena.alloc(InternPool.Alignment, fields_len);
+    const runtime_order = try sema.arena.alloc(InternPool.RuntimeOrder, fields_len);
+    const offsets = try sema.arena.alloc(u32, fields_len);
+    var struct_align: InternPool.Alignment = .@"1";
+    var has_runtime = false;
+    var has_comptime = false;
+    var has_npv = false;
+    for (f.field_types, resolved_aligns, runtime_order, 0..) |field_ty, *field_align, *order, idx| {
+        field_align.* = if (f.field_aligns.len != 0 and f.field_aligns[idx] != .none)
+            .fromByteUnits(@intCast(sema.intAsI128(f.field_aligns[idx]).?))
+        else
+            Type.fromIndex(field_ty).abiAlignment(ip) orelse
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@sizeOf: type not yet supported", .{});
+        if (structFieldIsComptime(f, idx)) {
+            order.* = .omitted; // comptime fields do not contribute to the runtime layout
+            continue;
+        }
+        order.* = @enumFromInt(idx);
+        struct_align = struct_align.maxStrict(field_align.*);
+        switch (Type.fromIndex(field_ty).classify(ip)) {
+            .one_possible_value => {},
+            .no_possible_value => has_npv = true,
+            .runtime => has_runtime = true,
+            .fully_comptime => has_comptime = true,
+            .partially_comptime => {
+                has_runtime = true;
+                has_comptime = true;
+            },
+        }
+    }
+    const class: InternPool.TypeClass = if (has_npv)
+        .no_possible_value
+    else if (has_comptime)
+        (if (has_runtime) .partially_comptime else .fully_comptime)
+    else if (has_runtime) .runtime else .one_possible_value;
+
+    if (f.layout == .auto) {
+        std.mem.sortUnstable(InternPool.RuntimeOrder, runtime_order, SortByAlignDesc{ .aligns = resolved_aligns }, SortByAlignDesc.lessThan);
+    }
+    var cur_offset: u64 = 0;
+    const order_len: u32 = switch (f.layout) {
+        .auto => @intCast(std.mem.sliceTo(runtime_order, .omitted).len),
+        .@"extern" => fields_len,
+        .@"packed" => unreachable,
+    };
+    for (0..order_len) |k| {
+        const field_idx: u32 = switch (f.layout) {
+            .auto => runtime_order[k].toInt().?,
+            .@"extern" => @intCast(k),
+            .@"packed" => unreachable,
+        };
+        const offset = resolved_aligns[field_idx].forward(cur_offset);
+        offsets[field_idx] = @truncate(offset);
+        cur_offset = offset + Type.fromIndex(f.field_types[field_idx]).abiSize(ip).?;
+    }
+    const size: u32 = if (class == .no_possible_value) 0 else @intCast(struct_align.forward(cur_offset));
+    ip.setStructLayout(struct_ty, runtime_order, offsets, size, struct_align, class);
+}
+
 /// wrapper types, resolve a container's fields. The REPL drops the incremental
-/// dependency tracking (single-shot). Struct/union layout resolution is not modelled
-/// yet, so those are inert; an enum resolves its fields here, fixing the integer tag
-/// type `abiSize` reads (a generated tag enum resolves through its owner union).
+/// dependency tracking (single-shot). A struct resolves its ABI layout here; union
+/// layout is not modelled yet, so a union is inert. An enum resolves its fields,
+/// fixing the integer tag type `abiSize` reads (a generated tag enum resolves through
+/// its owner union).
 fn ensureLayoutResolved(sema: *Sema, ty: InternPool.Index) Error!void {
     const ip = sema.intern_pool;
     switch (ip.indexToKey(ty)) {
@@ -2695,7 +2814,8 @@ fn ensureLayoutResolved(sema: *Sema, ty: InternPool.Index) Error!void {
         .enum_type => |et| if (et.generatedUnion() == .none) {
             _ = try sema.resolveEnumFields(ty);
         },
-        .struct_type, .union_type => {},
+        .struct_type => try sema.resolveStructLayout(ty),
+        .union_type => {},
         .simple_value, .enum_literal, .int, .float, .undef, .ptr, .slice, .err, .error_union, .func, .opt, .aggregate, .enum_tag, .un => unreachable,
     }
 }
@@ -2753,6 +2873,29 @@ fn evalSizeOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .storage = .{ .u64 = size },
     });
     return .{ .index = idx };
+}
+
+/// `offset_of` (`@offsetOf(T, "field")`): the byte offset of `field` within struct
+/// `T`, read from the resolved layout, as a `comptime_int`. Mirrors zirOffsetOf
+/// (`bitOffsetOf / 8`; the REPL models no packed-struct bit layout, so only the byte
+/// path is needed).
+fn evalOffsetOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const ip = sema.intern_pool;
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const ty = try sema.resolveDestType(extra.lhs, "@offsetOf");
+    const field_name = try sema.resolveConstStringIntern(extra.rhs);
+    if (Type.fromIndex(ty).zigTypeTag(ip) != .@"struct") {
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected struct type, found '{f}'", .{Type.fromIndex(ty).fmt(ip)});
+    }
+    try sema.ensureLayoutResolved(ty);
+    const field = (try sema.structFieldByName(ty, field_name)) orelse return sema.failNoMember(ty, field_name);
+    if (field.is_comptime) {
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "no offset available for comptime field", .{});
+    }
+    const offset = Type.fromIndex(ty).structFieldOffset(ip, field.index);
+    return .{ .index = try ip.internInt(.{ .ty = .comptime_int_type, .storage = .{ .u64 = offset } }) };
 }
 
 /// `bit_size_of` (`@bitSizeOf(T)`): the type's bit width as a `comptime_int`.
@@ -5389,6 +5532,10 @@ fn evalStructInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         try ip.getOrPutString(sema.gpa, name_text),
         .{ .declared = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst } },
         sema.this_type,
+        @intCast(values.len),
+        .auto,
+        false,
+        false,
     );
     return .{ .index = try ip.internAggregate(.{ .ty = struct_ty, .storage = .{ .elems = values } }) };
 }
@@ -5457,10 +5604,17 @@ fn rootModuleType(sema: *Sema) Error!InternPool.Index {
     // type then lives in that file's `root_type` slot, as for every other file.
     const file_index: Session.Index = @intCast(session.files.items.len);
     try session.files.append(sema.gpa, .{ .zir = null, .tree = null, .wrapped = null, .sub_file_path = null });
+    // A file's root struct is created before its ZIR (and thus its field count) is
+    // known, so it reserves no field trailing (`fields_len = 0`); its fields stay
+    // ZIR-read and its layout is not resolvable (`@sizeOf` of a file is unsupported).
     const ty = try sema.intern_pool.getDeclaredStructType(
         try sema.intern_pool.getOrPutString(sema.gpa, "root"),
         .{ .declared = .{ .source_zir_id = file_index, .decl_inst = .main_struct_inst } },
         .none,
+        0,
+        .auto,
+        false,
+        false,
     );
     sema.intern_pool.setNamespace(ty, session.root_namespace);
     session.files.items[file_index].root_type = ty;
@@ -5528,10 +5682,16 @@ fn lowerModule(sema: *Sema, canonical: []const u8, bytes: [:0]const u8) Error!In
     const file_index: Session.Index = @intCast(session.files.items.len - 1);
     try session.import_table.put(sema.gpa, sub_path, file_index);
 
+    // A module's root struct reserves no field trailing (see the root-file case);
+    // its fields stay ZIR-read.
     const root_type = try sema.intern_pool.getDeclaredStructType(
         try sema.moduleTypeName(canonical),
         .{ .declared = .{ .source_zir_id = file_index, .decl_inst = .main_struct_inst } },
         .none,
+        0,
+        .auto,
+        false,
+        false,
     );
     session.files.items[file_index].root_type = root_type;
     return root_type;
@@ -6540,6 +6700,17 @@ fn evalStructDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const captures = try sema.resolveCaptures(struct_decl.captures);
     defer sema.gpa.free(captures);
 
+    // The reserved field trailing depends on whether any field carries an explicit
+    // alignment or is comptime; scan the ZIR once to size it. Field types/names/aligns
+    // themselves are filled later, from ZIR, by `resolveStructLayout`.
+    var any_field_aligns = false;
+    var any_comptime_fields = false;
+    var it = struct_decl.iterateFields();
+    while (it.next()) |field| {
+        if (field.align_body != null) any_field_aligns = true;
+        if (field.is_comptime) any_comptime_fields = true;
+    }
+
     return .{
         // The container being evaluated is the enclosing one (`sema.this_type`); record
         // it so an unqualified decl reference resolves outward (the compiler's namespace
@@ -6548,7 +6719,7 @@ fn evalStructDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             .source_zir_id = sema.current_zir_id,
             .decl_inst = inst,
             .captures = captures,
-        } }, sema.this_type),
+        } }, sema.this_type, @intCast(struct_decl.field_names.len), struct_decl.layout, any_field_aligns, any_comptime_fields),
     };
 }
 

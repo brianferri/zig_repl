@@ -504,6 +504,19 @@ pub const Alignment = enum(u6) {
         if (n == @intFromEnum(Alignment.none)) return 0;
         return n + 1;
     }
+
+    pub fn maxStrict(lhs: Alignment, rhs: Alignment) Alignment {
+        assert(lhs != .none);
+        assert(rhs != .none);
+        return @enumFromInt(@max(@intFromEnum(lhs), @intFromEnum(rhs)));
+    }
+
+    /// Align an address forwards to this alignment.
+    pub fn forward(a: Alignment, addr: u64) u64 {
+        assert(a != .none);
+        const x = (@as(u64, 1) << @intFromEnum(a)) - 1;
+        return (addr + x) & ~x;
+    }
 };
 
 /// A `comptime { ... }` top-level block. Mirrors the compiler's
@@ -2003,7 +2016,11 @@ const TypeStruct = struct {
         /// Alignment of the whole struct. `.none` until layout resolved.
         alignment: Alignment,
         want_layout: bool,
-        _: u17 = 0,
+        /// Whether the field arrays are filled; `loadStructType` returns null until
+        /// then. A reified struct fills them at creation; a declared struct fills them
+        /// from ZIR during layout resolution (like a declared enum's `fields_resolved`).
+        fields_resolved: bool,
+        _: u16 = 0,
     };
 };
 
@@ -4013,6 +4030,23 @@ pub fn setEnumFields(
 /// offsets, class) are not modelled. Storage block layout: `[layout, backing_int,
 /// fields_len, defaults_len, aligns_len, comptime_len, names..., types...,
 /// defaults..., aligns..., comptime_bits...]`.
+/// A field's position in the struct's runtime memory order. Mirrors the compiler's
+/// `LoadedStructType.RuntimeOrder`: a real index for a runtime field, `.omitted` for a
+/// comptime field (no runtime storage), `.unresolved` before layout resolution.
+pub const RuntimeOrder = enum(u32) {
+    unresolved = std.math.maxInt(u32) - 0,
+    omitted = std.math.maxInt(u32) - 1,
+    _,
+
+    pub fn toInt(i: RuntimeOrder) ?u32 {
+        return switch (i) {
+            .omitted => null,
+            .unresolved => unreachable,
+            else => @intFromEnum(i),
+        };
+    }
+};
+
 pub const LoadedStructType = struct {
     layout: std.lang.Type.ContainerLayout,
     packed_backing_int_type: Index,
@@ -4025,6 +4059,15 @@ pub const LoadedStructType = struct {
     /// One bit per field, LSB-first within each u32; empty when no field is comptime.
     field_is_comptime_bits: []const u32,
     field_name_map: MapIndex,
+    // The remaining fields are only valid once the struct's layout is resolved
+    // (`flags.want_layout`), which `Sema.resolveStructLayout` sets.
+    /// Runtime memory order of the fields; `.@"extern"`/`.@"packed"` leave it empty.
+    field_runtime_order: []const RuntimeOrder,
+    /// Byte offset of each field; `.@"packed"` leaves it empty.
+    field_offsets: []const u32,
+    class: TypeClass,
+    size: u32,
+    alignment: Alignment,
 
     /// Field index for `name`, or null. Mirrors `LoadedStructType.nameIndex`.
     pub fn nameIndex(fields: LoadedStructType, pool: *const InternPool, name: NullTerminatedString) ?u32 {
@@ -4033,20 +4076,53 @@ pub const LoadedStructType = struct {
         const field_index = map.getIndexAdapted(name, adapter) orelse return null;
         return @intCast(field_index);
     }
+
+    /// Iterates non-comptime fields in runtime memory order. Mirrors the compiler's
+    /// `LoadedStructType.iterateRuntimeOrder`. Asserts the struct is not packed.
+    pub fn iterateRuntimeOrder(s: LoadedStructType) RuntimeOrderIterator {
+        return switch (s.layout) {
+            .auto => .{
+                .runtime_order = std.mem.sliceTo(s.field_runtime_order, .omitted),
+                .fields_len = @intCast(std.mem.sliceTo(s.field_runtime_order, .omitted).len),
+                .next_index = 0,
+            },
+            .@"extern" => .{
+                .runtime_order = null,
+                .fields_len = @intCast(s.field_names.len),
+                .next_index = 0,
+            },
+            .@"packed" => unreachable,
+        };
+    }
+
+    pub const RuntimeOrderIterator = struct {
+        runtime_order: ?[]const RuntimeOrder,
+        fields_len: u32,
+        next_index: u32,
+        pub fn next(it: *RuntimeOrderIterator) ?u32 {
+            const i = it.next_index;
+            if (i == it.fields_len) return null;
+            it.next_index = i + 1;
+            const ro = it.runtime_order orelse return i;
+            return ro[i].toInt().?;
+        }
+    };
 };
 
-/// This struct's resolved fields, or null if it stores none (a declared struct,
-/// which reads its fields from ZIR). Reads the `TypeStruct` trailing: the reified
-/// identity (4 slots) then `field_names`/`field_types`, then the optional
-/// `field_defaults`/`field_aligns`/`field_is_comptime_bits` per the header flags.
+/// This struct's stored fields, or null before they are resolved (a declared struct
+/// reads its fields from ZIR until layout resolution fills the reserved slots). Reads
+/// the `TypeStruct` trailing: the identity, then `field_names`/`field_types`, then the
+/// optional `field_defaults`/`field_aligns`/`field_is_comptime_bits` per the header
+/// flags, then `field_runtime_order` (`.auto` only) and `field_offsets`. The size,
+/// alignment, and class in the header are valid only once `flags.want_layout`.
 pub fn loadStructType(pool: *const InternPool, struct_ty: Index) ?LoadedStructType {
     const item = pool.items.get(@intFromEnum(struct_ty));
     assert(item.tag == .type_struct);
     const trail = pool.extraDataTrail(TypeStruct, item.data);
     const r = trail.data;
-    if (r.captures_len != captures_len_reified) return null;
+    if (!r.flags.fields_resolved) return null;
     const fields_len = r.fields_len;
-    var base = trail.end + 4;
+    var base = trail.end + containerIdTrailingLen(r.captures_len);
     const names: []const NullTerminatedString = @ptrCast(pool.extra.items[base..][0..fields_len]);
     base += fields_len;
     const types: []const Index = @ptrCast(pool.extra.items[base..][0..fields_len]);
@@ -4056,20 +4132,113 @@ pub fn loadStructType(pool: *const InternPool, struct_ty: Index) ?LoadedStructTy
     const aligns: []const Index = if (r.flags.any_field_aligns) @ptrCast(pool.extra.items[base..][0..fields_len]) else &.{};
     base += if (r.flags.any_field_aligns) fields_len else 0;
     const comptime_len: u32 = if (r.flags.any_comptime_fields) (fields_len + 31) / 32 else 0;
+    const comptime_bits = pool.extra.items[base..][0..comptime_len];
+    base += comptime_len;
+    const layout: std.lang.Type.ContainerLayout = switch (r.flags.layout) {
+        .auto => .auto,
+        .@"extern" => .@"extern",
+        .@"packed" => .@"packed",
+    };
+    const runtime_order_len: u32 = if (layout == .auto) fields_len else 0;
+    const runtime_order: []const RuntimeOrder = @ptrCast(pool.extra.items[base..][0..runtime_order_len]);
+    base += runtime_order_len;
+    const offsets: []const u32 = if (layout == .@"packed") &.{} else pool.extra.items[base..][0..fields_len];
     return .{
-        .layout = switch (r.flags.layout) {
-            .auto => .auto,
-            .@"extern" => .@"extern",
-            .@"packed" => .@"packed",
-        },
+        .layout = layout,
         .packed_backing_int_type = r.backing_int,
         .field_names = names,
         .field_types = types,
         .field_defaults = defaults,
         .field_aligns = aligns,
-        .field_is_comptime_bits = pool.extra.items[base..][0..comptime_len],
+        .field_is_comptime_bits = comptime_bits,
         .field_name_map = r.field_name_map.unwrap().?,
+        .field_runtime_order = runtime_order,
+        .field_offsets = offsets,
+        .class = r.flags.class,
+        .size = r.size,
+        .alignment = r.flags.alignment,
     };
+}
+
+/// Whether this struct's ABI layout (size/alignment/offsets/class) has been resolved.
+pub fn structLayoutResolved(pool: *const InternPool, struct_ty: Index) bool {
+    const item = pool.items.get(@intFromEnum(struct_ty));
+    assert(item.tag == .type_struct);
+    return pool.extraData(TypeStruct, item.data).flags.want_layout;
+}
+
+/// Fill a declared struct's reserved `field_names`/`field_types` (and, per the header
+/// flags, `field_aligns`/`field_is_comptime_bits`) from values Sema read out of the
+/// ZIR, populate the field-name map, and mark the fields resolved -- the
+/// declared-struct branch of the compiler's `resolveStructLayout`. Idempotent.
+pub fn fillDeclaredStructFields(
+    pool: *InternPool,
+    struct_ty: Index,
+    names: []NullTerminatedString,
+    types: []const Index,
+    aligns: []const Index,
+    comptime_bits: []const u32,
+) Allocator.Error!void {
+    const item = pool.items.get(@intFromEnum(struct_ty));
+    assert(item.tag == .type_struct);
+    const trail = pool.extraDataTrail(TypeStruct, item.data);
+    const r = trail.data;
+    if (r.flags.fields_resolved) return;
+    assert(r.fields_len == names.len);
+    assert(r.fields_len == types.len);
+    const base = trail.end + containerIdTrailingLen(r.captures_len);
+    for (names, 0..) |n, i| pool.extra.items[base + i] = @intFromEnum(n);
+    for (types, 0..) |t, i| pool.extra.items[base + r.fields_len + i] = @intFromEnum(t);
+    var off = base + r.fields_len + r.fields_len;
+    if (r.flags.any_field_aligns) {
+        for (aligns, 0..) |a, i| pool.extra.items[off + i] = @intFromEnum(a);
+        off += r.fields_len;
+    }
+    if (r.flags.any_comptime_fields) {
+        for (comptime_bits, 0..) |b, i| pool.extra.items[off + i] = b;
+    }
+    // AstGen validated the field names, so the map cannot collide.
+    const map = r.field_name_map.unwrap().?;
+    map.get(pool).clearRetainingCapacity();
+    for (names) |field_name| assert(pool.addFieldName(names, map, field_name) == null);
+    var flags = r.flags;
+    flags.fields_resolved = true;
+    pool.extra.items[item.data + std.meta.fieldIndex(TypeStruct, "flags").?] = @bitCast(flags);
+}
+
+/// Write a struct's resolved layout into its reserved `field_runtime_order` (`.auto`)
+/// and `field_offsets` slots and its header (`size`/`alignment`/`class`), setting
+/// `want_layout`. Mirrors the compiler's in-place `field_offsets`/`field_runtime_order`
+/// writes plus `ip.resolveStructLayout`.
+pub fn setStructLayout(
+    pool: *InternPool,
+    struct_ty: Index,
+    runtime_order: []const RuntimeOrder,
+    offsets: []const u32,
+    size: u32,
+    alignment: Alignment,
+    class: TypeClass,
+) void {
+    const item = pool.items.get(@intFromEnum(struct_ty));
+    assert(item.tag == .type_struct);
+    const trail = pool.extraDataTrail(TypeStruct, item.data);
+    const r = trail.data;
+    var base = trail.end + containerIdTrailingLen(r.captures_len) + r.fields_len + r.fields_len;
+    if (r.flags.any_field_aligns) base += r.fields_len;
+    if (r.flags.any_comptime_fields) base += (r.fields_len + 31) / 32;
+    if (r.flags.layout == .auto) {
+        for (runtime_order, 0..) |o, i| pool.extra.items[base + i] = @intFromEnum(o);
+        base += r.fields_len;
+    }
+    if (r.flags.layout != .@"packed") {
+        for (offsets, 0..) |o, i| pool.extra.items[base + i] = o;
+    }
+    pool.extra.items[item.data + std.meta.fieldIndex(TypeStruct, "size").?] = size;
+    var flags = r.flags;
+    flags.alignment = alignment;
+    flags.class = class;
+    flags.want_layout = true;
+    pool.extra.items[item.data + std.meta.fieldIndex(TypeStruct, "flags").?] = @bitCast(flags);
 }
 
 /// This container type's fully-qualified name, read from its stored header. Name is
@@ -4373,26 +4542,61 @@ fn getOrPutContainer(pool: *InternPool, key: Key) Allocator.Error!struct { exist
     return .{ .existing = null, .index = @intCast(gop.index) };
 }
 
-/// Create (or dedup) a declared struct type: just the `TypeStruct` header and the
-/// identity trailing. A declared struct's fields are read lazily from ZIR, so
-/// `loadStructType` returns null for it -- no field arrays are stored. Mirrors the
-/// compiler's `getDeclaredStructType` shell (the REPL fills fields lazily from ZIR
-/// rather than reserving+resolving them).
-pub fn getDeclaredStructType(pool: *InternPool, name: NullTerminatedString, id: Key.ContainerType, parent: Index) Allocator.Error!Index {
+/// Create (or dedup) a declared struct type: the `TypeStruct` header, the identity
+/// trailing, then the reserved (zeroed) field arrays that `resolveStructLayout` fills
+/// from ZIR -- `field_names`/`field_types`, then `field_aligns` (when `any_field_aligns`)
+/// and `field_is_comptime_bits` (when `any_comptime_fields`), then `field_runtime_order`
+/// (`.auto`) and `field_offsets`. `loadStructType` returns null until `fields_resolved`
+/// is set, so field access reads ZIR until then. A declared struct's defaults stay
+/// ZIR-lazy (`any_field_defaults` is false; `structFieldDefault` reads them on demand,
+/// like the compiler's separate `ensureStructDefaultsResolved`).
+pub fn getDeclaredStructType(
+    pool: *InternPool,
+    name: NullTerminatedString,
+    id: Key.ContainerType,
+    parent: Index,
+    fields_len: u32,
+    layout: std.lang.Type.ContainerLayout,
+    any_field_aligns: bool,
+    any_comptime_fields: bool,
+) Allocator.Error!Index {
     const gop = try pool.getOrPutContainer(.{ .struct_type = id });
     if (gop.existing) |e| return e;
+    const runtime_order_len: u32 = if (layout == .auto) fields_len else 0;
+    const comptime_len: u32 = if (any_comptime_fields) (fields_len + 31) / 32 else 0;
+    const field_name_map = try pool.addMap(pool.gpa, fields_len);
     const extra_index = try pool.addExtra(TypeStruct{
         .name = name,
         .parent = parent,
         .namespace = .none,
-        .fields_len = 0,
-        .field_name_map = .none,
+        .fields_len = fields_len,
+        .field_name_map = field_name_map.toOptional(),
         .backing_int = .none,
         .size = 0,
         .captures_len = containerCapturesLen(id),
-        .flags = .{ .layout = .auto, .any_comptime_fields = false, .any_field_defaults = false, .any_field_aligns = false, .class = .no_possible_value, .alignment = .none, .want_layout = false },
+        .flags = .{
+            .layout = switch (layout) {
+                .auto => .auto,
+                .@"extern" => .@"extern",
+                .@"packed" => .@"packed",
+            },
+            .any_comptime_fields = any_comptime_fields,
+            .any_field_defaults = false,
+            .any_field_aligns = any_field_aligns,
+            .class = .no_possible_value,
+            .alignment = .none,
+            .want_layout = false,
+            .fields_resolved = false,
+        },
     });
     try pool.appendContainerType(id);
+    try pool.extra.ensureUnusedCapacity(pool.gpa, fields_len + fields_len +
+        (if (any_field_aligns) fields_len else 0) + comptime_len + runtime_order_len + fields_len);
+    // field_names + field_types + field_aligns? + comptime_bits? zeroed (filled from ZIR).
+    pool.extra.appendNTimesAssumeCapacity(0, fields_len + fields_len +
+        (if (any_field_aligns) fields_len else 0) + comptime_len);
+    pool.extra.appendNTimesAssumeCapacity(@intFromEnum(RuntimeOrder.unresolved), runtime_order_len);
+    pool.extra.appendNTimesAssumeCapacity(0, fields_len);
     pool.items.appendAssumeCapacity(.{ .tag = .type_struct, .data = extra_index });
     return @enumFromInt(gop.index);
 }
@@ -4446,6 +4650,7 @@ pub fn getReifiedStructType(pool: *InternPool, ini: struct {
             .class = .no_possible_value,
             .alignment = .none,
             .want_layout = false,
+            .fields_resolved = true,
         },
     });
     try pool.appendContainerType(ini.id);
@@ -4457,7 +4662,8 @@ pub fn getReifiedStructType(pool: *InternPool, ini: struct {
     if (any_defaults) for (ini.defaults) |d| pool.extra.appendAssumeCapacity(@intFromEnum(d));
     if (any_aligns) for (ini.aligns) |a| pool.extra.appendAssumeCapacity(@intFromEnum(a));
     if (any_comptime) for (ini.comptime_bits) |b| pool.extra.appendAssumeCapacity(b);
-    pool.extra.appendNTimesAssumeCapacity(0, runtime_order_len);
+    // Reserved, filled by `resolveStructLayout`: runtime order (`.unresolved`) and offsets.
+    pool.extra.appendNTimesAssumeCapacity(@intFromEnum(RuntimeOrder.unresolved), runtime_order_len);
     pool.extra.appendNTimesAssumeCapacity(0, fields_len);
     pool.items.appendAssumeCapacity(.{ .tag = .type_struct, .data = extra_index });
     return @enumFromInt(gop.index);
@@ -5529,6 +5735,10 @@ test "fullyQualifiedName: a member of a named container nests under it" {
         try pool.getOrPutString(pool.gpa, "repl.Outer"),
         .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(1) } },
         .none,
+        0,
+        .auto,
+        false,
+        false,
     );
     const ns = try pool.createNamespace(pool.gpa, .none);
     pool.namespacePtr(ns).owner_type = outer;

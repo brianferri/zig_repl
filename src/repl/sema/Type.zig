@@ -199,6 +199,167 @@ pub fn onePossibleValue(ty: Type, sema: *Sema) Sema.Error!?Value {
     };
 }
 
+/// Ports the compiler's `Type.classify`: how a type's values split between comptime
+/// and runtime state. A container's class is read from its resolved layout, so the
+/// caller resolves it first (`ensureLayoutResolved`). Forced REPL deviations: no
+/// `assertUpToDate` (single-shot, no dependency graph); the absent `spirv_type` and
+/// `inferred_error_set_type` Key variants are not enumerated; a tuple stores no
+/// per-field comptime values so `classifyTuple` classifies types only; union layout
+/// is not modelled, so a union is `unreachable` here (a union field is rejected by
+/// `abiAlignment` before layout resolution).
+pub fn classify(start_ty: Type, pool: *const InternPool) InternPool.TypeClass {
+    var extra_states: enum { none, one, many } = .none;
+    var cur_ty = start_ty;
+    const base: InternPool.TypeClass = while (true) break switch (pool.indexToKey(cur_ty.index)) {
+        .simple_type => |t| switch (t) {
+            .f16,
+            .f32,
+            .f64,
+            .f80,
+            .f128,
+            .usize,
+            .isize,
+            .c_char,
+            .c_short,
+            .c_ushort,
+            .c_int,
+            .c_uint,
+            .c_long,
+            .c_ulong,
+            .c_longlong,
+            .c_ulonglong,
+            .c_longdouble,
+            .bool,
+            .anyerror,
+            .adhoc_inferred_error_set,
+            => .runtime,
+
+            .anyopaque => .no_possible_value,
+
+            .type,
+            .comptime_int,
+            .comptime_float,
+            .enum_literal,
+            .null,
+            .undefined,
+            => .fully_comptime,
+
+            .void => .one_possible_value,
+            .noreturn => .no_possible_value,
+
+            .generic_poison => unreachable,
+        },
+
+        .error_set_type,
+        .ptr_type,
+        .anyframe_type,
+        => .runtime,
+
+        .func_type => .fully_comptime,
+
+        .opaque_type => .no_possible_value,
+
+        .error_union_type => |eu| {
+            extra_states = .many;
+            cur_ty = fromIndex(eu.payload_type);
+            continue;
+        },
+
+        .int_type => |int| switch (int.bits) {
+            0 => .one_possible_value,
+            else => .runtime,
+        },
+        .array_type => |arr| {
+            if (arr.len == 0 and arr.sentinel == .none) break .one_possible_value;
+            cur_ty = fromIndex(arr.child);
+            continue;
+        },
+        .vector_type => |vec| {
+            if (vec.len == 0) break .one_possible_value;
+            cur_ty = fromIndex(vec.child);
+            continue;
+        },
+        .opt_type => |child_ty| {
+            extra_states = switch (extra_states) {
+                .none => .one,
+                .one, .many => .many,
+            };
+            cur_ty = fromIndex(child_ty);
+            continue;
+        },
+        .tuple_type => |tuple| break classifyTuple(tuple.types, pool),
+        .struct_type => break pool.loadStructType(cur_ty.index).?.class,
+        .union_type => unreachable,
+        .enum_type => {
+            cur_ty = fromIndex(pool.loadEnumType(cur_ty.index).?.int_tag_type);
+            continue;
+        },
+
+        .simple_value,
+        .enum_literal,
+        .int,
+        .float,
+        .undef,
+        .ptr,
+        .slice,
+        .err,
+        .error_union,
+        .func,
+        .opt,
+        .aggregate,
+        .enum_tag,
+        .un,
+        => unreachable,
+    };
+
+    return switch (base) {
+        .runtime => .runtime,
+        .partially_comptime => .partially_comptime,
+        .fully_comptime => .fully_comptime,
+        .no_possible_value => switch (extra_states) {
+            .none => .no_possible_value,
+            .one => .one_possible_value,
+            .many => .runtime,
+        },
+        .one_possible_value => switch (extra_states) {
+            .none => .one_possible_value,
+            .one, .many => .runtime,
+        },
+    };
+}
+
+/// Ports the compiler's `classifyTuple`. The REPL's tuple type stores no per-field
+/// comptime values, so every field is a runtime slot (a comptime tuple field is a
+/// forced gap).
+fn classifyTuple(types: []const InternPool.Index, pool: *const InternPool) InternPool.TypeClass {
+    var has_runtime_state = false;
+    var has_comptime_state = false;
+    for (types) |field_ty| {
+        switch (fromIndex(field_ty).classify(pool)) {
+            .no_possible_value => return .no_possible_value,
+            .one_possible_value => {},
+            .runtime => has_runtime_state = true,
+            .fully_comptime => has_comptime_state = true,
+            .partially_comptime => {
+                has_runtime_state = true;
+                has_comptime_state = true;
+            },
+        }
+    }
+    if (has_comptime_state) {
+        return if (has_runtime_state) .partially_comptime else .fully_comptime;
+    } else {
+        return if (has_runtime_state) .runtime else .one_possible_value;
+    }
+}
+
+/// Byte offset of struct field `index`, read from the resolved layout (the caller
+/// runs `ensureLayoutResolved` first). Mirrors the compiler's `Type.structFieldOffset`
+/// for a non-packed struct.
+pub fn structFieldOffset(ty: Type, pool: *const InternPool, index: u32) u64 {
+    return pool.loadStructType(ty.index).?.field_offsets[index];
+}
+
 pub fn fromIndex(index: InternPool.Index) Type {
     assert(index != .none);
     return .{ .index = index };
@@ -256,6 +417,9 @@ pub fn abiAlignment(ty: Type, pool: *const InternPool) ?InternPool.Alignment {
         // An enum's alignment is its integer tag type's, once resolved (the caller
         // runs `ensureLayoutResolved` first). Mirrors `Type.abiAlignment`'s enum arm.
         .enum_type => if (pool.loadEnumType(ty.index)) |f| abiAlignment(fromIndex(f.int_tag_type), pool) else null,
+        // A struct's alignment is stored in its header once layout is resolved (the
+        // caller runs `ensureLayoutResolved` first). Mirrors `Type.abiAlignment`.
+        .struct_type => if (pool.loadStructType(ty.index)) |f| f.alignment else null,
         else => null,
     };
 }
@@ -300,6 +464,9 @@ pub fn abiSize(ty: Type, pool: *const InternPool) ?u64 {
         // An enum's size is its integer tag type's, once resolved (the caller runs
         // `ensureLayoutResolved` first). Mirrors `Type.abiSize`'s enum arm.
         .enum_type => if (pool.loadEnumType(ty.index)) |f| abiSize(fromIndex(f.int_tag_type), pool) else null,
+        // A struct's size is stored in its header once layout is resolved (the caller
+        // runs `ensureLayoutResolved` first). Mirrors `Type.abiSize`.
+        .struct_type => if (pool.loadStructType(ty.index)) |f| f.size else null,
         else => null,
     };
 }
