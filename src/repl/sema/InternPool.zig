@@ -2080,20 +2080,29 @@ const TypeUnion = struct {
     name: NullTerminatedString,
     parent: Index,
     namespace: OptionalNamespaceIndex,
-    /// `.none` for an untagged union.
+    /// `.none` for an untagged union (and `.none` until resolved for a declared one).
     enum_tag_type: Index,
     /// `.none` unless a packed union.
     backing_int: Index,
     fields_len: u32,
     field_name_map: OptionalMapIndex,
     captures_len: u32,
+    /// Size in bytes of the whole union. 0 until layout resolved.
+    size: u32,
     flags: Flags,
 
     const Flags = packed struct(u32) {
         layout: enum(u2) { auto, @"extern", @"packed" },
         any_field_aligns: bool,
         want_layout: bool,
-        _: u28 = 0,
+        /// Whether the field arrays are filled; `unionFields` returns null until then.
+        fields_resolved: bool,
+        /// Whether an active-field tag is stored alongside the payload at runtime.
+        has_runtime_tag: bool,
+        class: TypeClass,
+        /// Alignment of the whole union. `.none` until layout resolved.
+        alignment: Alignment,
+        _: u17 = 0,
     };
 };
 
@@ -3987,6 +3996,24 @@ pub fn loadEnumType(pool: *const InternPool, enum_ty: Index) ?LoadedEnumType {
     };
 }
 
+/// This enum's stored integer tag type, or `.none` if not resolved yet. Unlike
+/// `loadEnumType`, this reads the header field directly, so it works for a union's
+/// generated tag enum -- whose fields are the union's (not stored), but whose integer
+/// tag type is resolved and stored so `abiSize`/`abiAlignment` can measure it.
+pub fn enumIntTagTypeStored(pool: *const InternPool, enum_ty: Index) Index {
+    const item = pool.items.get(@intFromEnum(enum_ty));
+    assert(item.tag == .type_enum);
+    return pool.extraData(TypeEnum, item.data).int_tag_type;
+}
+
+/// Store an enum's integer tag type in its header, in place, without marking its
+/// fields resolved -- used for a generated tag enum, whose fields stay lazy.
+pub fn setEnumIntTagType(pool: *InternPool, enum_ty: Index, int_tag_type: Index) void {
+    const item = pool.items.get(@intFromEnum(enum_ty));
+    assert(item.tag == .type_enum);
+    pool.extra.items[item.data + std.meta.fieldIndex(TypeEnum, "int_tag_type").?] = @intFromEnum(int_tag_type);
+}
+
 /// Fill a declared enum's reserved field trailing in place (idempotent -- a no-op
 /// once `fields_resolved`). `getDeclaredEnumType` reserves the `field_names` and (when
 /// `has_values`) `field_values` slots; this writes them, sets `int_tag_type` and
@@ -4323,19 +4350,27 @@ pub const UnionFields = struct {
     /// instead. Populated for duplicate detection; drives no lookup (a union field is
     /// resolved through the tag enum, per `unionFieldIndex`).
     field_name_map: MapIndex,
+    // The following are only valid once the union's layout is resolved (`want_layout`).
+    /// Whether a runtime active-field tag is stored alongside the payload.
+    has_runtime_tag: bool,
+    class: TypeClass,
+    size: u32,
+    alignment: Alignment,
 };
 
-/// This union's resolved fields, or null if it stores none (a declared union, which
-/// reads its fields from ZIR). Reads the `TypeUnion` trailing: the reified identity
-/// (4 slots) then `field_names`/`field_types`, then `field_aligns` when present.
+/// This union's stored fields, or null before they are resolved (a declared union
+/// reads its fields from ZIR until layout resolution fills the reserved slots). Reads
+/// the `TypeUnion` trailing: the identity then `field_names`/`field_types`, then
+/// `field_aligns` when present. Size/alignment/class in the header are valid only once
+/// `flags.want_layout`.
 pub fn unionFields(pool: *const InternPool, union_ty: Index) ?UnionFields {
     const item = pool.items.get(@intFromEnum(union_ty));
     assert(item.tag == .type_union);
     const trail = pool.extraDataTrail(TypeUnion, item.data);
     const r = trail.data;
-    if (r.captures_len != captures_len_reified) return null;
+    if (!r.flags.fields_resolved) return null;
     const fields_len = r.fields_len;
-    var base = trail.end + 4;
+    var base = trail.end + containerIdTrailingLen(r.captures_len);
     const names: []const NullTerminatedString = @ptrCast(pool.extra.items[base..][0..fields_len]);
     base += fields_len;
     const types: []const Index = @ptrCast(pool.extra.items[base..][0..fields_len]);
@@ -4353,7 +4388,74 @@ pub fn unionFields(pool: *const InternPool, union_ty: Index) ?UnionFields {
         .field_types = types,
         .field_aligns = aligns,
         .field_name_map = r.field_name_map.unwrap().?,
+        .has_runtime_tag = r.flags.has_runtime_tag,
+        .class = r.flags.class,
+        .size = r.size,
+        .alignment = r.flags.alignment,
     };
+}
+
+/// Whether this union's ABI layout (size/alignment/class/tag) has been resolved.
+pub fn unionLayoutResolved(pool: *const InternPool, union_ty: Index) bool {
+    const item = pool.items.get(@intFromEnum(union_ty));
+    assert(item.tag == .type_union);
+    return pool.extraData(TypeUnion, item.data).flags.want_layout;
+}
+
+/// Fill a declared union's reserved `field_names`/`field_types` (and `field_aligns`
+/// when `any_field_aligns`) from values Sema read out of the ZIR, populate the
+/// field-name map, and mark the fields resolved. Mirrors `fillDeclaredStructFields`.
+pub fn fillDeclaredUnionFields(
+    pool: *InternPool,
+    union_ty: Index,
+    names: []NullTerminatedString,
+    types: []const Index,
+    aligns: []const Index,
+) Allocator.Error!void {
+    const item = pool.items.get(@intFromEnum(union_ty));
+    assert(item.tag == .type_union);
+    const trail = pool.extraDataTrail(TypeUnion, item.data);
+    const r = trail.data;
+    if (r.flags.fields_resolved) return;
+    assert(r.fields_len == names.len);
+    assert(r.fields_len == types.len);
+    const base = trail.end + containerIdTrailingLen(r.captures_len);
+    for (names, 0..) |n, i| pool.extra.items[base + i] = @intFromEnum(n);
+    for (types, 0..) |t, i| pool.extra.items[base + r.fields_len + i] = @intFromEnum(t);
+    if (r.flags.any_field_aligns) {
+        for (aligns, 0..) |a, i| pool.extra.items[base + r.fields_len + r.fields_len + i] = @intFromEnum(a);
+    }
+    // AstGen validated the field names, so the map cannot collide.
+    const map = r.field_name_map.unwrap().?;
+    map.get(pool).clearRetainingCapacity();
+    for (names) |field_name| assert(pool.addFieldName(names, map, field_name) == null);
+    var flags = r.flags;
+    flags.fields_resolved = true;
+    pool.extra.items[item.data + std.meta.fieldIndex(TypeUnion, "flags").?] = @bitCast(flags);
+}
+
+/// Write a union's resolved layout into its header (`size`) and flags
+/// (`alignment`/`class`/`has_runtime_tag`), setting `want_layout`. Mirrors the
+/// compiler's `ip.resolveUnionLayout`. A union stores no per-field offsets; the tag
+/// type stays lazily resolved through `unionTagEnumType`.
+pub fn setUnionLayout(
+    pool: *InternPool,
+    union_ty: Index,
+    size: u32,
+    alignment: Alignment,
+    class: TypeClass,
+    has_runtime_tag: bool,
+) void {
+    const item = pool.items.get(@intFromEnum(union_ty));
+    assert(item.tag == .type_union);
+    const r = pool.extraData(TypeUnion, item.data);
+    pool.extra.items[item.data + std.meta.fieldIndex(TypeUnion, "size").?] = size;
+    var flags = r.flags;
+    flags.alignment = alignment;
+    flags.class = class;
+    flags.has_runtime_tag = has_runtime_tag;
+    flags.want_layout = true;
+    pool.extra.items[item.data + std.meta.fieldIndex(TypeUnion, "flags").?] = @bitCast(flags);
 }
 
 fn emitUnionValue(pool: *InternPool, uv: Key.Union) Allocator.Error!void {
@@ -4747,25 +4849,51 @@ pub fn internEnumTag(pool: *InternPool, et: Key.EnumTag) Allocator.Error!Index {
     return pool.get(.{ .enum_tag = et });
 }
 
-/// Create (or dedup) a declared union type: just the `TypeUnion` header and the
-/// identity trailing. A declared union's fields are read lazily from ZIR, so
-/// `unionFields` returns null for it -- no field arrays are stored. Mirrors
-/// `getDeclaredStructType`.
-pub fn getDeclaredUnionType(pool: *InternPool, name: NullTerminatedString, id: Key.ContainerType, parent: Index) Allocator.Error!Index {
+/// Create (or dedup) a declared union type: the `TypeUnion` header, the identity
+/// trailing, then the reserved (zeroed) `field_names`/`field_types` (and `field_aligns`
+/// when `any_field_aligns`) that `resolveUnionLayout` fills from ZIR. `unionFields`
+/// returns null until `fields_resolved` is set, so field access reads ZIR until then.
+/// Mirrors `getDeclaredStructType` (a union has no offsets or runtime order to reserve).
+pub fn getDeclaredUnionType(
+    pool: *InternPool,
+    name: NullTerminatedString,
+    id: Key.ContainerType,
+    parent: Index,
+    fields_len: u32,
+    layout: std.lang.Type.ContainerLayout,
+    any_field_aligns: bool,
+) Allocator.Error!Index {
     const gop = try pool.getOrPutContainer(.{ .union_type = id });
     if (gop.existing) |e| return e;
+    const field_name_map = try pool.addMap(pool.gpa, fields_len);
     const extra_index = try pool.addExtra(TypeUnion{
         .name = name,
         .parent = parent,
         .namespace = .none,
         .enum_tag_type = .none,
         .backing_int = .none,
-        .fields_len = 0,
-        .field_name_map = .none,
+        .fields_len = fields_len,
+        .field_name_map = field_name_map.toOptional(),
         .captures_len = containerCapturesLen(id),
-        .flags = .{ .layout = .auto, .any_field_aligns = false, .want_layout = false },
+        .size = 0,
+        .flags = .{
+            .layout = switch (layout) {
+                .auto => .auto,
+                .@"extern" => .@"extern",
+                .@"packed" => .@"packed",
+            },
+            .any_field_aligns = any_field_aligns,
+            .want_layout = false,
+            .fields_resolved = false,
+            .has_runtime_tag = false,
+            .class = .no_possible_value,
+            .alignment = .none,
+        },
     });
     try pool.appendContainerType(id);
+    const reserved = fields_len + fields_len + if (any_field_aligns) fields_len else 0;
+    try pool.extra.ensureUnusedCapacity(pool.gpa, reserved);
+    pool.extra.appendNTimesAssumeCapacity(0, reserved);
     pool.items.appendAssumeCapacity(.{ .tag = .type_union, .data = extra_index });
     return @enumFromInt(gop.index);
 }
@@ -4817,6 +4945,7 @@ pub fn getReifiedUnionType(pool: *InternPool, ini: struct {
         .fields_len = fields_len,
         .field_name_map = field_name_map.toOptional(),
         .captures_len = containerCapturesLen(ini.id),
+        .size = 0,
         .flags = .{
             .layout = switch (ini.layout) {
                 .auto => .auto,
@@ -4825,6 +4954,10 @@ pub fn getReifiedUnionType(pool: *InternPool, ini: struct {
             },
             .any_field_aligns = any_aligns,
             .want_layout = false,
+            .fields_resolved = true,
+            .has_runtime_tag = false,
+            .class = .no_possible_value,
+            .alignment = .none,
         },
     });
     try pool.appendContainerType(ini.id);

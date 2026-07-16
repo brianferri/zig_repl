@@ -2793,11 +2793,92 @@ fn resolveStructLayout(sema: *Sema, struct_ty: InternPool.Index) Error!void {
     ip.setStructLayout(struct_ty, runtime_order, offsets, size, struct_align, class);
 }
 
+/// Resolve and store a union type's ABI layout, mirroring the compiler's
+/// `resolveUnionLayout` for an `.auto`/`.extern` layout. A declared union's fields are
+/// first read from ZIR and stored; then the payload alignment/size and value class are
+/// computed over the fields, and -- for a tagged union with a runtime tag -- the tag
+/// and payload are combined (padded to the larger alignment). Idempotent.
+fn resolveUnionLayout(sema: *Sema, union_ty: InternPool.Index) Error!void {
+    const ip = sema.intern_pool;
+    assert(ip.indexToKey(union_ty) == .union_type);
+    if (ip.unionLayoutResolved(union_ty)) return;
+
+    if (ip.unionFields(union_ty) == null) {
+        const count = try sema.unionFieldCount(union_ty);
+        const names = try sema.arena.alloc(InternPool.NullTerminatedString, count);
+        const types = try sema.arena.alloc(InternPool.Index, count);
+        const aligns = try sema.arena.alloc(InternPool.Index, count);
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const name = (try sema.unionFieldNameAt(union_ty, i)).?;
+            const field = (try sema.unionFieldByName(union_ty, name)).?;
+            names[i] = name;
+            types[i] = field.ty;
+            aligns[i] = if (field.align_bytes) |a| try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = a } }) else .none;
+        }
+        try ip.fillDeclaredUnionFields(union_ty, names, types, aligns);
+    }
+
+    const saved_field_types = blk: {
+        const f = ip.unionFields(union_ty).?;
+        break :blk try sema.arena.dupe(InternPool.Index, f.field_types);
+    };
+    for (saved_field_types) |field_ty| try sema.ensureLayoutResolved(field_ty);
+
+    const is_tagged = try sema.unionIsTagged(union_ty);
+    const enum_tag_ty: InternPool.Index = if (is_tagged) try sema.unionTagEnumType(union_ty) else .none;
+    if (is_tagged) try sema.ensureLayoutResolved(enum_tag_ty);
+
+    const f = ip.unionFields(union_ty).?;
+    var payload_align: InternPool.Alignment = .@"1";
+    var payload_size: u64 = 0;
+    var possible_tags: u32 = 0;
+    var payload_has_comptime = false;
+    for (f.field_types, 0..) |field_ty, idx| {
+        const field_align: InternPool.Alignment = if (f.field_aligns.len != 0 and f.field_aligns[idx] != .none)
+            .fromByteUnits(@intCast(sema.intAsI128(f.field_aligns[idx]).?))
+        else
+            Type.fromIndex(field_ty).abiAlignment(ip) orelse
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@sizeOf: type not yet supported", .{});
+        payload_align = payload_align.maxStrict(field_align);
+        payload_size = @max(payload_size, Type.fromIndex(field_ty).abiSize(ip).?);
+        switch (Type.fromIndex(field_ty).classify(ip)) {
+            .no_possible_value => {},
+            .one_possible_value, .runtime => possible_tags += 1,
+            .partially_comptime, .fully_comptime => {
+                possible_tags += 1;
+                payload_has_comptime = true;
+            },
+        }
+    }
+    // A runtime tag is only needed with more than one possible active field and a
+    // non-comptime payload (a union's tag is not addressable, so a comptime-only union
+    // needs none).
+    const has_runtime_tag = switch (possible_tags) {
+        0, 1 => false,
+        else => is_tagged and !payload_has_comptime,
+    };
+    const class: InternPool.TypeClass = class: {
+        if (possible_tags == 0) break :class .no_possible_value;
+        if (payload_has_comptime) break :class if (payload_size > 0) .partially_comptime else .fully_comptime;
+        break :class if (has_runtime_tag or payload_size > 0) .runtime else .one_possible_value;
+    };
+    // The layout is (tag, payload) or (payload, tag) padded to the larger alignment, so
+    // the size is just tag + payload padded up; without a tag it is just the payload.
+    const size: u64, const alignment: InternPool.Alignment = layout: {
+        if (!has_runtime_tag) break :layout .{ payload_align.forward(payload_size), payload_align };
+        const tag_align = Type.fromIndex(enum_tag_ty).abiAlignment(ip).?;
+        const tag_size = Type.fromIndex(enum_tag_ty).abiSize(ip).?;
+        const alignment = tag_align.maxStrict(payload_align);
+        break :layout .{ alignment.forward(tag_size + payload_size), alignment };
+    };
+    ip.setUnionLayout(union_ty, @intCast(size), alignment, class, has_runtime_tag);
+}
+
 /// wrapper types, resolve a container's fields. The REPL drops the incremental
-/// dependency tracking (single-shot). A struct resolves its ABI layout here; union
-/// layout is not modelled yet, so a union is inert. An enum resolves its fields,
-/// fixing the integer tag type `abiSize` reads (a generated tag enum resolves through
-/// its owner union).
+/// dependency tracking (single-shot). A struct/union resolves its ABI layout here; an
+/// enum resolves its fields, fixing the integer tag type `abiSize` reads (a generated
+/// tag enum resolves through its owner union).
 fn ensureLayoutResolved(sema: *Sema, ty: InternPool.Index) Error!void {
     const ip = sema.intern_pool;
     switch (ip.indexToKey(ty)) {
@@ -2813,9 +2894,15 @@ fn ensureLayoutResolved(sema: *Sema, ty: InternPool.Index) Error!void {
         },
         .enum_type => |et| if (et.generatedUnion() == .none) {
             _ = try sema.resolveEnumFields(ty);
+        } else if (ip.enumIntTagTypeStored(ty) == .none) {
+            // A union's generated tag enum: store its integer tag type so
+            // `abiSize`/`abiAlignment` measure it like the compiler's resolved tag
+            // enum. Only the header int tag type is set; the tag's fields are the
+            // union's, read through `generatedTagScan`, so none are stored.
+            ip.setEnumIntTagType(ty, try sema.enumIntTagTypeOf(ty));
         },
         .struct_type => try sema.resolveStructLayout(ty),
-        .union_type => {},
+        .union_type => try sema.resolveUnionLayout(ty),
         .simple_value, .enum_literal, .int, .float, .undef, .ptr, .slice, .err, .error_union, .func, .opt, .aggregate, .enum_tag, .un => unreachable,
     }
 }
@@ -6781,6 +6868,14 @@ fn evalUnionDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const captures = try sema.resolveCaptures(union_decl.captures);
     defer sema.gpa.free(captures);
 
+    // The `kind` encodes both tagged-ness and layout; `field_align_body_lens` being
+    // present means some field carries an explicit alignment.
+    const layout: std.lang.Type.ContainerLayout = switch (union_decl.kind) {
+        .auto, .tagged_explicit, .tagged_enum, .tagged_enum_explicit => .auto,
+        .@"extern" => .@"extern",
+        .@"packed", .packed_explicit => .@"packed",
+    };
+
     return .{ .index = try sema.intern_pool.getDeclaredUnionType(
         name,
         .{ .declared = .{
@@ -6789,6 +6884,9 @@ fn evalUnionDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             .captures = captures,
         } },
         sema.this_type,
+        @intCast(union_decl.field_names.len),
+        layout,
+        union_decl.field_align_body_lens != null,
     ) };
 }
 
@@ -7516,9 +7614,11 @@ pub fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool
     // are not yet resolved when this is called during resolution, so it reads ZIR.)
     if (sema.intern_pool.loadEnumType(enum_ty)) |f| return f.int_tag_type;
     // The generated tag enum of a reified union is auto-numbered (the union has no
-    // ZIR, and a reified union carries no explicit int tag type).
+    // ZIR, and a reified union carries no explicit int tag type). A declared union's
+    // tag reads its `enum(T)` from ZIR below even once its fields are stored, so this
+    // keys on reified-ness, not on whether the fields are resolved.
     const gu = et.generatedUnion();
-    if (gu != .none and sema.intern_pool.unionFields(gu) != null) {
+    if (gu != .none and sema.intern_pool.indexToKey(gu).union_type == .reified) {
         return try sema.enumIntTagType(try sema.unionFieldCount(gu));
     }
     const cf = try sema.enterContainer(enum_ty, "enum tag type");
@@ -7799,15 +7899,21 @@ fn evalTagName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 /// its active field is a first-class enum tag reachable by `@tagName`/`switch`.
 /// Read from the union decl's ZIR `kind`. Auto/extern/packed unions are untagged.
 fn unionIsTagged(sema: *Sema, union_ty: InternPool.Index) Error!bool {
-    // A reified union has no ZIR; it is tagged iff it stores an explicit tag enum.
-    if (sema.intern_pool.unionFields(union_ty)) |f| return f.enum_tag_type != .none;
-    const ut = sema.intern_pool.indexToKey(union_ty).union_type;
-    const frame = try sema.enterSourceZir(ut.sourceZirId(), "union kind");
-    defer frame.restore(sema);
-    return switch (sema.zir.getUnionDecl(ut.declInst()).kind) {
-        .tagged_explicit, .tagged_enum, .tagged_enum_explicit => true,
-        .auto, .@"extern", .@"packed", .packed_explicit => false,
-    };
+    // A declared union's tagged-ness comes from its ZIR kind -- valid even after its
+    // fields are stored, since the stored `enum_tag_type` is resolved lazily. A reified
+    // union has no ZIR; it is tagged iff it stores an explicit tag enum.
+    switch (sema.intern_pool.indexToKey(union_ty).union_type) {
+        .declared => |d| {
+            const frame = try sema.enterSourceZir(d.source_zir_id, "union kind");
+            defer frame.restore(sema);
+            return switch (sema.zir.getUnionDecl(d.decl_inst).kind) {
+                .tagged_explicit, .tagged_enum, .tagged_enum_explicit => true,
+                .auto, .@"extern", .@"packed", .packed_explicit => false,
+            };
+        },
+        .reified => return sema.intern_pool.unionFields(union_ty).?.enum_tag_type != .none,
+        .generated_union_tag => unreachable,
+    }
 }
 
 /// A struct type's declared field count (read straight from its source ZIR's

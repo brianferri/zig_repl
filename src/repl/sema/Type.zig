@@ -289,7 +289,7 @@ pub fn classify(start_ty: Type, pool: *const InternPool) InternPool.TypeClass {
         },
         .tuple_type => |tuple| break classifyTuple(tuple.types, pool),
         .struct_type => break pool.loadStructType(cur_ty.index).?.class,
-        .union_type => unreachable,
+        .union_type => break pool.unionFields(cur_ty.index).?.class,
         .enum_type => {
             cur_ty = fromIndex(pool.loadEnumType(cur_ty.index).?.int_tag_type);
             continue;
@@ -415,11 +415,16 @@ pub fn abiAlignment(ty: Type, pool: *const InternPool) ?InternPool.Alignment {
             .generic_poison => unreachable,
         },
         // An enum's alignment is its integer tag type's, once resolved (the caller
-        // runs `ensureLayoutResolved` first). Mirrors `Type.abiAlignment`'s enum arm.
-        .enum_type => if (pool.loadEnumType(ty.index)) |f| abiAlignment(fromIndex(f.int_tag_type), pool) else null,
+        // runs `ensureLayoutResolved` first). Reads the header int tag type directly so
+        // a union's generated tag enum -- whose fields stay lazy -- also measures.
+        .enum_type => switch (pool.enumIntTagTypeStored(ty.index)) {
+            .none => null,
+            else => |int_ty| abiAlignment(fromIndex(int_ty), pool),
+        },
         // A struct's alignment is stored in its header once layout is resolved (the
         // caller runs `ensureLayoutResolved` first). Mirrors `Type.abiAlignment`.
         .struct_type => if (pool.loadStructType(ty.index)) |f| f.alignment else null,
+        .union_type => if (pool.unionFields(ty.index)) |f| f.alignment else null,
         else => null,
     };
 }
@@ -462,11 +467,16 @@ pub fn abiSize(ty: Type, pool: *const InternPool) ?u64 {
             .generic_poison => unreachable,
         },
         // An enum's size is its integer tag type's, once resolved (the caller runs
-        // `ensureLayoutResolved` first). Mirrors `Type.abiSize`'s enum arm.
-        .enum_type => if (pool.loadEnumType(ty.index)) |f| abiSize(fromIndex(f.int_tag_type), pool) else null,
+        // `ensureLayoutResolved` first). Reads the header int tag type directly so a
+        // union's generated tag enum -- whose fields stay lazy -- also measures.
+        .enum_type => switch (pool.enumIntTagTypeStored(ty.index)) {
+            .none => null,
+            else => |int_ty| abiSize(fromIndex(int_ty), pool),
+        },
         // A struct's size is stored in its header once layout is resolved (the caller
         // runs `ensureLayoutResolved` first). Mirrors `Type.abiSize`.
         .struct_type => if (pool.loadStructType(ty.index)) |f| f.size else null,
+        .union_type => if (pool.unionFields(ty.index)) |f| f.size else null,
         else => null,
     };
 }
