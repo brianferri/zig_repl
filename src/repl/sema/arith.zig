@@ -1506,7 +1506,7 @@ const Env = struct {
             .intern_pool = &e.pool,
             .zir = undefined,
             .writer = &e.w,
-            .results = .empty,
+            .inst_map = .empty,
             .comptime_allocs = .empty,
             .namespace = null,
         };
