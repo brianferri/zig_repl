@@ -20,7 +20,7 @@ pub const Error = std.Io.Writer.Error || std.mem.Allocator.Error;
 /// best-effort and `format` yields only `Writer.Error`).
 pub const Formatter = struct {
     value: Value,
-    pool: *const InternPool,
+    pool: *InternPool,
     pub fn format(self: Formatter, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         render(self.value, self.pool, null, writer) catch |err| switch (err) {
             error.WriteFailed => return error.WriteFailed,
@@ -29,7 +29,7 @@ pub const Formatter = struct {
     }
 };
 
-pub fn fmt(value: Value, pool: *const InternPool) Formatter {
+pub fn fmt(value: Value, pool: *InternPool) Formatter {
     return .{ .value = value, .pool = pool };
 }
 
@@ -38,7 +38,7 @@ pub fn fmt(value: Value, pool: *const InternPool) Formatter {
 /// mid-message.
 pub fn render(
     value: Value,
-    pool: *const InternPool,
+    pool: *InternPool,
     session: ?*const Session,
     writer: *std.Io.Writer,
 ) Error!void {
@@ -83,12 +83,11 @@ pub fn render(
         .aggregate => |agg| renderAggregate(agg, pool, session, writer),
         .enum_tag => |et| renderEnumTag(et, pool, session, writer),
         .un => |uv| renderUnion(uv, pool, session, writer),
-        // A packed struct/union value is stored as its backing integer; render those bits.
-        .bitpack => |bp| render(.{ .index = bp.backing_int_val }, pool, session, writer),
         // A bare type Key viewed as a value identifies the type itself
         // (Sema's value-of-type-type convention; see Value.typeOf). The
         // value Keys above are exhaustive, so the assert turns a future
         // unclassified one into a crash rather than a mis-render as a type.
+        .bitpack => |bp| renderBitpack(bp, pool, session, writer),
         else => blk: {
             assert(key.isType());
             break :blk renderTypeRef(value.index, pool, writer);
@@ -101,7 +100,7 @@ pub fn render(
 /// vector, or a struct with no name source, positionally `{ v0, v1, ... }`.
 fn renderAggregate(
     agg: InternPool.Key.Aggregate,
-    pool: *const InternPool,
+    pool: *InternPool,
     session: ?*const Session,
     writer: *std.Io.Writer,
 ) Error!void {
@@ -285,7 +284,7 @@ fn enumTagName(pool: *const InternPool, enum_ty: InternPool.Index, int_idx: Inte
 }
 
 /// `.tag` when the tag name resolves, else the underlying integer.
-fn renderEnumTag(et: InternPool.Key.EnumTag, pool: *const InternPool, session: ?*const Session, writer: *std.Io.Writer) Error!void {
+fn renderEnumTag(et: InternPool.Key.EnumTag, pool: *InternPool, session: ?*const Session, writer: *std.Io.Writer) Error!void {
     if (enumTagName(pool, et.ty, et.int)) |name| return writer.print(".{s}", .{name});
     return render(.{ .index = et.int }, pool, session, writer);
 }
@@ -294,7 +293,7 @@ fn renderEnumTag(et: InternPool.Key.EnumTag, pool: *const InternPool, session: ?
 /// field name comes from the tag value's enum -- for a generated tag enum, its fields
 /// were resolved when this union value was created (mirrors the compiler printing the
 /// tag value in `src/print_value.zig`).
-fn renderUnion(uv: InternPool.Key.Union, pool: *const InternPool, session: ?*const Session, writer: *std.Io.Writer) Error!void {
+fn renderUnion(uv: InternPool.Key.Union, pool: *InternPool, session: ?*const Session, writer: *std.Io.Writer) Error!void {
     const tag_key = pool.indexToKey(uv.tag);
     if (tag_key == .enum_tag) if (enumTagName(pool, tag_key.enum_tag.ty, tag_key.enum_tag.int)) |name| {
         try renderTypeRef(uv.ty, pool, writer);
@@ -307,13 +306,48 @@ fn renderUnion(uv: InternPool.Key.Union, pool: *const InternPool, session: ?*con
 
 fn renderErrorUnion(
     eu: InternPool.Key.ErrorUnion,
-    pool: *const InternPool,
+    pool: *InternPool,
     session: ?*const Session,
     writer: *std.Io.Writer,
 ) Error!void {
     switch (eu.val) {
         .err_name => |name| try writer.print("error.{s}", .{pool.stringSlice(name)}),
         .payload => |idx| try render(.{ .index = idx }, pool, session, writer),
+    }
+}
+
+/// A packed struct/union value is stored as its backing integer (`.bitpack`). Render it by unpacking the
+/// bits: a struct shows its fields (`Name{ .a = .., .b = .. }`) like any aggregate; a union has no active
+/// field to name, so it shows the backing bits as an explicit `@bitCast`, mirroring src/print_value.zig.
+/// Unpacking interns each field value, which is why the renderer holds a mutable pool.
+fn renderBitpack(bp: InternPool.Key.Bitpack, pool: *InternPool, session: ?*const Session, writer: *std.Io.Writer) Error!void {
+    const ty: Type = .fromIndex(bp.ty);
+    const backing_ty = ty.bitpackBackingInt(pool);
+    const buf = try pool.gpa.alloc(u8, @intCast((backing_ty.bitSize(pool) + 7) / 8));
+    defer pool.gpa.free(buf);
+    @memset(buf, 0);
+    Value.fromIndex(bp.backing_int_val).writeToPackedMemory(pool, buf, 0);
+
+    switch (pool.indexToKey(bp.ty)) {
+        .struct_type => {
+            const field_types = pool.loadStructType(bp.ty).field_types;
+            const elems = try pool.gpa.alloc(InternPool.Index, field_types.len);
+            defer pool.gpa.free(elems);
+            var bit_offset: usize = 0;
+            for (field_types, elems) |field_ty, *elem| {
+                elem.* = (try Value.readFromPackedMemory(.fromIndex(field_ty), pool, buf, bit_offset)).index;
+                bit_offset += @intCast(Type.fromIndex(field_ty).bitSize(pool));
+            }
+            return renderAggregate(.{ .ty = bp.ty, .storage = .{ .elems = elems } }, pool, session, writer);
+        },
+        .union_type => {
+            try writer.writeAll("@bitCast(@as(");
+            try renderTypeRef(backing_ty.index, pool, writer);
+            try writer.writeAll(", ");
+            try render(.{ .index = bp.backing_int_val }, pool, session, writer);
+            return writer.writeAll("))");
+        },
+        else => unreachable,
     }
 }
 

@@ -398,3 +398,31 @@ test "render: enum and union values print their names" {
         try testing.expectEqualStrings(c.want, w.buffered());
     }
 }
+
+test "render: a packed struct value unpacks its fields; a packed union shows the backing bits" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .none);
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+    var diag: std.Io.Writer.Allocating = .init(gpa);
+    defer diag.deinit();
+
+    _ = try eval.run(&session, "const S = packed struct(u8) { a: u4, b: u4 };", &diag.writer);
+    _ = try eval.run(&session, "const sv: S = @bitCast(@as(u8, 0x21));", &diag.writer);
+    const s = (try eval.run(&session, "sv", &diag.writer)).value.?;
+    var sbuf: [128]u8 = undefined;
+    var sw = Io.Writer.fixed(&sbuf);
+    try render.render(s, &pool, &session, &sw);
+    try testing.expectEqualStrings("repl.S{ .a = 1, .b = 2 }", sw.buffered());
+
+    // A packed union has no active field, so it prints the backing integer as an explicit @bitCast.
+    _ = try eval.run(&session, "const U = packed union { a: u8, b: u8 };", &diag.writer);
+    _ = try eval.run(&session, "const uv: U = @bitCast(@as(u8, 0x21));", &diag.writer);
+    const u = (try eval.run(&session, "uv", &diag.writer)).value.?;
+    var ubuf: [128]u8 = undefined;
+    var uw = Io.Writer.fixed(&ubuf);
+    try render.render(u, &pool, &session, &uw);
+    try testing.expectEqualStrings("@bitCast(@as(u8, 33))", uw.buffered());
+}
