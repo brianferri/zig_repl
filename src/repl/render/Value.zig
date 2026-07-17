@@ -140,34 +140,20 @@ fn renderAggregate(
 }
 
 /// The name of struct field `index` -- stored for a reified struct, read from the
-/// declaring ZIR for a declared one. Null if unavailable (the caller falls back to
-/// positional). The read-only analogue of `Sema.structFieldNameAt`.
+/// declaring ZIR for a declared one (whose fields are resolved lazily). Null if
+/// unavailable. The read-only analogue of `Sema.structFieldNameAt`.
 fn structFieldName(pool: *const InternPool, session: *const Session, struct_ty: InternPool.Index, index: u32) ?[]const u8 {
-    if (pool.loadStructType(struct_ty)) |f| return if (index < f.field_names.len) pool.stringSlice(f.field_names[index]) else null;
     const d = switch (pool.indexToKey(struct_ty).struct_type) {
+        .reified => {
+            const f = pool.loadStructType(struct_ty);
+            return if (index < f.field_names.len) pool.stringSlice(f.field_names[index]) else null;
+        },
         .declared => |dd| dd,
-        else => return null,
+        .generated_union_tag => return null,
     };
     if (d.source_zir_id >= session.files.items.len) return null;
     const zir = session.files.items[d.source_zir_id].zir orelse return null;
     var it = zir.getStructDecl(d.decl_inst).iterateFields();
-    while (it.next()) |field| {
-        if (field.idx == index) return zir.nullTerminatedString(field.name);
-    }
-    return null;
-}
-
-/// The name of union field `index` -- stored for a reified union, read from the
-/// declaring ZIR for a declared one. The read-only analogue of `Sema.unionFieldNameAt`.
-fn unionFieldName(pool: *const InternPool, session: *const Session, union_ty: InternPool.Index, index: u32) ?[]const u8 {
-    if (pool.unionFields(union_ty)) |f| return if (index < f.field_names.len) pool.stringSlice(f.field_names[index]) else null;
-    const d = switch (pool.indexToKey(union_ty).union_type) {
-        .declared => |dd| dd,
-        else => return null,
-    };
-    if (d.source_zir_id >= session.files.items.len) return null;
-    const zir = session.files.items[d.source_zir_id].zir orelse return null;
-    var it = zir.getUnionDecl(d.decl_inst).iterateFields();
     while (it.next()) |field| {
         if (field.idx == index) return zir.nullTerminatedString(field.name);
     }
@@ -282,15 +268,13 @@ fn renderByteSlice(pool: *const InternPool, writer: *std.Io.Writer, slice: Inter
     return true;
 }
 
-/// The field name an `enum_tag` selects: for a generated union-tag enum, the
-/// union's field at the tag index; otherwise the enum's resolved fields (cached
-/// once a value of the enum was produced) -- an auto enum indexes by the tag, an
-/// explicit one matches the tag value. Null if the fields are not resolved.
-fn enumTagName(pool: *const InternPool, session: *const Session, enum_ty: InternPool.Index, int_idx: InternPool.Index) ?[]const u8 {
+/// The field name an `enum_tag` selects, read from the enum's resolved fields (a value
+/// of the enum having been produced means they are stored -- including a union's
+/// generated tag enum, resolved when the union value was created). An auto enum indexes
+/// by the tag; an explicit one matches the tag value. Null if not resolved.
+fn enumTagName(pool: *const InternPool, enum_ty: InternPool.Index, int_idx: InternPool.Index) ?[]const u8 {
     const tag = intOf(pool, int_idx) orelse return null;
-    const gen = pool.indexToKey(enum_ty).enum_type.generatedUnion();
-    if (gen != .none) return if (tag >= 0) unionFieldName(pool, session, gen, @intCast(tag)) else null;
-    const f = pool.loadEnumType(enum_ty) orelse return null;
+    const f = pool.loadEnumType(enum_ty);
     if (f.field_values.len == 0) return if (tag >= 0 and tag < f.field_names.len) pool.stringSlice(f.field_names[@intCast(tag)]) else null;
     for (f.field_values, 0..) |v, pos| {
         if (intOf(pool, v)) |vv| if (vv == tag) return pool.stringSlice(f.field_names[pos]);
@@ -300,23 +284,22 @@ fn enumTagName(pool: *const InternPool, session: *const Session, enum_ty: Intern
 
 /// `.tag` when the tag name resolves, else the underlying integer.
 fn renderEnumTag(et: InternPool.Key.EnumTag, pool: *const InternPool, session: ?*const Session, writer: *std.Io.Writer) Error!void {
-    if (session) |s| if (enumTagName(pool, s, et.ty, et.int)) |name| return writer.print(".{s}", .{name});
+    if (enumTagName(pool, et.ty, et.int)) |name| return writer.print(".{s}", .{name});
     return render(.{ .index = et.int }, pool, session, writer);
 }
 
-/// `.{ .field = payload }` when the active field name resolves, else the payload.
+/// `.{ .field = payload }` when the active field name resolves, else the payload. The
+/// field name comes from the tag value's enum -- for a generated tag enum, its fields
+/// were resolved when this union value was created (mirrors the compiler printing the
+/// tag value in `src/print_value.zig`).
 fn renderUnion(uv: InternPool.Key.Union, pool: *const InternPool, session: ?*const Session, writer: *std.Io.Writer) Error!void {
-    if (session) |s| {
-        const tag_key = pool.indexToKey(uv.tag);
-        if (tag_key == .enum_tag) if (intOf(pool, tag_key.enum_tag.int)) |idx| {
-            if (idx >= 0) if (unionFieldName(pool, s, uv.ty, @intCast(idx))) |name| {
-                try renderTypeRef(uv.ty, pool, writer);
-                try writer.print("{{ .{s} = ", .{name});
-                try render(.{ .index = uv.val }, pool, session, writer);
-                return writer.writeAll(" }");
-            };
-        };
-    }
+    const tag_key = pool.indexToKey(uv.tag);
+    if (tag_key == .enum_tag) if (enumTagName(pool, tag_key.enum_tag.ty, tag_key.enum_tag.int)) |name| {
+        try renderTypeRef(uv.ty, pool, writer);
+        try writer.print("{{ .{s} = ", .{name});
+        try render(.{ .index = uv.val }, pool, session, writer);
+        return writer.writeAll(" }");
+    };
     return render(.{ .index = uv.val }, pool, session, writer);
 }
 

@@ -8,6 +8,10 @@ test "compliance: @typeName and @errorName produce string values" {
         // A `[N:0]u8` value renders as a string, not `{any}`'s byte list.
         .{ .src = &.{"@typeName(u32).*"}, .rendered = "\"u32\".*" },
         .{ .src = &.{"@typeName(?u8).*"}, .rendered = "\"?u8\".*" },
+        .{ .src = &.{"@typeName([*:0]u8).*"}, .rendered = "\"[*:0]u8\".*" },
+        .{ .src = &.{"@typeName([:0]u8).*"}, .rendered = "\"[:0]u8\".*" },
+        // Non-integer array sentinel renders via Value.print (simple_value), not "?".
+        .{ .src = &.{"@typeName([2:true]bool).*"}, .rendered = "\"[2:true]bool\".*" },
         .{ .src = &.{"@typeName(u32)[1]"}, .want = @typeName(u32)[1] },
         .{ .src = &.{"@errorName(error.Foo).*"}, .rendered = "\"Foo\".*" },
         .{ .src = &.{"@errorName(error.Boom)[0]"}, .want = @errorName(error.Boom)[0] },

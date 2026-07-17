@@ -17,7 +17,7 @@ pub fn minInt(ty: Type, sema: *Sema, dest_ty: Type) !Value {
 }
 
 pub fn minIntScalar(ty: Type, sema: *Sema, dest_ty: Type) !Value {
-    const info = ty.intInfo(sema.intern_pool).?;
+    const info = ty.intInfo(sema.intern_pool);
     if (info.signedness == .unsigned) return sema.intValue_u64(dest_ty, 0);
     if (std.math.cast(u6, info.bits - 1)) |shift| {
         const n = @as(i64, std.math.minInt(i64)) >> (63 - shift);
@@ -36,7 +36,7 @@ pub fn maxInt(ty: Type, sema: *Sema, dest_ty: Type) !Value {
 }
 
 pub fn maxIntScalar(ty: Type, sema: *Sema, dest_ty: Type) !Value {
-    const info = ty.intInfo(sema.intern_pool).?;
+    const info = ty.intInfo(sema.intern_pool);
     switch (info.bits) {
         0 => return sema.intValue_u64(dest_ty, 0),
         1 => return switch (info.signedness) {
@@ -267,11 +267,29 @@ pub fn classify(start_ty: Type, pool: *const InternPool) InternPool.TypeClass {
             cur_ty = fromIndex(child_ty);
             continue;
         },
-        .tuple_type => |tuple| break classifyTuple(tuple.types, pool),
-        .struct_type => break pool.loadStructType(cur_ty.index).?.class,
-        .union_type => break pool.unionFields(cur_ty.index).?.class,
+        .tuple_type => |tuple| break classifyTuple(tuple.types, tuple.values, pool),
+        .struct_type => {
+            const struct_obj = pool.loadStructType(cur_ty.index);
+            switch (struct_obj.layout) {
+                .auto, .@"extern" => break struct_obj.class,
+                .@"packed" => {
+                    cur_ty = fromIndex(struct_obj.packed_backing_int_type);
+                    continue;
+                },
+            }
+        },
+        .union_type => {
+            const union_obj = pool.unionFields(cur_ty.index);
+            switch (union_obj.layout) {
+                .auto, .@"extern" => break union_obj.class,
+                .@"packed" => {
+                    cur_ty = fromIndex(union_obj.packed_backing_int_type);
+                    continue;
+                },
+            }
+        },
         .enum_type => {
-            cur_ty = fromIndex(pool.loadEnumType(cur_ty.index).?.int_tag_type);
+            cur_ty = fromIndex(pool.loadEnumType(cur_ty.index).int_tag_type);
             continue;
         },
 
@@ -308,10 +326,11 @@ pub fn classify(start_ty: Type, pool: *const InternPool) InternPool.TypeClass {
     };
 }
 
-fn classifyTuple(types: []const InternPool.Index, pool: *const InternPool) InternPool.TypeClass {
+fn classifyTuple(types: []const InternPool.Index, values: []const InternPool.Index, pool: *const InternPool) InternPool.TypeClass {
     var has_runtime_state = false;
     var has_comptime_state = false;
-    for (types) |field_ty| {
+    for (types, values) |field_ty, field_comptime_val| {
+        if (field_comptime_val != .none) continue;
         switch (fromIndex(field_ty).classify(pool)) {
             .no_possible_value => return .no_possible_value,
             .one_possible_value => {},
@@ -330,8 +349,143 @@ fn classifyTuple(types: []const InternPool.Index, pool: *const InternPool) Inter
     }
 }
 
-pub fn structFieldOffset(ty: Type, pool: *const InternPool, index: u32) u64 {
-    return pool.loadStructType(ty.index).?.field_offsets[index];
+pub fn containerLayout(ty: Type, pool: *const InternPool) std.lang.Type.ContainerLayout {
+    return switch (pool.indexToKey(ty.index)) {
+        .tuple_type => .auto,
+        .struct_type => pool.loadStructType(ty.index).layout,
+        .union_type => pool.unionFields(ty.index).layout,
+        else => unreachable,
+    };
+}
+
+pub fn hasRuntimeBits(ty: Type, pool: *const InternPool) bool {
+    return switch (ty.classify(pool)) {
+        .no_possible_value, .one_possible_value, .fully_comptime => false,
+        .runtime, .partially_comptime => true,
+    };
+}
+
+pub fn isNoReturn(ty: Type, pool: *const InternPool) bool {
+    return ty.classify(pool) == .no_possible_value;
+}
+
+pub const UnionLayout = struct {
+    abi_size: u64,
+    abi_align: InternPool.Alignment,
+    most_aligned_field: u32,
+    most_aligned_field_size: u64,
+    biggest_field: u32,
+    payload_size: u64,
+    payload_align: InternPool.Alignment,
+    tag_align: InternPool.Alignment,
+    tag_size: u64,
+    padding: u32,
+};
+
+pub fn getUnionLayout(loaded_union: InternPool.UnionFields, pool: *const InternPool) UnionLayout {
+    assert(loaded_union.layout != .@"packed");
+    var most_aligned_field: u32 = 0;
+    var most_aligned_field_align: InternPool.Alignment = .@"1";
+    var most_aligned_field_size: u64 = 0;
+    var biggest_field: u32 = 0;
+    var payload_size: u64 = 0;
+    var payload_align: InternPool.Alignment = .@"1";
+    for (loaded_union.field_types, 0..) |field_ty_ip_index, field_index| {
+        const field_ty: Type = .fromIndex(field_ty_ip_index);
+        if (field_ty.isNoReturn(pool)) continue;
+
+        const field_align: InternPool.Alignment = a: {
+            const explicit_aligns = loaded_union.field_aligns;
+            if (explicit_aligns.len > 0) {
+                const alignment = explicit_aligns[field_index];
+                if (alignment != .none) break :a .fromByteUnits(Value.fromIndex(alignment).toUnsignedInt(pool));
+            }
+            break :a field_ty.abiAlignment(pool);
+        };
+        if (field_ty.hasRuntimeBits(pool)) {
+            const field_size = field_ty.abiSize(pool);
+            if (field_size > payload_size) {
+                payload_size = field_size;
+                biggest_field = @intCast(field_index);
+            }
+            if (field_size > 0 and field_align.compare(.gte, most_aligned_field_align)) {
+                most_aligned_field = @intCast(field_index);
+                most_aligned_field_align = field_align;
+                most_aligned_field_size = field_size;
+            }
+        }
+        payload_align = payload_align.max(field_align);
+    }
+    if (!loaded_union.has_runtime_tag or
+        !Type.fromIndex(loaded_union.enum_tag_type).hasRuntimeBits(pool))
+    {
+        return .{
+            .abi_size = payload_align.forward(payload_size),
+            .abi_align = payload_align,
+            .most_aligned_field = most_aligned_field,
+            .most_aligned_field_size = most_aligned_field_size,
+            .biggest_field = biggest_field,
+            .payload_size = payload_size,
+            .payload_align = payload_align,
+            .tag_align = .none,
+            .tag_size = 0,
+            .padding = 0,
+        };
+    }
+
+    const tag_size = Type.fromIndex(loaded_union.enum_tag_type).abiSize(pool);
+    const tag_align = Type.fromIndex(loaded_union.enum_tag_type).abiAlignment(pool).max(.@"1");
+    const abi_size: u64 = loaded_union.size;
+    return .{
+        .abi_size = abi_size,
+        .abi_align = tag_align.max(payload_align),
+        .most_aligned_field = most_aligned_field,
+        .most_aligned_field_size = most_aligned_field_size,
+        .biggest_field = biggest_field,
+        .payload_size = payload_size,
+        .payload_align = payload_align,
+        .tag_align = tag_align,
+        .tag_size = tag_size,
+        .padding = @intCast(abi_size - tag_size - payload_size),
+    };
+}
+
+pub fn structFieldOffset(ty: Type, pool: *const InternPool, index: usize) u64 {
+    switch (pool.indexToKey(ty.index)) {
+        .struct_type => {
+            const struct_type = pool.loadStructType(ty.index);
+            assert(struct_type.layout != .@"packed");
+            return struct_type.field_offsets[index];
+        },
+        .tuple_type => |tuple| {
+            var offset: u64 = 0;
+            var big_align: InternPool.Alignment = .none;
+            for (tuple.types, tuple.values, 0..) |field_ty, field_val, i| {
+                if (field_val != .none or !fromIndex(field_ty).hasRuntimeBits(pool)) {
+                    if (i == index) return 0;
+                    continue;
+                }
+                const field_align = fromIndex(field_ty).abiAlignment(pool);
+                big_align = big_align.max(field_align);
+                offset = field_align.forward(offset);
+                if (i == index) return offset;
+                offset += fromIndex(field_ty).abiSize(pool);
+            }
+            offset = big_align.max(.@"1").forward(offset);
+            return offset;
+        },
+        .union_type => {
+            const union_type = pool.unionFields(ty.index);
+            if (!union_type.has_runtime_tag) return 0;
+            const layout = getUnionLayout(union_type, pool);
+            if (layout.tag_align.compare(.gte, layout.payload_align)) {
+                return layout.payload_align.forward(layout.tag_size);
+            } else {
+                return 0;
+            }
+        },
+        else => unreachable,
+    }
 }
 
 pub fn fromIndex(index: InternPool.Index) Type {
@@ -340,6 +494,7 @@ pub fn fromIndex(index: InternPool.Index) Type {
 }
 
 pub fn toIndex(ty: Type) InternPool.Index {
+    assert(ty.index != .none);
     return ty.index;
 }
 
@@ -350,18 +505,57 @@ pub const comptime_int_type: Type = .{ .index = .comptime_int_type };
 
 const target: *const std.Target = &builtin.target;
 
-pub fn abiAlignment(ty: Type, pool: *const InternPool) ?InternPool.Alignment {
+pub fn abiAlignment(ty: Type, pool: *const InternPool) InternPool.Alignment {
     return switch (pool.indexToKey(ty.index)) {
-        .int_type => |it| if (it.bits == 0)
-            .@"1"
-        else
-            .fromByteUnits(std.zig.target.intAlignment(target, it.bits)),
+        .int_type => |int_type| {
+            if (int_type.bits == 0) return .@"1";
+            return .fromByteUnits(std.zig.target.intAlignment(target, int_type.bits));
+        },
         .ptr_type, .anyframe_type => ptrAbiAlignment(),
-        .array_type => |at| abiAlignment(fromIndex(at.child), pool),
+        .array_type => |array_type| abiAlignment(fromIndex(array_type.child), pool),
+        .vector_type => |vector_type| {
+            if (vector_type.len == 0) return .@"1";
+            if (vector_type.child == .bool_type) {
+                if (vector_type.len > 256 and target.cpu.has(.x86, .avx512f)) return .@"64";
+                if (vector_type.len > 128 and target.cpu.has(.x86, .avx)) return .@"32";
+                if (vector_type.len > 64) return .@"16";
+                const bytes = std.math.divCeil(u32, vector_type.len, 8) catch unreachable;
+                return .fromByteUnits(std.math.ceilPowerOfTwoAssert(u32, bytes));
+            }
+            const elem_bytes: u32 = @intCast(abiSize(fromIndex(vector_type.child), pool));
+            if (elem_bytes == 0) return .@"1";
+            const bytes = elem_bytes * vector_type.len;
+            if (bytes > 32 and target.cpu.has(.x86, .avx512f)) return .@"64";
+            if (bytes > 16 and target.cpu.has(.x86, .avx)) return .@"32";
+            return .@"16";
+        },
+
+        .opt_type => |child| abiAlignment(fromIndex(child), pool),
+        .error_union_type => |eu| InternPool.Alignment.maxStrict(
+            abiAlignment(fromIndex(eu.payload_type), pool),
+            errorAbiAlignment(pool),
+        ),
+
+        .error_set_type => errorAbiAlignment(pool),
+
+        .func_type => minFunctionAlignment(target),
+
         .simple_type => |t| switch (t) {
-            .bool, .void, .noreturn, .anyopaque, .type, .comptime_int, .comptime_float, .null, .undefined, .enum_literal => .@"1",
-            .anyerror, .adhoc_inferred_error_set => null,
+            .bool,
+            .void,
+            .noreturn,
+            .anyopaque,
+            .type,
+            .comptime_int,
+            .comptime_float,
+            .null,
+            .undefined,
+            .enum_literal,
+            => .@"1",
+
+            .anyerror, .adhoc_inferred_error_set => errorAbiAlignment(pool),
             .usize, .isize => .fromByteUnits(std.zig.target.intAlignment(target, target.ptrBitWidth())),
+
             .c_char => cTypeAlign(.char),
             .c_short => cTypeAlign(.short),
             .c_ushort => cTypeAlign(.ushort),
@@ -372,39 +566,176 @@ pub fn abiAlignment(ty: Type, pool: *const InternPool) ?InternPool.Alignment {
             .c_longlong => cTypeAlign(.longlong),
             .c_ulonglong => cTypeAlign(.ulonglong),
             .c_longdouble => cTypeAlign(.longdouble),
+
             .f16 => .@"2",
             .f32 => cTypeAlign(.float),
             .f64 => if (target.cTypeBitSize(.double) == 64) cTypeAlign(.double) else .@"8",
-            .f80 => if (target.cTypeBitSize(.longdouble) == 80) cTypeAlign(.longdouble) else .fromByteUnits(std.zig.target.intAlignment(target, 80)),
+            .f80 => if (target.cTypeBitSize(.longdouble) == 80) cTypeAlign(.longdouble) else abiAlignment(fromIndex(.u80_type), pool),
             .f128 => if (target.cTypeBitSize(.longdouble) == 128) cTypeAlign(.longdouble) else .@"16",
+
             .generic_poison => unreachable,
         },
-        .enum_type => switch (pool.enumIntTagTypeStored(ty.index)) {
-            .none => null,
-            else => |int_ty| abiAlignment(fromIndex(int_ty), pool),
+        .tuple_type => |tuple| {
+            var big_align: InternPool.Alignment = .@"1";
+            for (tuple.types) |field_ty| {
+                const field_align = abiAlignment(fromIndex(field_ty), pool);
+                big_align = big_align.maxStrict(field_align);
+            }
+            return big_align;
         },
-        .struct_type => if (pool.loadStructType(ty.index)) |f| f.alignment else null,
-        .union_type => if (pool.unionFields(ty.index)) |f| f.alignment else null,
-        else => null,
+        .struct_type => {
+            const struct_obj = pool.loadStructType(ty.index);
+            switch (struct_obj.layout) {
+                .@"packed" => return abiAlignment(fromIndex(struct_obj.packed_backing_int_type), pool),
+                .auto, .@"extern" => return struct_obj.alignment,
+            }
+        },
+        .union_type => {
+            const union_obj = pool.unionFields(ty.index);
+            switch (union_obj.layout) {
+                .@"packed" => return abiAlignment(fromIndex(union_obj.packed_backing_int_type), pool),
+                .auto, .@"extern" => return union_obj.alignment,
+            }
+        },
+        .enum_type => abiAlignment(fromIndex(pool.loadEnumType(ty.index).int_tag_type), pool),
+        .opaque_type => .@"1",
+
+        .simple_value,
+        .enum_literal,
+        .int,
+        .float,
+        .undef,
+        .ptr,
+        .slice,
+        .err,
+        .error_union,
+        .func,
+        .opt,
+        .aggregate,
+        .enum_tag,
+        .un,
+        => unreachable,
     };
 }
 
-pub fn abiSize(ty: Type, pool: *const InternPool) ?u64 {
+fn errorAbiAlignment(pool: *const InternPool) InternPool.Alignment {
+    return .fromNonzeroByteUnits(std.zig.target.intAlignment(target, pool.errorSetBits()));
+}
+
+fn errorAbiSize(pool: *const InternPool) u64 {
+    return std.zig.target.intByteSize(target, pool.errorSetBits());
+}
+
+fn minFunctionAlignment(t: *const std.Target) InternPool.Alignment {
+    return switch (t.cpu.arch) {
+        .riscv32,
+        .riscv32be,
+        .riscv64,
+        .riscv64be,
+        => if (t.cpu.hasAny(.riscv, &.{ .c, .zca })) .@"2" else .@"4",
+        .thumb,
+        .thumbeb,
+        .csky,
+        .m68k,
+        .msp430,
+        .sh,
+        .sheb,
+        .s390x,
+        .xcore,
+        => .@"2",
+        .aarch64,
+        .aarch64_be,
+        .alpha,
+        .arc,
+        .arceb,
+        .arm,
+        .armeb,
+        .hexagon,
+        .hppa,
+        .hppa64,
+        .lanai,
+        .loongarch32,
+        .loongarch64,
+        .microblaze,
+        .microblazeel,
+        .mips,
+        .mipsel,
+        .powerpc,
+        .powerpcle,
+        .powerpc64,
+        .powerpc64le,
+        .sparc,
+        .sparc64,
+        .xtensa,
+        .xtensaeb,
+        => .@"4",
+        .bpfeb,
+        .bpfel,
+        .kvx,
+        .mips64,
+        .mips64el,
+        => .@"8",
+        .ve,
+        => .@"16",
+        else => .@"1",
+    };
+}
+
+pub fn optionalReprIsPayload(ty: Type, pool: *const InternPool) bool {
     return switch (pool.indexToKey(ty.index)) {
-        .int_type => |it| std.zig.target.intByteSize(target, it.bits),
-        .ptr_type => |pt| switch (pt.flags.size) {
+        .opt_type => |child| child == .anyerror_type or switch (pool.indexToKey(child)) {
+            .ptr_type => |pt| pt.flags.size != .c and !pt.flags.is_allowzero,
+            .error_set_type => true,
+            else => false,
+        },
+        .ptr_type => |pt| pt.flags.size == .c,
+        else => false,
+    };
+}
+
+pub fn abiSize(ty: Type, pool: *const InternPool) u64 {
+    return switch (pool.indexToKey(ty.index)) {
+        .int_type => |int_type| std.zig.target.intByteSize(target, int_type.bits),
+        .ptr_type => |ptr_type| switch (ptr_type.flags.size) {
             .slice => ptrByteSize() * 2,
             .one, .many, .c => ptrByteSize(),
         },
         .anyframe_type => ptrByteSize(),
-        .array_type => |at| blk: {
-            const child = abiSize(fromIndex(at.child), pool) orelse break :blk null;
-            break :blk at.lenIncludingSentinel() * child;
+        .array_type => |arr| arr.lenIncludingSentinel() * abiSize(fromIndex(arr.child), pool),
+        .vector_type => |vec| {
+            const elem_ty = fromIndex(vec.child);
+            const bytes = switch (elem_ty.index) {
+                .bool_type => std.math.divCeil(u64, vec.len, 8) catch unreachable,
+                else => vec.len * abiSize(elem_ty, pool),
+            };
+            return abiAlignment(ty, pool).forward(bytes);
         },
+        .opt_type => |child_ip| {
+            const child = fromIndex(child_ip);
+            switch (child.classify(pool)) {
+                .no_possible_value => return 0,
+                .fully_comptime => return 0,
+                .one_possible_value, .partially_comptime, .runtime => {
+                    if (optionalReprIsPayload(ty, pool)) return abiSize(child, pool);
+                    return abiSize(child, pool) + abiAlignment(child, pool).toByteUnits().?;
+                },
+            }
+        },
+        .error_set_type => errorAbiSize(pool),
+        .error_union_type => |error_union| {
+            const payload_ty = fromIndex(error_union.payload_type);
+            switch (payload_ty.classify(pool)) {
+                .fully_comptime => return 0,
+                .no_possible_value, .one_possible_value, .partially_comptime, .runtime => {},
+            }
+            const big_align = errorAbiAlignment(pool).maxStrict(payload_ty.abiAlignment(pool));
+            return big_align.forward(errorAbiSize(pool) + payload_ty.abiSize(pool));
+        },
+        .func_type => 0,
         .simple_type => |t| switch (t) {
-            .void, .noreturn, .anyopaque, .type, .comptime_int, .comptime_float, .null, .undefined, .enum_literal => 0,
-            .anyerror, .adhoc_inferred_error_set => null,
+            .void, .noreturn, .type, .comptime_int, .comptime_float, .null, .undefined, .enum_literal => 0,
             .bool => 1,
+            .anyerror, .adhoc_inferred_error_set => errorAbiSize(pool),
             .usize, .isize => ptrByteSize(),
             .c_char => target.cTypeByteSize(.char),
             .c_short => target.cTypeByteSize(.short),
@@ -419,63 +750,68 @@ pub fn abiSize(ty: Type, pool: *const InternPool) ?u64 {
             .f16 => 2,
             .f32 => 4,
             .f64 => 8,
-            .f80 => if (target.cTypeBitSize(.longdouble) == 80) target.cTypeByteSize(.longdouble) else std.zig.target.intByteSize(target, 80),
+            .f80 => if (target.cTypeBitSize(.longdouble) == 80) target.cTypeByteSize(.longdouble) else abiSize(fromIndex(.u80_type), pool),
             .f128 => 16,
+            .anyopaque => unreachable,
             .generic_poison => unreachable,
         },
-        .enum_type => switch (pool.enumIntTagTypeStored(ty.index)) {
-            .none => null,
-            else => |int_ty| abiSize(fromIndex(int_ty), pool),
+        .tuple_type => |tuple| switch (ty.classify(pool)) {
+            .no_possible_value => 0,
+            else => ty.structFieldOffset(pool, tuple.types.len),
         },
-        .struct_type => if (pool.loadStructType(ty.index)) |f| f.size else null,
-        .union_type => if (pool.unionFields(ty.index)) |f| f.size else null,
-        else => null,
+        .struct_type => {
+            const struct_obj = pool.loadStructType(ty.index);
+            switch (struct_obj.layout) {
+                .@"packed" => return abiSize(fromIndex(struct_obj.packed_backing_int_type), pool),
+                .auto, .@"extern" => return struct_obj.size,
+            }
+        },
+        .union_type => {
+            const union_obj = pool.unionFields(ty.index);
+            switch (union_obj.layout) {
+                .@"packed" => return abiSize(fromIndex(union_obj.packed_backing_int_type), pool),
+                .auto, .@"extern" => return union_obj.size,
+            }
+        },
+        .enum_type => abiSize(fromIndex(pool.loadEnumType(ty.index).int_tag_type), pool),
+        .opaque_type => unreachable,
+
+        .simple_value,
+        .enum_literal,
+        .int,
+        .float,
+        .undef,
+        .ptr,
+        .slice,
+        .err,
+        .error_union,
+        .func,
+        .opt,
+        .aggregate,
+        .enum_tag,
+        .un,
+        => unreachable,
     };
 }
 
-pub fn bitSize(ty: Type, pool: *const InternPool) ?u64 {
-    return switch (pool.indexToKey(ty.index)) {
-        .int_type => |it| it.bits,
-        .ptr_type => |pt| switch (pt.flags.size) {
-            .slice => target.ptrBitWidth() * 2,
-            .one, .many, .c => target.ptrBitWidth(),
+pub fn bitSize(ty: Type, pool: *const InternPool) u64 {
+    return switch (ty.zigTypeTag(pool)) {
+        .void => 0,
+        .bool => 1,
+        .float => ty.floatBits(),
+        .pointer, .optional => {
+            assert(ty.isPtrAtRuntime(pool));
+            return target.ptrBitWidth();
         },
-        .array_type => |at| blk: {
-            const child = bitSize(fromIndex(at.child), pool) orelse break :blk null;
-            break :blk at.lenIncludingSentinel() * child;
-        },
-        .vector_type => |vt| blk: {
-            const child = bitSize(fromIndex(vt.child), pool) orelse break :blk null;
-            break :blk vt.len * child;
-        },
-        .simple_type => |t| switch (t) {
-            .void => 0,
-            .bool => 1,
-            .usize, .isize => target.ptrBitWidth(),
-            .c_char => target.cTypeBitSize(.char),
-            .c_short => target.cTypeBitSize(.short),
-            .c_ushort => target.cTypeBitSize(.ushort),
-            .c_int => target.cTypeBitSize(.int),
-            .c_uint => target.cTypeBitSize(.uint),
-            .c_long => target.cTypeBitSize(.long),
-            .c_ulong => target.cTypeBitSize(.ulong),
-            .c_longlong => target.cTypeBitSize(.longlong),
-            .c_ulonglong => target.cTypeBitSize(.ulonglong),
-            .c_longdouble => target.cTypeBitSize(.longdouble),
-            .f16 => 16,
-            .f32 => 32,
-            .f64 => 64,
-            .f80 => 80,
-            .f128 => 128,
-            else => null,
-        },
-        else => null,
+        .array, .vector => ty.arrayLenIncludingSentinel(pool) * ty.childType(pool).bitSize(pool),
+        else => ty.intInfo(pool).bits,
     };
 }
 
-pub fn intInfo(starting_ty: Type, pool: *const InternPool) ?std.lang.Type.Int {
+pub fn intInfo(starting_ty: Type, pool: *const InternPool) std.lang.Type.Int {
     var ty = starting_ty;
     while (true) switch (ty.index) {
+        .anyerror_type, .adhoc_inferred_error_set_type => return .{ .signedness = .unsigned, .bits = pool.errorSetBits() },
         .usize_type => return .{ .signedness = .unsigned, .bits = target.ptrBitWidth() },
         .isize_type => return .{ .signedness = .signed, .bits = target.ptrBitWidth() },
         .c_char_type => return .{ .signedness = target.cCharSignedness(), .bits = target.cTypeBitSize(.char) },
@@ -488,10 +824,47 @@ pub fn intInfo(starting_ty: Type, pool: *const InternPool) ?std.lang.Type.Int {
         .c_longlong_type => return .{ .signedness = .signed, .bits = target.cTypeBitSize(.longlong) },
         .c_ulonglong_type => return .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ulonglong) },
         else => switch (pool.indexToKey(ty.index)) {
-            .int_type => |it| return it,
-            .enum_type => ty = .fromIndex(pool.loadEnumType(ty.index).?.int_tag_type),
+            .int_type => |int_type| return int_type,
+            .struct_type => {
+                const struct_obj = pool.loadStructType(ty.index);
+                assert(struct_obj.layout == .@"packed");
+                ty = .fromIndex(struct_obj.packed_backing_int_type);
+            },
+            .union_type => {
+                const union_obj = pool.unionFields(ty.index);
+                assert(union_obj.layout == .@"packed");
+                ty = .fromIndex(union_obj.packed_backing_int_type);
+            },
+            .enum_type => ty = .fromIndex(pool.loadEnumType(ty.index).int_tag_type),
             .vector_type => |vector_type| ty = .fromIndex(vector_type.child),
-            else => return null,
+
+            .error_set_type => return .{ .signedness = .unsigned, .bits = pool.errorSetBits() },
+
+            .tuple_type,
+            .ptr_type,
+            .anyframe_type,
+            .array_type,
+            .opt_type,
+            .error_union_type,
+            .func_type,
+            .simple_type,
+            .opaque_type,
+
+            .undef,
+            .simple_value,
+            .enum_literal,
+            .func,
+            .int,
+            .err,
+            .error_union,
+            .enum_tag,
+            .float,
+            .ptr,
+            .slice,
+            .opt,
+            .aggregate,
+            .un,
+            => unreachable,
         },
     };
 }
@@ -504,7 +877,7 @@ pub fn toUnsigned(ty: Type, pool: *InternPool) std.mem.Allocator.Error!Type {
         .c_ulong_type, .c_long_type => .fromIndex(.c_ulong_type),
         .c_ulonglong_type, .c_longlong_type => .fromIndex(.c_ulonglong_type),
         else => switch (ty.zigTypeTag(pool)) {
-            .int => .fromIndex(try pool.internIntType(.unsigned, ty.intInfo(pool).?.bits)),
+            .int => .fromIndex(try pool.internIntType(.unsigned, ty.intInfo(pool).bits)),
             .vector => .fromIndex(try pool.internVectorType(.{
                 .len = ty.vectorLen(pool),
                 .child = (try ty.childType(pool).toUnsigned(pool)).index,
@@ -594,7 +967,7 @@ pub fn isPtrLikeOptional(ty: Type, pool: *const InternPool) bool {
 }
 
 pub fn ptrAllowsZero(ty: Type, pool: *const InternPool) bool {
-    return ty.isPtrLikeOptional(pool) or pool.indexToKey(ty.index).ptr_type.flags.is_allowzero;
+    return ty.isPtrLikeOptional(pool) or ty.ptrInfo(pool).flags.is_allowzero;
 }
 
 pub fn optionalChild(ty: Type, pool: *const InternPool) Type {
@@ -619,7 +992,15 @@ pub fn arrayInfo(ty: Type, pool: *const InternPool) ArrayInfo {
 }
 
 pub fn vectorLen(ty: Type, pool: *const InternPool) u32 {
-    return pool.indexToKey(ty.index).vector_type.len;
+    return switch (pool.indexToKey(ty.index)) {
+        .vector_type => |vector_type| vector_type.len,
+        .tuple_type => |tuple| @intCast(tuple.types.len),
+        else => unreachable,
+    };
+}
+
+pub fn arrayLenIncludingSentinel(ty: Type, pool: *const InternPool) u64 {
+    return pool.aggregateTypeLenIncludingSentinel(ty.index);
 }
 
 pub fn scalarType(ty: Type, pool: *const InternPool) Type {
@@ -709,18 +1090,43 @@ pub fn ptrInfo(ty: Type, pool: *const InternPool) InternPool.Key.PtrType {
 }
 
 pub fn comptimeOnly(ty: Type, pool: *const InternPool) bool {
-    return switch (pool.indexToKey(ty.index)) {
-        .simple_type => |t| switch (t) {
-            .type, .comptime_int, .comptime_float, .enum_literal, .null, .undefined => true,
-            else => false,
-        },
-        .func_type => true,
-        .int_type, .error_set_type, .ptr_type, .anyframe_type => false,
-        .array_type => |arr| Type.fromIndex(arr.child).comptimeOnly(pool),
-        .vector_type => |vec| Type.fromIndex(vec.child).comptimeOnly(pool),
-        .opt_type => |child| Type.fromIndex(child).comptimeOnly(pool),
-        .error_union_type => |eu| Type.fromIndex(eu.payload_type).comptimeOnly(pool),
-        else => false,
+    if (ty.index == .generic_poison_type) return false;
+    if (ty.zigTypeTag(pool) == .error_union and ty.errorUnionPayload(pool).index == .generic_poison_type) return false;
+    return switch (ty.classify(pool)) {
+        .no_possible_value, .one_possible_value, .runtime => false,
+        .partially_comptime, .fully_comptime => true,
+    };
+}
+
+pub fn hasBitRepresentation(ty: Type, pool: *const InternPool) bool {
+    return switch (ty.zigTypeTag(pool)) {
+        .@"fn",
+        .noreturn,
+        .undefined,
+        .null,
+        .@"opaque",
+        .spirv,
+        .type,
+        .enum_literal,
+        .comptime_float,
+        .comptime_int,
+        .error_set,
+        .error_union,
+        .frame,
+        .@"anyframe",
+        => false,
+
+        .void,
+        .bool,
+        .int,
+        .float,
+        => true,
+
+        .@"enum" => pool.loadEnumType(ty.index).int_tag_mode == .explicit,
+        .pointer, .optional => ty.isPtrAtRuntime(pool),
+        .@"struct", .@"union" => ty.containerLayout(pool) == .@"packed",
+
+        .array, .vector => ty.childType(pool).hasBitRepresentation(pool),
     };
 }
 
@@ -729,7 +1135,8 @@ fn cTypeAlign(c: std.Target.CType) InternPool.Alignment {
 }
 
 fn ptrAbiAlignment() InternPool.Alignment {
-    return .fromByteUnits(ptrByteSize());
+    if (target.cpu.arch == .ez80) return .@"1";
+    return .fromNonzeroByteUnits(ptrByteSize());
 }
 fn ptrByteSize() u64 {
     return @divExact(target.ptrBitWidth(), 8);
@@ -786,6 +1193,7 @@ pub fn print(ty: Type, pool: *const InternPool, writer: *std.Io.Writer) PrintErr
         },
         .tuple_type => |tt| try printTuple(tt, pool, writer),
         .struct_type, .enum_type, .union_type, .opaque_type => try writer.writeAll(pool.stringSlice(pool.typeName(ty.index))),
+        .undef => try writer.writeAll("@as(type, undefined)"),
         else => |other| {
             assert(other.isType());
             try writer.writeAll("<type>");
@@ -821,9 +1229,9 @@ pub fn isSelfComparable(ty: Type, pool: *const InternPool, is_equality_cmp: bool
             .noreturn, .undefined, .null, .generic_poison => false,
         },
         .vector_type => |vt| fromIndex(vt.child).isSelfComparable(pool, is_equality_cmp),
-        .enum_type, .error_set_type, .func_type, .anyframe_type => is_equality_cmp,
+        .enum_type, .error_set_type, .func_type, .anyframe_type, .opaque_type => is_equality_cmp,
         .error_union_type, .array_type => false,
-        .struct_type, .union_type, .tuple_type => false,
+        .struct_type, .union_type, .tuple_type => is_equality_cmp and ty.containerLayout(pool) == .@"packed",
         .ptr_type => |pt| pt.flags.size != .slice and (is_equality_cmp or pt.flags.size == .c),
         .opt_type => |child| is_equality_cmp and fromIndex(child).isSelfComparable(pool, is_equality_cmp),
         else => false,
@@ -832,7 +1240,15 @@ pub fn isSelfComparable(ty: Type, pool: *const InternPool, is_equality_cmp: bool
 
 fn printPtr(pt: InternPool.Key.PtrType, pool: *const InternPool, writer: *std.Io.Writer) PrintError!void {
     assert(pt.child != .none);
-    try writer.writeAll(switch (pt.flags.size) {
+    if (pt.sentinel != .none) {
+        try writer.writeAll(switch (pt.flags.size) {
+            .many => "[*:",
+            .slice => "[:",
+            .one, .c => unreachable,
+        });
+        try Value.print(.fromIndex(pt.sentinel), pool, writer);
+        try writer.writeAll("]");
+    } else try writer.writeAll(switch (pt.flags.size) {
         .one => "*",
         .many => "[*]",
         .slice => "[]",
@@ -849,13 +1265,7 @@ fn printArray(at: InternPool.Key.ArrayType, pool: *const InternPool, writer: *st
     try writer.print("[{d}", .{at.len});
     if (at.sentinel != .none) {
         try writer.writeAll(":");
-        switch (pool.indexToKey(at.sentinel)) {
-            .int => |iv| {
-                var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-                try writer.print("{f}", .{iv.storage.toBigInt(&space)});
-            },
-            else => try writer.writeAll("?"),
-        }
+        try Value.print(.fromIndex(at.sentinel), pool, writer);
     }
     try writer.writeAll("]");
     try print(fromIndex(at.child), pool, writer);
@@ -863,13 +1273,18 @@ fn printArray(at: InternPool.Key.ArrayType, pool: *const InternPool, writer: *st
 
 fn printTuple(tt: InternPool.Key.TupleType, pool: *const InternPool, writer: *std.Io.Writer) PrintError!void {
     if (tt.types.len == 0) {
-        try writer.writeAll("struct {}");
+        try writer.writeAll("@TypeOf(.{})");
         return;
     }
     try writer.writeAll("struct { ");
-    for (tt.types, 0..) |field_ty, i| {
+    for (tt.types, tt.values, 0..) |field_ty, val, i| {
         if (i != 0) try writer.writeAll(", ");
+        if (val != .none) try writer.writeAll("comptime ");
         try print(fromIndex(field_ty), pool, writer);
+        if (val != .none) {
+            try writer.writeAll(" = ");
+            try Value.print(.fromIndex(val), pool, writer);
+        }
     }
     try writer.writeAll(" }");
 }
@@ -889,7 +1304,7 @@ fn printFunc(ft: InternPool.Key.FuncType, pool: *const InternPool, writer: *std.
             if (ft.paramIsComptime(idx)) try writer.writeAll("comptime ");
             if (ft.paramIsNoalias(idx)) try writer.writeAll("noalias ");
         }
-        try print(fromIndex(p), pool, writer);
+        if (p == .generic_poison_type) try writer.writeAll("anytype") else try print(fromIndex(p), pool, writer);
     }
     if (ft.is_var_args) {
         try writer.writeAll(if (ft.param_types.len > 0) ", ..." else "...");
@@ -904,13 +1319,13 @@ fn printFunc(ft: InternPool.Key.FuncType, pool: *const InternPool, writer: *std.
             try writer.print("callconv(.{s}) ", .{name});
         }
     }
-    try print(fromIndex(ft.return_type), pool, writer);
+    if (ft.return_type == .generic_poison_type) try writer.writeAll("anytype") else try print(fromIndex(ft.return_type), pool, writer);
 }
 
 fn printErrorUnion(eu: InternPool.Key.ErrorUnionType, pool: *const InternPool, writer: *std.Io.Writer) PrintError!void {
     try print(fromIndex(eu.error_set_type), pool, writer);
     try writer.writeAll("!");
-    try print(fromIndex(eu.payload_type), pool, writer);
+    if (eu.payload_type == .generic_poison_type) try writer.writeAll("anytype") else try print(fromIndex(eu.payload_type), pool, writer);
 }
 
 fn printErrorSet(es: InternPool.Key.ErrorSetType, pool: *const InternPool, writer: *std.Io.Writer) PrintError!void {

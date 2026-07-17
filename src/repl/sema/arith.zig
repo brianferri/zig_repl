@@ -1042,7 +1042,7 @@ fn intAddWithOverflow(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value.Over
 fn intAddWithOverflowInner(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value.OverflowArithmeticResult {
     assert(ty.index != .comptime_int_type);
     const pool = sema.intern_pool;
-    const info = ty.intInfo(pool).?;
+    const info = ty.intInfo(pool);
     var lhs_space: BigIntSpace = undefined;
     var rhs_space: BigIntSpace = undefined;
     const lhs_bigint = lhs.toBigInt(&lhs_space, pool);
@@ -1057,7 +1057,7 @@ fn intAddWithOverflowInner(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value
 }
 fn intAddSat(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value {
     const pool = sema.intern_pool;
-    const info = ty.intInfo(pool).?;
+    const info = ty.intInfo(pool);
     var lhs_space: BigIntSpace = undefined;
     var rhs_space: BigIntSpace = undefined;
     const lhs_bigint = lhs.toBigInt(&lhs_space, pool);
@@ -1101,7 +1101,7 @@ fn intSubWithOverflow(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value.Over
 fn intSubWithOverflowInner(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value.OverflowArithmeticResult {
     assert(ty.index != .comptime_int_type);
     const pool = sema.intern_pool;
-    const info = ty.intInfo(pool).?;
+    const info = ty.intInfo(pool);
     var lhs_space: BigIntSpace = undefined;
     var rhs_space: BigIntSpace = undefined;
     const lhs_bigint = lhs.toBigInt(&lhs_space, pool);
@@ -1116,7 +1116,7 @@ fn intSubWithOverflowInner(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value
 }
 fn intSubSat(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value {
     const pool = sema.intern_pool;
-    const info = ty.intInfo(pool).?;
+    const info = ty.intInfo(pool);
     var lhs_space: BigIntSpace = undefined;
     var rhs_space: BigIntSpace = undefined;
     const lhs_bigint = lhs.toBigInt(&lhs_space, pool);
@@ -1160,7 +1160,7 @@ fn intMulWithOverflow(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value.Over
 }
 fn intMulWithOverflowInner(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value.OverflowArithmeticResult {
     const pool = sema.intern_pool;
-    const info = ty.intInfo(pool).?;
+    const info = ty.intInfo(pool);
     var lhs_space: BigIntSpace = undefined;
     var rhs_space: BigIntSpace = undefined;
     const lhs_bigint = lhs.toBigInt(&lhs_space, pool);
@@ -1177,7 +1177,7 @@ fn intMulWithOverflowInner(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value
 }
 fn intMulSat(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value {
     const pool = sema.intern_pool;
-    const info = ty.intInfo(pool).?;
+    const info = ty.intInfo(pool);
     var lhs_space: BigIntSpace = undefined;
     var rhs_space: BigIntSpace = undefined;
     const lhs_bigint = lhs.toBigInt(&lhs_space, pool);
@@ -1214,7 +1214,7 @@ fn intDivTruncInner(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value {
     var result_r: BigIntMutable = .{ .limbs = limbs_r, .positive = undefined, .len = undefined };
     result_q.divTrunc(&result_r, lhs_bigint, rhs_bigint, limbs_buf);
     if (ty.index != .comptime_int_type) {
-        const info = ty.intInfo(pool).?;
+        const info = ty.intInfo(pool);
         if (!result_q.toConst().fitsInTwosComp(info.signedness, info.bits)) return error.Overflow;
     }
     return sema.intValue_big(ty, result_q.toConst());
@@ -1233,7 +1233,7 @@ fn intDivExact(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !union(enum) { rem
     result_q.divTrunc(&result_r, lhs_bigint, rhs_bigint, limbs_buf);
     if (!result_r.toConst().eqlZero()) return .remainder;
     if (ty.index != .comptime_int_type) {
-        const info = ty.intInfo(pool).?;
+        const info = ty.intInfo(pool);
         if (!result_q.toConst().fitsInTwosComp(info.signedness, info.bits)) return .{ .overflow = try sema.intValue_big(comptime_int_ty, result_q.toConst()) };
     }
     return .{ .success = try sema.intValue_big(ty, result_q.toConst()) };
@@ -1264,7 +1264,7 @@ fn intDivFloorInner(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value {
     var result_r: BigIntMutable = .{ .limbs = limbs_r, .positive = undefined, .len = undefined };
     result_q.divFloor(&result_r, lhs_bigint, rhs_bigint, limbs_buf);
     if (ty.index != .comptime_int_type) {
-        const info = ty.intInfo(pool).?;
+        const info = ty.intInfo(pool);
         if (!result_q.toConst().fitsInTwosComp(info.signedness, info.bits)) return error.Overflow;
     }
     return sema.intValue_big(ty, result_q.toConst());
@@ -1309,7 +1309,7 @@ fn intTruncate(sema: *Sema, val: Value, dest_ty: Type, dest_signedness: std.lang
 fn intBitwiseNot(sema: *Sema, val: Value, ty: Type) !Value {
     const pool = sema.intern_pool;
     if (ty.index == .bool_type) return Value.makeBool(!val.toBool());
-    const info = ty.intInfo(pool).?;
+    const info = ty.intInfo(pool);
     var val_space: BigIntSpace = undefined;
     const val_bigint = val.toBigInt(&val_space, pool);
     const limbs = try sema.arena.alloc(Limb, std.math.big.int.calcTwosCompLimbCount(info.bits));
@@ -1321,7 +1321,7 @@ fn intValueAa(sema: *Sema, ty: Type) !Value {
     const pool = sema.intern_pool;
     if (ty.index == .bool_type) return Value.bool_true;
     if (ty.index == .u0_type) return sema.intValue_u64(ty, 0);
-    const info = ty.intInfo(pool).?;
+    const info = ty.intInfo(pool);
     const buf = try sema.arena.alloc(u8, (info.bits + 7) / 8);
     @memset(buf, 0xAA);
     const limbs = try sema.arena.alloc(Limb, std.math.big.int.calcTwosCompLimbCount(info.bits));
@@ -1344,7 +1344,7 @@ fn intBitwiseAnd(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value {
 fn intBitwiseNand(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value {
     const pool = sema.intern_pool;
     if (ty.index == .bool_type) return Value.makeBool(!(lhs.toBool() and rhs.toBool()));
-    const info = ty.intInfo(pool).?;
+    const info = ty.intInfo(pool);
     var lhs_space: BigIntSpace = undefined;
     var rhs_space: BigIntSpace = undefined;
     const lhs_bigint = lhs.toBigInt(&lhs_space, pool);
@@ -1388,7 +1388,7 @@ pub const BitwiseBinOp = enum { @"and", nand, @"or", xor };
 
 fn intShl(sema: *Sema, lhs_ty: Type, lhs: Value, rhs: Value) !Value {
     const pool = sema.intern_pool;
-    const info = lhs_ty.intInfo(pool).?;
+    const info = lhs_ty.intInfo(pool);
     var lhs_space: BigIntSpace = undefined;
     const lhs_bigint = lhs.toBigInt(&lhs_space, pool);
     const shift_amt: usize = @intCast(rhs.toUnsignedInt(pool));
@@ -1399,7 +1399,7 @@ fn intShl(sema: *Sema, lhs_ty: Type, lhs: Value, rhs: Value) !Value {
 }
 fn intShlSat(sema: *Sema, lhs_ty: Type, lhs: Value, rhs: Value) !Value {
     const pool = sema.intern_pool;
-    const info = lhs_ty.intInfo(pool).?;
+    const info = lhs_ty.intInfo(pool);
     var lhs_space: BigIntSpace = undefined;
     const lhs_bigint = lhs.toBigInt(&lhs_space, pool);
     const shift_amt: usize = amt: {
@@ -1415,7 +1415,7 @@ fn intShlSat(sema: *Sema, lhs_ty: Type, lhs: Value, rhs: Value) !Value {
 }
 fn intShlWithOverflow(sema: *Sema, lhs_ty: Type, lhs: Value, rhs: Value, truncate_result: bool) !struct { overflow: bool, val: Value } {
     const pool = sema.intern_pool;
-    const info = lhs_ty.intInfo(pool).?;
+    const info = lhs_ty.intInfo(pool);
     var lhs_space: BigIntSpace = undefined;
     const lhs_bigint = lhs.toBigInt(&lhs_space, pool);
     const shift_amt: usize = @intCast(rhs.toUnsignedInt(pool));
@@ -1466,7 +1466,7 @@ fn intShr(sema: *Sema, lhs_ty: Type, rhs_ty: Type, lhs: Value, rhs: Value, op: S
             return sema.failWithUnsupportedComptimeShiftAmount();
         }
     } else @intCast(rhs.toUnsignedInt(pool));
-    if (lhs_ty.index != .comptime_int_type and shift_amt >= lhs_ty.intInfo(pool).?.bits) {
+    if (lhs_ty.index != .comptime_int_type and shift_amt >= lhs_ty.intInfo(pool).bits) {
         return sema.failWithTooLargeShiftAmount(lhs_ty, rhs);
     }
     if (op == .shr_exact and lhs_bigint.ctz(shift_amt) < shift_amt) {

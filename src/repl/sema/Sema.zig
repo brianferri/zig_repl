@@ -559,7 +559,7 @@ fn overflowArithmeticTupleType(sema: *Sema, ty: Type) Error!Type {
         try sema.vectorType(.{ .len = ty.vectorLen(ip), .child = .u1_type })
     else
         .fromIndex(.u1_type);
-    return .fromIndex(try ip.internTupleType(&.{ ty.index, ov_ty.index }));
+    return .fromIndex(try ip.internTupleType(&.{ ty.index, ov_ty.index }, &.{ .none, .none }));
 }
 
 pub fn aggregateValue(sema: *Sema, ty: Type, elems: []const InternPool.Index) Error!Value {
@@ -723,7 +723,7 @@ fn evalModRem(sema: *Sema, resolved_type: Type, lhs_orig: Value, rhs_orig: Value
 }
 
 fn isUnsignedIntType(ty: Type, pool: *const InternPool) bool {
-    return ty.zigTypeTag(pool) == .int and ty.intInfo(pool).?.signedness == .unsigned;
+    return ty.zigTypeTag(pool) == .int and ty.intInfo(pool).signedness == .unsigned;
 }
 
 fn resolveArithPeerType(sema: *Sema, lhs: Value, rhs: Value, op_name: []const u8) Error!Type {
@@ -1070,7 +1070,7 @@ fn log2IntType(sema: *Sema, int_ty: InternPool.Index) Error!?InternPool.Index {
     switch (operand.zigTypeTag(ip)) {
         .comptime_int => return .comptime_int_type,
         .int => {
-            const bits = operand.intInfo(ip).?.bits;
+            const bits = operand.intInfo(ip).bits;
             const log2_bits: u16 = if (bits == 0) 0 else std.math.log2_int_ceil(u16, bits);
             return try ip.internIntType(.unsigned, log2_bits);
         },
@@ -1179,7 +1179,7 @@ fn materialiseIntFromFloat(
         return .{ .index = idx };
     }
     if (Type.fromIndex(dest_type_index).zigTypeTag(sema.intern_pool) == .int) {
-        const dest_int = Type.fromIndex(dest_type_index).intInfo(sema.intern_pool).?;
+        const dest_int = Type.fromIndex(dest_type_index).intInfo(sema.intern_pool);
         if (!big.fitsInTwosComp(dest_int.signedness, dest_int.bits)) {
             return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@intFromFloat: value does not fit in {c}{d}", .{
                 @as(u8, switch (dest_int.signedness) {
@@ -1927,7 +1927,7 @@ fn evalAbs(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const result_ty: Type = switch (scalar_ty.zigTypeTag(ip)) {
         .comptime_float, .float, .comptime_int => operand_ty,
-        .int => if (scalar_ty.intInfo(ip).?.signedness == .signed) try operand_ty.toUnsigned(ip) else return operand,
+        .int => if (scalar_ty.intInfo(ip).signedness == .signed) try operand_ty.toUnsigned(ip) else return operand,
         else => {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected integer, float, or vector of either integers or floats, found '{f}'", .{operand_ty.fmt(ip)});
         },
@@ -2068,7 +2068,7 @@ fn resolveStructLayout(sema: *Sema, struct_ty: InternPool.Index) Error!void {
     assert(ip.indexToKey(struct_ty) == .struct_type);
     if (ip.structLayoutResolved(struct_ty)) return;
 
-    if (ip.loadStructType(struct_ty) == null) {
+    if (ip.indexToKey(struct_ty).struct_type == .declared) {
         const count = try sema.structFieldCount(struct_ty);
         const names = try sema.arena.alloc(InternPool.NullTerminatedString, count);
         const types = try sema.arena.alloc(InternPool.Index, count);
@@ -2088,12 +2088,12 @@ fn resolveStructLayout(sema: *Sema, struct_ty: InternPool.Index) Error!void {
     }
 
     const saved_field_types = blk: {
-        const f = ip.loadStructType(struct_ty).?;
+        const f = ip.loadStructType(struct_ty);
         break :blk try sema.arena.dupe(InternPool.Index, f.field_types);
     };
     for (saved_field_types) |field_ty| try sema.ensureLayoutResolved(field_ty);
 
-    const f = ip.loadStructType(struct_ty).?;
+    const f = ip.loadStructType(struct_ty);
     const fields_len: u32 = @intCast(f.field_types.len);
     const resolved_aligns = try sema.arena.alloc(InternPool.Alignment, fields_len);
     const runtime_order = try sema.arena.alloc(InternPool.RuntimeOrder, fields_len);
@@ -2106,8 +2106,7 @@ fn resolveStructLayout(sema: *Sema, struct_ty: InternPool.Index) Error!void {
         field_align.* = if (f.field_aligns.len != 0 and f.field_aligns[idx] != .none)
             .fromByteUnits(@intCast(sema.intAsI128(f.field_aligns[idx]).?))
         else
-            Type.fromIndex(field_ty).abiAlignment(ip) orelse
-                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@sizeOf: type not yet supported", .{});
+            Type.fromIndex(field_ty).abiAlignment(ip);
         if (structFieldIsComptime(f, idx)) {
             order.* = .omitted;
             continue;
@@ -2148,44 +2147,47 @@ fn resolveStructLayout(sema: *Sema, struct_ty: InternPool.Index) Error!void {
         };
         const offset = resolved_aligns[field_idx].forward(cur_offset);
         offsets[field_idx] = @truncate(offset);
-        cur_offset = offset + Type.fromIndex(f.field_types[field_idx]).abiSize(ip).?;
+        cur_offset = offset + Type.fromIndex(f.field_types[field_idx]).abiSize(ip);
     }
     const size: u32 = if (class == .no_possible_value) 0 else @intCast(struct_align.forward(cur_offset));
     ip.setStructLayout(struct_ty, runtime_order, offsets, size, struct_align, class);
+}
+
+fn resolveUnionFields(sema: *Sema, union_ty: InternPool.Index) Error!void {
+    const ip = sema.intern_pool;
+    if (ip.indexToKey(union_ty).union_type != .declared) return;
+    const count = try sema.unionFieldCount(union_ty);
+    const names = try sema.arena.alloc(InternPool.NullTerminatedString, count);
+    const types = try sema.arena.alloc(InternPool.Index, count);
+    const aligns = try sema.arena.alloc(InternPool.Index, count);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const name = (try sema.unionFieldNameAt(union_ty, i)).?;
+        const field = (try sema.unionFieldByName(union_ty, name)).?;
+        names[i] = name;
+        types[i] = field.ty;
+        aligns[i] = if (field.align_bytes) |a| try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = a } }) else .none;
+    }
+    try ip.fillDeclaredUnionFields(union_ty, names, types, aligns);
 }
 
 fn resolveUnionLayout(sema: *Sema, union_ty: InternPool.Index) Error!void {
     const ip = sema.intern_pool;
     assert(ip.indexToKey(union_ty) == .union_type);
     if (ip.unionLayoutResolved(union_ty)) return;
-
-    if (ip.unionFields(union_ty) == null) {
-        const count = try sema.unionFieldCount(union_ty);
-        const names = try sema.arena.alloc(InternPool.NullTerminatedString, count);
-        const types = try sema.arena.alloc(InternPool.Index, count);
-        const aligns = try sema.arena.alloc(InternPool.Index, count);
-        var i: u32 = 0;
-        while (i < count) : (i += 1) {
-            const name = (try sema.unionFieldNameAt(union_ty, i)).?;
-            const field = (try sema.unionFieldByName(union_ty, name)).?;
-            names[i] = name;
-            types[i] = field.ty;
-            aligns[i] = if (field.align_bytes) |a| try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = a } }) else .none;
-        }
-        try ip.fillDeclaredUnionFields(union_ty, names, types, aligns);
-    }
+    try sema.resolveUnionFields(union_ty);
 
     const saved_field_types = blk: {
-        const f = ip.unionFields(union_ty).?;
+        const f = ip.unionFields(union_ty);
         break :blk try sema.arena.dupe(InternPool.Index, f.field_types);
     };
     for (saved_field_types) |field_ty| try sema.ensureLayoutResolved(field_ty);
 
-    const is_tagged = try sema.unionIsTagged(union_ty);
-    const enum_tag_ty: InternPool.Index = if (is_tagged) try sema.unionTagEnumType(union_ty) else .none;
-    if (is_tagged) try sema.ensureLayoutResolved(enum_tag_ty);
+    const tag_usage = ip.unionFields(union_ty).tag_usage;
+    const enum_tag_ty: InternPool.Index = if (tag_usage != .none) try sema.unionTagEnumType(union_ty) else .none;
+    if (tag_usage != .none) try sema.ensureLayoutResolved(enum_tag_ty);
 
-    const f = ip.unionFields(union_ty).?;
+    const f = ip.unionFields(union_ty);
     var payload_align: InternPool.Alignment = .@"1";
     var payload_size: u64 = 0;
     var possible_tags: u32 = 0;
@@ -2194,10 +2196,9 @@ fn resolveUnionLayout(sema: *Sema, union_ty: InternPool.Index) Error!void {
         const field_align: InternPool.Alignment = if (f.field_aligns.len != 0 and f.field_aligns[idx] != .none)
             .fromByteUnits(@intCast(sema.intAsI128(f.field_aligns[idx]).?))
         else
-            Type.fromIndex(field_ty).abiAlignment(ip) orelse
-                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@sizeOf: type not yet supported", .{});
+            Type.fromIndex(field_ty).abiAlignment(ip);
         payload_align = payload_align.maxStrict(field_align);
-        payload_size = @max(payload_size, Type.fromIndex(field_ty).abiSize(ip).?);
+        payload_size = @max(payload_size, Type.fromIndex(field_ty).abiSize(ip));
         switch (Type.fromIndex(field_ty).classify(ip)) {
             .no_possible_value => {},
             .one_possible_value, .runtime => possible_tags += 1,
@@ -2209,7 +2210,7 @@ fn resolveUnionLayout(sema: *Sema, union_ty: InternPool.Index) Error!void {
     }
     const has_runtime_tag = switch (possible_tags) {
         0, 1 => false,
-        else => is_tagged and !payload_has_comptime,
+        else => tag_usage != .none and !payload_has_comptime,
     };
     const class: InternPool.TypeClass = class: {
         if (possible_tags == 0) break :class .no_possible_value;
@@ -2218,8 +2219,8 @@ fn resolveUnionLayout(sema: *Sema, union_ty: InternPool.Index) Error!void {
     };
     const size: u64, const alignment: InternPool.Alignment = layout: {
         if (!has_runtime_tag) break :layout .{ payload_align.forward(payload_size), payload_align };
-        const tag_align = Type.fromIndex(enum_tag_ty).abiAlignment(ip).?;
-        const tag_size = Type.fromIndex(enum_tag_ty).abiSize(ip).?;
+        const tag_align = Type.fromIndex(enum_tag_ty).abiAlignment(ip);
+        const tag_size = Type.fromIndex(enum_tag_ty).abiSize(ip);
         const alignment = tag_align.maxStrict(payload_align);
         break :layout .{ alignment.forward(tag_size + payload_size), alignment };
     };
@@ -2239,11 +2240,7 @@ fn ensureLayoutResolved(sema: *Sema, ty: InternPool.Index) Error!void {
             for (ft.param_types) |param_ty| try sema.ensureLayoutResolved(param_ty);
             try sema.ensureLayoutResolved(ft.return_type);
         },
-        .enum_type => |et| if (et.generatedUnion() == .none) {
-            _ = try sema.resolveEnumFields(ty);
-        } else if (ip.enumIntTagTypeStored(ty) == .none) {
-            ip.setEnumIntTagType(ty, try sema.enumIntTagTypeOf(ty));
-        },
+        .enum_type => {},
         .struct_type => try sema.resolveStructLayout(ty),
         .union_type => try sema.resolveUnionLayout(ty),
         .simple_value, .enum_literal, .int, .float, .undef, .ptr, .slice, .err, .error_union, .func, .opt, .aggregate, .enum_tag, .un => unreachable,
@@ -2259,9 +2256,7 @@ fn evalAlignOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@alignOf: no align available for uninstantiable type 'noreturn'", .{});
     }
     try sema.ensureLayoutResolved(ty);
-    const alignment = Type.fromIndex(ty).abiAlignment(sema.intern_pool) orelse {
-        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@alignOf: type not yet supported", .{});
-    };
+    const alignment = Type.fromIndex(ty).abiAlignment(sema.intern_pool);
     const idx = try sema.intern_pool.internInt(.{
         .ty = .comptime_int_type,
         .storage = .{ .u64 = alignment.toByteUnits().? },
@@ -2276,6 +2271,9 @@ fn evalSizeOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ty = try sema.resolveDestType(un_node.operand, "@sizeOf");
     try sema.ensureLayoutResolved(ty);
     const key = sema.intern_pool.indexToKey(ty);
+    if (key == .opaque_type) {
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@sizeOf: no size available for opaque type", .{});
+    }
     if (key == .simple_type) switch (key.simple_type) {
         .noreturn => {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@sizeOf: no size available for uninstantiable type 'noreturn'", .{});
@@ -2285,9 +2283,7 @@ fn evalSizeOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         },
         else => {},
     };
-    const size = Type.fromIndex(ty).abiSize(sema.intern_pool) orelse {
-        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@sizeOf: type not yet supported", .{});
-    };
+    const size = Type.fromIndex(ty).abiSize(sema.intern_pool);
     const idx = try sema.intern_pool.internInt(.{
         .ty = .comptime_int_type,
         .storage = .{ .u64 = size },
@@ -2318,9 +2314,15 @@ fn evalBitSizeOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     const ty = try sema.resolveDestType(un_node.operand, "@bitSizeOf");
-    const bits = Type.fromIndex(ty).bitSize(sema.intern_pool) orelse {
-        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@bitSizeOf: no bit size available for type '{f}'", .{Type.fromIndex(ty).fmt(sema.intern_pool)});
-    };
+    const operand_ty = Type.fromIndex(ty);
+    if (!operand_ty.hasBitRepresentation(sema.intern_pool) and
+        operand_ty.zigTypeTag(sema.intern_pool) != .error_set and
+        operand_ty.zigTypeTag(sema.intern_pool) != .@"enum")
+    {
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "no bit size available for type '{f}'", .{operand_ty.fmt(sema.intern_pool)});
+    }
+    try sema.ensureLayoutResolved(ty);
+    const bits = operand_ty.bitSize(sema.intern_pool);
     const idx = try sema.intern_pool.internInt(.{
         .ty = .comptime_int_type,
         .storage = .{ .u64 = bits },
@@ -2339,7 +2341,7 @@ fn evalBitCount(
     const operand = try sema.resolveRef(un_node.operand);
     const operand_ty = operand.typeOf(ip);
     _ = try sema.checkIntOrVector(operand);
-    const bits = operand_ty.intInfo(ip).?.bits;
+    const bits = operand_ty.intInfo(ip).bits;
 
     const result_scalar_ty = Type.fromIndex(try ip.internIntType(.unsigned, Type.smallestUnsignedBits(bits)));
     switch (operand_ty.zigTypeTag(ip)) {
@@ -2390,7 +2392,7 @@ fn evalByteSwap(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand = try sema.resolveRef(un_node.operand);
     const operand_ty = operand.typeOf(ip);
     const scalar_ty = try sema.checkIntOrVector(operand);
-    const bits = scalar_ty.intInfo(ip).?.bits;
+    const bits = scalar_ty.intInfo(ip).bits;
     if (bits % 8 != 0) {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@byteSwap requires the number of bits to be evenly divisible by 8, but '{f}' has {d} bits", .{ scalar_ty.fmt(ip), bits });
     }
@@ -2452,7 +2454,7 @@ fn bitReverse(sema: *Sema, val: Value, ty: Type) Error!Value {
 
 fn intByteSwap(sema: *Sema, val: Value, ty: Type) Error!Value {
     const ip = sema.intern_pool;
-    const info = ty.intInfo(ip).?;
+    const info = ty.intInfo(ip);
     var val_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const val_bigint = val.toBigInt(&val_space, ip);
     const limbs = try sema.arena.alloc(std.math.big.Limb, std.math.big.int.calcTwosCompLimbCount(info.bits));
@@ -2463,7 +2465,7 @@ fn intByteSwap(sema: *Sema, val: Value, ty: Type) Error!Value {
 
 fn intBitReverse(sema: *Sema, val: Value, ty: Type) Error!Value {
     const ip = sema.intern_pool;
-    const info = ty.intInfo(ip).?;
+    const info = ty.intInfo(ip);
     var val_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const val_bigint = val.toBigInt(&val_space, ip);
     const limbs = try sema.arena.alloc(std.math.big.Limb, std.math.big.int.calcTwosCompLimbCount(info.bits));
@@ -2490,9 +2492,10 @@ fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const p = key.ptr;
     const ip = sema.intern_pool;
     const ptr_ty = ip.indexToKey(p.ty).ptr_type;
-    const natural: InternPool.Alignment = Type.fromIndex(ptr_ty.child).abiAlignment(ip) orelse .@"1";
+    try sema.ensureLayoutResolved(ptr_ty.child);
+    const natural: InternPool.Alignment = Type.fromIndex(ptr_ty.child).abiAlignment(ip);
     const align_bytes: u64 = ptr_ty.flags.alignment.toByteUnits() orelse natural.toByteUnits().?;
-    const size: u64 = Type.fromIndex(ptr_ty.child).abiSize(ip) orelse 1;
+    const size: u64 = Type.fromIndex(ptr_ty.child).abiSize(ip);
 
     const base: u64 = switch (p.base_addr) {
         .comptime_alloc => |i| blk: {
@@ -3067,8 +3070,8 @@ fn coerceInMemoryAllowed(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_mut: 
     const src_tag = src_ty.zigTypeTag(ip);
 
     if (dest_tag == .int and src_tag == .int) {
-        const dest_info = dest_ty.intInfo(ip).?;
-        const src_info = src_ty.intInfo(ip).?;
+        const dest_info = dest_ty.intInfo(ip);
+        const src_info = src_ty.intInfo(ip);
         if (dest_info.signedness == src_info.signedness and dest_info.bits == src_info.bits) return .{ .ok = .bit_cast };
         if ((src_info.signedness == dest_info.signedness and dest_info.bits < src_info.bits) or
             (dest_info.signedness == .signed and src_info.signedness == .unsigned and dest_info.bits <= src_info.bits) or
@@ -3221,7 +3224,7 @@ fn coerceInMemoryAllowed(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_mut: 
 }
 
 fn intFitsInType(sema: *Sema, val: Value, ty: Type) bool {
-    const info = ty.intInfo(sema.intern_pool).?;
+    const info = ty.intInfo(sema.intern_pool);
     var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const big = sema.intern_pool.indexToKey(val.index).int.storage.toBigInt(&space);
     return big.fitsInTwosComp(info.signedness, info.bits);
@@ -3286,8 +3289,10 @@ fn coerceInMemoryAllowedPtrs(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_m
     }
 
     if (src_info.flags.alignment != .none or dest_info.flags.alignment != .none or dest_info.child != src_info.child) {
-        const src_align = if (src_info.flags.alignment == .none) (src_child.abiAlignment(ip) orelse .none) else src_info.flags.alignment;
-        const dest_align = if (dest_info.flags.alignment == .none) (dest_child.abiAlignment(ip) orelse .none) else dest_info.flags.alignment;
+        try sema.ensureLayoutResolved(src_info.child);
+        try sema.ensureLayoutResolved(dest_info.child);
+        const src_align = if (src_info.flags.alignment == .none) src_child.abiAlignment(ip) else src_info.flags.alignment;
+        const dest_align = if (dest_info.flags.alignment == .none) dest_child.abiAlignment(ip) else dest_info.flags.alignment;
         if (dest_align.compare(if (dest_is_mut) .neq else .gt, src_align)) {
             return .{ .ptr_alignment = .{ .actual = src_align, .wanted = dest_align } };
         }
@@ -3679,7 +3684,10 @@ fn evalReifyTuple(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Valu
         try sema.validateTupleFieldType(field_ty_val);
         field_ty.* = field_ty_val;
     }
-    return .{ .index = try ip.internTupleType(field_types) };
+    const field_vals = try sema.gpa.alloc(InternPool.Index, fields_len);
+    defer sema.gpa.free(field_vals);
+    @memset(field_vals, .none);
+    return .{ .index = try ip.internTupleType(field_types, field_vals) };
 }
 
 fn derefSliceAsArray(sema: *Sema, val: Value) Error!Value {
@@ -3953,7 +3961,7 @@ fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.In
         .names = names,
         .values = values,
     });
-    const fields = ip.loadEnumType(enum_ty).?;
+    const fields = ip.loadEnumType(enum_ty);
     fields.field_name_map.get(ip).clearRetainingCapacity();
     for (names, 0..) |field_name, field_index| {
         if (ip.addFieldName(names, fields.field_name_map, field_name)) |prev_field_index| {
@@ -4110,7 +4118,7 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
         .aligns = if (any_aligns) aligns else &.{},
         .comptime_bits = if (any_comptime) comptime_words else &.{},
     });
-    const fields = ip.loadStructType(struct_ty).?;
+    const fields = ip.loadStructType(struct_ty);
     fields.field_name_map.get(ip).clearRetainingCapacity();
     for (names, 0..) |field_name, field_index| {
         if (ip.addFieldName(names, fields.field_name_map, field_name)) |prev_field_index| {
@@ -4215,18 +4223,26 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
         },
     };
 
+    const tag_usage: InternPool.UnionFields.TagUsage = if (tag_type != .none)
+        .tagged
+    else switch (layout) {
+        .auto => .safety,
+        .@"extern", .@"packed" => .none,
+    };
+
     const union_ty = try ip.getReifiedUnionType(.{
         .name = name,
         .id = .{ .reified = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst, .type_hash = hasher.final() } },
         .parent = sema.this_type,
         .layout = layout,
+        .tag_usage = tag_usage,
         .enum_tag_type = tag_type,
         .backing_int = backing_int,
         .names = names,
         .types = types,
         .aligns = if (any_aligns) aligns else &.{},
     });
-    const fields = ip.unionFields(union_ty).?;
+    const fields = ip.unionFields(union_ty);
     fields.field_name_map.get(ip).clearRetainingCapacity();
     for (names, 0..) |field_name, field_index| {
         if (ip.addFieldName(names, fields.field_name_map, field_name)) |prev_field_index| {
@@ -4453,7 +4469,10 @@ fn evalArrayInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         val.* = elem.index;
     }
 
-    const tuple_ty = try ip.internTupleType(types);
+    const field_vals = try sema.gpa.alloc(InternPool.Index, operands.len);
+    defer sema.gpa.free(field_vals);
+    @memset(field_vals, .none);
+    const tuple_ty = try ip.internTupleType(types, field_vals);
     const agg = try ip.internAggregate(.{ .ty = tuple_ty, .storage = .{ .elems = values } });
     return .{ .index = agg };
 }
@@ -4710,7 +4729,7 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const tag_enum = try sema.unionTagEnumType(type_info_ty);
 
     if (Type.fromIndex(ty).zigTypeTag(ip) == .int) {
-        const it = Type.fromIndex(ty).intInfo(ip).?;
+        const it = Type.fromIndex(ty).intInfo(ip);
         const int_info_ty = try sema.getStdLangType(.@"Type.Int");
         const signedness_ty = try sema.getStdLangType(.Signedness);
         const sign_idx = (try sema.enumFieldIndex(signedness_ty, try ip.getOrPutString(sema.gpa, @tagName(it.signedness)))).?;
@@ -4853,11 +4872,14 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const field_attrs_val = try sema.internConstSlice(attrs_ty, attrs);
             const decl_names_val = try sema.typeInfoDecls(ty);
 
+            try sema.resolveUnionFields(ty);
             const uf = ip.unionFields(ty);
-            const layout = if (uf) |f| f.layout else .auto;
-            const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(layout))).?;
-            const tag_type_val = try sema.optTypeValue(if (try sema.unionIsTagged(ty)) try sema.unionTagEnumType(ty) else .none);
-            const backing_integer_val = try sema.optTypeValue(if (uf) |f| f.packed_backing_int_type else .none);
+            const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(uf.layout))).?;
+            const tag_type_val = try sema.optTypeValue(switch (uf.tag_usage) {
+                .tagged => try sema.unionTagEnumType(ty),
+                .none, .safety => .none,
+            });
+            const backing_integer_val = try sema.optTypeValue(uf.packed_backing_int_type);
 
             var elems = [_]InternPool.Index{ layout_val.index, tag_type_val, backing_integer_val, field_names_val, field_types_val, field_attrs_val, decl_names_val };
             return try sema.typeInfoUnion(type_info_ty, tag_enum, "union", try ip.internAggregate(.{ .ty = union_std_ty, .storage = .{ .elems = &elems } }));
@@ -4907,7 +4929,7 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const field_attrs_val = try sema.internConstSlice(attrs_ty, attrs);
             const decl_names_val = if (tuple_types != null) try sema.internStringSlice(&.{}) else try sema.typeInfoDecls(ty);
 
-            const sf: ?InternPool.LoadedStructType = if (tuple_types == null) ip.loadStructType(ty) else null;
+            const sf: ?InternPool.LoadedStructType = if (tuple_types == null and ip.indexToKey(ty).struct_type == .reified) ip.loadStructType(ty) else null;
             const layout = if (sf) |f| f.layout else .auto;
             const layout_val = (try sema.enumValueFieldIndex(layout_ty, @intFromEnum(layout))).?;
             const backing_integer_val = try sema.optTypeValue(if (sf) |f| f.packed_backing_int_type else .none);
@@ -5348,7 +5370,10 @@ fn evalTupleDecl(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value
         ty.* = try sema.resolveDestType(zir_field_ty, "tuple field type");
     }
 
-    return .{ .index = try sema.intern_pool.internTupleType(types) };
+    const vals = try sema.gpa.alloc(InternPool.Index, fields_len);
+    defer sema.gpa.free(vals);
+    @memset(vals, .none);
+    return .{ .index = try sema.intern_pool.internTupleType(types, vals) };
 }
 
 fn evalStructDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
@@ -5402,7 +5427,7 @@ fn evalEnumDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const captures = try sema.resolveCaptures(enum_decl.captures);
     defer sema.gpa.free(captures);
 
-    return .{ .index = try sema.intern_pool.getDeclaredEnumType(
+    const result = try sema.intern_pool.getDeclaredEnumType(
         name,
         .{ .declared = .{
             .source_zir_id = sema.current_zir_id,
@@ -5412,7 +5437,15 @@ fn evalEnumDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         sema.this_type,
         @intCast(enum_decl.field_names.len),
         enum_decl.nonexhaustive or enum_decl.tag_type_body != null,
-    ) };
+        if (enum_decl.tag_type_body != null) .explicit else .auto,
+    );
+    switch (result) {
+        .existing => |enum_ty| return .{ .index = enum_ty },
+        .wip => |wip| {
+            _ = try sema.resolveEnumFields(wip.index);
+            return .{ .index = wip.index };
+        },
+    }
 }
 
 fn evalUnionDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
@@ -5438,7 +5471,13 @@ fn evalUnionDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .@"packed", .packed_explicit => .@"packed",
     };
 
-    return .{ .index = try sema.intern_pool.getDeclaredUnionType(
+    const tag_usage: InternPool.UnionFields.TagUsage = switch (union_decl.kind) {
+        .auto => .safety,
+        .tagged_explicit, .tagged_enum, .tagged_enum_explicit => .tagged,
+        .@"extern", .@"packed", .packed_explicit => .none,
+    };
+
+    const result = try sema.intern_pool.getDeclaredUnionType(
         name,
         .{ .declared = .{
             .source_zir_id = sema.current_zir_id,
@@ -5449,7 +5488,12 @@ fn evalUnionDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         @intCast(union_decl.field_names.len),
         layout,
         union_decl.field_align_body_lens != null,
-    ) };
+        tag_usage,
+    );
+    return .{ .index = switch (result) {
+        .existing => |union_ty| union_ty,
+        .wip => |wip| wip.index,
+    } };
 }
 
 fn evalOpaqueDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
@@ -5625,14 +5669,19 @@ pub fn structFieldByName(
     name: InternPool.NullTerminatedString,
 ) Error!?FieldInfo {
     const ip = sema.intern_pool;
-    if (ip.loadStructType(struct_ty)) |f| {
-        const i = f.nameIndex(ip, name) orelse return null;
-        return .{
-            .index = i,
-            .ty = f.field_types[i],
-            .is_comptime = structFieldIsComptime(f, i),
-            .align_bytes = structFieldAlign(sema, f, i),
-        };
+    switch (ip.indexToKey(struct_ty).struct_type) {
+        .reified => {
+            const f = ip.loadStructType(struct_ty);
+            const i = f.nameIndex(ip, name) orelse return null;
+            return .{
+                .index = i,
+                .ty = f.field_types[i],
+                .is_comptime = structFieldIsComptime(f, i),
+                .align_bytes = structFieldAlign(sema, f, i),
+            };
+        },
+        .declared => {},
+        .generated_union_tag => unreachable,
     }
     const cf = try sema.enterContainer(struct_ty, "struct field");
     defer cf.restore(sema);
@@ -5658,9 +5707,14 @@ pub fn structFieldDefault(
     name: InternPool.NullTerminatedString,
 ) Error!InternPool.Index {
     const ip = sema.intern_pool;
-    if (ip.loadStructType(struct_ty)) |f| {
-        const i = f.nameIndex(ip, name) orelse return .none;
-        return if (f.field_defaults.len == 0) .none else f.field_defaults[i];
+    switch (ip.indexToKey(struct_ty).struct_type) {
+        .reified => {
+            const f = ip.loadStructType(struct_ty);
+            const i = f.nameIndex(ip, name) orelse return .none;
+            return if (f.field_defaults.len == 0) .none else f.field_defaults[i];
+        },
+        .declared => {},
+        .generated_union_tag => unreachable,
     }
     const cf = try sema.enterContainer(struct_ty, "struct field default");
     defer cf.restore(sema);
@@ -5699,16 +5753,21 @@ pub fn unionFieldByName(
     name: InternPool.NullTerminatedString,
 ) Error!?FieldInfo {
     const ip = sema.intern_pool;
-    if (ip.unionFields(union_ty)) |f| {
-        for (f.field_names, 0..) |n, i| {
-            if (n != name) continue;
-            return .{
-                .index = @intCast(i),
-                .ty = f.field_types[i],
-                .align_bytes = if (f.field_aligns.len == 0 or f.field_aligns[i] == .none) null else @intCast(sema.intAsI128(f.field_aligns[i]).?),
-            };
-        }
-        return null;
+    switch (ip.indexToKey(union_ty).union_type) {
+        .reified => {
+            const f = ip.unionFields(union_ty);
+            for (f.field_names, 0..) |n, i| {
+                if (n != name) continue;
+                return .{
+                    .index = @intCast(i),
+                    .ty = f.field_types[i],
+                    .align_bytes = if (f.field_aligns.len == 0 or f.field_aligns[i] == .none) null else @intCast(sema.intAsI128(f.field_aligns[i]).?),
+                };
+            }
+            return null;
+        },
+        .declared => {},
+        .generated_union_tag => unreachable,
     }
     const cf = try sema.enterContainer(union_ty, "union field");
     defer cf.restore(sema);
@@ -5766,9 +5825,28 @@ fn callConvValue(sema: *Sema, cc: std.lang.CallingConvention) Error!InternPool.I
 
 pub fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
     const ip = sema.intern_pool;
-    if (ip.loadStructType(struct_ty)) |f| return if (index < f.field_names.len) f.field_names[index] else null;
+    switch (ip.indexToKey(struct_ty).struct_type) {
+        .reified => {
+            const f = ip.loadStructType(struct_ty);
+            return if (index < f.field_names.len) f.field_names[index] else null;
+        },
+        .declared => {},
+        .generated_union_tag => unreachable,
+    }
     const cf = try sema.enterContainer(struct_ty, "struct field name");
     defer cf.restore(sema);
+    if (sema.zir.instructions.items(.tag)[@intFromEnum(cf.decl_inst)] == .struct_init_anon) {
+        const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(cf.decl_inst)].pl_node;
+        const extra = sema.zir.extraData(Zir.Inst.StructInitAnon, pl_node.payload_index);
+        var extra_index = extra.end;
+        var i: u32 = 0;
+        while (i < extra.data.fields_len) : (i += 1) {
+            const item = sema.zir.extraData(Zir.Inst.StructInitAnon.Item, extra_index);
+            extra_index = item.end;
+            if (i == index) return try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(item.data.field_name));
+        }
+        return null;
+    }
     var it = sema.zir.getStructDecl(cf.decl_inst).iterateFields();
     while (it.next()) |field| {
         if (field.idx == index)
@@ -5778,7 +5856,11 @@ pub fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) E
 }
 
 pub fn unionFieldCount(sema: *Sema, union_ty: InternPool.Index) Error!u32 {
-    if (sema.intern_pool.unionFields(union_ty)) |f| return @intCast(f.field_names.len);
+    switch (sema.intern_pool.indexToKey(union_ty).union_type) {
+        .reified => return @intCast(sema.intern_pool.unionFields(union_ty).field_names.len),
+        .declared => {},
+        .generated_union_tag => unreachable,
+    }
     const cf = try sema.enterContainer(union_ty, "union field count");
     defer cf.restore(sema);
     return @intCast(sema.zir.getUnionDecl(cf.decl_inst).field_names.len);
@@ -5786,7 +5868,14 @@ pub fn unionFieldCount(sema: *Sema, union_ty: InternPool.Index) Error!u32 {
 
 pub fn unionFieldNameAt(sema: *Sema, union_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {
     const ip = sema.intern_pool;
-    if (ip.unionFields(union_ty)) |f| return if (index < f.field_names.len) f.field_names[index] else null;
+    switch (ip.indexToKey(union_ty).union_type) {
+        .reified => {
+            const f = ip.unionFields(union_ty);
+            return if (index < f.field_names.len) f.field_names[index] else null;
+        },
+        .declared => {},
+        .generated_union_tag => unreachable,
+    }
     const cf = try sema.enterContainer(union_ty, "union field name");
     defer cf.restore(sema);
     var it = sema.zir.getUnionDecl(cf.decl_inst).iterateFields();
@@ -5802,7 +5891,8 @@ fn failUntaggedUnionCmp(sema: *Sema) Error {
 }
 
 fn cmpUnionTagNoValue(sema: *Sema, union_ty: InternPool.Index, tag_name: InternPool.NullTerminatedString, op: std.math.CompareOperator) Error!?Value {
-    if (!try sema.unionIsTagged(union_ty)) return sema.failUntaggedUnionCmp();
+    try sema.resolveUnionFields(union_ty);
+    if (sema.intern_pool.unionFields(union_ty).tag_usage != .tagged) return sema.failUntaggedUnionCmp();
     if (op != .eq and op != .neq) return null;
     const field = (try sema.unionFieldByName(union_ty, tag_name)) orelse return null;
     if (!try sema.isNoPossibleValue(field.ty)) return null;
@@ -5847,33 +5937,42 @@ fn unionAllFieldsNpv(sema: *Sema, union_ty: InternPool.Index) Error!bool {
 
 pub fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPool.Index {
     const ip = sema.intern_pool;
-    if (ip.unionFields(union_ty)) |f| {
-        if (f.enum_tag_type != .none) return f.enum_tag_type;
-        return try ip.getDeclaredEnumType(
-            ip.typeName(union_ty),
-            .{ .generated_union_tag = union_ty },
-            .none,
-            0,
-            false,
-        );
+    switch (ip.indexToKey(union_ty).union_type) {
+        .reified => {
+            const f = ip.unionFields(union_ty);
+            if (f.enum_tag_type != .none) return f.enum_tag_type;
+        },
+        .declared => {
+            const cf = try sema.enterContainer(union_ty, "union tag type");
+            defer cf.restore(sema);
+            const decl = sema.zir.getUnionDecl(cf.decl_inst);
+            if (decl.kind == .tagged_explicit) {
+                const ty = (try sema.resolveInlineBody(decl.arg_type_body.?, cf.decl_inst)).index;
+                if (ip.indexToKey(ty) != .enum_type) {
+                    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected enum tag type, found '{f}'", .{Type.fromIndex(ty).fmt(ip)});
+                }
+                return ty;
+            }
+        },
+        .generated_union_tag => unreachable,
     }
-    const cf = try sema.enterContainer(union_ty, "union tag type");
-    defer cf.restore(sema);
-    const decl = sema.zir.getUnionDecl(cf.decl_inst);
-    if (decl.kind == .tagged_explicit) {
-        const ty = (try sema.resolveInlineBody(decl.arg_type_body.?, cf.decl_inst)).index;
-        if (ip.indexToKey(ty) != .enum_type) {
-            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected enum tag type, found '{f}'", .{Type.fromIndex(ty).fmt(ip)});
-        }
-        return ty;
+    const fields_len = try sema.unionFieldCount(union_ty);
+    const result = try ip.getDeclaredEnumType(ip.typeName(union_ty), .{ .generated_union_tag = union_ty }, .none, fields_len, false, .auto);
+    switch (result) {
+        .existing => |tag| return tag,
+        .wip => |wip| {
+            _ = try sema.resolveGeneratedTagFields(wip.index, union_ty);
+            return wip.index;
+        },
     }
-    return try ip.getDeclaredEnumType(ip.typeName(union_ty), .{ .generated_union_tag = union_ty }, .none, 0, false);
 }
 
 fn enumFieldCount(sema: *Sema, enum_ty: InternPool.Index) Error!u32 {
-    const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
-    if (et.generatedUnion() != .none) return try sema.unionFieldCount(et.generatedUnion());
-    if (sema.intern_pool.loadEnumType(enum_ty)) |f| return @intCast(f.field_names.len);
+    switch (sema.intern_pool.indexToKey(enum_ty).enum_type) {
+        .generated_union_tag => |u| return try sema.unionFieldCount(u),
+        .reified => return @intCast(sema.intern_pool.loadEnumType(enum_ty).field_names.len),
+        .declared => {},
+    }
     const cf = try sema.enterContainer(enum_ty, "enum field count");
     defer cf.restore(sema);
     return @intCast(sema.zir.getEnumDecl(cf.decl_inst).field_names.len);
@@ -5890,10 +5989,7 @@ const EnumMatchResult = struct { tag: Value, name: InternPool.NullTerminatedStri
 
 fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?EnumMatchResult {
     const ip = sema.intern_pool;
-    const et = ip.indexToKey(enum_ty).enum_type;
-    if (et.generatedUnion() != .none) return try sema.generatedTagScan(enum_ty, match);
-
-    const fields = try sema.resolveEnumFields(enum_ty);
+    const fields = ip.loadEnumType(enum_ty);
     if (match == .name) {
         const pos = fields.nameIndex(ip, match.name) orelse return null;
         const cur: i128 = if (fields.field_values.len == 0) @intCast(pos) else sema.intAsI128(fields.field_values[pos]).?;
@@ -5908,7 +6004,7 @@ fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error
 
 fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.LoadedEnumType {
     const ip = sema.intern_pool;
-    if (ip.loadEnumType(enum_ty)) |f| return f;
+    assert(ip.indexToKey(enum_ty).enum_type == .declared);
 
     const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
     const cf = try sema.enterContainer(enum_ty, "enum field");
@@ -5936,7 +6032,7 @@ fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Lo
         try values.append(sema.gpa, try sema.enumTagIntValue(tag_ty, cur));
     }
     try ip.setEnumFields(enum_ty, tag_ty, decl.nonexhaustive, names.items, values.items);
-    const fields = ip.loadEnumType(enum_ty).?;
+    const fields = ip.loadEnumType(enum_ty);
     fields.field_name_map.get(ip).clearRetainingCapacity();
     for (names.items) |field_name| assert(ip.addFieldName(names.items, fields.field_name_map, field_name) == null);
     if (fields.field_value_map.unwrap()) |value_map| {
@@ -5953,57 +6049,57 @@ fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Lo
             }
         }
     }
-    return ip.loadEnumType(enum_ty).?;
+    return ip.loadEnumType(enum_ty);
 }
 
-fn generatedTagScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error!?EnumMatchResult {
+fn resolveGeneratedTagFields(sema: *Sema, enum_ty: InternPool.Index, union_ty: InternPool.Index) Error!InternPool.LoadedEnumType {
     const ip = sema.intern_pool;
     const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
-    const owner = ip.indexToKey(enum_ty).enum_type.generatedUnion();
-    if (ip.unionFields(owner)) |f| {
-        for (f.field_names, 0..) |field_name, idx| {
-            if (try sema.matchEnumField(enum_ty, tag_ty, match, field_name, @intCast(idx), @intCast(idx))) |m| return m;
-        }
-        return null;
-    }
-    const cf = try sema.enterContainer(enum_ty, "union tag field");
-    defer cf.restore(sema);
-    const decl = sema.zir.getUnionDecl(cf.decl_inst);
-    var it = decl.iterateFields();
-    while (it.next()) |field| {
-        const field_name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
-        if (try sema.matchEnumField(enum_ty, tag_ty, match, field_name, field.idx, field.idx)) |m| return m;
-    }
-    return null;
+
+    const count = try sema.unionFieldCount(union_ty);
+    const names = try sema.arena.alloc(InternPool.NullTerminatedString, count);
+    for (names, 0..) |*n, i| n.* = (try sema.unionFieldNameAt(union_ty, @intCast(i))).?;
+
+    try ip.setEnumFields(enum_ty, tag_ty, false, names, &.{});
+    const fields = ip.loadEnumType(enum_ty);
+    fields.field_name_map.get(ip).clearRetainingCapacity();
+    for (names) |field_name| assert(ip.addFieldName(names, fields.field_name_map, field_name) == null);
+    return fields;
 }
 
 pub fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Index {
-    const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
-    if (sema.intern_pool.loadEnumType(enum_ty)) |f| return f.int_tag_type;
-    const gu = et.generatedUnion();
-    if (gu != .none and sema.intern_pool.indexToKey(gu).union_type == .reified) {
-        return try sema.enumIntTagType(try sema.unionFieldCount(gu));
+    switch (sema.intern_pool.indexToKey(enum_ty).enum_type) {
+        .reified => return sema.intern_pool.loadEnumType(enum_ty).int_tag_type,
+        .generated_union_tag => |gu| {
+            if (sema.intern_pool.indexToKey(gu).union_type == .reified) {
+                return try sema.enumIntTagType(try sema.unionFieldCount(gu));
+            }
+            const cf = try sema.enterContainer(enum_ty, "enum tag type");
+            defer cf.restore(sema);
+            const decl = sema.zir.getUnionDecl(cf.decl_inst);
+            return if (decl.kind == .tagged_enum_explicit)
+                (try sema.resolveInlineBody(decl.arg_type_body.?, cf.decl_inst)).index
+            else
+                try sema.enumIntTagType(@intCast(decl.field_names.len));
+        },
+        .declared => {
+            const cf = try sema.enterContainer(enum_ty, "enum tag type");
+            defer cf.restore(sema);
+            const decl = sema.zir.getEnumDecl(cf.decl_inst);
+            return if (decl.tag_type_body) |body|
+                (try sema.resolveInlineBody(body, cf.decl_inst)).index
+            else
+                try sema.enumIntTagType(@intCast(decl.field_names.len));
+        },
     }
-    const cf = try sema.enterContainer(enum_ty, "enum tag type");
-    defer cf.restore(sema);
-    if (et.generatedUnion() != .none) {
-        const decl = sema.zir.getUnionDecl(cf.decl_inst);
-        return if (decl.kind == .tagged_enum_explicit)
-            (try sema.resolveInlineBody(decl.arg_type_body.?, cf.decl_inst)).index
-        else
-            try sema.enumIntTagType(@intCast(decl.field_names.len));
-    }
-    const decl = sema.zir.getEnumDecl(cf.decl_inst);
-    return if (decl.tag_type_body) |body|
-        (try sema.resolveInlineBody(body, cf.decl_inst)).index
-    else
-        try sema.enumIntTagType(@intCast(decl.field_names.len));
 }
 
 fn enumNonexhaustive(sema: *Sema, enum_ty: InternPool.Index) Error!bool {
-    const et = sema.intern_pool.indexToKey(enum_ty).enum_type;
-    if (et.generatedUnion() != .none) return false;
-    if (sema.intern_pool.loadEnumType(enum_ty)) |f| return f.nonexhaustive;
+    switch (sema.intern_pool.indexToKey(enum_ty).enum_type) {
+        .generated_union_tag => return false,
+        .reified => return sema.intern_pool.loadEnumType(enum_ty).nonexhaustive,
+        .declared => {},
+    }
     const cf = try sema.enterContainer(enum_ty, "enum mode");
     defer cf.restore(sema);
     return sema.zir.getEnumDecl(cf.decl_inst).nonexhaustive;
@@ -6193,7 +6289,8 @@ fn evalTagName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const tag: InternPool.Key.EnumTag = switch (ip.indexToKey(operand.index)) {
         .enum_tag => |et| et,
         .un => |uv| blk: {
-            if (!try sema.unionIsTagged(uv.ty)) {
+            try sema.resolveUnionFields(uv.ty);
+            if (ip.unionFields(uv.ty).tag_usage != .tagged) {
                 return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "union '{f}' is untagged", .{Type.fromIndex(uv.ty).fmt(ip)});
             }
             break :blk ip.indexToKey(uv.tag).enum_tag;
@@ -6207,23 +6304,12 @@ fn evalTagName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return try sema.internStringLiteral(ip.stringSlice(name));
 }
 
-fn unionIsTagged(sema: *Sema, union_ty: InternPool.Index) Error!bool {
-    switch (sema.intern_pool.indexToKey(union_ty).union_type) {
-        .declared => |d| {
-            const frame = try sema.enterSourceZir(d.source_zir_id, "union kind");
-            defer frame.restore(sema);
-            return switch (sema.zir.getUnionDecl(d.decl_inst).kind) {
-                .tagged_explicit, .tagged_enum, .tagged_enum_explicit => true,
-                .auto, .@"extern", .@"packed", .packed_explicit => false,
-            };
-        },
-        .reified => return sema.intern_pool.unionFields(union_ty).?.enum_tag_type != .none,
+pub fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
+    switch (sema.intern_pool.indexToKey(struct_ty).struct_type) {
+        .reified => return @intCast(sema.intern_pool.loadStructType(struct_ty).field_names.len),
+        .declared => {},
         .generated_union_tag => unreachable,
     }
-}
-
-pub fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
-    if (sema.intern_pool.loadStructType(struct_ty)) |f| return @intCast(f.field_names.len);
     const st = sema.intern_pool.indexToKey(struct_ty).struct_type;
     const decl_inst = st.declInst();
     const frame = try sema.enterSourceZir(st.sourceZirId(), "struct field count");
@@ -6669,9 +6755,10 @@ fn evalUnionInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const field = (try sema.unionFieldByName(union_ty, field_name)) orelse
         return sema.failBadUnionFieldAccess(union_ty, field_name);
     const payload = try sema.coerceValueToType(try sema.resolveRef(extra.init), field.ty, "@unionInit");
-    if (ip.unionFields(union_ty)) |uf| if (uf.layout == .@"packed") {
+    try sema.resolveUnionFields(union_ty);
+    if (ip.unionFields(union_ty).layout == .@"packed") {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@unionInit of a packed union is not supported", .{});
-    };
+    }
     const tag_enum = try sema.unionTagEnumType(union_ty);
     const tag_val = (try sema.enumValueFieldIndex(tag_enum, field.index)).?;
     return .{ .index = try ip.internUnion(.{ .ty = union_ty, .tag = tag_val.index, .val = payload.index }) };
@@ -7498,7 +7585,10 @@ fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const len = dest_len orelse src_len.?;
     if (len == 0) return null;
 
-    if (!src_elem.comptimeOnly(ip) and (src_elem.abiSize(ip) orelse 0) == 0) return null;
+    if (!src_elem.comptimeOnly(ip)) {
+        try sema.ensureLayoutResolved(src_elem.index);
+        if (src_elem.abiSize(ip) == 0) return null;
+    }
 
     if (sema.doPointersOverlap(dest, src, len)) {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@memcpy: arguments alias", .{});
@@ -8222,7 +8312,8 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     var union_operand: ?InternPool.Key.Union = null;
     if (sema.intern_pool.indexToKey(operand.index) == .un) {
         const uv = sema.intern_pool.indexToKey(operand.index).un;
-        if (!try sema.unionIsTagged(uv.ty)) {
+        try sema.resolveUnionFields(uv.ty);
+        if (sema.intern_pool.unionFields(uv.ty).tag_usage != .tagged) {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "switch on union with no attached enum", .{});
         }
         cond = .{ .index = uv.tag };
@@ -9074,7 +9165,7 @@ fn evalIntFromError(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Va
     const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.UnNode, extended.operand).data;
     const operand = try sema.coerceValueToType(try sema.resolveRef(extra.operand), .anyerror_type, "@intFromError");
-    const err_int_ty = Type.fromIndex(ip.errorIntType());
+    const err_int_ty = Type.fromIndex(try ip.errorIntType());
     if (operand.isUndef(ip)) return try sema.undefValue(err_int_ty);
     const err_name = ip.indexToKey(operand.index).err.name;
     return try sema.intValue_u64(err_int_ty, try ip.getErrorValue(err_name));
@@ -9083,7 +9174,7 @@ fn evalIntFromError(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Va
 fn evalErrorFromInt(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
     const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.UnNode, extended.operand).data;
-    const err_int_ty = Type.fromIndex(ip.errorIntType());
+    const err_int_ty = Type.fromIndex(try ip.errorIntType());
     const operand = try sema.coerceValueToType(try sema.resolveRef(extra.operand), err_int_ty.index, "@errorFromInt");
     const int = operand.toUnsignedInt(ip);
     if (int == 0 or int > ip.global_error_set.count()) {
@@ -9298,7 +9389,7 @@ fn opvEnum(sema: *Sema, hash: u64, names: []const []const u8) !Type {
         .names = handles,
         .values = &.{},
     });
-    const f = pool.loadEnumType(enum_ty).?;
+    const f = pool.loadEnumType(enum_ty);
     f.field_name_map.get(pool).clearRetainingCapacity();
     for (handles) |name| assert(pool.addFieldName(handles, f.field_name_map, name) == null);
     return .fromIndex(enum_ty);
@@ -9319,7 +9410,7 @@ fn opvStruct(sema: *Sema, hash: u64, names: []const []const u8, types: []const I
         .aligns = &.{},
         .comptime_bits = &.{},
     });
-    const f = pool.loadStructType(struct_ty).?;
+    const f = pool.loadStructType(struct_ty);
     f.field_name_map.get(pool).clearRetainingCapacity();
     for (handles) |name| assert(pool.addFieldName(handles, f.field_name_map, name) == null);
     return .fromIndex(struct_ty);
@@ -9334,13 +9425,14 @@ fn opvUnion(sema: *Sema, hash: u64, tag_hash: u64, names: []const []const u8, ty
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
         .parent = .none,
         .layout = .auto,
+        .tag_usage = .tagged,
         .enum_tag_type = tag_enum.index,
         .backing_int = .none,
         .names = handles,
         .types = types,
         .aligns = &.{},
     });
-    const f = pool.unionFields(union_ty).?;
+    const f = pool.unionFields(union_ty);
     f.field_name_map.get(pool).clearRetainingCapacity();
     for (handles) |name| assert(pool.addFieldName(handles, f.field_name_map, name) == null);
     return .fromIndex(union_ty);
@@ -9376,8 +9468,8 @@ test "onePossibleValue: every type-kind branch" {
     try expectOpv(s, .fromIndex(try pool.internVectorType(.{ .len = 3, .child = .u8_type })), false);
     try expectOpv(s, .fromIndex(try pool.internOptionalType(.noreturn_type)), true);
     try expectOpv(s, .fromIndex(try pool.internOptionalType(.u8_type)), false);
-    try expectOpv(s, .fromIndex(try pool.internTupleType(&.{ .u0_type, .void_type })), true);
-    try expectOpv(s, .fromIndex(try pool.internTupleType(&.{.u8_type})), false);
+    try expectOpv(s, .fromIndex(try pool.internTupleType(&.{ .u0_type, .void_type }, &.{ .none, .none })), true);
+    try expectOpv(s, .fromIndex(try pool.internTupleType(&.{.u8_type}, &.{.none})), false);
     try expectOpv(s, try opvEnum(s, 0x1001, &.{"only"}), true);
     try expectOpv(s, try opvEnum(s, 0x1002, &.{ "a", "b" }), false);
     try expectOpv(s, try opvStruct(s, 0x2001, &.{ "x", "y" }, &.{ .u0_type, .void_type }), true);

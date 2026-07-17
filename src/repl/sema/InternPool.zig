@@ -326,6 +326,11 @@ pub const Alignment = enum(u6) {
         return @enumFromInt(@ctz(n));
     }
 
+    pub fn fromNonzeroByteUnits(n: u64) Alignment {
+        assert(n != 0);
+        return fromByteUnits(n);
+    }
+
     pub fn toByteUnits(a: Alignment) ?u64 {
         return switch (a) {
             .none => null,
@@ -342,6 +347,12 @@ pub const Alignment = enum(u6) {
         assert(n <= @intFromEnum(Alignment.none));
         if (n == @intFromEnum(Alignment.none)) return 0;
         return n + 1;
+    }
+
+    pub fn max(lhs: Alignment, rhs: Alignment) Alignment {
+        if (lhs == .none) return rhs;
+        if (rhs == .none) return lhs;
+        return maxStrict(lhs, rhs);
     }
 
     pub fn maxStrict(lhs: Alignment, rhs: Alignment) Alignment {
@@ -585,6 +596,7 @@ pub const Key = union(enum) {
 
     pub const TupleType = struct {
         types: []const Index,
+        values: []const Index,
     };
 
     pub const ContainerType = union(enum) {
@@ -783,6 +795,7 @@ pub const Key = union(enum) {
             .tuple_type => |tt| {
                 std.hash.autoHash(&hasher, @as(u32, @intCast(tt.types.len)));
                 for (tt.types) |ty| std.hash.autoHash(&hasher, ty);
+                for (tt.values) |val| std.hash.autoHash(&hasher, val);
             },
             .struct_type => |ct| hashContainerType(&hasher, ct),
             .enum_type => |ct| hashContainerType(&hasher, ct),
@@ -926,7 +939,7 @@ pub const Key = union(enum) {
                 };
             },
             .error_set_type => |x| std.mem.eql(NullTerminatedString, x.names, b.error_set_type.names),
-            .tuple_type => |x| std.mem.eql(Index, x.types, b.tuple_type.types),
+            .tuple_type => |x| std.mem.eql(Index, x.types, b.tuple_type.types) and std.mem.eql(Index, x.values, b.tuple_type.values),
             .struct_type => |x| eqlContainerType(x, b.struct_type),
             .enum_type => |x| eqlContainerType(x, b.enum_type),
             .enum_tag => |x| blk: {
@@ -1306,7 +1319,8 @@ const TypeEnum = struct {
         has_values: bool,
         fields_resolved: bool,
         want_layout: bool,
-        _: u28 = 0,
+        int_tag_mode: BackingTypeMode,
+        _: u27 = 0,
     };
 };
 
@@ -1330,7 +1344,8 @@ const TypeUnion = struct {
         has_runtime_tag: bool,
         class: TypeClass,
         alignment: Alignment,
-        _: u17 = 0,
+        tag_usage: UnionFields.TagUsage,
+        _: u15 = 0,
     };
 };
 
@@ -1666,8 +1681,24 @@ pub fn getErrorValueIfExists(pool: *const InternPool, name: NullTerminatedString
     return @intCast((pool.global_error_set.getIndex(name) orelse return null) + 1);
 }
 
-pub fn errorIntType(_: *const InternPool) Index {
-    return .u16_type;
+pub fn errorIntType(pool: *InternPool) Allocator.Error!Index {
+    return pool.internIntType(.unsigned, pool.errorSetBits());
+}
+
+pub fn errorSetBits(pool: *const InternPool) u16 {
+    const error_limit: u32 = @intCast(pool.global_error_set.count());
+    if (error_limit == 0) return 0;
+    return @as(u16, std.math.log2_int(u32, error_limit)) + 1;
+}
+
+pub fn aggregateTypeLenIncludingSentinel(pool: *const InternPool, ty: Index) u64 {
+    return switch (pool.indexToKey(ty)) {
+        .struct_type => pool.loadStructType(ty).field_types.len,
+        .tuple_type => |tuple_type| tuple_type.types.len,
+        .array_type => |array_type| array_type.lenIncludingSentinel(),
+        .vector_type => |vector_type| vector_type.len,
+        else => unreachable,
+    };
 }
 
 fn seedEmptyString(pool: *InternPool) Allocator.Error!void {
@@ -1934,7 +1965,7 @@ const static_keys: [first_dynamic_index]Key = .{
     .{ .error_union_type = .{ .error_set_type = .anyerror_type, .payload_type = .void_type } },
     .{ .simple_type = .adhoc_inferred_error_set },
     .{ .simple_type = .generic_poison },
-    .{ .tuple_type = .{ .types = &.{} } },
+    .{ .tuple_type = .{ .types = &.{}, .values = &.{} } },
 
     .{ .undef = .undefined_type },
     .{ .undef = .bool_type },
@@ -2351,8 +2382,9 @@ fn tupleTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
     assert(extra_index + 1 + types_len <= pool.extra.items.len);
 
     const raw_types = pool.extra.items[extra_index + 1 ..][0..types_len];
+    const raw_values = pool.extra.items[extra_index + 1 + types_len ..][0..types_len];
     return .{
-        .tuple_type = .{ .types = @ptrCast(raw_types) },
+        .tuple_type = .{ .types = @ptrCast(raw_types), .values = @ptrCast(raw_values) },
     };
 }
 
@@ -2893,16 +2925,24 @@ fn emitErrorSetType(pool: *InternPool, es: Key.ErrorSetType) Allocator.Error!voi
 
 fn emitTupleType(pool: *InternPool, tt: Key.TupleType) Allocator.Error!void {
     assert(tt.types.len <= std.math.maxInt(u32));
+    assert(tt.types.len == tt.values.len);
 
     const extra_index: u32 = @intCast(pool.extra.items.len);
-    try pool.extra.ensureUnusedCapacity(pool.gpa, 1 + tt.types.len);
+    try pool.extra.ensureUnusedCapacity(pool.gpa, 1 + tt.types.len + tt.values.len);
     pool.extra.appendAssumeCapacity(@intCast(tt.types.len));
     for (tt.types) |ty| pool.extra.appendAssumeCapacity(@intFromEnum(ty));
+    for (tt.values) |val| pool.extra.appendAssumeCapacity(@intFromEnum(val));
     pool.items.appendAssumeCapacity(.{ .tag = .type_tuple, .data = extra_index });
 }
 
+pub const BackingTypeMode = enum(u1) {
+    explicit,
+    auto,
+};
+
 pub const LoadedEnumType = struct {
     int_tag_type: Index,
+    int_tag_mode: BackingTypeMode,
     nonexhaustive: bool,
     field_names: []const NullTerminatedString,
     field_values: []const Index,
@@ -2932,12 +2972,12 @@ pub const LoadedEnumType = struct {
     }
 };
 
-pub fn loadEnumType(pool: *const InternPool, enum_ty: Index) ?LoadedEnumType {
+pub fn loadEnumType(pool: *const InternPool, enum_ty: Index) LoadedEnumType {
     const item = pool.items.get(@intFromEnum(enum_ty));
     assert(item.tag == .type_enum);
     const trail = pool.extraDataTrail(TypeEnum, item.data);
     const r = trail.data;
-    if (!r.flags.fields_resolved) return null;
+    assert(r.flags.fields_resolved);
     const fields_len = r.fields_len;
     var base = trail.end + containerIdTrailingLen(r.captures_len);
     const names: []const NullTerminatedString = @ptrCast(pool.extra.items[base..][0..fields_len]);
@@ -2945,24 +2985,13 @@ pub fn loadEnumType(pool: *const InternPool, enum_ty: Index) ?LoadedEnumType {
     const values: []const Index = if (r.flags.has_values) @ptrCast(pool.extra.items[base..][0..fields_len]) else &.{};
     return .{
         .int_tag_type = r.int_tag_type,
+        .int_tag_mode = r.flags.int_tag_mode,
         .nonexhaustive = r.flags.nonexhaustive,
         .field_names = names,
         .field_values = values,
         .field_name_map = r.field_name_map.unwrap().?,
         .field_value_map = r.field_value_map,
     };
-}
-
-pub fn enumIntTagTypeStored(pool: *const InternPool, enum_ty: Index) Index {
-    const item = pool.items.get(@intFromEnum(enum_ty));
-    assert(item.tag == .type_enum);
-    return pool.extraData(TypeEnum, item.data).int_tag_type;
-}
-
-pub fn setEnumIntTagType(pool: *InternPool, enum_ty: Index, int_tag_type: Index) void {
-    const item = pool.items.get(@intFromEnum(enum_ty));
-    assert(item.tag == .type_enum);
-    pool.extra.items[item.data + std.meta.fieldIndex(TypeEnum, "int_tag_type").?] = @intFromEnum(int_tag_type);
 }
 
 pub fn setEnumFields(
@@ -3062,12 +3091,11 @@ pub const LoadedStructType = struct {
     };
 };
 
-pub fn loadStructType(pool: *const InternPool, struct_ty: Index) ?LoadedStructType {
+pub fn loadStructType(pool: *const InternPool, struct_ty: Index) LoadedStructType {
     const item = pool.items.get(@intFromEnum(struct_ty));
     assert(item.tag == .type_struct);
     const trail = pool.extraDataTrail(TypeStruct, item.data);
     const r = trail.data;
-    if (!r.flags.fields_resolved) return null;
     const fields_len = r.fields_len;
     var base = trail.end + containerIdTrailingLen(r.captures_len);
     const names: []const NullTerminatedString = @ptrCast(pool.extra.items[base..][0..fields_len]);
@@ -3230,6 +3258,7 @@ fn emitEnumTag(pool: *InternPool, et: Key.EnumTag) Allocator.Error!void {
 
 pub const UnionFields = struct {
     layout: std.lang.Type.ContainerLayout,
+    tag_usage: TagUsage,
     enum_tag_type: Index,
     packed_backing_int_type: Index,
     field_names: []const NullTerminatedString,
@@ -3240,14 +3269,19 @@ pub const UnionFields = struct {
     class: TypeClass,
     size: u32,
     alignment: Alignment,
+
+    pub const TagUsage = enum(u2) {
+        none,
+        safety,
+        tagged,
+    };
 };
 
-pub fn unionFields(pool: *const InternPool, union_ty: Index) ?UnionFields {
+pub fn unionFields(pool: *const InternPool, union_ty: Index) UnionFields {
     const item = pool.items.get(@intFromEnum(union_ty));
     assert(item.tag == .type_union);
     const trail = pool.extraDataTrail(TypeUnion, item.data);
     const r = trail.data;
-    if (!r.flags.fields_resolved) return null;
     const fields_len = r.fields_len;
     var base = trail.end + containerIdTrailingLen(r.captures_len);
     const names: []const NullTerminatedString = @ptrCast(pool.extra.items[base..][0..fields_len]);
@@ -3261,6 +3295,7 @@ pub fn unionFields(pool: *const InternPool, union_ty: Index) ?UnionFields {
             .@"extern" => .@"extern",
             .@"packed" => .@"packed",
         },
+        .tag_usage = r.flags.tag_usage,
         .enum_tag_type = r.enum_tag_type,
         .packed_backing_int_type = r.backing_int,
         .field_names = names,
@@ -3465,9 +3500,18 @@ pub fn internPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!Index {
     return pool.get(.{ .ptr = p });
 }
 
-pub fn internTupleType(pool: *InternPool, types: []const Index) Allocator.Error!Index {
-    return pool.get(.{ .tuple_type = .{ .types = types } });
+pub fn internTupleType(pool: *InternPool, types: []const Index, values: []const Index) Allocator.Error!Index {
+    return pool.get(.{ .tuple_type = .{ .types = types, .values = values } });
 }
+
+pub const WipContainerType = struct {
+    index: Index,
+
+    pub const Result = union(enum) {
+        wip: WipContainerType,
+        existing: Index,
+    };
+};
 
 fn getOrPutContainer(pool: *InternPool, key: Key) Allocator.Error!struct { existing: ?Index, index: u32 } {
     const adapter: KeyAdapter = .{ .pool = pool };
@@ -3595,9 +3639,10 @@ pub fn getDeclaredEnumType(
     parent: Index,
     fields_len: u32,
     has_values: bool,
-) Allocator.Error!Index {
+    int_tag_mode: BackingTypeMode,
+) Allocator.Error!WipContainerType.Result {
     const gop = try pool.getOrPutContainer(.{ .enum_type = id });
-    if (gop.existing) |e| return e;
+    if (gop.existing) |e| return .{ .existing = e };
     const extra_index = try pool.addExtra(TypeEnum{
         .name = name,
         .parent = parent,
@@ -3607,14 +3652,14 @@ pub fn getDeclaredEnumType(
         .field_name_map = .none,
         .field_value_map = .none,
         .captures_len = containerCapturesLen(id),
-        .flags = .{ .nonexhaustive = false, .has_values = has_values, .fields_resolved = false, .want_layout = false },
+        .flags = .{ .nonexhaustive = false, .has_values = has_values, .fields_resolved = false, .want_layout = false, .int_tag_mode = int_tag_mode },
     });
     try pool.appendContainerType(id);
     const reserved = fields_len + if (has_values) fields_len else 0;
     try pool.extra.ensureUnusedCapacity(pool.gpa, reserved);
     pool.extra.appendNTimesAssumeCapacity(0, reserved);
     pool.items.appendAssumeCapacity(.{ .tag = .type_enum, .data = extra_index });
-    return @enumFromInt(gop.index);
+    return .{ .wip = .{ .index = @enumFromInt(gop.index) } };
 }
 
 pub fn getReifiedEnumType(pool: *InternPool, ini: struct {
@@ -3642,7 +3687,7 @@ pub fn getReifiedEnumType(pool: *InternPool, ini: struct {
         .field_name_map = field_name_map.toOptional(),
         .field_value_map = field_value_map,
         .captures_len = containerCapturesLen(ini.id),
-        .flags = .{ .nonexhaustive = ini.nonexhaustive, .has_values = has_values, .fields_resolved = true, .want_layout = false },
+        .flags = .{ .nonexhaustive = ini.nonexhaustive, .has_values = has_values, .fields_resolved = true, .want_layout = false, .int_tag_mode = .explicit },
     });
     try pool.appendContainerType(ini.id);
     try pool.extra.ensureUnusedCapacity(pool.gpa, fields_len + if (has_values) fields_len else 0);
@@ -3664,9 +3709,10 @@ pub fn getDeclaredUnionType(
     fields_len: u32,
     layout: std.lang.Type.ContainerLayout,
     any_field_aligns: bool,
-) Allocator.Error!Index {
+    tag_usage: UnionFields.TagUsage,
+) Allocator.Error!WipContainerType.Result {
     const gop = try pool.getOrPutContainer(.{ .union_type = id });
-    if (gop.existing) |e| return e;
+    if (gop.existing) |e| return .{ .existing = e };
     const field_name_map = try pool.addMap(pool.gpa, fields_len);
     const extra_index = try pool.addExtra(TypeUnion{
         .name = name,
@@ -3690,6 +3736,7 @@ pub fn getDeclaredUnionType(
             .has_runtime_tag = false,
             .class = .no_possible_value,
             .alignment = .none,
+            .tag_usage = tag_usage,
         },
     });
     try pool.appendContainerType(id);
@@ -3697,7 +3744,7 @@ pub fn getDeclaredUnionType(
     try pool.extra.ensureUnusedCapacity(pool.gpa, reserved);
     pool.extra.appendNTimesAssumeCapacity(0, reserved);
     pool.items.appendAssumeCapacity(.{ .tag = .type_union, .data = extra_index });
-    return @enumFromInt(gop.index);
+    return .{ .wip = .{ .index = @enumFromInt(gop.index) } };
 }
 
 pub fn getDeclaredOpaqueType(pool: *InternPool, name: NullTerminatedString, id: Key.ContainerType, parent: Index) Allocator.Error!Index {
@@ -3719,6 +3766,7 @@ pub fn getReifiedUnionType(pool: *InternPool, ini: struct {
     id: Key.ContainerType,
     parent: Index,
     layout: std.lang.Type.ContainerLayout,
+    tag_usage: UnionFields.TagUsage,
     enum_tag_type: Index,
     backing_int: Index,
     names: []const NullTerminatedString,
@@ -3754,6 +3802,7 @@ pub fn getReifiedUnionType(pool: *InternPool, ini: struct {
             .has_runtime_tag = false,
             .class = .no_possible_value,
             .alignment = .none,
+            .tag_usage = ini.tag_usage,
         },
     });
     try pool.appendContainerType(ini.id);

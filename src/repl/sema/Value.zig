@@ -18,6 +18,41 @@ pub fn toIndex(val: Value) InternPool.Index {
     return val.index;
 }
 
+pub fn print(val: Value, pool: *const InternPool, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    switch (pool.indexToKey(val.index)) {
+        .int => |iv| {
+            var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+            try writer.print("{f}", .{iv.storage.toBigInt(&space)});
+        },
+        .enum_tag => |et| {
+            const f = pool.loadEnumType(et.ty);
+            var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+            const tag = pool.indexToKey(et.int).int.storage.toBigInt(&space).toInt(i64) catch {
+                return print(.fromIndex(et.int), pool, writer);
+            };
+            if (f.field_values.len == 0) {
+                if (tag >= 0 and tag < f.field_names.len) {
+                    return writer.print(".{s}", .{pool.stringSlice(f.field_names[@intCast(tag)])});
+                }
+            } else for (f.field_values, 0..) |v, pos| {
+                var value_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+                const field_val = pool.indexToKey(v).int.storage.toBigInt(&value_space).toInt(i64) catch continue;
+                if (field_val == tag) return writer.print(".{s}", .{pool.stringSlice(f.field_names[pos])});
+            }
+            return print(.fromIndex(et.int), pool, writer);
+        },
+        .simple_value => |sv| try writer.writeAll(switch (sv) {
+            .void => "void",
+            .null => "null",
+            .true => "true",
+            .false => "false",
+            .@"unreachable" => "unreachable",
+        }),
+        .err => |e| try writer.print("error.{s}", .{pool.stringSlice(e.name)}),
+        else => try writer.writeAll("?"),
+    }
+}
+
 pub fn typeOf(val: Value, pool: *const InternPool) Type {
     const key = pool.indexToKey(val.index);
     return switch (key) {
@@ -487,19 +522,19 @@ pub fn toBigInt(val: Value, space: *InternPool.Key.Int.Storage.BigIntSpace, pool
 pub fn clz(val: Value, ty: Type, pool: *const InternPool) u64 {
     var bigint_buf: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const bigint = val.toBigInt(&bigint_buf, pool);
-    return bigint.clz(ty.intInfo(pool).?.bits);
+    return bigint.clz(ty.intInfo(pool).bits);
 }
 
 pub fn ctz(val: Value, ty: Type, pool: *const InternPool) u64 {
     var bigint_buf: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const bigint = val.toBigInt(&bigint_buf, pool);
-    return bigint.ctz(ty.intInfo(pool).?.bits);
+    return bigint.ctz(ty.intInfo(pool).bits);
 }
 
 pub fn popCount(val: Value, ty: Type, pool: *const InternPool) u64 {
     var bigint_buf: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const bigint = val.toBigInt(&bigint_buf, pool);
-    return @intCast(bigint.popCount(ty.intInfo(pool).?.bits));
+    return @intCast(bigint.popCount(ty.intInfo(pool).bits));
 }
 
 pub const undef: Value = .{ .index = .undef };

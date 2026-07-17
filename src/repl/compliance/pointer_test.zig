@@ -53,6 +53,27 @@ test "compliance: @sizeOf matches the host target ABI" {
     });
 }
 
+test "compliance: @bitSizeOf matches the host target ABI" {
+    @setEvalBranchQuota(20_000);
+    try compliance.check(a, .{
+        .{ .src = &.{"@bitSizeOf(u0)"}, .want = @bitSizeOf(u0) },
+        .{ .src = &.{"@bitSizeOf(u7)"}, .want = @bitSizeOf(u7) },
+        .{ .src = &.{"@bitSizeOf(u8)"}, .want = @bitSizeOf(u8) },
+        .{ .src = &.{"@bitSizeOf(u64)"}, .want = @bitSizeOf(u64) },
+        .{ .src = &.{"@bitSizeOf(bool)"}, .want = @bitSizeOf(bool) },
+        .{ .src = &.{"@bitSizeOf(void)"}, .want = @bitSizeOf(void) },
+        .{ .src = &.{"@bitSizeOf(f32)"}, .want = @bitSizeOf(f32) },
+        .{ .src = &.{"@bitSizeOf(f64)"}, .want = @bitSizeOf(f64) },
+        .{ .src = &.{"@bitSizeOf(*u8)"}, .want = @bitSizeOf(*u8) },
+        .{ .src = &.{"@bitSizeOf([4]u8)"}, .want = @bitSizeOf([4]u8) },
+        // Exercises the int_tag_mode `.explicit` path: enum bitSize routes through intInfo -> int tag.
+        .{ .src = &.{"@bitSizeOf(enum(u8) { a, b })"}, .want = @bitSizeOf(enum(u8) { a, b }) },
+        // hasBitRepresentation rejects comptime-only operands.
+        .{ .src = &.{"@bitSizeOf(comptime_int)"}, .reject = {} },
+        .{ .src = &.{"@bitSizeOf(type)"}, .reject = {} },
+    });
+}
+
 test "compliance: &decl carries the binding's constness and alignment" {
     try compliance.check(a, .{
         .{ .src = &.{ "var x: u32 = 5;", "@TypeOf(&x)" }, .want = *u32 },
