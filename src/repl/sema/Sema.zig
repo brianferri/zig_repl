@@ -7238,6 +7238,21 @@ fn elemPtr(sema: *Sema, array_ptr: Value, index: u64) Error!Value {
     if (ip.indexToKey(child_ty) == .ptr_type and ip.indexToKey(child_ty).ptr_type.flags.size == .slice) {
         return try sema.elemPtrSlice(array_ptr, index, child_ty);
     }
+    if (ip.indexToKey(child_ty) == .tuple_type) {
+        const tuple = ip.indexToKey(child_ty).tuple_type;
+        if (index >= tuple.types.len) {
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index {d} outside tuple of length {d}", .{ index, tuple.types.len });
+        }
+        const elem_ptr_ty = try ip.internPtrType(.{
+            .child = tuple.types[@intCast(index)],
+            .flags = .{ .size = .one, .is_const = ip.indexToKey(parent_ty).ptr_type.flags.is_const },
+        });
+        return .{ .index = try ip.internPtr(.{
+            .ty = elem_ptr_ty,
+            .base_addr = .{ .field = .{ .base = array_ptr.index, .index = @intCast(index) } },
+            .byte_offset = 0,
+        }) };
+    }
     const elems = indexableInfo(ip, child_ty) orelse {
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "elem ptr: operand is not an array pointer", .{});
     };
