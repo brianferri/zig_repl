@@ -63,6 +63,7 @@ pub fn maxIntScalar(ty: Type, sema: *Sema, dest_ty: Type) !Value {
 
 pub fn onePossibleValue(ty: Type, sema: *Sema) Sema.Error!?Value {
     const ip = sema.intern_pool;
+    try sema.ensureLayoutResolved(ty.index);
     return switch (ip.indexToKey(ty.index)) {
         .ptr_type,
         .error_union_type,
@@ -128,13 +129,25 @@ pub fn onePossibleValue(ty: Type, sema: *Sema) Sema.Error!?Value {
         else
             null,
         .tuple_type => |tuple| {
-            const field_vals = try sema.arena.alloc(InternPool.Index, tuple.types.len);
+            if (ty.classify(ip) != .one_possible_value) return null;
+            const field_vals = try sema.arena.dupe(InternPool.Index, tuple.values);
             for (field_vals, tuple.types) |*field_val, field_ty| {
-                field_val.* = ((try Type.fromIndex(field_ty).onePossibleValue(sema)) orelse return null).index;
+                if (field_val.* != .none) continue;
+                field_val.* = (try Type.fromIndex(field_ty).onePossibleValue(sema)).?.index;
             }
             return try sema.aggregateValue(ty, field_vals);
         },
         .struct_type => {
+            const struct_obj = ip.loadStructType(ty.index);
+            switch (struct_obj.layout) {
+                .auto, .@"extern" => {},
+                .@"packed" => {
+                    const backing_ty: Type = .fromIndex(struct_obj.packed_backing_int_type);
+                    const backing_val = try backing_ty.onePossibleValue(sema) orelse return null;
+                    return try sema.bitpackValue(ty, backing_val);
+                },
+            }
+            if (ty.classify(ip) != .one_possible_value) return null;
             const count = try sema.structFieldCount(ty.index);
             const field_vals = try sema.arena.alloc(InternPool.Index, count);
             for (field_vals, 0..) |*field_val, i| {
@@ -146,27 +159,32 @@ pub fn onePossibleValue(ty: Type, sema: *Sema) Sema.Error!?Value {
                     field_val.* = default;
                     continue;
                 }
-                field_val.* = ((try Type.fromIndex(field.ty).onePossibleValue(sema)) orelse return null).index;
+                field_val.* = (try Type.fromIndex(field.ty).onePossibleValue(sema)).?.index;
             }
             return try sema.aggregateValue(ty, field_vals);
         },
         .union_type => {
+            const union_obj = ip.unionFields(ty.index);
+            if (union_obj.layout == .@"packed") {
+                const backing_ty: Type = .fromIndex(union_obj.packed_backing_int_type);
+                const backing_val = try backing_ty.onePossibleValue(sema) orelse return null;
+                return try sema.bitpackValue(ty, backing_val);
+            }
+            if (ty.classify(ip) != .one_possible_value) return null;
             const count = try sema.unionFieldCount(ty.index);
-            var opv_index: ?u32 = null;
             var i: u32 = 0;
             while (i < count) : (i += 1) {
                 const name = (try sema.unionFieldNameAt(ty.index, i)).?;
                 const field_ty = (try sema.unionFieldByName(ty.index, name)).?.ty;
-                if (try sema.isNoPossibleValue(field_ty)) continue;
-                if (opv_index != null) return null;
-                opv_index = i;
-            }
-            const field_index = opv_index orelse return null;
-            const name = (try sema.unionFieldNameAt(ty.index, field_index)).?;
-            const field_ty = (try sema.unionFieldByName(ty.index, name)).?.ty;
-            const payload = (try Type.fromIndex(field_ty).onePossibleValue(sema)) orelse return null;
-            const tag_val = (try sema.enumValueFieldIndex(try sema.unionTagEnumType(ty.index), field_index)).?;
-            return .{ .index = try ip.internUnion(.{ .ty = ty.index, .tag = tag_val.index, .val = payload.index }) };
+                switch (Type.fromIndex(field_ty).classify(ip)) {
+                    .no_possible_value => continue,
+                    .one_possible_value => {},
+                    else => unreachable,
+                }
+                const tag_val = (try sema.enumValueFieldIndex(try sema.unionTagEnumType(ty.index), i)).?;
+                const payload = (try Type.fromIndex(field_ty).onePossibleValue(sema)).?;
+                return .{ .index = try ip.internUnion(.{ .ty = ty.index, .tag = tag_val.index, .val = payload.index }) };
+            } else unreachable;
         },
 
         .simple_value,
@@ -183,6 +201,7 @@ pub fn onePossibleValue(ty: Type, sema: *Sema) Sema.Error!?Value {
         .aggregate,
         .enum_tag,
         .un,
+        .bitpack,
         => unreachable,
     };
 }
@@ -307,6 +326,7 @@ pub fn classify(start_ty: Type, pool: *const InternPool) InternPool.TypeClass {
         .aggregate,
         .enum_tag,
         .un,
+        .bitpack,
         => unreachable,
     };
 
@@ -354,6 +374,14 @@ pub fn containerLayout(ty: Type, pool: *const InternPool) std.lang.Type.Containe
         .tuple_type => .auto,
         .struct_type => pool.loadStructType(ty.index).layout,
         .union_type => pool.unionFields(ty.index).layout,
+        else => unreachable,
+    };
+}
+
+pub fn bitpackBackingInt(ty: Type, pool: *const InternPool) Type {
+    return switch (pool.indexToKey(ty.index)) {
+        .struct_type => .fromIndex(pool.loadStructType(ty.index).packed_backing_int_type),
+        .union_type => .fromIndex(pool.unionFields(ty.index).packed_backing_int_type),
         else => unreachable,
     };
 }
@@ -614,6 +642,7 @@ pub fn abiAlignment(ty: Type, pool: *const InternPool) InternPool.Alignment {
         .aggregate,
         .enum_tag,
         .un,
+        .bitpack,
         => unreachable,
     };
 }
@@ -790,6 +819,7 @@ pub fn abiSize(ty: Type, pool: *const InternPool) u64 {
         .aggregate,
         .enum_tag,
         .un,
+        .bitpack,
         => unreachable,
     };
 }
@@ -864,6 +894,7 @@ pub fn intInfo(starting_ty: Type, pool: *const InternPool) std.lang.Type.Int {
             .opt,
             .aggregate,
             .un,
+            .bitpack,
             => unreachable,
         },
     };
@@ -999,8 +1030,22 @@ pub fn vectorLen(ty: Type, pool: *const InternPool) u32 {
     };
 }
 
+pub fn arrayLen(ty: Type, pool: *const InternPool) u64 {
+    return pool.aggregateTypeLen(ty.index);
+}
+
 pub fn arrayLenIncludingSentinel(ty: Type, pool: *const InternPool) u64 {
     return pool.aggregateTypeLenIncludingSentinel(ty.index);
+}
+
+/// Asserts the type is an array, pointer, or vector.
+pub fn sentinel(ty: Type, pool: *const InternPool) ?Value {
+    return switch (pool.indexToKey(ty.index)) {
+        .vector_type, .struct_type, .tuple_type => null,
+        .array_type => |t| if (t.sentinel != .none) .fromIndex(t.sentinel) else null,
+        .ptr_type => |t| if (t.sentinel != .none) .fromIndex(t.sentinel) else null,
+        else => unreachable,
+    };
 }
 
 pub fn scalarType(ty: Type, pool: *const InternPool) Type {

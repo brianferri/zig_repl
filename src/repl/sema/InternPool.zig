@@ -496,6 +496,7 @@ pub const Key = union(enum) {
     aggregate: Aggregate,
     enum_tag: EnumTag,
     un: Union,
+    bitpack: Bitpack,
 
     pub const Int = struct {
         ty: Index,
@@ -654,6 +655,11 @@ pub const Key = union(enum) {
         int: Index,
     };
 
+    pub const Bitpack = struct {
+        ty: Index,
+        backing_int_val: Index,
+    };
+
     pub const Error = extern struct {
         ty: Index,
         name: NullTerminatedString,
@@ -810,6 +816,10 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, uv.tag);
                 std.hash.autoHash(&hasher, uv.val);
             },
+            .bitpack => |b| {
+                std.hash.autoHash(&hasher, b.ty);
+                std.hash.autoHash(&hasher, b.backing_int_val);
+            },
             .slice => |s| {
                 std.hash.autoHash(&hasher, s.ty);
                 std.hash.autoHash(&hasher, s.ptr);
@@ -952,6 +962,10 @@ pub const Key = union(enum) {
                 const y = b.un;
                 break :blk x.ty == y.ty and x.tag == y.tag and x.val == y.val;
             },
+            .bitpack => |x| blk: {
+                const y = b.bitpack;
+                break :blk x.ty == y.ty and x.backing_int_val == y.backing_int_val;
+            },
             .slice => |x| blk: {
                 const y = b.slice;
                 break :blk x.ty == y.ty and x.ptr == y.ptr and x.len == y.len;
@@ -1059,6 +1073,7 @@ pub const Key = union(enum) {
             .aggregate,
             .enum_tag,
             .un,
+            .bitpack,
             => false,
         };
     }
@@ -1141,6 +1156,7 @@ const Item = struct {
         type_union,
         type_opaque,
         union_value,
+        bitpack,
         error_set_error,
         type_error_union,
         error_union_error,
@@ -1691,6 +1707,16 @@ pub fn errorSetBits(pool: *const InternPool) u16 {
     return @as(u16, std.math.log2_int(u32, error_limit)) + 1;
 }
 
+pub fn aggregateTypeLen(pool: *const InternPool, ty: Index) u64 {
+    return switch (pool.indexToKey(ty)) {
+        .struct_type => pool.loadStructType(ty).field_types.len,
+        .tuple_type => |tuple_type| tuple_type.types.len,
+        .array_type => |array_type| array_type.len,
+        .vector_type => |vector_type| vector_type.len,
+        else => unreachable,
+    };
+}
+
 pub fn aggregateTypeLenIncludingSentinel(pool: *const InternPool, ty: Index) u64 {
     return switch (pool.indexToKey(ty)) {
         .struct_type => pool.loadStructType(ty).field_types.len,
@@ -2065,6 +2091,7 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .union_type => unreachable,
         .opaque_type => unreachable,
         .un => |uv| try emitUnionValue(pool, uv),
+        .bitpack => |b| try emitBitpack(pool, b),
         .err => |e| try emitErr(pool, e),
         .error_union_type => |eu| try emitErrorUnionType(pool, eu),
         .error_union => |eu| try emitErrorUnion(pool, eu),
@@ -2255,6 +2282,7 @@ pub fn zigTypeTag(pool: *const InternPool, index: Index) std.lang.TypeId {
             .aggregate,
             .enum_tag,
             .un,
+            .bitpack,
             => unreachable,
         },
     };
@@ -2345,6 +2373,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .type_struct => structTypeFromExtra(pool, item.data),
         .type_enum => enumTypeFromExtra(pool, item.data),
         .enum_tag => enumTagFromExtra(pool, item.data),
+        .bitpack => bitpackFromExtra(pool, item.data),
         .type_union => unionTypeFromExtra(pool, item.data),
         .type_opaque => opaqueTypeFromExtra(pool, item.data),
         .union_value => unionValueFromExtra(pool, item.data),
@@ -2400,6 +2429,10 @@ fn enumTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
 
 fn enumTagFromExtra(pool: *const InternPool, extra_index: u32) Key {
     return .{ .enum_tag = pool.extraData(Key.EnumTag, extra_index) };
+}
+
+fn bitpackFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    return .{ .bitpack = pool.extraData(Key.Bitpack, extra_index) };
 }
 
 fn sliceFromExtra(pool: *const InternPool, extra_index: u32) Key {
@@ -3175,6 +3208,18 @@ pub fn fillDeclaredStructFields(
     pool.extra.items[item.data + std.meta.fieldIndex(TypeStruct, "flags").?] = @bitCast(flags);
 }
 
+pub fn setStructPackedBackingInt(pool: *InternPool, struct_ty: Index, backing: Index) void {
+    const item = pool.items.get(@intFromEnum(struct_ty));
+    assert(item.tag == .type_struct);
+    pool.extra.items[item.data + std.meta.fieldIndex(TypeStruct, "backing_int").?] = @intFromEnum(backing);
+}
+
+pub fn setUnionPackedBackingInt(pool: *InternPool, union_ty: Index, backing: Index) void {
+    const item = pool.items.get(@intFromEnum(union_ty));
+    assert(item.tag == .type_union);
+    pool.extra.items[item.data + std.meta.fieldIndex(TypeUnion, "backing_int").?] = @intFromEnum(backing);
+}
+
 pub fn setStructLayout(
     pool: *InternPool,
     struct_ty: Index,
@@ -3254,6 +3299,11 @@ pub fn setNamespace(pool: *InternPool, ty: Index, ns: NamespaceIndex) void {
 fn emitEnumTag(pool: *InternPool, et: Key.EnumTag) Allocator.Error!void {
     const extra_index = try pool.addExtra(et);
     pool.items.appendAssumeCapacity(.{ .tag = .enum_tag, .data = extra_index });
+}
+
+fn emitBitpack(pool: *InternPool, b: Key.Bitpack) Allocator.Error!void {
+    const extra_index = try pool.addExtra(b);
+    pool.items.appendAssumeCapacity(.{ .tag = .bitpack, .data = extra_index });
 }
 
 pub const UnionFields = struct {
@@ -3816,6 +3866,10 @@ pub fn getReifiedUnionType(pool: *InternPool, ini: struct {
 
 pub fn internUnion(pool: *InternPool, uv: Key.Union) Allocator.Error!Index {
     return pool.get(.{ .un = uv });
+}
+
+pub fn internBitpack(pool: *InternPool, b: Key.Bitpack) Allocator.Error!Index {
+    return pool.get(.{ .bitpack = b });
 }
 
 pub fn internErrorSetType(

@@ -1274,7 +1274,7 @@ test "cast builtins reject ptr_type destinations with their own diagnostic" {
     // the handler rejects the mismatch. Each one names its
     // own kind in the diagnostic, not "destination is not a type".
     try expectEvalFails(gpa, &pool, "@as(*const u8, @intCast(5))", "destination is not a supported int type");
-    try expectEvalFails(gpa, &pool, "@as(*u8, @bitCast(@as(u64, 0)))", "operands must be fixed-width numeric types");
+    try expectEvalFails(gpa, &pool, "@as(*u8, @bitCast(@as(u64, 0)))", "cannot @bitCast to '*u8'");
 }
 
 test "ptr_type: a sentinel-terminated pointer carries the coerced sentinel value" {

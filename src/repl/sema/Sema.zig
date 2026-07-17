@@ -566,6 +566,11 @@ pub fn aggregateValue(sema: *Sema, ty: Type, elems: []const InternPool.Index) Er
     return .fromIndex(try sema.intern_pool.internAggregate(.{ .ty = ty.index, .storage = .{ .elems = elems } }));
 }
 
+pub fn bitpackValue(sema: *Sema, ty: Type, backing_int_val: Value) Error!Value {
+    assert(backing_int_val.typeOf(sema.intern_pool).index == ty.bitpackBackingInt(sema.intern_pool).index);
+    return .fromIndex(try sema.intern_pool.internBitpack(.{ .ty = ty.index, .backing_int_val = backing_int_val.index }));
+}
+
 pub fn vectorType(sema: *Sema, info: InternPool.Key.VectorType) Error!Type {
     return .fromIndex(try sema.intern_pool.internVectorType(info));
 }
@@ -1261,24 +1266,56 @@ fn evalTruncate(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 fn evalBitCast(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
     const bin = sema.binData(inst);
+    const src = sema.block.nodeOffset(sema.srcNodeOffset(inst));
 
-    const dest_type_index = try sema.resolveDestType(bin.lhs, "@bitCast");
-    const operand_value = try sema.resolveRef(bin.rhs);
-    const operand_type = Value.typeOf(operand_value, sema.intern_pool);
-    if (dest_type_index == operand_type.index) return operand_value;
+    const dest_ty: Type = .fromIndex(try sema.resolveDestType(bin.lhs, "@bitCast"));
+    const operand = try sema.resolveRef(bin.rhs);
+    const operand_ty = Value.typeOf(operand, ip);
 
-    const operand_key = sema.intern_pool.indexToKey(operand_value.index);
-    const operand_bits = numericBitSize(sema.intern_pool, operand_type.index);
-    const dest_bits = numericBitSize(sema.intern_pool, dest_type_index);
-    if (operand_bits == null or dest_bits == null) {
-        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@bitCast: operands must be fixed-width numeric types", .{});
+    // Reject pointers explicitly (they have a bit representation, but `@bitCast` routes them through
+    // `@ptrCast`/`@ptrFromInt`/`@intFromPtr`), then anything lacking a fixed bit representation.
+    switch (dest_ty.scalarType(ip).zigTypeTag(ip)) {
+        .pointer, .optional => return sema.fail(sema.block, src, "cannot @bitCast to '{f}'", .{dest_ty.fmt(ip)}),
+        else => {},
     }
-    if (operand_bits.? != dest_bits.?) {
-        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@bitCast: type sizes differ ({d} vs {d} bits)", .{ operand_bits.?, dest_bits.? });
+    if (!dest_ty.hasBitRepresentation(ip))
+        return sema.fail(sema.block, src, "cannot @bitCast to '{f}'", .{dest_ty.fmt(ip)});
+    switch (operand_ty.scalarType(ip).zigTypeTag(ip)) {
+        .pointer, .optional => return sema.fail(sema.block, src, "cannot @bitCast from '{f}'", .{operand_ty.fmt(ip)}),
+        else => {},
     }
+    if (!operand_ty.hasBitRepresentation(ip))
+        return sema.fail(sema.block, src, "cannot @bitCast from '{f}'", .{operand_ty.fmt(ip)});
 
-    return try sema.reinterpretBitCast(operand_key, dest_type_index, dest_bits.?);
+    return try sema.bitCast(dest_ty, operand, src);
+}
+
+fn bitCast(sema: *Sema, dest_ty: Type, operand: Value, src: LazySrcLoc) Error!Value {
+    const ip = sema.intern_pool;
+    try sema.ensureLayoutResolved(dest_ty.index);
+    const dest_bits = dest_ty.bitSize(ip);
+    const operand_ty = Value.typeOf(operand, ip);
+    const old_bits = operand_ty.bitSize(ip);
+    if (old_bits != dest_bits)
+        return sema.fail(sema.block, src, "@bitCast size mismatch: destination type '{f}' has {d} bits but source type '{f}' has {d} bits", .{ dest_ty.fmt(ip), dest_bits, operand_ty.fmt(ip), old_bits });
+    return try sema.bitCastVal(operand, dest_ty);
+}
+
+/// Reinterpret `val`'s bits as `dest_ty` by serializing to a packed byte buffer and reading it back.
+/// The single general `@bitCast` mechanism: it handles int/float/bool/enum/vector/array and packed
+/// struct/union uniformly through `writeToPackedMemory`/`readFromPackedMemory`. Asserts equal bit sizes.
+fn bitCastVal(sema: *Sema, val: Value, dest_ty: Type) Error!Value {
+    const ip = sema.intern_pool;
+    const bit_size = dest_ty.bitSize(ip);
+    assert(Value.typeOf(val, ip).bitSize(ip) == bit_size);
+    if (val.isUndef(ip)) return .fromIndex(try ip.get(.{ .undef = dest_ty.index }));
+    const buf = try sema.gpa.alloc(u8, @intCast((bit_size + 7) / 8));
+    defer sema.gpa.free(buf);
+    @memset(buf, 0);
+    val.writeToPackedMemory(ip, buf, 0);
+    return try Value.readFromPackedMemory(dest_ty, ip, buf, 0);
 }
 
 fn numericBitSize(pool: *const InternPool, ty: InternPool.Index) ?u16 {
@@ -1291,106 +1328,6 @@ fn numericBitSize(pool: *const InternPool, ty: InternPool.Index) ?u16 {
         .f128_type => 128,
         else => null,
     };
-}
-
-fn reinterpretBitCast(
-    sema: *Sema,
-    operand_key: InternPool.Key,
-    dest_ty: InternPool.Index,
-    bits: u16,
-) Error!Value {
-    const ip = sema.intern_pool;
-    const dest_int = intTypeInfo(ip, dest_ty);
-
-    switch (operand_key) {
-        .int => |int| {
-            if (dest_int) |info| {
-                var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-                const big = int.storage.toBigInt(&space);
-                const workspace_limbs: usize = std.math.big.int.calcTwosCompLimbCount(info.bits) + 1;
-                const workspace = try sema.gpa.alloc(std.math.big.Limb, workspace_limbs);
-                defer sema.gpa.free(workspace);
-                var mutable: std.math.big.int.Mutable = .{
-                    .limbs = workspace,
-                    .len = undefined,
-                    .positive = undefined,
-                };
-                mutable.truncate(big, info.signedness, info.bits);
-                const idx = try ip.internIntValue(dest_ty, mutable.toConst());
-                return .{ .index = idx };
-            }
-            const bits_u128 = try intBitsAsU128(int, bits);
-            return try sema.internBitsAsFloat(bits_u128, dest_ty);
-        },
-        .float => |float| {
-            const bits_u128 = floatBitsAsU128(float);
-            if (dest_int) |info| {
-                return try sema.internBitsAsInt(bits_u128, dest_ty, info);
-            }
-            return try sema.internBitsAsFloat(bits_u128, dest_ty);
-        },
-        else => {
-            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@bitCast: operand kind not supported", .{});
-        },
-    }
-}
-
-fn intBitsAsU128(int: InternPool.Key.Int, bits: u16) Error!u128 {
-    assert(bits > 0);
-    assert(bits <= 128);
-    var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const big = int.storage.toBigInt(&space);
-    var buf: [std.math.big.int.calcTwosCompLimbCount(128) + 1]std.math.big.Limb = undefined;
-    var pattern: std.math.big.int.Mutable = .{ .limbs = &buf, .len = undefined, .positive = undefined };
-    pattern.truncate(big, .unsigned, bits);
-    return pattern.toConst().toInt(u128) catch unreachable;
-}
-
-fn floatBitsAsU128(float: InternPool.Key.Float) u128 {
-    return switch (float.storage) {
-        .f16 => |v| @as(u16, @bitCast(v)),
-        .f32 => |v| @as(u32, @bitCast(v)),
-        .f64 => |v| @as(u64, @bitCast(v)),
-        .f80 => |v| @as(u80, @bitCast(v)),
-        .f128 => |v| @as(u128, @bitCast(v)),
-    };
-}
-
-fn internBitsAsFloat(sema: *Sema, bits: u128, dest_ty: InternPool.Index) Error!Value {
-    const storage: InternPool.Key.Float.Storage = switch (dest_ty) {
-        .f16_type => .{ .f16 = @bitCast(@as(u16, @intCast(bits))) },
-        .f32_type => .{ .f32 = @bitCast(@as(u32, @intCast(bits))) },
-        .f64_type => .{ .f64 = @bitCast(@as(u64, @intCast(bits))) },
-        .f80_type => .{ .f80 = @bitCast(@as(u80, @intCast(bits))) },
-        .f128_type => .{ .f128 = @bitCast(bits) },
-        else => unreachable,
-    };
-    const idx = try sema.intern_pool.internFloat(.{ .ty = dest_ty, .storage = storage });
-    return .{ .index = idx };
-}
-
-fn internBitsAsInt(
-    sema: *Sema,
-    bits: u128,
-    dest_ty: InternPool.Index,
-    dest_info: std.lang.Type.Int,
-) Error!Value {
-    var limbs_buf: [std.math.big.int.calcTwosCompLimbCount(128) + 1]std.math.big.Limb = undefined;
-    var mutable: std.math.big.int.Mutable = .{
-        .limbs = &limbs_buf,
-        .len = undefined,
-        .positive = undefined,
-    };
-    mutable.set(bits);
-    var work_buf: [limbs_buf.len]std.math.big.Limb = undefined;
-    var work: std.math.big.int.Mutable = .{
-        .limbs = &work_buf,
-        .len = undefined,
-        .positive = undefined,
-    };
-    work.truncate(mutable.toConst(), dest_info.signedness, dest_info.bits);
-    const idx = try sema.intern_pool.internIntValue(dest_ty, work.toConst());
-    return .{ .index = idx };
 }
 
 fn isFixedWidthFloatType(ty: InternPool.Index) bool {
@@ -2093,6 +2030,25 @@ fn resolveStructLayout(sema: *Sema, struct_ty: InternPool.Index) Error!void {
     };
     for (saved_field_types) |field_ty| try sema.ensureLayoutResolved(field_ty);
 
+    if (ip.loadStructType(struct_ty).layout == .@"packed") {
+        const backing = backing: {
+            if (ip.indexToKey(struct_ty).struct_type == .declared) {
+                const cf = try sema.enterContainer(struct_ty, "packed struct backing integer");
+                defer cf.restore(sema);
+                if (sema.zir.getStructDecl(cf.decl_inst).backing_int_type_body) |body| {
+                    break :backing (try sema.resolveInlineBody(body, cf.decl_inst)).index;
+                }
+            }
+            var total_bits: u16 = 0;
+            for (ip.loadStructType(struct_ty).field_types) |field_ty| total_bits += @intCast(Type.fromIndex(field_ty).bitSize(ip));
+            break :backing try ip.internIntType(.unsigned, total_bits);
+        };
+        ip.setStructPackedBackingInt(struct_ty, backing);
+        const backing_ty: Type = .fromIndex(backing);
+        ip.setStructLayout(struct_ty, &.{}, &.{}, @intCast(backing_ty.abiSize(ip)), backing_ty.abiAlignment(ip), backing_ty.classify(ip));
+        return;
+    }
+
     const f = ip.loadStructType(struct_ty);
     const fields_len: u32 = @intCast(f.field_types.len);
     const resolved_aligns = try sema.arena.alloc(InternPool.Alignment, fields_len);
@@ -2183,6 +2139,17 @@ fn resolveUnionLayout(sema: *Sema, union_ty: InternPool.Index) Error!void {
     };
     for (saved_field_types) |field_ty| try sema.ensureLayoutResolved(field_ty);
 
+    if (ip.unionFields(union_ty).layout == .@"packed") {
+        const uf = ip.unionFields(union_ty);
+        var max_bits: u16 = 0;
+        for (uf.field_types) |field_ty| max_bits = @max(max_bits, @as(u16, @intCast(Type.fromIndex(field_ty).bitSize(ip))));
+        const backing = try ip.internIntType(.unsigned, max_bits);
+        ip.setUnionPackedBackingInt(union_ty, backing);
+        const backing_ty: Type = .fromIndex(backing);
+        ip.setUnionLayout(union_ty, @intCast(backing_ty.abiSize(ip)), backing_ty.abiAlignment(ip), backing_ty.classify(ip), false);
+        return;
+    }
+
     const tag_usage = ip.unionFields(union_ty).tag_usage;
     const enum_tag_ty: InternPool.Index = if (tag_usage != .none) try sema.unionTagEnumType(union_ty) else .none;
     if (tag_usage != .none) try sema.ensureLayoutResolved(enum_tag_ty);
@@ -2227,7 +2194,7 @@ fn resolveUnionLayout(sema: *Sema, union_ty: InternPool.Index) Error!void {
     ip.setUnionLayout(union_ty, @intCast(size), alignment, class, has_runtime_tag);
 }
 
-fn ensureLayoutResolved(sema: *Sema, ty: InternPool.Index) Error!void {
+pub fn ensureLayoutResolved(sema: *Sema, ty: InternPool.Index) Error!void {
     const ip = sema.intern_pool;
     switch (ip.indexToKey(ty)) {
         .int_type, .ptr_type, .anyframe_type, .simple_type, .error_set_type, .opaque_type => {},
@@ -2243,7 +2210,7 @@ fn ensureLayoutResolved(sema: *Sema, ty: InternPool.Index) Error!void {
         .enum_type => {},
         .struct_type => try sema.resolveStructLayout(ty),
         .union_type => try sema.resolveUnionLayout(ty),
-        .simple_value, .enum_literal, .int, .float, .undef, .ptr, .slice, .err, .error_union, .func, .opt, .aggregate, .enum_tag, .un => unreachable,
+        .simple_value, .enum_literal, .int, .float, .undef, .ptr, .slice, .err, .error_union, .func, .opt, .aggregate, .enum_tag, .un, .bitpack => unreachable,
     }
 }
 
@@ -6437,6 +6404,7 @@ fn containerNamespace(sema: *Sema, container_ty: InternPool.Index) ?ContainerNam
         .aggregate,
         .enum_tag,
         .un,
+        .bitpack,
         => null,
     };
 }
@@ -6594,6 +6562,7 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
         .aggregate,
         .enum_tag,
         .un,
+        .bitpack,
         => {},
     }
 
@@ -6609,7 +6578,25 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
         .struct_type => {
             const fld = (try sema.structFieldByName(inner_ty, name)) orelse
                 return sema.failBadStructFieldAccess(inner_ty, name);
-            return .{ .index = InternPool.aggregateElementAt(ip.indexToKey(inner.index).aggregate, fld.index) };
+            switch (ip.indexToKey(inner.index)) {
+                .aggregate => |agg| return .{ .index = InternPool.aggregateElementAt(agg, fld.index) },
+                .bitpack => |bp| {
+                    const struct_ty: Type = .fromIndex(inner_ty);
+                    var field_bit_offset: u16 = 0;
+                    var preceding: u32 = 0;
+                    while (preceding < fld.index) : (preceding += 1) {
+                        const pname = (try sema.structFieldNameAt(inner_ty, preceding)).?;
+                        const pf = (try sema.structFieldByName(inner_ty, pname)).?;
+                        field_bit_offset += @intCast(Type.fromIndex(pf.ty).bitSize(ip));
+                    }
+                    const buf = try sema.gpa.alloc(u8, @intCast((struct_ty.bitSize(ip) + 7) / 8));
+                    defer sema.gpa.free(buf);
+                    @memset(buf, 0);
+                    Value.fromIndex(bp.backing_int_val).writeToPackedMemory(ip, buf, 0);
+                    return try Value.readFromPackedMemory(Type.fromIndex(fld.ty), ip, buf, field_bit_offset);
+                },
+                else => unreachable,
+            }
         },
         .union_type => {
             const fld = (try sema.unionFieldByName(inner_ty, name)) orelse
@@ -6649,6 +6636,7 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
         .aggregate,
         .enum_tag,
         .un,
+        .bitpack,
         => return sema.failNoMember(inner_ty, name),
     }
 }
@@ -7092,6 +7080,12 @@ fn evalStructInitUnion(sema: *Sema, union_ty: InternPool.Index, result_ty: Inter
     const raw = try sema.resolveRef(item.init);
     const val = (try sema.coerceValueToType(raw, field.ty, "union field")).index;
 
+    if (Type.fromIndex(union_ty).containerLayout(ip) == .@"packed") {
+        const union_val = try sema.bitCast(.fromIndex(union_ty), Value.fromIndex(val), sema.block.nodeOffset(sema.srcNodeOffset(inst)));
+        const final = if (result_ty == union_ty) union_val else try sema.coerceValueToType(union_val, result_ty, "union init");
+        return if (is_ref) try sema.materializeConstPtr(final) else final;
+    }
+
     const tag_enum = try sema.unionTagEnumType(union_ty);
     const tag_index = (try sema.enumFieldIndex(tag_enum, name)) orelse
         return sema.failBadMemberAccess(tag_enum, name);
@@ -7171,7 +7165,25 @@ fn finishStructInit(sema: *Sema, struct_ty: InternPool.Index, result_ty: InternP
         elem.* = default;
     }
 
-    const value: Value = .{ .index = try ip.internAggregate(.{ .ty = struct_ty, .storage = .{ .elems = elems } }) };
+    const value: Value = switch (Type.fromIndex(struct_ty).containerLayout(ip)) {
+        .auto, .@"extern" => .{ .index = try ip.internAggregate(.{ .ty = struct_ty, .storage = .{ .elems = elems } }) },
+        .@"packed" => blk: {
+            try sema.ensureLayoutResolved(struct_ty);
+            const packed_ty: Type = .fromIndex(struct_ty);
+            const buf = try sema.gpa.alloc(u8, @intCast((packed_ty.bitSize(ip) + 7) / 8));
+            defer sema.gpa.free(buf);
+            @memset(buf, 0);
+
+            var bit_offset: u16 = 0;
+            for (elems) |elem| {
+                const field_val = Value.fromIndex(elem);
+                field_val.writeToPackedMemory(ip, buf, bit_offset);
+                bit_offset += @intCast(field_val.typeOf(ip).bitSize(ip));
+            }
+            assert(bit_offset == packed_ty.bitSize(ip));
+            break :blk try Value.readFromPackedMemory(packed_ty, ip, buf, 0);
+        },
+    };
     const final = if (result_ty == struct_ty) value else try sema.coerceValueToType(value, result_ty, "struct init");
     return if (is_ref) try sema.materializeConstPtr(final) else final;
 }

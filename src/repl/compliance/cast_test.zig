@@ -54,6 +54,10 @@ test "compliance: int/float casts and coercions" {
         .{ .src = &.{"@as(u8, @truncate(@as(u32, 0x1234)))"}, .want = @as(u8, @truncate(@as(u32, 0x1234))) },
         .{ .src = &.{"@as(u32, @bitCast(@as(f32, 1.5)))"}, .want = @as(u32, @bitCast(@as(f32, 1.5))) },
         .{ .src = &.{"@as(u8, @bitCast(@as(i8, -1)))"}, .want = @as(u8, @bitCast(@as(i8, -1))) },
+        // @bitCast to/from a vector routes through the packed-memory serializer: int -> vector reads each
+        // element out of the backing bits, and the round-trip writes them back.
+        .{ .src = &.{"@as(@Vector(4, u8), @bitCast(@as(u32, 0x04030201)))"}, .want = @as(@Vector(4, u8), @bitCast(@as(u32, 0x04030201))) },
+        .{ .src = &.{"@as(u32, @bitCast(@as(@Vector(4, u8), @bitCast(@as(u32, 0x04030201)))))"}, .want = @as(u32, @bitCast(@as(@Vector(4, u8), @bitCast(@as(u32, 0x04030201))))) },
         .{ .src = &.{"@as(usize, 100) + 1"}, .want = @as(usize, 100) + 1 },
         .{ .src = &.{"@as(c_int, 5) * 2"}, .want = @as(c_int, 5) * 2 },
         .{ .src = &.{"@as(u16, 1000) > @as(u8, 200)"}, .want = @as(u16, 1000) > @as(u8, 200) },

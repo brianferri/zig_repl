@@ -83,6 +83,8 @@ pub fn render(
         .aggregate => |agg| renderAggregate(agg, pool, session, writer),
         .enum_tag => |et| renderEnumTag(et, pool, session, writer),
         .un => |uv| renderUnion(uv, pool, session, writer),
+        // A packed struct/union value is stored as its backing integer; render those bits.
+        .bitpack => |bp| render(.{ .index = bp.backing_int_val }, pool, session, writer),
         // A bare type Key viewed as a value identifies the type itself
         // (Sema's value-of-type-type convention; see Value.typeOf). The
         // value Keys above are exhaustive, so the assert turns a future

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 const InternPool = @import("InternPool.zig");
@@ -16,6 +17,133 @@ pub fn fromIndex(index: InternPool.Index) Value {
 
 pub fn toIndex(val: Value) InternPool.Index {
     return val.index;
+}
+
+pub fn writeToPackedMemory(val: Value, pool: *const InternPool, buffer: []u8, bit_offset: usize) void {
+    const endian = builtin.target.cpu.arch.endian();
+    const ty = val.typeOf(pool);
+    if (val.isUndef(pool)) {
+        const bit_size: usize = @intCast(ty.bitSize(pool));
+        if (bit_size != 0) std.mem.writeVarPackedInt(buffer, bit_offset, bit_size, @as(u1, 0), endian);
+        return;
+    }
+    switch (ty.zigTypeTag(pool)) {
+        .void => {},
+        .bool => {
+            const byte_index = bit_offset / 8;
+            if (pool.indexToKey(val.index).simple_value == .true) {
+                buffer[byte_index] |= (@as(u8, 1) << @as(u3, @intCast(bit_offset % 8)));
+            } else {
+                buffer[byte_index] &= ~(@as(u8, 1) << @as(u3, @intCast(bit_offset % 8)));
+            }
+        },
+        .@"enum" => {
+            const int_val: Value = .fromIndex(pool.indexToKey(val.index).enum_tag.int);
+            int_val.writeToPackedMemory(pool, buffer, bit_offset);
+        },
+        .int => {
+            const bits = ty.intInfo(pool).bits;
+            if (bits == 0 or buffer.len == 0) return;
+            switch (pool.indexToKey(val.index).int.storage) {
+                inline .u64, .i64 => |int| std.mem.writeVarPackedInt(buffer, bit_offset, bits, int, endian),
+                .big_int => |bigint| bigint.writePackedTwosComplement(buffer, bit_offset, bits, endian),
+            }
+        },
+        .float => switch (ty.floatBits()) {
+            16 => std.mem.writePackedInt(u16, buffer, bit_offset, @bitCast(val.toFloat(f16, pool)), endian),
+            32 => std.mem.writePackedInt(u32, buffer, bit_offset, @bitCast(val.toFloat(f32, pool)), endian),
+            64 => std.mem.writePackedInt(u64, buffer, bit_offset, @bitCast(val.toFloat(f64, pool)), endian),
+            80 => std.mem.writePackedInt(u80, buffer, bit_offset, @bitCast(val.toFloat(f80, pool)), endian),
+            128 => std.mem.writePackedInt(u128, buffer, bit_offset, @bitCast(val.toFloat(f128, pool)), endian),
+            else => unreachable,
+        },
+        .@"struct", .@"union" => {
+            const int_val: Value = .fromIndex(pool.indexToKey(val.index).bitpack.backing_int_val);
+            int_val.writeToPackedMemory(pool, buffer, bit_offset);
+        },
+        .array, .vector => {
+            const elem_bits: usize = @intCast(ty.childType(pool).bitSize(pool));
+            const len: usize = @intCast(ty.arrayLen(pool));
+            var elem_bit_off: usize = bit_offset;
+            switch (pool.indexToKey(val.index).aggregate.storage) {
+                .repeated_elem => |elem_val_ip| {
+                    const elem_val: Value = .fromIndex(elem_val_ip);
+                    for (0..len) |_| {
+                        elem_val.writeToPackedMemory(pool, buffer, elem_bit_off);
+                        elem_bit_off += elem_bits;
+                    }
+                },
+                .elems => |elems| for (elems[0..len]) |elem_val_ip| {
+                    const elem_val: Value = .fromIndex(elem_val_ip);
+                    elem_val.writeToPackedMemory(pool, buffer, elem_bit_off);
+                    elem_bit_off += elem_bits;
+                },
+            }
+            if (ty.sentinel(pool)) |sentinel_val| {
+                sentinel_val.writeToPackedMemory(pool, buffer, elem_bit_off);
+            }
+        },
+        else => unreachable,
+    }
+}
+
+pub fn readFromPackedMemory(ty: Type, pool: *InternPool, buffer: []const u8, bit_offset: usize) std.mem.Allocator.Error!Value {
+    const endian = builtin.target.cpu.arch.endian();
+    switch (ty.zigTypeTag(pool)) {
+        .void => return void_value,
+        .bool => {
+            const byte = buffer[bit_offset / 8];
+            const bit_set = ((byte >> @as(u3, @intCast(bit_offset % 8))) & 1) != 0;
+            return .fromIndex(try pool.get(.{ .simple_value = if (bit_set) .true else .false }));
+        },
+        .int => {
+            if (buffer.len == 0 or ty.index == .u0_type) return .fromIndex(try pool.internInt(.{ .ty = ty.index, .storage = .{ .u64 = 0 } }));
+            const int_info = ty.intInfo(pool);
+            const bits = int_info.bits;
+            if (bits <= 64) return switch (int_info.signedness) {
+                .unsigned => .fromIndex(try pool.internInt(.{ .ty = ty.index, .storage = .{ .u64 = std.mem.readVarPackedInt(u64, buffer, bit_offset, bits, endian, .unsigned) } })),
+                .signed => .fromIndex(try pool.internInt(.{ .ty = ty.index, .storage = .{ .i64 = std.mem.readVarPackedInt(i64, buffer, bit_offset, bits, endian, .signed) } })),
+            };
+            const abi_size: usize = @intCast(ty.abiSize(pool));
+            const limb_count = (abi_size + @sizeOf(std.math.big.Limb) - 1) / @sizeOf(std.math.big.Limb);
+            const limbs = try pool.gpa.alloc(std.math.big.Limb, limb_count);
+            defer pool.gpa.free(limbs);
+            var bigint = std.math.big.int.Mutable.init(limbs, 0);
+            bigint.readPackedTwosComplement(buffer, bit_offset, bits, endian, int_info.signedness);
+            return .fromIndex(try pool.internIntValue(ty.index, bigint.toConst()));
+        },
+        .float => return .fromIndex(try pool.internFloat(.{ .ty = ty.index, .storage = switch (ty.floatBits()) {
+            16 => .{ .f16 = @bitCast(std.mem.readPackedInt(u16, buffer, bit_offset, endian)) },
+            32 => .{ .f32 = @bitCast(std.mem.readPackedInt(u32, buffer, bit_offset, endian)) },
+            64 => .{ .f64 = @bitCast(std.mem.readPackedInt(u64, buffer, bit_offset, endian)) },
+            80 => .{ .f80 = @bitCast(std.mem.readPackedInt(u80, buffer, bit_offset, endian)) },
+            128 => .{ .f128 = @bitCast(std.mem.readPackedInt(u128, buffer, bit_offset, endian)) },
+            else => unreachable,
+        } })),
+        .@"enum" => {
+            const int_ty = pool.loadEnumType(ty.index).int_tag_type;
+            const int_val = try readFromPackedMemory(.fromIndex(int_ty), pool, buffer, bit_offset);
+            return .fromIndex(try pool.internEnumTag(.{ .ty = ty.index, .int = int_val.index }));
+        },
+        .@"struct", .@"union" => {
+            const int_val = try readFromPackedMemory(ty.bitpackBackingInt(pool), pool, buffer, bit_offset);
+            return .fromIndex(try pool.internBitpack(.{ .ty = ty.index, .backing_int_val = int_val.index }));
+        },
+        .array, .vector => {
+            const elem_ty = ty.childType(pool);
+            const elem_bits: usize = @intCast(elem_ty.bitSize(pool));
+            const elems_buf = try pool.gpa.alloc(InternPool.Index, @intCast(ty.arrayLen(pool)));
+            defer pool.gpa.free(elems_buf);
+            var elem_bit_off: usize = bit_offset;
+            for (elems_buf) |*elem| {
+                const elem_val = try readFromPackedMemory(elem_ty, pool, buffer, elem_bit_off);
+                elem.* = elem_val.index;
+                elem_bit_off += elem_bits;
+            }
+            return .fromIndex(try pool.internAggregate(.{ .ty = ty.index, .storage = .{ .elems = elems_buf } }));
+        },
+        else => unreachable,
+    }
 }
 
 pub fn print(val: Value, pool: *const InternPool, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -75,6 +203,7 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
         .enum_tag => |et| .{ .index = et.ty },
         .enum_literal => .{ .index = .enum_literal_type },
         .un => |uv| .{ .index = uv.ty },
+        .bitpack => |bp| .{ .index = bp.ty },
         else => blk: {
             assert(key.isType());
             break :blk .type_type;

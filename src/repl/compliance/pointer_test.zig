@@ -50,6 +50,57 @@ test "compliance: @sizeOf matches the host target ABI" {
         .{ .src = &.{"@sizeOf(usize)"}, .want = @sizeOf(usize) },
         .{ .src = &.{"@sizeOf(comptime_int)"}, .reject = {} },
         .{ .src = &.{"@sizeOf(noreturn)"}, .reject = {} },
+        // Packed struct/union layout resolves via the backing integer.
+        .{ .src = &.{"@sizeOf(packed struct(u16) { a: u8, b: u8 })"}, .want = @sizeOf(packed struct(u16) { a: u8, b: u8 }) },
+        .{ .src = &.{"@sizeOf(packed union { a: u8, b: u8 })"}, .want = @sizeOf(packed union { a: u8, b: u8 }) },
+    });
+}
+
+test "compliance: a packed struct value round-trips through @bitCast" {
+    try compliance.check(a, .{
+        .{
+            .src = &.{"@as(u8, @bitCast(@as(packed struct(u8) { a: u4, b: u4 }, @bitCast(@as(u8, 0x21)))))"},
+            .want = @as(u8, @bitCast(@as(packed struct(u8) { a: u4, b: u4 }, @bitCast(@as(u8, 0x21))))),
+        },
+    });
+}
+
+test "compliance: a packed struct literal packs fields into the backing int" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const x: packed struct(u8) { a: u4, b: u4 } = .{ .a = 1, .b = 2 }; break :blk x.a; }"}, .want = blk: {
+            const x: packed struct(u8) { a: u4, b: u4 } = .{ .a = 1, .b = 2 };
+            break :blk x.a;
+        } },
+        .{ .src = &.{"blk: { const x: packed struct(u8) { a: u4, b: u4 } = .{ .a = 1, .b = 2 }; break :blk x.b; }"}, .want = blk: {
+            const x: packed struct(u8) { a: u4, b: u4 } = .{ .a = 1, .b = 2 };
+            break :blk x.b;
+        } },
+        .{
+            .src = &.{"@as(u8, @bitCast(@as(packed struct(u8) { a: u4, b: u4 }, .{ .a = 1, .b = 2 })))"},
+            .want = @as(u8, @bitCast(@as(packed struct(u8) { a: u4, b: u4 }, .{ .a = 1, .b = 2 }))),
+        },
+    });
+}
+
+test "compliance: a packed union literal bitcasts its field into the backing int" {
+    try compliance.check(a, .{
+        .{
+            .src = &.{"@as(u8, @bitCast(@as(packed union { a: u8, b: u8 }, .{ .a = 0x21 })))"},
+            .want = @as(u8, @bitCast(@as(packed union { a: u8, b: u8 }, .{ .a = 0x21 }))),
+        },
+    });
+}
+
+test "compliance: packed struct field access extracts the field bits" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const x: packed struct(u8) { a: u4, b: u4 } = @bitCast(@as(u8, 0x21)); break :blk x.a; }"}, .want = blk: {
+            const x: packed struct(u8) { a: u4, b: u4 } = @bitCast(@as(u8, 0x21));
+            break :blk x.a;
+        } },
+        .{ .src = &.{"blk: { const x: packed struct(u8) { a: u4, b: u4 } = @bitCast(@as(u8, 0x21)); break :blk x.b; }"}, .want = blk: {
+            const x: packed struct(u8) { a: u4, b: u4 } = @bitCast(@as(u8, 0x21));
+            break :blk x.b;
+        } },
     });
 }
 
