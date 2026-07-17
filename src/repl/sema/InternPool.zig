@@ -601,6 +601,7 @@ pub const Key = union(enum) {
             comptime_alloc: ComptimeAllocIndex,
             nav: Nav.Index,
             uav: Uav,
+            comptime_field: Index,
             field: BaseIndex,
             arr_elem: BaseIndex,
             opt_payload: Index,
@@ -827,6 +828,7 @@ pub const Key = union(enum) {
                         std.hash.autoHash(&hasher, uav.val);
                         std.hash.autoHash(&hasher, uav.orig_ty);
                     },
+                    .comptime_field => |val| std.hash.autoHash(&hasher, val),
                     .field, .arr_elem => |f| {
                         std.hash.autoHash(&hasher, f.base);
                         std.hash.autoHash(&hasher, f.index);
@@ -982,6 +984,7 @@ pub const Key = union(enum) {
                     .comptime_alloc => |slot| slot == y.base_addr.comptime_alloc,
                     .nav => |nav| nav == y.base_addr.nav,
                     .uav => |uav| uav.val == y.base_addr.uav.val and uav.orig_ty == y.base_addr.uav.orig_ty,
+                    .comptime_field => |val| val == y.base_addr.comptime_field,
                     .field => |f| f.base == y.base_addr.field.base and f.index == y.base_addr.field.index,
                     .arr_elem => |f| f.base == y.base_addr.arr_elem.base and f.index == y.base_addr.arr_elem.index,
                     .opt_payload => |base| base == y.base_addr.opt_payload,
@@ -1183,6 +1186,7 @@ const Item = struct {
         ptr_comptime_alloc,
         ptr_nav,
         ptr_uav,
+        ptr_comptime_field,
         ptr_field,
         ptr_arr_elem,
         ptr_opt_payload,
@@ -2403,6 +2407,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .ptr_comptime_alloc => ptrComptimeAllocFromExtra(pool, item.data),
         .ptr_nav => ptrNavFromExtra(pool, item.data),
         .ptr_uav => ptrUavFromExtra(pool, item.data),
+        .ptr_comptime_field => ptrComptimeFieldFromExtra(pool, item.data),
         .ptr_field => ptrFieldFromExtra(pool, item.data),
         .ptr_opt_payload => ptrOptPayloadFromExtra(pool, item.data, false),
         .ptr_eu_payload => ptrOptPayloadFromExtra(pool, item.data, true),
@@ -2616,6 +2621,15 @@ fn ptrOptPayloadFromExtra(pool: *const InternPool, extra_index: u32, is_eu: bool
     return .{ .ptr = .{
         .ty = r.ty,
         .base_addr = if (is_eu) .{ .eu_payload = r.base } else .{ .opt_payload = r.base },
+        .byte_offset = r.byteOffset(),
+    } };
+}
+
+fn ptrComptimeFieldFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const r = pool.extraData(PtrBase, extra_index);
+    return .{ .ptr = .{
+        .ty = r.ty,
+        .base_addr = .{ .comptime_field = r.base },
         .byte_offset = r.byteOffset(),
     } };
 }
@@ -2972,6 +2986,10 @@ fn emitPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!void {
         .uav => |uav| {
             const extra_index = try pool.addExtra(PtrUav.init(p.ty, uav.val, uav.orig_ty, p.byte_offset));
             pool.items.appendAssumeCapacity(.{ .tag = .ptr_uav, .data = extra_index });
+        },
+        .comptime_field => |val| {
+            const extra_index = try pool.addExtra(PtrBase.init(p.ty, val, p.byte_offset));
+            pool.items.appendAssumeCapacity(.{ .tag = .ptr_comptime_field, .data = extra_index });
         },
         .field, .arr_elem => |f| {
             const extra_index = try pool.addExtra(PtrBaseIndex.init(p.ty, f.base, f.index, p.byte_offset));

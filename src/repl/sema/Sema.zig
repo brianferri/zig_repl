@@ -2475,7 +2475,7 @@ fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             try sema.synthetic_addresses.put(sema.gpa, ptr.index, aligned);
             break :addr aligned;
         },
-        .field, .arr_elem, .opt_payload, .eu_payload => {
+        .field, .arr_elem, .opt_payload, .eu_payload, .comptime_field => {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@intFromPtr: address of an aggregate element is not supported", .{});
         },
     };
@@ -2510,7 +2510,7 @@ fn freezeBacking(sema: *Sema, ptr: InternPool.Key.Ptr) void {
         .comptime_alloc => |idx| sema.comptime_allocs.items[@intFromEnum(idx)].is_const = true,
         .field, .arr_elem => |f| sema.freezeBacking(ip.indexToKey(f.base).ptr),
         .opt_payload, .eu_payload => |base| sema.freezeBacking(ip.indexToKey(base).ptr),
-        .nav, .uav => {},
+        .nav, .uav, .comptime_field => {},
     }
 }
 
@@ -2687,6 +2687,7 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
     switch (ptr_key.ptr.base_addr) {
         .nav => |nav| return .{ .index = ip.getNav(nav).resolved.?.value },
         .uav => |uav| return .{ .index = uav.val },
+        .comptime_field => |val| return .{ .index = val },
         .field, .arr_elem => |f| {
             const parent = try sema.loadValue(.{ .index = f.base });
             const parent_key = ip.indexToKey(parent.index);
@@ -6933,6 +6934,11 @@ fn storePointee(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
     const ip = sema.intern_pool;
     switch (ptr.base_addr) {
         .comptime_alloc => (try sema.lookupComptimeAlloc(ptr)).val = value,
+        .comptime_field => |field_val| {
+            if (value.index != field_val) {
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "value stored in comptime field does not match the comptime field value", .{});
+            }
+        },
         .field, .arr_elem => try sema.storeElement(ptr, value),
         .opt_payload => |base| {
             const opt_ty = ip.indexToKey(ip.indexToKey(base).ptr.ty).ptr_type.child;
