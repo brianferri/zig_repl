@@ -65,6 +65,21 @@ test "compliance: a packed struct value round-trips through @bitCast" {
     });
 }
 
+test "compliance: @as to a named packed struct resolves its layout without clobbering the ref cache" {
+    // Referencing a named `packed struct(T)` as `@as`'s dest resolves its explicit backing-int body in
+    // the decl's own ZIR; that nested evaluation must not clobber the caller's cached instruction results.
+    try compliance.check(a, .{
+        .{
+            .src = &.{ "const S = packed struct(u8) { a: u4, b: u4 };", "@as(u8, @bitCast(@as(S, @bitCast(@as(u8, 0x21)))))" },
+            .want = @as(u8, @bitCast(@as(packed struct(u8) { a: u4, b: u4 }, @bitCast(@as(u8, 0x21))))),
+        },
+        .{
+            .src = &.{ "const S = packed struct(u8) { a: u4, b: u4 };", "@as(S, @bitCast(@as(u8, 0x21))).a" },
+            .want = @as(packed struct(u8) { a: u4, b: u4 }, @bitCast(@as(u8, 0x21))).a,
+        },
+    });
+}
+
 test "compliance: a packed struct literal packs fields into the backing int" {
     try compliance.check(a, .{
         .{ .src = &.{"blk: { const x: packed struct(u8) { a: u4, b: u4 } = .{ .a = 1, .b = 2 }; break :blk x.a; }"}, .want = blk: {

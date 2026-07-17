@@ -5530,8 +5530,11 @@ const ContainerFrame = struct {
     zir: ZirFrame,
     saved_this: InternPool.Index,
     decl_inst: Zir.Inst.Index,
+    old_inst_map: std.AutoHashMapUnmanaged(Zir.Inst.Index, Value),
 
     fn restore(cf: ContainerFrame, sema: *Sema) void {
+        sema.inst_map.deinit(sema.gpa);
+        sema.inst_map = cf.old_inst_map;
         sema.this_type = cf.saved_this;
         cf.zir.restore(sema);
     }
@@ -5546,7 +5549,9 @@ fn enterContainer(sema: *Sema, container_ty: InternPool.Index, ctx: []const u8) 
     const zir = try sema.enterSourceZir(ns.source_zir_id, ctx);
     const saved_this = sema.this_type;
     sema.this_type = owner;
-    return .{ .zir = zir, .saved_this = saved_this, .decl_inst = ns.decl_inst };
+    const old_inst_map = sema.inst_map;
+    sema.inst_map = .empty;
+    return .{ .zir = zir, .saved_this = saved_this, .decl_inst = ns.decl_inst, .old_inst_map = old_inst_map };
 }
 
 fn containerTypeSrc(sema: *Sema, container_ty: InternPool.Index) LazySrcLoc {
