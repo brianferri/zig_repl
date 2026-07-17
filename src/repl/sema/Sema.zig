@@ -2521,14 +2521,39 @@ fn evalMakePtrConst(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ptr = try sema.resolveInst(un_node.operand);
     const ip = sema.intern_pool;
     const p = ip.indexToKey(ptr.index).ptr;
-    sema.freezeBacking(p);
     const old = ip.indexToKey(p.ty).ptr_type;
+    if (p.base_addr == .comptime_alloc) try sema.fillComptimeAllocFields(p, old.child);
+    sema.freezeBacking(p);
     if (old.flags.is_const) return ptr;
     var flags = old.flags;
     flags.is_const = true;
     const const_ty = try ip.internPtrType(.{ .child = old.child, .sentinel = old.sentinel, .flags = flags });
     const const_ptr = try ip.internPtr(.{ .ty = const_ty, .base_addr = p.base_addr, .byte_offset = p.byte_offset });
     return .{ .index = const_ptr };
+}
+
+// A comptime field is addressed by a standalone comptime_field pointer, so its element store is a no-op;
+// fill comptime fields from their type defaults when the comptime-known alloc is finalized, mirroring the
+// compiler resolving the comptime fields of such an alloc.
+fn fillComptimeAllocFields(sema: *Sema, alloc_ptr: InternPool.Key.Ptr, agg_ty: InternPool.Index) Error!void {
+    const ip = sema.intern_pool;
+    const key = ip.indexToKey(agg_ty);
+    const count: u32 = switch (key) {
+        .tuple_type => |t| @intCast(t.types.len),
+        .struct_type => count: {
+            try sema.ensureLayoutResolved(agg_ty);
+            break :count try sema.structFieldCount(agg_ty);
+        },
+        else => return,
+    };
+    const ty: Type = .fromIndex(agg_ty);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        if (!ty.structFieldIsComptime(i, ip)) continue;
+        const default = ty.structFieldDefaultValue(i, ip).?;
+        const alloc = try sema.lookupComptimeAlloc(alloc_ptr);
+        alloc.val = try sema.setAggregateElement(alloc.val, agg_ty, i, default);
+    }
 }
 
 fn pushComptimeAlloc(
@@ -7243,6 +7268,39 @@ fn evalArrayInitElemPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return try sema.elemPtr(array_ptr, extra.index);
 }
 
+fn structFieldPtrByIndex(sema: *Sema, struct_ptr: Value, field_index: u32, struct_ty: Type) Error!Value {
+    const ip = sema.intern_pool;
+    ip.assertLayoutResolved(struct_ty.index);
+    const struct_ptr_ty = struct_ptr.typeOf(ip);
+    if (struct_ty.structFieldIsComptime(field_index, ip)) {
+        const field_ptr_ty = try struct_ptr_ty.fieldPtrType(field_index, ip);
+        return .{ .index = try ip.internPtr(.{
+            .ty = field_ptr_ty.index,
+            .base_addr = .{ .comptime_field = struct_ty.structFieldDefaultValue(field_index, ip).?.index },
+            .byte_offset = 0,
+        }) };
+    }
+    return try struct_ptr.ptrField(field_index, ip);
+}
+
+fn tupleElemPtr(sema: *Sema, tuple_ptr: Value, index: u64) Error!Value {
+    const ip = sema.intern_pool;
+    const tuple_ptr_ty = tuple_ptr.typeOf(ip);
+    assert(tuple_ptr_ty.isSinglePointer(ip));
+    const tuple_ty = tuple_ptr_ty.childType(ip);
+    assert(tuple_ty.isTuple(ip));
+
+    const field_count = ip.indexToKey(tuple_ty.index).tuple_type.types.len;
+    if (field_count == 0) {
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "indexing into empty tuple is not allowed", .{});
+    }
+    if (index >= field_count) {
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index {d} outside tuple of length {d}", .{ index, field_count });
+    }
+
+    return try sema.structFieldPtrByIndex(tuple_ptr, @intCast(index), tuple_ty);
+}
+
 fn elemPtr(sema: *Sema, array_ptr: Value, index: u64) Error!Value {
     const ip = sema.intern_pool;
     const parent_ty = ip.indexToKey(array_ptr.index).ptr.ty;
@@ -7251,19 +7309,7 @@ fn elemPtr(sema: *Sema, array_ptr: Value, index: u64) Error!Value {
         return try sema.elemPtrSlice(array_ptr, index, child_ty);
     }
     if (ip.indexToKey(child_ty) == .tuple_type) {
-        const tuple = ip.indexToKey(child_ty).tuple_type;
-        if (index >= tuple.types.len) {
-            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index {d} outside tuple of length {d}", .{ index, tuple.types.len });
-        }
-        const elem_ptr_ty = try ip.internPtrType(.{
-            .child = tuple.types[@intCast(index)],
-            .flags = .{ .size = .one, .is_const = ip.indexToKey(parent_ty).ptr_type.flags.is_const },
-        });
-        return .{ .index = try ip.internPtr(.{
-            .ty = elem_ptr_ty,
-            .base_addr = .{ .field = .{ .base = array_ptr.index, .index = @intCast(index) } },
-            .byte_offset = 0,
-        }) };
+        return try sema.tupleElemPtr(array_ptr, index);
     }
     const elems = indexableInfo(ip, child_ty) orelse {
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "elem ptr: operand is not an array pointer", .{});

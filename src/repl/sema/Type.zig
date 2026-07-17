@@ -683,6 +683,23 @@ pub fn structFieldIsComptime(ty: Type, index: usize, pool: *const InternPool) bo
     }
 }
 
+pub fn structFieldDefaultValue(ty: Type, index: usize, pool: *const InternPool) ?Value {
+    switch (pool.indexToKey(ty.index)) {
+        .struct_type => {
+            const field_defaults = pool.loadStructType(ty.index).field_defaults;
+            if (field_defaults.len == 0) return null;
+            if (field_defaults[index] == .none) return null;
+            return .fromIndex(field_defaults[index]);
+        },
+        .tuple_type => |tuple| {
+            const val = tuple.values[index];
+            if (val == .none) return null;
+            return .fromIndex(val);
+        },
+        else => unreachable,
+    }
+}
+
 pub fn isAbiInt(ty: Type, pool: *const InternPool) bool {
     return switch (ty.zigTypeTag(pool)) {
         .int, .@"enum", .error_set => true,
@@ -1147,6 +1164,13 @@ pub fn isPtrAtRuntime(ty: Type, pool: *const InternPool) bool {
 pub fn isSlice(ty: Type, pool: *const InternPool) bool {
     return switch (pool.indexToKey(ty.index)) {
         .ptr_type => |ptr_type| ptr_type.flags.size == .slice,
+        else => false,
+    };
+}
+
+pub fn isSinglePointer(ty: Type, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(ty.index)) {
+        .ptr_type => |info| info.flags.size == .one,
         else => false,
     };
 }
