@@ -19,6 +19,14 @@ pub fn toIndex(val: Value) InternPool.Index {
     return val.index;
 }
 
+pub fn getOffsetPtr(ptr_val: Value, byte_off: u64, new_ty: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (ptr_val.isUndef(pool)) return ptr_val;
+    var ptr = pool.indexToKey(ptr_val.index).ptr;
+    ptr.ty = new_ty.index;
+    ptr.byte_offset += byte_off;
+    return .fromIndex(try pool.internPtr(ptr));
+}
+
 pub fn writeToPackedMemory(val: Value, pool: *const InternPool, buffer: []u8, bit_offset: usize) void {
     const endian = builtin.target.cpu.arch.endian();
     const ty = val.typeOf(pool);

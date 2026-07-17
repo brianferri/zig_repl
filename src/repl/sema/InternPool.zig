@@ -366,6 +366,29 @@ pub const Alignment = enum(u6) {
         const x = (@as(u64, 1) << @intFromEnum(a)) - 1;
         return (addr + x) & ~x;
     }
+
+    pub fn fromLog2Units(a: u32) Alignment {
+        assert(a != @intFromEnum(Alignment.none));
+        return @enumFromInt(a);
+    }
+
+    pub fn compareStrict(lhs: Alignment, op: std.math.CompareOperator, rhs: Alignment) bool {
+        assert(lhs != .none);
+        assert(rhs != .none);
+        return std.math.compare(@intFromEnum(lhs), op, @intFromEnum(rhs));
+    }
+
+    pub fn min(lhs: Alignment, rhs: Alignment) Alignment {
+        if (lhs == .none) return lhs;
+        if (rhs == .none) return rhs;
+        return minStrict(lhs, rhs);
+    }
+
+    pub fn minStrict(lhs: Alignment, rhs: Alignment) Alignment {
+        assert(lhs != .none);
+        assert(rhs != .none);
+        return @enumFromInt(@min(@intFromEnum(lhs), @intFromEnum(rhs)));
+    }
 };
 
 pub const ComptimeUnit = struct {

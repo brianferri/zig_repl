@@ -526,6 +526,31 @@ pub fn toIndex(ty: Type) InternPool.Index {
     return ty.index;
 }
 
+pub fn isAbiInt(ty: Type, pool: *const InternPool) bool {
+    return switch (ty.zigTypeTag(pool)) {
+        .int, .@"enum", .error_set => true,
+        .@"struct", .@"union" => ty.containerLayout(pool) == .@"packed",
+        else => false,
+    };
+}
+
+pub fn defaultStructFieldAlignment(field_ty: Type, layout: std.lang.Type.ContainerLayout, pool: *const InternPool) InternPool.Alignment {
+    const overalign_big_int = switch (layout) {
+        .@"packed" => unreachable,
+        .auto => target.ofmt == .c,
+        .@"extern" => true,
+    };
+    const abi_align = field_ty.abiAlignment(pool);
+    assert(abi_align != .none);
+    if (overalign_big_int and
+        ((field_ty.isAbiInt(pool) and field_ty.intInfo(pool).bits > 64) or
+            (field_ty.index == .f80_type and target.cTypeBitSize(.longdouble) != 80)))
+    {
+        return abi_align.maxStrict(if (target.cpu.arch == .s390x) .@"8" else .@"16");
+    }
+    return abi_align;
+}
+
 pub const void_type: Type = .{ .index = .void_type };
 pub const bool_type: Type = .{ .index = .bool_type };
 pub const type_type: Type = .{ .index = .type_type };
