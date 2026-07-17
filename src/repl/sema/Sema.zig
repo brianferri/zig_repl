@@ -4473,27 +4473,66 @@ fn evalStructInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.StructInitAnon, pl_node.payload_index);
 
-    const values = try sema.gpa.alloc(InternPool.Index, extra.data.fields_len);
+    const fields_len = extra.data.fields_len;
+    const types = try sema.gpa.alloc(InternPool.Index, fields_len);
+    defer sema.gpa.free(types);
+    const values = try sema.gpa.alloc(InternPool.Index, fields_len);
     defer sema.gpa.free(values);
+    const names = try sema.gpa.alloc(InternPool.NullTerminatedString, fields_len);
+    defer sema.gpa.free(names);
+
     var extra_index = extra.end;
-    for (values) |*val| {
+    for (types, values, names) |*field_ty, *field_val, *field_name| {
         const item = sema.zir.extraData(Zir.Inst.StructInitAnon.Item, extra_index);
         extra_index = item.end;
-        val.* = (try sema.resolveInst(item.data.init)).index;
+        field_name.* = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(item.data.field_name));
+        const init = try sema.resolveInst(item.data.init);
+        field_val.* = init.index;
+        field_ty.* = init.typeOf(ip).index;
     }
+
+    // The compiler treats anon struct types as reified: fields are stored eagerly, and every
+    // comptime-known field is a comptime field with its value as the default. The REPL is
+    // comptime-only, so every field value is known and every field is comptime.
+    const comptime_words = try sema.gpa.alloc(u32, (fields_len + 31) / 32);
+    defer sema.gpa.free(comptime_words);
+    @memset(comptime_words, 0);
+    var i: u32 = 0;
+    while (i < fields_len) : (i += 1) comptime_words[i / 32] |= @as(u32, 1) << @intCast(i % 32);
+
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(std.mem.sliceAsBytes(types));
+    hasher.update(std.mem.sliceAsBytes(values));
+    hasher.update(std.mem.sliceAsBytes(names));
 
     const ctx = ip.stringSlice(sema.type_name_ctx);
     const name_text = try std.fmt.allocPrint(sema.gpa, "{s}__struct_{d}", .{ ctx, @intFromEnum(inst) });
     defer sema.gpa.free(name_text);
-    const struct_ty = try ip.getDeclaredStructType(
-        try ip.getOrPutString(sema.gpa, name_text),
-        .{ .declared = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst } },
-        sema.this_type,
-        @intCast(values.len),
-        .auto,
-        false,
-        false,
-    );
+    const struct_ty = try ip.getReifiedStructType(.{
+        .name = try ip.getOrPutString(sema.gpa, name_text),
+        .id = .{ .reified = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst, .type_hash = hasher.final() } },
+        .parent = sema.this_type,
+        .layout = .auto,
+        .backing_int = .none,
+        .names = names,
+        .types = types,
+        .defaults = values,
+        .aligns = &.{},
+        .comptime_bits = comptime_words,
+    });
+    const fields = ip.loadStructType(struct_ty);
+    fields.field_name_map.get(ip).clearRetainingCapacity();
+    for (names, 0..) |field_name, field_index| {
+        if (ip.addFieldName(names, fields.field_name_map, field_name)) |prev_field_index| {
+            return sema.failWithOwnedErrorMsg(sema.block, msg: {
+                const src = sema.block.nodeOffset(sema.srcNodeOffset(inst));
+                const msg = try sema.errMsg(src, "duplicate struct field '{f}' at index '{d}'", .{ field_name.fmt(ip), field_index });
+                errdefer msg.destroy(sema.gpa);
+                try sema.errNote(src, msg, "previous field at index '{d}'", .{prev_field_index});
+                break :msg msg;
+            });
+        }
+    }
     return .{ .index = try ip.internAggregate(.{ .ty = struct_ty, .storage = .{ .elems = values } }) };
 }
 
