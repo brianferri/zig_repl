@@ -562,6 +562,114 @@ pub fn explicitFieldAlignment(ty: Type, index: usize, pool: *const InternPool) I
     };
 }
 
+pub fn fieldPtrType(ptr_ty: Type, field_index: u32, pool: *InternPool) std.mem.Allocator.Error!Type {
+    const ptr_info = pool.indexToKey(ptr_ty.index).ptr_type;
+    assert(ptr_info.flags.size == .one or ptr_info.flags.size == .c);
+    const aggregate_ty: Type = .fromIndex(ptr_info.child);
+    pool.assertLayoutResolved(aggregate_ty.index);
+    const field_ty: Type, const field_align: InternPool.Alignment = switch (aggregate_ty.zigTypeTag(pool)) {
+        .@"struct" => switch (aggregate_ty.containerLayout(pool)) {
+            .auto => field: {
+                if (aggregate_ty.isTuple(pool)) {
+                    break :field .{ aggregate_ty.fieldType(field_index, pool), .none };
+                }
+                const struct_obj = pool.loadStructType(aggregate_ty.index);
+                break :field .{
+                    .fromIndex(struct_obj.field_types[field_index]),
+                    struct_obj.field_aligns.getOrNone(field_index),
+                };
+            },
+            .@"extern" => {
+                const extern_field_ty = aggregate_ty.fieldType(field_index, pool);
+                const field_offset = aggregate_ty.structFieldOffset(pool, field_index);
+                const parent_align = switch (ptr_info.flags.alignment) {
+                    .none => aggregate_ty.abiAlignment(pool),
+                    else => |a| a,
+                };
+                const actual_field_align = switch (field_offset) {
+                    0 => parent_align,
+                    else => parent_align.minStrict(.fromLog2Units(@ctz(field_offset))),
+                };
+                const field_ptr_align: InternPool.Alignment = a: {
+                    if (ptr_info.flags.alignment == .none and
+                        aggregate_ty.explicitFieldAlignment(field_index, pool) == .none and
+                        actual_field_align == extern_field_ty.abiAlignment(pool))
+                    {
+                        break :a .none;
+                    }
+                    break :a actual_field_align;
+                };
+                var field_ptr_info = ptr_info;
+                field_ptr_info.child = extern_field_ty.index;
+                field_ptr_info.flags.alignment = field_ptr_align;
+                return .fromIndex(try pool.internPtrType(field_ptr_info));
+            },
+            // A packed field pointer needs the bit-offset info (`packed_offset`) the REPL's pointer flags omit;
+            // the REPL instead reads packed fields through the backing integer, so this is a plain pointer.
+            .@"packed" => {
+                var field_ptr_info = ptr_info;
+                field_ptr_info.child = aggregate_ty.fieldType(field_index, pool).index;
+                return .fromIndex(try pool.internPtrType(field_ptr_info));
+            },
+        },
+        .@"union" => switch (aggregate_ty.containerLayout(pool)) {
+            .auto => field: {
+                const union_obj = pool.unionFields(aggregate_ty.index);
+                break :field .{
+                    .fromIndex(union_obj.field_types[field_index]),
+                    union_obj.field_aligns.getOrNone(field_index),
+                };
+            },
+            .@"extern" => {
+                const extern_field_ty = aggregate_ty.fieldType(field_index, pool);
+                var field_ptr_info = ptr_info;
+                field_ptr_info.child = extern_field_ty.index;
+                if (field_ptr_info.flags.alignment == .none and
+                    InternPool.Alignment.compareStrict(extern_field_ty.abiAlignment(pool), .neq, aggregate_ty.abiAlignment(pool)))
+                {
+                    field_ptr_info.flags.alignment = aggregate_ty.abiAlignment(pool);
+                }
+                return .fromIndex(try pool.internPtrType(field_ptr_info));
+            },
+            .@"packed" => {
+                var field_ptr_info = ptr_info;
+                field_ptr_info.child = aggregate_ty.fieldType(field_index, pool).index;
+                return .fromIndex(try pool.internPtrType(field_ptr_info));
+            },
+        },
+        else => unreachable,
+    };
+    const field_ptr_align: InternPool.Alignment = a: {
+        if (aggregate_ty.zigTypeTag(pool) == .@"struct" and aggregate_ty.structFieldIsComptime(field_index, pool)) {
+            break :a field_align;
+        }
+        const actual_field_align = switch (field_align) {
+            .none => switch (pool.indexToKey(aggregate_ty.index)) {
+                .tuple_type, .union_type => field_ty.abiAlignment(pool),
+                .struct_type => field_ty.defaultStructFieldAlignment(.auto, pool),
+                else => unreachable,
+            },
+            else => |a| a,
+        };
+        const actual_aggregate_align = switch (ptr_info.flags.alignment) {
+            .none => aggregate_ty.abiAlignment(pool),
+            else => |a| a,
+        };
+        if (actual_aggregate_align.compareStrict(.lt, actual_field_align)) {
+            assert(ptr_info.flags.alignment != .none);
+            break :a actual_aggregate_align;
+        }
+        if (field_align == .none and actual_field_align == field_ty.abiAlignment(pool)) {
+            break :a .none;
+        }
+        break :a actual_field_align;
+    };
+    var field_ptr_info = ptr_info;
+    field_ptr_info.flags.alignment = field_ptr_align;
+    field_ptr_info.child = field_ty.index;
+    return .fromIndex(try pool.internPtrType(field_ptr_info));
+}
+
 pub fn structFieldIsComptime(ty: Type, index: usize, pool: *const InternPool) bool {
     switch (pool.indexToKey(ty.index)) {
         .struct_type => {
