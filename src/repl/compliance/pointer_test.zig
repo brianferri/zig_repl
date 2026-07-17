@@ -35,6 +35,9 @@ test "compliance: @alignOf matches the host target ABI" {
         .{ .src = &.{"@alignOf(*u8)"}, .want = @alignOf(*u8) },
         .{ .src = &.{"@alignOf(*align(16) u8)"}, .want = @alignOf(*align(16) u8) },
         .{ .src = &.{"@alignOf(comptime_int)"}, .want = @alignOf(comptime_int) },
+        // An explicit field alignment is stored as an Alignment and drives the container's layout.
+        .{ .src = &.{"@alignOf(struct { a: u8, b: u32 align(16) })"}, .want = @alignOf(struct { a: u8, b: u32 align(16) }) },
+        .{ .src = &.{"@sizeOf(struct { a: u8, b: u32 align(16) })"}, .want = @sizeOf(struct { a: u8, b: u32 align(16) }) },
     });
 }
 

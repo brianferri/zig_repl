@@ -423,11 +423,8 @@ pub fn getUnionLayout(loaded_union: InternPool.UnionFields, pool: *const InternP
         if (field_ty.isNoReturn(pool)) continue;
 
         const field_align: InternPool.Alignment = a: {
-            const explicit_aligns = loaded_union.field_aligns;
-            if (explicit_aligns.len > 0) {
-                const alignment = explicit_aligns[field_index];
-                if (alignment != .none) break :a .fromByteUnits(Value.fromIndex(alignment).toUnsignedInt(pool));
-            }
+            const explicit = loaded_union.field_aligns.getOrNone(field_index);
+            if (explicit != .none) break :a explicit;
             break :a field_ty.abiAlignment(pool);
         };
         if (field_ty.hasRuntimeBits(pool)) {

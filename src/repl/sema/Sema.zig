@@ -2004,7 +2004,7 @@ fn resolveStructLayout(sema: *Sema, struct_ty: InternPool.Index) Error!void {
         const count = try sema.structFieldCount(struct_ty);
         const names = try sema.arena.alloc(InternPool.NullTerminatedString, count);
         const types = try sema.arena.alloc(InternPool.Index, count);
-        const aligns = try sema.arena.alloc(InternPool.Index, count);
+        const aligns = try sema.arena.alloc(InternPool.Alignment, count);
         const comptime_bits = try sema.arena.alloc(u32, (count + 31) / 32);
         @memset(comptime_bits, 0);
         var i: u32 = 0;
@@ -2013,7 +2013,7 @@ fn resolveStructLayout(sema: *Sema, struct_ty: InternPool.Index) Error!void {
             const field = (try sema.structFieldByName(struct_ty, name)).?;
             names[i] = name;
             types[i] = field.ty;
-            aligns[i] = if (field.align_bytes) |a| try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = a } }) else .none;
+            aligns[i] = if (field.align_bytes) |a| .fromByteUnits(a) else .none;
             if (field.is_comptime) comptime_bits[i / 32] |= @as(u32, 1) << @intCast(i % 32);
         }
         try ip.fillDeclaredStructFields(struct_ty, names, types, aligns, comptime_bits);
@@ -2054,8 +2054,9 @@ fn resolveStructLayout(sema: *Sema, struct_ty: InternPool.Index) Error!void {
     var has_comptime = false;
     var has_npv = false;
     for (f.field_types, resolved_aligns, runtime_order, 0..) |field_ty, *field_align, *order, idx| {
-        field_align.* = if (f.field_aligns.len != 0 and f.field_aligns[idx] != .none)
-            .fromByteUnits(@intCast(sema.intAsI128(f.field_aligns[idx]).?))
+        const explicit_align = f.field_aligns.getOrNone(idx);
+        field_align.* = if (explicit_align != .none)
+            explicit_align
         else
             Type.fromIndex(field_ty).abiAlignment(ip);
         if (structFieldIsComptime(f, idx)) {
@@ -2110,14 +2111,14 @@ fn resolveUnionFields(sema: *Sema, union_ty: InternPool.Index) Error!void {
     const count = try sema.unionFieldCount(union_ty);
     const names = try sema.arena.alloc(InternPool.NullTerminatedString, count);
     const types = try sema.arena.alloc(InternPool.Index, count);
-    const aligns = try sema.arena.alloc(InternPool.Index, count);
+    const aligns = try sema.arena.alloc(InternPool.Alignment, count);
     var i: u32 = 0;
     while (i < count) : (i += 1) {
         const name = (try sema.unionFieldNameAt(union_ty, i)).?;
         const field = (try sema.unionFieldByName(union_ty, name)).?;
         names[i] = name;
         types[i] = field.ty;
-        aligns[i] = if (field.align_bytes) |a| try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = a } }) else .none;
+        aligns[i] = if (field.align_bytes) |a| .fromByteUnits(a) else .none;
     }
     try ip.fillDeclaredUnionFields(union_ty, names, types, aligns);
 }
@@ -2155,8 +2156,9 @@ fn resolveUnionLayout(sema: *Sema, union_ty: InternPool.Index) Error!void {
     var possible_tags: u32 = 0;
     var payload_has_comptime = false;
     for (f.field_types, 0..) |field_ty, idx| {
-        const field_align: InternPool.Alignment = if (f.field_aligns.len != 0 and f.field_aligns[idx] != .none)
-            .fromByteUnits(@intCast(sema.intAsI128(f.field_aligns[idx]).?))
+        const explicit_align = f.field_aligns.getOrNone(idx);
+        const field_align: InternPool.Alignment = if (explicit_align != .none)
+            explicit_align
         else
             Type.fromIndex(field_ty).abiAlignment(ip);
         payload_align = payload_align.maxStrict(field_align);
@@ -3996,7 +3998,7 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
     const defaults = try sema.gpa.alloc(InternPool.Index, fields_len);
     defer sema.gpa.free(defaults);
     @memset(defaults, .none);
-    const aligns = try sema.gpa.alloc(InternPool.Index, fields_len);
+    const aligns = try sema.gpa.alloc(InternPool.Alignment, fields_len);
     defer sema.gpa.free(aligns);
     @memset(aligns, .none);
     const comptime_words = try sema.gpa.alloc(u32, (fields_len + 31) / 32);
@@ -4048,7 +4050,7 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
             if (layout == .@"packed") {
                 return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "packed struct fields cannot be aligned", .{});
             }
-            aligns[i] = align_opt;
+            aligns[i] = .fromByteUnits(Value.fromIndex(align_opt).toUnsignedInt(ip));
             any_aligns = true;
         }
 
@@ -4143,7 +4145,7 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
     defer sema.gpa.free(names);
     const types = try sema.gpa.alloc(InternPool.Index, fields_len);
     defer sema.gpa.free(types);
-    const aligns = try sema.gpa.alloc(InternPool.Index, fields_len);
+    const aligns = try sema.gpa.alloc(InternPool.Alignment, fields_len);
     defer sema.gpa.free(aligns);
     @memset(aligns, .none);
     var any_aligns = false;
@@ -4169,7 +4171,7 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
             if (layout == .@"packed") {
                 return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "packed union fields cannot be aligned", .{});
             }
-            aligns[i] = align_opt;
+            aligns[i] = .fromByteUnits(Value.fromIndex(align_opt).toUnsignedInt(ip));
             any_aligns = true;
         }
         std.hash.autoHash(&hasher, name_out.*);
@@ -5626,9 +5628,10 @@ fn structFieldIsComptime(f: InternPool.LoadedStructType, i: usize) bool {
     return f.field_is_comptime_bits[i / 32] >> @intCast(i % 32) & 1 != 0;
 }
 
-fn structFieldAlign(sema: *Sema, f: InternPool.LoadedStructType, i: usize) ?u64 {
-    if (f.field_aligns.len == 0 or f.field_aligns[i] == .none) return null;
-    return @intCast(sema.intAsI128(f.field_aligns[i]).?);
+fn structFieldAlign(f: InternPool.LoadedStructType, i: usize) ?u64 {
+    const a = f.field_aligns.getOrNone(i);
+    if (a == .none) return null;
+    return a.toByteUnits().?;
 }
 
 pub fn structFieldByName(
@@ -5645,7 +5648,7 @@ pub fn structFieldByName(
                 .index = i,
                 .ty = f.field_types[i],
                 .is_comptime = structFieldIsComptime(f, i),
-                .align_bytes = structFieldAlign(sema, f, i),
+                .align_bytes = structFieldAlign(f, i),
             };
         },
         .declared => {},
@@ -5729,7 +5732,10 @@ pub fn unionFieldByName(
                 return .{
                     .index = @intCast(i),
                     .ty = f.field_types[i],
-                    .align_bytes = if (f.field_aligns.len == 0 or f.field_aligns[i] == .none) null else @intCast(sema.intAsI128(f.field_aligns[i]).?),
+                    .align_bytes = blk: {
+                        const a = f.field_aligns.getOrNone(i);
+                        break :blk if (a == .none) null else a.toByteUnits().?;
+                    },
                 };
             }
             return null;

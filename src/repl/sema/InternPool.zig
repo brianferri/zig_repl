@@ -389,6 +389,23 @@ pub const Alignment = enum(u6) {
         assert(rhs != .none);
         return @enumFromInt(@min(@intFromEnum(lhs), @intFromEnum(rhs)));
     }
+
+    // A view over the per-field alignments stored one-per-`extra` slot. The compiler packs these
+    // (Alignment is u6); the REPL keeps one u32 slot each, like `field_offsets`.
+    pub const Slice = struct {
+        start: []const u32,
+
+        pub const empty: Slice = .{ .start = &.{} };
+
+        pub fn get(s: Slice, i: usize) Alignment {
+            return @enumFromInt(@as(u6, @intCast(s.start[i])));
+        }
+
+        pub fn getOrNone(s: Slice, i: usize) Alignment {
+            if (s.start.len == 0) return .none;
+            return s.get(i);
+        }
+    };
 };
 
 pub const ComptimeUnit = struct {
@@ -3101,7 +3118,7 @@ pub const LoadedStructType = struct {
     field_names: []const NullTerminatedString,
     field_types: []const Index,
     field_defaults: []const Index,
-    field_aligns: []const Index,
+    field_aligns: Alignment.Slice,
     field_is_comptime_bits: []const u32,
     field_name_map: MapIndex,
     field_runtime_order: []const RuntimeOrder,
@@ -3160,7 +3177,7 @@ pub fn loadStructType(pool: *const InternPool, struct_ty: Index) LoadedStructTyp
     base += fields_len;
     const defaults: []const Index = if (r.flags.any_field_defaults) @ptrCast(pool.extra.items[base..][0..fields_len]) else &.{};
     base += if (r.flags.any_field_defaults) fields_len else 0;
-    const aligns: []const Index = if (r.flags.any_field_aligns) @ptrCast(pool.extra.items[base..][0..fields_len]) else &.{};
+    const aligns: Alignment.Slice = .{ .start = if (r.flags.any_field_aligns) pool.extra.items[base..][0..fields_len] else &.{} };
     base += if (r.flags.any_field_aligns) fields_len else 0;
     const comptime_len: u32 = if (r.flags.any_comptime_fields) (fields_len + 31) / 32 else 0;
     const comptime_bits = pool.extra.items[base..][0..comptime_len];
@@ -3202,7 +3219,7 @@ pub fn fillDeclaredStructFields(
     struct_ty: Index,
     names: []NullTerminatedString,
     types: []const Index,
-    aligns: []const Index,
+    aligns: []const Alignment,
     comptime_bits: []const u32,
 ) Allocator.Error!void {
     const item = pool.items.get(@intFromEnum(struct_ty));
@@ -3336,7 +3353,7 @@ pub const UnionFields = struct {
     packed_backing_int_type: Index,
     field_names: []const NullTerminatedString,
     field_types: []const Index,
-    field_aligns: []const Index,
+    field_aligns: Alignment.Slice,
     field_name_map: MapIndex,
     has_runtime_tag: bool,
     class: TypeClass,
@@ -3361,7 +3378,7 @@ pub fn unionFields(pool: *const InternPool, union_ty: Index) UnionFields {
     base += fields_len;
     const types: []const Index = @ptrCast(pool.extra.items[base..][0..fields_len]);
     base += fields_len;
-    const aligns: []const Index = if (r.flags.any_field_aligns) @ptrCast(pool.extra.items[base..][0..fields_len]) else &.{};
+    const aligns: Alignment.Slice = .{ .start = if (r.flags.any_field_aligns) pool.extra.items[base..][0..fields_len] else &.{} };
     return .{
         .layout = switch (r.flags.layout) {
             .auto => .auto,
@@ -3393,7 +3410,7 @@ pub fn fillDeclaredUnionFields(
     union_ty: Index,
     names: []NullTerminatedString,
     types: []const Index,
-    aligns: []const Index,
+    aligns: []const Alignment,
 ) Allocator.Error!void {
     const item = pool.items.get(@intFromEnum(union_ty));
     assert(item.tag == .type_union);
@@ -3654,7 +3671,7 @@ pub fn getReifiedStructType(pool: *InternPool, ini: struct {
     names: []const NullTerminatedString,
     types: []const Index,
     defaults: []const Index,
-    aligns: []const Index,
+    aligns: []const Alignment,
     comptime_bits: []const u32,
 }) Allocator.Error!Index {
     assert(ini.types.len == ini.names.len);
@@ -3844,7 +3861,7 @@ pub fn getReifiedUnionType(pool: *InternPool, ini: struct {
     backing_int: Index,
     names: []const NullTerminatedString,
     types: []const Index,
-    aligns: []const Index,
+    aligns: []const Alignment,
 }) Allocator.Error!Index {
     assert(ini.types.len == ini.names.len);
     assert(ini.aligns.len == 0 or ini.aligns.len == ini.names.len);
