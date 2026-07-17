@@ -12,6 +12,9 @@ test "compliance: anonymous struct (.{ .a = ... }) field access" {
                 break :blk p.a + p.b;
             },
         },
+        // Anon struct fields are all comptime, so the type carries no runtime layout (size 0).
+        // Exercises resolveStructLayout on a reified struct that has field defaults.
+        .{ .src = &.{"@sizeOf(@TypeOf(.{ .a = 1, .b = 2 }))"}, .want = @sizeOf(@TypeOf(.{ .a = 1, .b = 2 })) },
         .{
             .src = &.{"blk: { const p = .{ .x = @as(u8, 5), .y = true }; break :blk p.x; }"},
             .want = blk: {

@@ -2001,7 +2001,9 @@ fn resolveStructLayout(sema: *Sema, struct_ty: InternPool.Index) Error!void {
     if (ip.structLayoutResolved(struct_ty)) return;
 
     if (ip.indexToKey(struct_ty).struct_type == .declared) {
-        const count = try sema.structFieldCount(struct_ty);
+        // The field count stored at type creation is authoritative; structFieldCount re-derives from
+        // ZIR and misreads the main_struct_inst sentinel (index 0) of a namespace/module root.
+        const count: u32 = @intCast(ip.loadStructType(struct_ty).field_types.len);
         const names = try sema.arena.alloc(InternPool.NullTerminatedString, count);
         const types = try sema.arena.alloc(InternPool.Index, count);
         const aligns = try sema.arena.alloc(InternPool.Alignment, count);

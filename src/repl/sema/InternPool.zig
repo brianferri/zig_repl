@@ -3292,6 +3292,7 @@ pub fn setStructLayout(
     const trail = pool.extraDataTrail(TypeStruct, item.data);
     const r = trail.data;
     var base = trail.end + containerIdTrailingLen(r.captures_len) + r.fields_len + r.fields_len;
+    if (r.flags.any_field_defaults) base += r.fields_len;
     if (r.flags.any_field_aligns) base += r.fields_len;
     if (r.flags.any_comptime_fields) base += (r.fields_len + 31) / 32;
     if (r.flags.layout == .auto) {
