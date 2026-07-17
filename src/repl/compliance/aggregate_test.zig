@@ -137,6 +137,9 @@ test "compliance: void and explicit tuple types" {
         .{ .src = &.{"const x: struct { void } = .{ 420 };"}, .reject = {} },
         .{ .src = &.{"const x: struct { i32, f128 } = .{ 1 };"}, .reject = {} },
         .{ .src = &.{"const x: struct { i32 } = .{ 1, 2 };"}, .reject = {} },
+        // A tuple type may carry a comptime field default (tuple_decl field init); the comptime
+        // field takes no runtime space.
+        .{ .src = &.{"@sizeOf(struct { u32, comptime i32 = 7 })"}, .want = @sizeOf(struct { u32, comptime i32 = 7 }) },
     });
 }
 

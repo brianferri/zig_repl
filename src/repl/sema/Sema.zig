@@ -5323,18 +5323,19 @@ fn evalTupleDecl(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value
 
     const types = try sema.gpa.alloc(InternPool.Index, fields_len);
     defer sema.gpa.free(types);
-    for (types, 0..) |*ty, i| {
-        const zir_field_ty = refs[i * 2];
-        const zir_field_init = refs[i * 2 + 1];
-        if (zir_field_init != .none) {
-            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "tuple field {d}: comptime field defaults are not supported", .{i});
-        }
-        ty.* = try sema.resolveDestType(zir_field_ty, "tuple field type");
-    }
-
     const vals = try sema.gpa.alloc(InternPool.Index, fields_len);
     defer sema.gpa.free(vals);
-    @memset(vals, .none);
+    for (types, vals, 0..) |*ty, *val, i| {
+        const zir_field_ty = refs[i * 2];
+        const zir_field_init = refs[i * 2 + 1];
+        const field_type = try sema.resolveDestType(zir_field_ty, "tuple field type");
+        ty.* = field_type;
+        val.* = if (zir_field_init != .none)
+            (try sema.coerceValueToType(try sema.resolveInst(zir_field_init), field_type, "tuple field default")).index
+        else
+            .none;
+    }
+
     return .{ .index = try sema.intern_pool.internTupleType(types, vals) };
 }
 
