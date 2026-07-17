@@ -1,28 +1,13 @@
-//! Structured analysis errors and their source locations, shared between the
-//! analyzer (which produces them) and the session (which holds them for the
-//! driver to render). Mirrors `Zcu.ErrorMsg` and `Zcu.LazySrcLoc`, which live
-//! together in the compiler's `Zcu`; the REPL keeps them in a leaf module so
-//! `Session` can own an `*ErrorMsg` without importing the analyzer.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const Zir = std.zig.Zir;
 const Ast = std.zig.Ast;
 
-/// Mirrors `Zcu.LazySrcLoc`. `base_node_inst` is the instruction whose
-/// declaration node the `offset` is measured against. The compiler uses a
-/// cross-file `InternPool.TrackedInst.Index`; the REPL is single-file, so a
-/// plain `Zir.Inst.Index` suffices (the one field that legitimately does not
-/// port). The driver, which holds the AST, turns the resolved node into a span.
 pub const LazySrcLoc = struct {
     base_node_inst: Zir.Inst.Index,
     offset: Offset,
 
-    /// Mirrors `Zcu.LazySrcLoc.Offset`. Only the variants the REPL
-    /// constructs are listed; adding a new source-location kind trips the
-    /// exhaustive switch in `resolveNode`, which is where its AST navigation is
-    /// added.
     pub const Offset = union(enum) {
         unneeded,
         node_offset: Ast.Node.Offset,
@@ -39,13 +24,6 @@ pub const LazySrcLoc = struct {
         }
     };
 
-    /// The base AST node `offset` is relative to. Mirrors `Zcu.resolveBaseNode`,
-    /// arm for arm: a declaration, a struct-init, or an `extended` container
-    /// declaration. The compiler's `else => unreachable` becomes `.root` here: its
-    /// `TrackedInst` names the file the base lives in, but the REPL's fileless
-    /// `Zir.Inst.Index` cannot, so a note anchored at a prior line's container
-    /// (resolved against this line's ZIR) may land on an unrelated tag -- degrade to
-    /// the file root rather than crash. Same-file bases resolve exactly.
     pub fn resolveBaseNode(base_node_inst: Zir.Inst.Index, zir: Zir) Ast.Node.Index {
         if (base_node_inst == .main_struct_inst) return .root;
         if (@intFromEnum(base_node_inst) >= zir.instructions.len) return .root;
@@ -65,11 +43,6 @@ pub const LazySrcLoc = struct {
         };
     }
 
-    /// The absolute AST node the caret anchors on: the base declaration node with
-    /// `offset` applied. Mirrors the node `Zcu.SrcLoc.span` resolves before taking
-    /// a byte span; the driver applies `tree.nodeToSpan` to the result. The
-    /// builtin-call-arg / bin-operand navigation `span` performs with the tree is
-    /// not modeled -- those resolve to the enclosing call / operator node.
     pub fn resolveNode(src_loc: LazySrcLoc, zir: Zir) Ast.Node.Index {
         const base = resolveBaseNode(src_loc.base_node_inst, zir);
         return switch (src_loc.offset) {
@@ -84,23 +57,10 @@ pub const LazySrcLoc = struct {
     }
 };
 
-/// Mirrors `Zcu.ErrorMsg`: a message anchored at a source location, with
-/// sub-notes. The `reference_trace_root` field the compiler carries has no REPL
-/// analog (no cross-unit reference tracing). Allocated with `gpa` (message and
-/// notes included) so it outlives the analyzer's arena, exactly as the compiler
-/// keeps `failed_analysis` entries alive past a `Sema`.
 pub const ErrorMsg = struct {
     src_loc: LazySrcLoc,
     msg: []const u8,
     notes: []ErrorMsg = &.{},
-    /// The file (`Session.File.Index`) the `src_loc`'s `base_node_inst` belongs
-    /// to. The compiler's `LazySrcLoc.base_node_inst` is a cross-file
-    /// `TrackedInst.Index` that names its own file; the REPL's is a bare, fileless
-    /// `Zir.Inst.Index`, so the file it was raised in is carried here instead --
-    /// stamped when the error is built -- and the driver resolves the node against
-    /// that file's ZIR/AST rather than the current line's. Without it, an error
-    /// inside a called function (whose body lives on an earlier line) resolves
-    /// against the calling line's tree and reads out of bounds.
     file: u32 = 0,
 
     pub fn create(gpa: Allocator, src_loc: LazySrcLoc, comptime format: []const u8, args: anytype) !*ErrorMsg {

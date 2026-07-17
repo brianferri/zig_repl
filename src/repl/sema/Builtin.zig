@@ -1,21 +1,7 @@
-//! Generates the `builtin` module's source, mirroring the compiler's
-//! `src/Builtin.zig`. The compiler serializes a `Compilation`'s target and build
-//! options into a source file it then analyses like any other; the REPL evaluates
-//! native code, so the target is the REPL's own `@import("builtin").target`, and
-//! only the target-model declarations are emitted -- enough for the
-//! target-dependent resolution the REPL reaches (calling conventions:
-//! `std.lang.CallingConvention.c` is `builtin.target.cCallingConvention()`).
-//!
-//! The `cpu`, `os`, and `abi` declarations, and the `target` that gathers them,
-//! are written as fully expanded literals -- never via `Target` helper calls --
-//! so the source parses back to the target value with no runtime dependency.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const native = @import("builtin");
 
-/// Emit the `builtin` source for the native target. Caller owns the returned
-/// bytes.
 pub fn generate(gpa: Allocator) Allocator.Error![:0]u8 {
     const target = native.target;
     const arch_family_name = @tagName(target.cpu.arch.family());
@@ -132,11 +118,6 @@ pub fn generate(gpa: Allocator) Allocator.Error![:0]u8 {
         try buffer.appendSlice("    .dynamic_linker = .none,\n};\n");
     }
 
-    // The build-configuration declarations. The REPL has no `Compilation`, so it
-    // reflects its own build config (`native.*`) -- coherent, and (being a Debug
-    // exe) matching `zig run` defaults. `wasi_exec_model`/`test_functions`, which
-    // the compiler emits only for wasi / test builds, do not apply to the native
-    // REPL target and are omitted.
     try buffer.print(
         \\pub const object_format: std.Target.ObjectFormat = .{f};
         \\pub const mode: std.lang.OptimizeMode = .{f};

@@ -1,6 +1,3 @@
-//! Thin newtype over `InternPool.Index` that names "this index refers to a
-//! value".
-
 const std = @import("std");
 const assert = std.debug.assert;
 
@@ -10,19 +7,6 @@ const Type = @import("Type.zig");
 const Value = @This();
 
 index: InternPool.Index,
-/// Whether this value is comptime-known. The evaluator always has a concrete
-/// `index` (it substitutes a call's args to evaluate the body), so this is a
-/// *provenance* bit: a value built from literals and consts is comptime-known;
-/// one derived from a non-`comptime` parameter is not. Coercion needs it -- a
-/// comptime-known value coerces value-based (the value must fit), a runtime
-/// value type-based (the source *type* must coerce) -- so the body of
-/// `fn (a: u32) i32 { return a; }` is rejected as the compiler rejects it.
-///
-/// The compiler reads this structurally (a comptime value interns, a runtime
-/// one is an Air instruction with no constant: `resolveValue(ref) != null`).
-/// This evaluator has no Air, so it carries the bit. Seeded from the
-/// parameter's `comptime`-ness (`Block.Param.is_comptime` / FuncType
-/// `comptime_bits`) and ANDed through each operation that builds a value.
 is_comptime: bool = true,
 
 pub fn fromIndex(index: InternPool.Index) Value {
@@ -56,10 +40,6 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
         .enum_tag => |et| .{ .index = et.ty },
         .enum_literal => .{ .index = .enum_literal_type },
         .un => |uv| .{ .index = uv.ty },
-        // Every remaining Key is a type used as a value, whose own type is
-        // `type`. The value Keys above are exhaustive, so anything reaching
-        // here is a type -- the assert turns a future unclassified value Key
-        // into a loud crash rather than a silent `.type_type`.
         else => blk: {
             assert(key.isType());
             break :blk .type_type;
@@ -67,7 +47,6 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
     };
 }
 
-/// Interpret an int or float value as a float of type `T`.
 pub fn toFloat(val: Value, comptime T: type, pool: *const InternPool) T {
     return switch (pool.indexToKey(val.index)) {
         .int => |int| switch (int.storage) {
@@ -86,8 +65,6 @@ pub fn toFloat(val: Value, comptime T: type, pool: *const InternPool) T {
     };
 }
 
-/// The element at `index` of an aggregate value (the childless undef of an undef
-/// aggregate).
 pub fn elemValue(val: Value, pool: *InternPool, index: usize) std.mem.Allocator.Error!Value {
     switch (pool.indexToKey(val.index)) {
         .undef => |ty| return .fromIndex(try pool.get(.{ .undef = Type.fromIndex(ty).childType(pool).index })),
@@ -96,7 +73,6 @@ pub fn elemValue(val: Value, pool: *InternPool, index: usize) std.mem.Allocator.
     }
 }
 
-/// `@mulAdd(float_type, mulend1, mulend2, addend)`.
 pub fn mulAdd(
     float_type: Type,
     mulend1: Value,
@@ -137,7 +113,6 @@ pub fn mulAddScalar(
     return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
 }
 
-/// `@abs(val)` of type `ty`.
 pub fn abs(val: Value, ty: Type, arena: std.mem.Allocator, pool: *InternPool) std.mem.Allocator.Error!Value {
     if (ty.zigTypeTag(pool) == .vector) {
         const result_data = try arena.alloc(InternPool.Index, ty.vectorLen(pool));
@@ -505,14 +480,10 @@ pub fn truncScalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allo
     return .fromIndex(try pool.internFloat(.{ .ty = float_type.index, .storage = storage }));
 }
 
-/// The value as a `std.math.big.int.Const`, borrowing into `space` for the
-/// `.u64`/`.i64` storage forms. The REPL stores no lazy int, so it reads
-/// `int.storage.toBigInt` directly.
 pub fn toBigInt(val: Value, space: *InternPool.Key.Int.Storage.BigIntSpace, pool: *const InternPool) std.math.big.int.Const {
     return pool.indexToKey(val.index).int.storage.toBigInt(space);
 }
 
-/// `@clz`/`@ctz`/`@popCount` of one integer value at `ty`'s width.
 pub fn clz(val: Value, ty: Type, pool: *const InternPool) u64 {
     var bigint_buf: InternPool.Key.Int.Storage.BigIntSpace = undefined;
     const bigint = val.toBigInt(&bigint_buf, pool);
@@ -531,7 +502,6 @@ pub fn popCount(val: Value, ty: Type, pool: *const InternPool) u64 {
     return @intCast(bigint.popCount(ty.intInfo(pool).?.bits));
 }
 
-/// The untyped undef value.
 pub const undef: Value = .{ .index = .undef };
 
 pub fn isUndef(val: Value, pool: *const InternPool) bool {
@@ -555,8 +525,6 @@ pub fn isNan(val: Value, pool: *const InternPool) bool {
     };
 }
 
-/// The numeric ordering of two number values: a float pair compares as f128, an
-/// int pair as bignums.
 pub fn order(lhs: Value, rhs: Value, pool: *const InternPool) std.math.Order {
     if (lhs.isFloat(pool) or rhs.isFloat(pool)) {
         const lhs_f128 = lhs.toFloat(f128, pool);
@@ -570,14 +538,11 @@ pub fn order(lhs: Value, rhs: Value, pool: *const InternPool) std.math.Order {
     return lhs_bigint.order(rhs_bigint);
 }
 
-/// Compares numeric operands only; `@min`/`@max`/`@reduce` never compare
-/// pointers here.
 pub fn compareHetero(lhs: Value, op: std.math.CompareOperator, rhs: Value, pool: *const InternPool) bool {
     if (lhs.isNan(pool) or rhs.isNan(pool)) return op == .neq;
     return order(lhs, rhs, pool).compare(op);
 }
 
-/// The smaller of two numbers (undef if either is undef; NaN loses).
 pub fn numberMin(lhs: Value, rhs: Value, pool: *const InternPool) Value {
     if (lhs.isUndef(pool) or rhs.isUndef(pool)) return undef;
     if (lhs.isNan(pool)) return rhs;
@@ -589,7 +554,6 @@ pub fn numberMin(lhs: Value, rhs: Value, pool: *const InternPool) Value {
     }
 }
 
-/// The larger of two numbers.
 pub fn numberMax(lhs: Value, rhs: Value, pool: *const InternPool) Value {
     if (lhs.isUndef(pool) or rhs.isUndef(pool)) return undef;
     if (lhs.isNan(pool)) return rhs;

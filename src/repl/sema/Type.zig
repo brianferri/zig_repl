@@ -1,7 +1,3 @@
-//! Thin newtype over `InternPool.Index` that names "this index refers to a
-//! type". The pool itself enforces shape; this wrapper only documents intent
-//! and gives type-related helpers a place to live.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
@@ -65,12 +61,6 @@ pub fn maxIntScalar(ty: Type, sema: *Sema, dest_ty: Type) !Value {
     return sema.intValue_big(dest_ty, res.toConst());
 }
 
-/// The single value inhabiting `ty`, or `null` if it has zero or many. Ports the
-/// compiler's `Type.onePossibleValue` (`src/Type.zig`). Takes `sema` (like
-/// `minInt`/`maxInt`) because the aggregate arms recurse through this evaluator's
-/// field resolvers; the compiler reaches equivalent stored fields through public
-/// `loadStructType`. The `one_possible_value` classification the compiler caches on
-/// the type is computed on demand here by field recursion.
 pub fn onePossibleValue(ty: Type, sema: *Sema) Sema.Error!?Value {
     const ip = sema.intern_pool;
     return switch (ip.indexToKey(ty.index)) {
@@ -161,7 +151,6 @@ pub fn onePossibleValue(ty: Type, sema: *Sema) Sema.Error!?Value {
             return try sema.aggregateValue(ty, field_vals);
         },
         .union_type => {
-            // The OPV comes from exactly one field whose type is OPV, all others NPV.
             const count = try sema.unionFieldCount(ty.index);
             var opv_index: ?u32 = null;
             var i: u32 = 0;
@@ -169,10 +158,10 @@ pub fn onePossibleValue(ty: Type, sema: *Sema) Sema.Error!?Value {
                 const name = (try sema.unionFieldNameAt(ty.index, i)).?;
                 const field_ty = (try sema.unionFieldByName(ty.index, name)).?.ty;
                 if (try sema.isNoPossibleValue(field_ty)) continue;
-                if (opv_index != null) return null; // more than one inhabitable field
+                if (opv_index != null) return null;
                 opv_index = i;
             }
-            const field_index = opv_index orelse return null; // all fields NPV
+            const field_index = opv_index orelse return null;
             const name = (try sema.unionFieldNameAt(ty.index, field_index)).?;
             const field_ty = (try sema.unionFieldByName(ty.index, name)).?.ty;
             const payload = (try Type.fromIndex(field_ty).onePossibleValue(sema)) orelse return null;
@@ -180,7 +169,6 @@ pub fn onePossibleValue(ty: Type, sema: *Sema) Sema.Error!?Value {
             return .{ .index = try ip.internUnion(.{ .ty = ty.index, .tag = tag_val.index, .val = payload.index }) };
         },
 
-        // values, not types
         .simple_value,
         .enum_literal,
         .int,
@@ -199,14 +187,6 @@ pub fn onePossibleValue(ty: Type, sema: *Sema) Sema.Error!?Value {
     };
 }
 
-/// Ports the compiler's `Type.classify`: how a type's values split between comptime
-/// and runtime state. A container's class is read from its resolved layout, so the
-/// caller resolves it first (`ensureLayoutResolved`). Forced REPL deviations: no
-/// `assertUpToDate` (single-shot, no dependency graph); the absent `spirv_type` and
-/// `inferred_error_set_type` Key variants are not enumerated; a tuple stores no
-/// per-field comptime values so `classifyTuple` classifies types only; union layout
-/// is not modelled, so a union is `unreachable` here (a union field is rejected by
-/// `abiAlignment` before layout resolution).
 pub fn classify(start_ty: Type, pool: *const InternPool) InternPool.TypeClass {
     var extra_states: enum { none, one, many } = .none;
     var cur_ty = start_ty;
@@ -328,9 +308,6 @@ pub fn classify(start_ty: Type, pool: *const InternPool) InternPool.TypeClass {
     };
 }
 
-/// Ports the compiler's `classifyTuple`. The REPL's tuple type stores no per-field
-/// comptime values, so every field is a runtime slot (a comptime tuple field is a
-/// forced gap).
 fn classifyTuple(types: []const InternPool.Index, pool: *const InternPool) InternPool.TypeClass {
     var has_runtime_state = false;
     var has_comptime_state = false;
@@ -353,9 +330,6 @@ fn classifyTuple(types: []const InternPool.Index, pool: *const InternPool) Inter
     }
 }
 
-/// Byte offset of struct field `index`, read from the resolved layout (the caller
-/// runs `ensureLayoutResolved` first). Mirrors the compiler's `Type.structFieldOffset`
-/// for a non-packed struct.
 pub fn structFieldOffset(ty: Type, pool: *const InternPool, index: u32) u64 {
     return pool.loadStructType(ty.index).?.field_offsets[index];
 }
@@ -374,16 +348,8 @@ pub const bool_type: Type = .{ .index = .bool_type };
 pub const type_type: Type = .{ .index = .type_type };
 pub const comptime_int_type: Type = .{ .index = .comptime_int_type };
 
-/// The host target -- the one `zig run` selects with no `-target`, so the ABI
-/// results below match it. The whole REPL is compiled for, and evaluates as,
-/// this single target.
 const target: *const std.Target = &builtin.target;
 
-/// ABI alignment of `ty`, or `null` for a type whose layout this subset does
-/// not model yet (struct / vector / optional / tuple / error / fn). Ports
-/// `Type.abiAlignment` (src/Type.zig). Comptime-only and `noreturn` types
-/// return a real alignment here (as the compiler's function does); `@alignOf`
-/// guards `noreturn` separately.
 pub fn abiAlignment(ty: Type, pool: *const InternPool) ?InternPool.Alignment {
     return switch (pool.indexToKey(ty.index)) {
         .int_type => |it| if (it.bits == 0)
@@ -394,7 +360,7 @@ pub fn abiAlignment(ty: Type, pool: *const InternPool) ?InternPool.Alignment {
         .array_type => |at| abiAlignment(fromIndex(at.child), pool),
         .simple_type => |t| switch (t) {
             .bool, .void, .noreturn, .anyopaque, .type, .comptime_int, .comptime_float, .null, .undefined, .enum_literal => .@"1",
-            .anyerror, .adhoc_inferred_error_set => null, // error-set ABI not modelled yet
+            .anyerror, .adhoc_inferred_error_set => null,
             .usize, .isize => .fromByteUnits(std.zig.target.intAlignment(target, target.ptrBitWidth())),
             .c_char => cTypeAlign(.char),
             .c_short => cTypeAlign(.short),
@@ -411,27 +377,18 @@ pub fn abiAlignment(ty: Type, pool: *const InternPool) ?InternPool.Alignment {
             .f64 => if (target.cTypeBitSize(.double) == 64) cTypeAlign(.double) else .@"8",
             .f80 => if (target.cTypeBitSize(.longdouble) == 80) cTypeAlign(.longdouble) else .fromByteUnits(std.zig.target.intAlignment(target, 80)),
             .f128 => if (target.cTypeBitSize(.longdouble) == 128) cTypeAlign(.longdouble) else .@"16",
-            // An internal generic-return marker, never a real `@alignOf` operand.
             .generic_poison => unreachable,
         },
-        // An enum's alignment is its integer tag type's, once resolved (the caller
-        // runs `ensureLayoutResolved` first). Reads the header int tag type directly so
-        // a union's generated tag enum -- whose fields stay lazy -- also measures.
         .enum_type => switch (pool.enumIntTagTypeStored(ty.index)) {
             .none => null,
             else => |int_ty| abiAlignment(fromIndex(int_ty), pool),
         },
-        // A struct's alignment is stored in its header once layout is resolved (the
-        // caller runs `ensureLayoutResolved` first). Mirrors `Type.abiAlignment`.
         .struct_type => if (pool.loadStructType(ty.index)) |f| f.alignment else null,
         .union_type => if (pool.unionFields(ty.index)) |f| f.alignment else null,
         else => null,
     };
 }
 
-/// ABI byte size of `ty`, or `null` for an unmodelled layout (same set as
-/// `abiAlignment`). Comptime-only and uninstantiable simple types return `0`
-/// here as the compiler's function does; `@sizeOf` rejects them before calling.
 pub fn abiSize(ty: Type, pool: *const InternPool) ?u64 {
     return switch (pool.indexToKey(ty.index)) {
         .int_type => |it| std.zig.target.intByteSize(target, it.bits),
@@ -466,25 +423,16 @@ pub fn abiSize(ty: Type, pool: *const InternPool) ?u64 {
             .f128 => 16,
             .generic_poison => unreachable,
         },
-        // An enum's size is its integer tag type's, once resolved (the caller runs
-        // `ensureLayoutResolved` first). Reads the header int tag type directly so a
-        // union's generated tag enum -- whose fields stay lazy -- also measures.
         .enum_type => switch (pool.enumIntTagTypeStored(ty.index)) {
             .none => null,
             else => |int_ty| abiSize(fromIndex(int_ty), pool),
         },
-        // A struct's size is stored in its header once layout is resolved (the caller
-        // runs `ensureLayoutResolved` first). Mirrors `Type.abiSize`.
         .struct_type => if (pool.loadStructType(ty.index)) |f| f.size else null,
         .union_type => if (pool.unionFields(ty.index)) |f| f.size else null,
         else => null,
     };
 }
 
-/// The type's meaningful bit width (`@bitSizeOf`). `null` for a type the
-/// comptime-only model cannot measure (a struct, union, or enum, whose layout
-/// is unresolved) -- the compiler's `else` arm reads `intInfo(zcu).bits`, which
-/// the scalar cases below cover directly.
 pub fn bitSize(ty: Type, pool: *const InternPool) ?u64 {
     return switch (pool.indexToKey(ty.index)) {
         .int_type => |it| it.bits,
@@ -525,13 +473,6 @@ pub fn bitSize(ty: Type, pool: *const InternPool) ?u64 {
     };
 }
 
-/// `{signedness, bits}` of a fixed-width int, else null, unwrapping the wrappers
-/// whose underlying representation is that int -- a vector to its element and an
-/// enum to its tag type -- in a loop. The compiler's packed-struct/union and
-/// error-set arms are omitted (the REPL models neither a packed backing int nor
-/// `errorSetBits`, and routes error-set reflection separately); those and every
-/// other non-int type return `null` (the compiler asserts unreachable there, but
-/// the REPL uses `intInfo` as a nullable classifier).
 pub fn intInfo(starting_ty: Type, pool: *const InternPool) ?std.lang.Type.Int {
     var ty = starting_ty;
     while (true) switch (ty.index) {
@@ -555,10 +496,6 @@ pub fn intInfo(starting_ty: Type, pool: *const InternPool) ?std.lang.Type.Int {
     };
 }
 
-/// The unsigned integer type with the same width as `ty` (a signed int, or a
-/// vector thereof). `usize`/`isize` map to `usize` and each `c_*` pair to its
-/// unsigned member; `c_char` (absent from those pairs) falls to a plain unsigned
-/// int of its width, as in the compiler.
 pub fn toUnsigned(ty: Type, pool: *InternPool) std.mem.Allocator.Error!Type {
     return switch (ty.index) {
         .usize_type, .isize_type => .fromIndex(.usize_type),
@@ -581,12 +518,10 @@ pub fn zigTypeTag(ty: Type, pool: *const InternPool) std.lang.TypeId {
     return pool.zigTypeTag(ty.index);
 }
 
-/// The child type of a pointer/array/vector/optional/anyframe.
 pub fn childType(ty: Type, pool: *const InternPool) Type {
     return .fromIndex(pool.childType(ty.index));
 }
 
-/// The number of bits an unsigned integer needs to hold `max`.
 pub fn smallestUnsignedBits(max: u64) u16 {
     return switch (max) {
         0 => 0,
@@ -594,8 +529,6 @@ pub fn smallestUnsignedBits(max: u64) u16 {
     };
 }
 
-/// Bit width of a float type; `c_longdouble` resolves against the host target,
-/// like the sibling `intInfo` c-type arms.
 pub fn floatBits(ty: Type) u16 {
     return switch (ty.index) {
         .f16_type => 16,
@@ -608,8 +541,6 @@ pub fn floatBits(ty: Type) u16 {
     };
 }
 
-/// Whether `ty` is a pointer at runtime -- a real pointer, or a pointer-like
-/// optional.
 pub fn isPtrAtRuntime(ty: Type, pool: *const InternPool) bool {
     return switch (pool.indexToKey(ty.index)) {
         .ptr_type => |ptr_type| switch (ptr_type.flags.size) {
@@ -627,7 +558,6 @@ pub fn isPtrAtRuntime(ty: Type, pool: *const InternPool) bool {
     };
 }
 
-/// A pointer whose size is `.slice`.
 pub fn isSlice(ty: Type, pool: *const InternPool) bool {
     return switch (pool.indexToKey(ty.index)) {
         .ptr_type => |ptr_type| ptr_type.flags.size == .slice,
@@ -635,7 +565,6 @@ pub fn isSlice(ty: Type, pool: *const InternPool) bool {
     };
 }
 
-/// A `const` pointer.
 pub fn isConstPtr(ty: Type, pool: *const InternPool) bool {
     return switch (pool.indexToKey(ty.index)) {
         .ptr_type => |ptr_type| ptr_type.flags.is_const,
@@ -643,7 +572,6 @@ pub fn isConstPtr(ty: Type, pool: *const InternPool) bool {
     };
 }
 
-/// A `volatile` pointer.
 pub fn isVolatilePtr(ty: Type, pool: *const InternPool) bool {
     return switch (pool.indexToKey(ty.index)) {
         .ptr_type => |ptr_type| ptr_type.flags.is_volatile,
@@ -651,8 +579,6 @@ pub fn isVolatilePtr(ty: Type, pool: *const InternPool) bool {
     };
 }
 
-/// A pointer-like optional (`?*T`, `?[*]T`, `[*c]T`) -- represented as a bare
-/// pointer with null as the zero address.
 pub fn isPtrLikeOptional(ty: Type, pool: *const InternPool) bool {
     return switch (pool.indexToKey(ty.index)) {
         .ptr_type => |ptr_type| ptr_type.flags.size == .c,
@@ -667,13 +593,10 @@ pub fn isPtrLikeOptional(ty: Type, pool: *const InternPool) bool {
     };
 }
 
-/// Whether a pointer (or pointer-like optional) admits the null address.
 pub fn ptrAllowsZero(ty: Type, pool: *const InternPool) bool {
     return ty.isPtrLikeOptional(pool) or pool.indexToKey(ty.index).ptr_type.flags.is_allowzero;
 }
 
-/// The child of an optional (or a C pointer, which represents itself); asserts
-/// `ty` is an optional or a C pointer.
 pub fn optionalChild(ty: Type, pool: *const InternPool) Type {
     return switch (pool.indexToKey(ty.index)) {
         .opt_type => |child| .fromIndex(child),
@@ -685,9 +608,6 @@ pub fn optionalChild(ty: Type, pool: *const InternPool) Type {
     };
 }
 
-/// `{len, sentinel, elem_type}` of an array type; the sentinel is an interned
-/// value `Index` (`null` when absent), so callers compare it by identity as the
-/// compiler compares its `Value` after coercion.
 pub const ArrayInfo = struct { len: u64, sentinel: ?InternPool.Index, elem_type: Type };
 pub fn arrayInfo(ty: Type, pool: *const InternPool) ArrayInfo {
     const at = pool.indexToKey(ty.index).array_type;
@@ -698,12 +618,10 @@ pub fn arrayInfo(ty: Type, pool: *const InternPool) ArrayInfo {
     };
 }
 
-/// Element count of a vector.
 pub fn vectorLen(ty: Type, pool: *const InternPool) u32 {
     return pool.indexToKey(ty.index).vector_type.len;
 }
 
-/// The element type of a vector; otherwise `ty` itself.
 pub fn scalarType(ty: Type, pool: *const InternPool) Type {
     return switch (ty.zigTypeTag(pool)) {
         .vector => ty.childType(pool),
@@ -711,12 +629,10 @@ pub fn scalarType(ty: Type, pool: *const InternPool) Type {
     };
 }
 
-/// The payload type of an error union.
 pub fn errorUnionPayload(ty: Type, pool: *const InternPool) Type {
     return .fromIndex(pool.indexToKey(ty.index).error_union_type.payload_type);
 }
 
-/// The error-set type of an error union.
 pub fn errorUnionSet(ty: Type, pool: *const InternPool) Type {
     return .fromIndex(pool.indexToKey(ty.index).error_union_type.error_set_type);
 }
@@ -757,9 +673,6 @@ pub fn errorSetHasField(ty: Type, name: InternPool.NullTerminatedString, pool: *
     };
 }
 
-/// Peel optional and error-union wrappers to the innermost payload; `?T`, `E!T`,
-/// and `?E!T` all yield `T`. A result-location type carries these wrappers (from
-/// `@as(?S, .{...})`), but the init syntax binds against the payload container.
 pub fn optEuBaseType(ty: Type, pool: *const InternPool) Type {
     var cur = ty;
     while (true) switch (cur.zigTypeTag(pool)) {
@@ -769,13 +682,10 @@ pub fn optEuBaseType(ty: Type, pool: *const InternPool) Type {
     };
 }
 
-/// A tuple type.
 pub fn isTuple(ty: Type, pool: *const InternPool) bool {
     return pool.indexToKey(ty.index) == .tuple_type;
 }
 
-/// The element type of an indexable type (array/vector, or a pointer to one, or a
-/// many/slice/C pointer).
 pub fn indexableElem(ty: Type, pool: *const InternPool) Type {
     return switch (pool.indexToKey(ty.index)) {
         inline .array_type, .vector_type => |arr| .fromIndex(arr.child),
@@ -790,22 +700,14 @@ pub fn indexableElem(ty: Type, pool: *const InternPool) Type {
     };
 }
 
-/// The pointer's type info; asserts `ty` is a pointer.
 pub fn ptrInfo(ty: Type, pool: *const InternPool) InternPool.Key.PtrType {
     return switch (pool.indexToKey(ty.index)) {
         .ptr_type => |p| p,
-        // A pointer-like optional carries its pointer info on the payload.
         .opt_type => |child| pool.indexToKey(child).ptr_type,
         else => unreachable,
     };
 }
 
-/// Whether `ty` contains comptime-only state, so its values are never runtime-
-/// known. Derived directly over the Key here, recursing on the child for
-/// optional/array/vector/error-union. Nominal containers (struct/union/enum) need
-/// resolved layout this pool-only query cannot reach; they are treated as not
-/// comptime-only (they are unreachable on the `@memcpy` element path, which
-/// recurses only through the arms below).
 pub fn comptimeOnly(ty: Type, pool: *const InternPool) bool {
     return switch (pool.indexToKey(ty.index)) {
         .simple_type => |t| switch (t) {
@@ -826,9 +728,6 @@ fn cTypeAlign(c: std.Target.CType) InternPool.Alignment {
     return .fromByteUnits(target.cTypeAlignment(c));
 }
 
-/// Pointer ABI alignment/size for the host: the pointer's byte width. Off the
-/// eZ80 (whose 24-bit pointers we never host) this is exactly the pointer's byte
-/// width.
 fn ptrAbiAlignment() InternPool.Alignment {
     return .fromByteUnits(ptrByteSize());
 }
@@ -836,15 +735,8 @@ fn ptrByteSize() u64 {
     return @divExact(target.ptrBitWidth(), 8);
 }
 
-/// Errors writing a type name: I/O, plus the allocation the `error{...}` name
-/// sort needs (it dupes the names slice to order them alphabetically).
 pub const PrintError = std.Io.Writer.Error || std.mem.Allocator.Error;
 
-/// A `{f}`-formattable wrapper carrying the `InternPool` `print` needs (a plain
-/// `format(self, writer)` method cannot take one), letting diagnostics write
-/// `"found '{f}'"` with `ty.fmt(ip)`. OOM while sorting error-set names degrades
-/// to `<type>` rather than propagating (a diagnostic is best-effort and `format`
-/// yields only `Writer.Error`).
 pub const Formatter = struct {
     ty: Type,
     pool: *const InternPool,
@@ -860,16 +752,9 @@ pub fn fmt(ty: Type, pool: *const InternPool) Formatter {
     return .{ .ty = ty, .pool = pool };
 }
 
-/// Write `ty`'s Zig surface-syntax name with no trailing newline (`*const u8`,
-/// `error{A,B}!u32`, `fn (u8) void`), recursing on container children. Ports
-/// `Type.print` (src/Type.zig). Pointer sentinels and `align(N)` are printed;
-/// pointer `address_space` / `vector_index` / `bit_range` prefixes are not yet
-/// covered.
 pub fn print(ty: Type, pool: *const InternPool, writer: *std.Io.Writer) PrintError!void {
     assert(ty.index != .none);
     switch (pool.indexToKey(ty.index)) {
-        // Most simple types print as their tag name; the three literal types
-        // have surface-syntax names that differ from the tag.
         .simple_type => |st| switch (st) {
             .null => try writer.writeAll("@TypeOf(null)"),
             .undefined => try writer.writeAll("@TypeOf(undefined)"),
@@ -900,11 +785,7 @@ pub fn print(ty: Type, pool: *const InternPool, writer: *std.Io.Writer) PrintErr
             try print(fromIndex(child), pool, writer);
         },
         .tuple_type => |tt| try printTuple(tt, pool, writer),
-        // Nominal types print their fully-qualified `name`, baked at creation and
-        // stored in the container header (not the identity Key).
         .struct_type, .enum_type, .union_type, .opaque_type => try writer.writeAll(pool.stringSlice(pool.typeName(ty.index))),
-        // Unhandled *type* Keys (opaque, ...) aren't rendered yet. A value Key
-        // reaching a type printer is a bug, so assert it's a type.
         else => |other| {
             assert(other.isType());
             try writer.writeAll("<type>");
@@ -912,12 +793,6 @@ pub fn print(ty: Type, pool: *const InternPool, writer: *std.Io.Writer) PrintErr
     }
 }
 
-/// Whether two values of this type can be compared with each other -- `==`/`!=`
-/// when `is_equality_cmp`, `<`/`>`/... otherwise. Ports `Type.isSelfComparable`
-/// (src/Type.zig), keyed on the pool Key in place of `zigTypeTag`. The REPL
-/// models no `packed`/`opaque`/`frame`/`anyframe` values, so those fold to the
-/// same `false`/`is_equality_cmp` result the compiler gives. Used by the
-/// array-sentinel type check (`checkSentinelType`).
 pub fn isSelfComparable(ty: Type, pool: *const InternPool, is_equality_cmp: bool) bool {
     return switch (pool.indexToKey(ty.index)) {
         .int_type => true,
@@ -933,14 +808,14 @@ pub fn isSelfComparable(ty: Type, pool: *const InternPool, is_equality_cmp: bool
             .c_ulong,
             .c_longlong,
             .c_ulonglong,
-            .comptime_int, // .int / .comptime_int
+            .comptime_int,
             .f16,
             .f32,
             .f64,
             .f80,
             .f128,
             .c_longdouble,
-            .comptime_float, // .float / .comptime_float
+            .comptime_float,
             => true,
             .bool, .type, .void, .anyerror, .adhoc_inferred_error_set, .enum_literal, .anyopaque => is_equality_cmp,
             .noreturn, .undefined, .null, .generic_poison => false,
@@ -948,8 +823,6 @@ pub fn isSelfComparable(ty: Type, pool: *const InternPool, is_equality_cmp: bool
         .vector_type => |vt| fromIndex(vt.child).isSelfComparable(pool, is_equality_cmp),
         .enum_type, .error_set_type, .func_type, .anyframe_type => is_equality_cmp,
         .error_union_type, .array_type => false,
-        // The REPL has only auto-layout aggregates; a non-packed struct/union is
-        // not self-comparable (the compiler allows `packed` only).
         .struct_type, .union_type, .tuple_type => false,
         .ptr_type => |pt| pt.flags.size != .slice and (is_equality_cmp or pt.flags.size == .c),
         .opt_type => |child| is_equality_cmp and fromIndex(child).isSelfComparable(pool, is_equality_cmp),
@@ -966,16 +839,12 @@ fn printPtr(pt: InternPool.Key.PtrType, pool: *const InternPool, writer: *std.Io
         .c => "[*c]",
     });
     if (pt.flags.is_allowzero and pt.flags.size != .c) try writer.writeAll("allowzero ");
-    // An explicit alignment prints `align(N)`; natural alignment (`.none`)
-    // is omitted.
     if (pt.flags.alignment.toByteUnits()) |bytes| try writer.print("align({d}) ", .{bytes});
     if (pt.flags.is_const) try writer.writeAll("const ");
     if (pt.flags.is_volatile) try writer.writeAll("volatile ");
     try print(fromIndex(pt.child), pool, writer);
 }
 
-/// `[N]T` or `[N:s]T`. The sentinel prints via its integer literal text for
-/// the current numeric subset; other sentinel kinds fall back to `?`.
 fn printArray(at: InternPool.Key.ArrayType, pool: *const InternPool, writer: *std.Io.Writer) PrintError!void {
     try writer.print("[{d}", .{at.len});
     if (at.sentinel != .none) {
@@ -992,7 +861,6 @@ fn printArray(at: InternPool.Key.ArrayType, pool: *const InternPool, writer: *st
     try print(fromIndex(at.child), pool, writer);
 }
 
-/// `struct { T0, T1, ... }`; an empty tuple is `struct {}` (matching `@typeName`).
 fn printTuple(tt: InternPool.Key.TupleType, pool: *const InternPool, writer: *std.Io.Writer) PrintError!void {
     if (tt.types.len == 0) {
         try writer.writeAll("struct {}");
@@ -1006,23 +874,17 @@ fn printTuple(tt: InternPool.Key.TupleType, pool: *const InternPool, writer: *st
     try writer.writeAll(" }");
 }
 
-/// `@Vector(N, T)`.
 fn printVector(vt: InternPool.Key.VectorType, pool: *const InternPool, writer: *std.Io.Writer) PrintError!void {
     try writer.print("@Vector({d}, ", .{vt.len});
     try print(fromIndex(vt.child), pool, writer);
     try writer.writeAll(")");
 }
 
-/// `[noinline] fn ([comptime|noalias] P0, ...[, ...]) [callconv(.@"name")] R`.
-/// CC is omitted when `.auto`. Per-param `comptime`/`noalias` come from the
-/// FuncType bitmasks (first 32 params).
 fn printFunc(ft: InternPool.Key.FuncType, pool: *const InternPool, writer: *std.Io.Writer) PrintError!void {
     if (ft.is_noinline) try writer.writeAll("noinline ");
     try writer.writeAll("fn (");
     for (ft.param_types, 0..) |p, i| {
         if (i != 0) try writer.writeAll(", ");
-        // Only the first 32 params have flag bits; std.math.cast succeeds IFF
-        // `i` fits the u5 index `paramIsComptime`/`paramIsNoalias` take.
         if (std.math.cast(u5, i)) |idx| {
             if (ft.paramIsComptime(idx)) try writer.writeAll("comptime ");
             if (ft.paramIsNoalias(idx)) try writer.writeAll("noalias ");
@@ -1036,8 +898,6 @@ fn printFunc(ft: InternPool.Key.FuncType, pool: *const InternPool, writer: *std.
     const cc_tag: std.lang.CallingConvention.Tag = ft.cc;
     if (cc_tag != .auto) {
         const name = @tagName(cc_tag);
-        // Escape only names that are Zig keywords (`.@"async"`), as the
-        // value-printer does, so render output stays byte-equal with `zig run`.
         if (std.zig.Token.getKeyword(name) != null) {
             try writer.print("callconv(.@\"{s}\") ", .{name});
         } else {
@@ -1054,9 +914,6 @@ fn printErrorUnion(eu: InternPool.Key.ErrorUnionType, pool: *const InternPool, w
 }
 
 fn printErrorSet(es: InternPool.Key.ErrorSetType, pool: *const InternPool, writer: *std.Io.Writer) PrintError!void {
-    // Display wants the members byte-sorted, but the pool stores them id-sorted,
-    // so a sortable copy is needed. A stack buffer holds the common small set
-    // (0-alloc); only an unusually large error set falls back to the heap.
     var stack_buf: [32]InternPool.NullTerminatedString = undefined;
     const on_heap = es.names.len > stack_buf.len;
     const sorted = if (on_heap)

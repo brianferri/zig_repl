@@ -1,5 +1,3 @@
-//! Port of the compiler's `src/Sema/arith.zig`.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
@@ -1490,8 +1488,6 @@ fn intShr(sema: *Sema, lhs_ty: Type, rhs_ty: Type, lhs: Value, rhs: Value, op: S
 
 const testing = std.testing;
 
-/// A bare `Sema` for exercising the comptime arithmetic surface directly:
-/// these functions read only `intern_pool`, `arena`, and `writer`.
 const Env = struct {
     pool: InternPool,
     arena_state: std.heap.ArenaAllocator,
@@ -1514,24 +1510,18 @@ const Env = struct {
             .comptime_allocs = .empty,
             .namespace = null,
         };
-        // A diagnostic here builds a `LazySrcLoc` from `block`; it is never resolved
-        // in these unit tests (no AST), so a default block is enough to avoid
-        // dereferencing an undefined `sema.block`.
         e.sema.block = &e.block;
     }
     fn deinit(e: *Env) void {
         e.arena_state.deinit();
         e.pool.deinit();
     }
-    /// A signed `comptime_int` value.
     fn ci(e: *Env, x: i64) !Value {
         return e.sema.intValue_i64(comptime_int_ty, x);
     }
-    /// An unsigned `comptime_int` value (for magnitudes beyond i64).
     fn cu(e: *Env, x: u64) !Value {
         return e.sema.intValue_u64(comptime_int_ty, x);
     }
-    /// A fixed-width int value of type `ty`.
     fn cw(e: *Env, ty: Type, x: u64) !Value {
         return e.sema.intValue_u64(ty, x);
     }
