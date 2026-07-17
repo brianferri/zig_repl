@@ -27,6 +27,68 @@ pub fn getOffsetPtr(ptr_val: Value, byte_off: u64, new_ty: Type, pool: *InternPo
     return .fromIndex(try pool.internPtr(ptr));
 }
 
+fn canonicalizeBasePtr(base_ptr: Value, want_size: InternPool.Key.PtrType.Size, want_child: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const ptr_info = base_ptr.typeOf(pool).ptrInfo(pool);
+    if (ptr_info.flags.size == want_size and
+        ptr_info.child == want_child.index and
+        !ptr_info.flags.is_const and
+        !ptr_info.flags.is_volatile and
+        !ptr_info.flags.is_allowzero and
+        ptr_info.sentinel == .none and
+        ptr_info.flags.alignment == .none)
+    {
+        return base_ptr;
+    }
+    const new_ty = try pool.internPtrType(.{
+        .child = want_child.index,
+        .sentinel = .none,
+        .flags = .{
+            .size = want_size,
+            .alignment = .none,
+            .is_const = false,
+            .is_volatile = false,
+            .is_allowzero = false,
+            .address_space = ptr_info.flags.address_space,
+        },
+    });
+    return base_ptr.getOffsetPtr(0, .fromIndex(new_ty), pool);
+}
+
+pub fn ptrField(parent_ptr: Value, field_idx: u32, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const parent_ptr_ty = parent_ptr.typeOf(pool);
+    const aggregate_ty = parent_ptr_ty.childType(pool);
+    pool.assertLayoutResolved(aggregate_ty.index);
+
+    const parent_ptr_info = parent_ptr_ty.ptrInfo(pool);
+    assert(parent_ptr_info.flags.size == .one or parent_ptr_info.flags.size == .c);
+
+    const field_ptr_ty = try parent_ptr_ty.fieldPtrType(field_idx, pool);
+
+    switch (aggregate_ty.zigTypeTag(pool)) {
+        .pointer => assert(aggregate_ty.isSlice(pool)),
+        .@"struct" => switch (aggregate_ty.containerLayout(pool)) {
+            .auto => {},
+            .@"extern" => return parent_ptr.getOffsetPtr(aggregate_ty.structFieldOffset(pool, field_idx), field_ptr_ty, pool),
+            .@"packed" => return parent_ptr.getOffsetPtr(0, field_ptr_ty, pool),
+        },
+        .@"union" => switch (aggregate_ty.containerLayout(pool)) {
+            .auto => {},
+            .@"packed", .@"extern" => return parent_ptr.getOffsetPtr(0, field_ptr_ty, pool),
+        },
+        else => unreachable,
+    }
+
+    // The aggregate has no well-defined layout, so use the `.field` comptime pointer representation.
+    if (parent_ptr.isUndef(pool)) return .fromIndex(try pool.get(.{ .undef = field_ptr_ty.index }));
+
+    const base_ptr = try parent_ptr.canonicalizeBasePtr(.one, aggregate_ty, pool);
+    return .fromIndex(try pool.internPtr(.{
+        .ty = field_ptr_ty.index,
+        .base_addr = .{ .field = .{ .base = base_ptr.index, .index = field_idx } },
+        .byte_offset = 0,
+    }));
+}
+
 pub fn writeToPackedMemory(val: Value, pool: *const InternPool, buffer: []u8, bit_offset: usize) void {
     const endian = builtin.target.cpu.arch.endian();
     const ty = val.typeOf(pool);
