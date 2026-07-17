@@ -1274,8 +1274,6 @@ fn evalBitCast(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand = try sema.resolveRef(bin.rhs);
     const operand_ty = Value.typeOf(operand, ip);
 
-    // Reject pointers explicitly (they have a bit representation, but `@bitCast` routes them through
-    // `@ptrCast`/`@ptrFromInt`/`@intFromPtr`), then anything lacking a fixed bit representation.
     switch (dest_ty.scalarType(ip).zigTypeTag(ip)) {
         .pointer, .optional => return sema.fail(sema.block, src, "cannot @bitCast to '{f}'", .{dest_ty.fmt(ip)}),
         else => {},
@@ -1303,9 +1301,6 @@ fn bitCast(sema: *Sema, dest_ty: Type, operand: Value, src: LazySrcLoc) Error!Va
     return try sema.bitCastVal(operand, dest_ty);
 }
 
-/// Reinterpret `val`'s bits as `dest_ty` by serializing to a packed byte buffer and reading it back.
-/// The single general `@bitCast` mechanism: it handles int/float/bool/enum/vector/array and packed
-/// struct/union uniformly through `writeToPackedMemory`/`readFromPackedMemory`. Asserts equal bit sizes.
 fn bitCastVal(sema: *Sema, val: Value, dest_ty: Type) Error!Value {
     const ip = sema.intern_pool;
     const bit_size = dest_ty.bitSize(ip);

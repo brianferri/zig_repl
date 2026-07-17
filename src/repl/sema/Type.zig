@@ -1038,7 +1038,6 @@ pub fn arrayLenIncludingSentinel(ty: Type, pool: *const InternPool) u64 {
     return pool.aggregateTypeLenIncludingSentinel(ty.index);
 }
 
-/// Asserts the type is an array, pointer, or vector.
 pub fn sentinel(ty: Type, pool: *const InternPool) ?Value {
     return switch (pool.indexToKey(ty.index)) {
         .vector_type, .struct_type, .tuple_type => null,
