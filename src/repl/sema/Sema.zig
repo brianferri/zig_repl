@@ -6745,7 +6745,7 @@ fn evalUnionInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const payload = try sema.coerceValueToType(try sema.resolveInst(extra.init), field.ty, "@unionInit");
     try sema.resolveUnionFields(union_ty);
     if (ip.unionFields(union_ty).layout == .@"packed") {
-        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@unionInit of a packed union is not supported", .{});
+        return try sema.bitCast(.fromIndex(union_ty), payload, sema.block.nodeOffset(sema.srcNodeOffset(inst)));
     }
     const tag_enum = try sema.unionTagEnumType(union_ty);
     const tag_val = (try sema.enumValueFieldIndex(tag_enum, field.index)).?;
