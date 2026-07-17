@@ -3405,6 +3405,17 @@ pub fn unionLayoutResolved(pool: *const InternPool, union_ty: Index) bool {
     return pool.extraData(TypeUnion, item.data).flags.want_layout;
 }
 
+// The REPL analog of the compiler's Type.assertHasLayout, which asserts (in runtime-safety builds) that a
+// type's layout is resolved. The compiler builds that on Zcu.assertUpToDate (incremental-analysis currency),
+// which the REPL doesn't model; here it checks the container's own resolved flag.
+pub fn assertLayoutResolved(pool: *const InternPool, ty: Index) void {
+    switch (pool.indexToKey(ty)) {
+        .struct_type => assert(pool.structLayoutResolved(ty)),
+        .union_type => assert(pool.unionLayoutResolved(ty)),
+        else => {},
+    }
+}
+
 pub fn fillDeclaredUnionFields(
     pool: *InternPool,
     union_ty: Index,

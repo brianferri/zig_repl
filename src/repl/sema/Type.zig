@@ -523,6 +523,58 @@ pub fn toIndex(ty: Type) InternPool.Index {
     return ty.index;
 }
 
+/// Returns the field type. Supports tuples, structs, and unions.
+pub fn fieldType(ty: Type, index: usize, pool: *const InternPool) Type {
+    const types = switch (pool.indexToKey(ty.index)) {
+        .struct_type => types: {
+            pool.assertLayoutResolved(ty.index);
+            break :types pool.loadStructType(ty.index).field_types;
+        },
+        .union_type => types: {
+            pool.assertLayoutResolved(ty.index);
+            break :types pool.unionFields(ty.index).field_types;
+        },
+        .tuple_type => |tuple| tuple.types,
+        else => unreachable,
+    };
+    return .fromIndex(types[index]);
+}
+
+/// If an alignment was explicitly specified for the given field of the struct or union type `ty`,
+/// returns that. Otherwise, returns `.none`. This function also supports tuples, for which it
+/// always returns `.none`.
+pub fn explicitFieldAlignment(ty: Type, index: usize, pool: *const InternPool) InternPool.Alignment {
+    return switch (pool.indexToKey(ty.index)) {
+        .tuple_type => .none,
+        .struct_type => {
+            pool.assertLayoutResolved(ty.index);
+            const struct_obj = pool.loadStructType(ty.index);
+            assert(struct_obj.layout != .@"packed");
+            return struct_obj.field_aligns.getOrNone(index);
+        },
+        .union_type => {
+            pool.assertLayoutResolved(ty.index);
+            const union_obj = pool.unionFields(ty.index);
+            assert(union_obj.layout != .@"packed");
+            return union_obj.field_aligns.getOrNone(index);
+        },
+        else => unreachable,
+    };
+}
+
+pub fn structFieldIsComptime(ty: Type, index: usize, pool: *const InternPool) bool {
+    switch (pool.indexToKey(ty.index)) {
+        .struct_type => {
+            pool.assertLayoutResolved(ty.index);
+            const bits = pool.loadStructType(ty.index).field_is_comptime_bits;
+            if (bits.len == 0) return false;
+            return bits[index / 32] >> @intCast(index % 32) & 1 != 0;
+        },
+        .tuple_type => |tuple| return tuple.values[index] != .none,
+        else => unreachable,
+    }
+}
+
 pub fn isAbiInt(ty: Type, pool: *const InternPool) bool {
     return switch (ty.zigTypeTag(pool)) {
         .int, .@"enum", .error_set => true,
