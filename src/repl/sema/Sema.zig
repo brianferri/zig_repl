@@ -7679,69 +7679,19 @@ fn coerceToErrorUnion(
 fn evalBitNot(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
+    const ip = sema.intern_pool;
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     assert(un_node.operand != .none);
 
-    const ip = sema.intern_pool;
-    const operand_value = try sema.resolveInst(un_node.operand);
-    const operand_key = ip.indexToKey(operand_value.index);
+    const operand = try sema.resolveInst(un_node.operand);
+    const operand_ty = Value.typeOf(operand, ip);
+    const scalar_ty = operand_ty.scalarType(ip);
+    const scalar_tag = scalar_ty.zigTypeTag(ip);
 
-    if (operand_key != .int) {
-        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "bit_not: operand is not an int", .{});
-    }
+    if (scalar_tag != .int and scalar_tag != .bool)
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "bitwise not operation on type '{f}'", .{operand_ty.fmt(ip)});
 
-    if (operand_key.int.ty == .comptime_int_type) {
-        return try sema.runComptimeIntBitNot(operand_key.int);
-    }
-
-    const dest_info = intTypeInfo(ip, operand_key.int.ty) orelse {
-        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "bit_not: int type not yet supported", .{});
-    };
-    return try sema.runFixedWidthBitNot(operand_key.int, operand_key.int.ty, dest_info);
-}
-
-fn runComptimeIntBitNot(sema: *Sema, operand_int: InternPool.Key.Int) Error!Value {
-    assert(operand_int.ty == .comptime_int_type);
-    var op_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const operand_big = operand_int.storage.toBigInt(&op_space);
-
-    const workspace_limbs = operand_big.limbs.len + 1;
-    const workspace = try sema.gpa.alloc(std.math.big.Limb, workspace_limbs);
-    defer sema.gpa.free(workspace);
-
-    var mutable: std.math.big.int.Mutable = .{
-        .limbs = workspace,
-        .len = undefined,
-        .positive = undefined,
-    };
-    mutable.addScalar(operand_big, 1);
-    const plus_one = mutable.toConst();
-
-    const idx = try sema.intern_pool.internComptimeInt(plus_one.negate());
-    return .{ .index = idx };
-}
-
-fn runFixedWidthBitNot(
-    sema: *Sema,
-    operand_int: InternPool.Key.Int,
-    dest_ty: InternPool.Index,
-    dest_info: std.lang.Type.Int,
-) Error!Value {
-    var op_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const operand_big = operand_int.storage.toBigInt(&op_space);
-
-    const workspace_limbs: usize = std.math.big.int.calcTwosCompLimbCount(dest_info.bits) + 1;
-    const workspace = try sema.gpa.alloc(std.math.big.Limb, workspace_limbs);
-    defer sema.gpa.free(workspace);
-
-    var mutable: std.math.big.int.Mutable = .{
-        .limbs = workspace,
-        .len = undefined,
-        .positive = undefined,
-    };
-    mutable.bitNotWrap(operand_big, dest_info.signedness, dest_info.bits);
-    const idx = try sema.intern_pool.internIntValue(dest_ty, mutable.toConst());
-    return .{ .index = idx };
+    return try arith.bitwiseNot(sema, operand_ty, operand);
 }
 
 fn resolveInst(sema: *Sema, ref: Zir.Inst.Ref) Error!Value {

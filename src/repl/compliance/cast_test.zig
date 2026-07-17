@@ -135,6 +135,9 @@ test "compliance: bit_not and negate" {
     try compliance.check(a, .{
         .{ .src = &.{"~@as(u8, 5)"}, .want = ~@as(u8, 5) },
         .{ .src = &.{"~@as(i32, 100)"}, .want = ~@as(i32, 100) },
+        // bit_not on a bool and element-wise on a vector, via arith.bitwiseNot.
+        .{ .src = &.{"~true"}, .want = ~true },
+        .{ .src = &.{"~@as(@Vector(2, u8), .{ 1, 254 })"}, .want = ~@as(@Vector(2, u8), .{ 1, 254 }) },
         .{ .src = &.{"-%@as(i8, -128)"}, .want = -%@as(i8, -128) },
         .{ .src = &.{"-@as(i32, 100)"}, .want = -@as(i32, 100) },
     });
