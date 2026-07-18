@@ -333,3 +333,20 @@ test "compliance: union member declarations and decl literals" {
         .{ .src = &.{"blk: { const U = union(enum) { a: u32, b: u32 }; const u: U = undefined; break :blk u.a; }"}, .reject = {} },
     });
 }
+
+// A packed union stores its value as a backing-integer bitpack; any field reads reinterpret the
+// bits (no active-tag check), like a packed struct field.
+test "compliance: a packed union field reinterprets the backing bits" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const U = packed union { x: u8, y: i8 }; const u = U{ .x = 200 }; break :blk u.x; }"}, .want = blk: {
+            const U = packed union { x: u8, y: i8 };
+            const u = U{ .x = 200 };
+            break :blk u.x;
+        } },
+        .{ .src = &.{"blk: { const U = packed union { x: u8, y: i8 }; const u = U{ .x = 200 }; break :blk u.y; }"}, .want = blk: {
+            const U = packed union { x: u8, y: i8 };
+            const u = U{ .x = 200 };
+            break :blk u.y;
+        } },
+    });
+}

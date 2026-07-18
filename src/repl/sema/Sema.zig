@@ -7786,6 +7786,9 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
             const fld = (try sema.unionFieldByName(inner_ty, name)) orelse
                 return sema.failBadUnionFieldAccess(inner_ty, name);
             if (inner.isUndef(ip)) return sema.failWithUseOfUndef();
+            // A packed union stores its value as a `.bitpack` backing integer with no active-tag
+            // notion -- any field reinterprets the bits (bit offset 0), like a packed struct field.
+            if (ip.indexToKey(inner.index) == .bitpack) return try inner.fieldValue(fld.index, ip);
             return try sema.loadUnionField(inner.index, fld.index);
         },
         .ptr_type => |ptr_ty| {
