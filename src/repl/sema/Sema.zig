@@ -6645,6 +6645,7 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
             const fld = (try sema.structFieldByName(inner_ty, name)) orelse
                 return sema.failBadStructFieldAccess(inner_ty, name);
             switch (ip.indexToKey(inner.index)) {
+                .undef => return .{ .index = try ip.get(.{ .undef = fld.ty }) },
                 .aggregate => |agg| return .{ .index = InternPool.aggregateElementAt(agg, fld.index) },
                 .bitpack => |bp| {
                     const struct_ty: Type = .fromIndex(inner_ty);
@@ -6667,6 +6668,7 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
         .union_type => {
             const fld = (try sema.unionFieldByName(inner_ty, name)) orelse
                 return sema.failBadUnionFieldAccess(inner_ty, name);
+            if (inner.isUndef(ip)) return sema.failWithUseOfUndef();
             return try sema.loadUnionField(inner.index, fld.index);
         },
         .ptr_type => |ptr_ty| {
@@ -7315,7 +7317,9 @@ fn unionFieldPtr(sema: *Sema, union_ptr: Value, field_name: InternPool.NullTermi
         // Reading a union field asserts it is the active one; an initializing store sets the tag when the
         // field pointer is written (storeElement), so no tag store is needed here.
         .auto => if (!initializing) {
-            _ = try sema.loadUnionField((try sema.loadValue(union_ptr)).index, field.index);
+            const union_val = try sema.loadValue(union_ptr);
+            if (union_val.isUndef(ip)) return sema.failWithUseOfUndef();
+            _ = try sema.loadUnionField(union_val.index, field.index);
         },
         .@"packed", .@"extern" => {},
     }

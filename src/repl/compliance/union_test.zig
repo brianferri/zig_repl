@@ -329,5 +329,7 @@ test "compliance: union member declarations and decl literals" {
                 break :blk u == .b;
             },
         },
+        // Reading a field of an undefined union cannot determine the active field: use-of-undef, not a crash.
+        .{ .src = &.{"blk: { const U = union(enum) { a: u32, b: u32 }; const u: U = undefined; break :blk u.a; }"}, .reject = {} },
     });
 }
