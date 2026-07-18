@@ -3479,7 +3479,11 @@ fn coerceValueToType(
         .ptr_type => |p| switch (p.flags.size) {
             .slice => if (try sema.coerceToSlice(value, dest_ty)) |c| return c,
             .many => if (try sema.coerceToManyPtr(value, dest_ty)) |c| return c,
-            else => {},
+            // A function value coerces to a pointer-to-function (`fn(...)` -> `*const fn(...)`) by
+            // taking its address, like `&f` -- the coercion that builds a vtable of method pointers.
+            .one => if (ip.indexToKey(p.child) == .func_type and ip.indexToKey(value.index) == .func)
+                return try sema.materializeConstPtr(value),
+            .c => {},
         },
         .array_type, .vector_type => if (try sema.coerceArrayLike(value, dest_ty, op_name)) |c| return c,
         .enum_type => switch (ip.indexToKey(value.index)) {
