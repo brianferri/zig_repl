@@ -348,5 +348,7 @@ test "compliance: a packed union field reinterprets the backing bits" {
             const u = U{ .x = 200 };
             break :blk u.y;
         } },
+        // All fields of a packed union must share one bit width.
+        .{ .src = &.{"blk: { const U = packed union { a: u8, b: u4 }; const u = U{ .a = 1 }; break :blk u.a; }"}, .reject = {} },
     });
 }

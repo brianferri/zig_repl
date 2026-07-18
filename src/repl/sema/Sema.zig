@@ -3117,9 +3117,17 @@ fn resolveUnionLayout(sema: *Sema, union_ty: InternPool.Index) Error!void {
 
     if (ip.unionFields(union_ty).layout == .@"packed") {
         const uf = ip.unionFields(union_ty);
-        var max_bits: u16 = 0;
-        for (uf.field_types) |field_ty| max_bits = @max(max_bits, @as(u16, @intCast(Type.fromIndex(field_ty).bitSize(ip))));
-        const backing = try ip.internIntType(.unsigned, max_bits);
+        // Every field of a packed union must have the same bit width; the backing integer is that
+        // width. The first field sets it and the rest must agree.
+        const first_field_bits = Type.fromIndex(uf.field_types[0]).bitSize(ip);
+        for (uf.field_types[1..]) |field_ty| {
+            if (Type.fromIndex(field_ty).bitSize(ip) != first_field_bits) {
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "field bit width does not match earlier field", .{});
+            }
+        }
+        const backing_int_bits = std.math.cast(u16, first_field_bits) orelse
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "packed union bit width '{d}' exceeds maximum bit width of 65535", .{first_field_bits});
+        const backing = try ip.internIntType(.unsigned, backing_int_bits);
         ip.setUnionPackedBackingInt(union_ty, backing);
         const backing_ty: Type = .fromIndex(backing);
         ip.setUnionLayout(union_ty, @intCast(backing_ty.abiSize(ip)), backing_ty.abiAlignment(ip), backing_ty.classify(ip), false);
