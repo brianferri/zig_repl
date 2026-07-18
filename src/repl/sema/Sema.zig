@@ -4445,11 +4445,15 @@ fn evalArrayInitRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 fn evalArrayInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
-
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.MultiOp, pl_node.payload_index);
     const operands = sema.zir.refSlice(extra.end, extra.data.operands_len);
+    return .{ .index = try sema.arrayInitAnon(operands) };
+}
 
+/// Build an anonymous tuple aggregate from the operand values -- used for `array_init_anon` and
+/// when `array_init`'s result type is generic (`anytype`). Mirrors the compiler's `arrayInitAnon`.
+fn arrayInitAnon(sema: *Sema, operands: []const Zir.Inst.Ref) Error!InternPool.Index {
     const ip = sema.intern_pool;
     const types = try sema.gpa.alloc(InternPool.Index, operands.len);
     defer sema.gpa.free(types);
@@ -4466,8 +4470,7 @@ fn evalArrayInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     defer sema.gpa.free(field_vals);
     @memset(field_vals, .none);
     const tuple_ty = try ip.internTupleType(types, field_vals);
-    const agg = try ip.internAggregate(.{ .ty = tuple_ty, .storage = .{ .elems = values } });
-    return .{ .index = agg };
+    return try ip.internAggregate(.{ .ty = tuple_ty, .storage = .{ .elems = values } });
 }
 
 const ArrayCatInfo = struct { elem_type: Type, sentinel: InternPool.Index, len: u64, array: Value };
@@ -5252,6 +5255,9 @@ fn buildArrayAggregate(sema: *Sema, inst: Zir.Inst.Index) Error!InternPool.Index
 
     const ip = sema.intern_pool;
     const array_ty = try sema.resolveDestType(operands[0], "array_init");
+    // A generic (`anytype`) result type is unknown; build an anonymous tuple of the elements, as
+    // the compiler's zirArrayInit does (`resolveTypeOrPoison ... orelse arrayInitAnon(args[1..])`).
+    if (array_ty == .generic_poison_type) return try sema.arrayInitAnon(operands[1..]);
     const array_key = ip.indexToKey(array_ty);
 
     const elems = operands[1..];
@@ -5296,6 +5302,8 @@ fn evalArrayInitElemType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const bin = sema.zir.instructions.items(.data)[@intFromEnum(inst)].bin;
     const indexable_ty = try sema.resolveDestType(bin.lhs, "array_init_elem_type");
+    // A generic (`anytype`) aggregate has a generic element type; the element resolves on coercion.
+    if (indexable_ty == .generic_poison_type) return .{ .index = .generic_poison_type };
     const index: usize = @intFromEnum(bin.rhs);
     const elem_ty = try sema.arrayInitElemType(
         sema.intern_pool.indexToKey(indexable_ty),
@@ -5396,6 +5404,8 @@ fn evalValidateArrayInitTy(sema: *Sema, inst: Zir.Inst.Index, comptime is_result
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const data = sema.zir.extraData(Zir.Inst.ArrayInit, pl_node.payload_index).data;
     const ty = try sema.resolveDestType(data.ty, "array init");
+    // A generic (`anytype`) result type is not known yet; the init proceeds anonymously.
+    if (ty == .generic_poison_type) return null;
     const arr_ty = if (is_result_ty) sema.optEuBaseType(ty) else ty;
     try sema.validateArrayInitTy(data.init_count, arr_ty);
     return null;
