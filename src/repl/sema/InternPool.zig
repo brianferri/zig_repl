@@ -577,6 +577,7 @@ pub const Key = union(enum) {
         child: Index,
         sentinel: Index = .none,
         flags: Flags = .{},
+        packed_offset: PackedOffset = .{ .host_size = 0, .bit_offset = 0 },
 
         pub const Flags = packed struct(u32) {
             size: Size = .one,
@@ -586,6 +587,14 @@ pub const Key = union(enum) {
             is_allowzero: bool = false,
             address_space: AddressSpace = .generic,
             _reserved: u16 = 0,
+        };
+
+        pub const PackedOffset = packed struct(u32) {
+            /// If this is non-zero it means the pointer points to a sub-byte range of data, which is
+            /// backed by a "host integer" with this number of bytes. When host_size=pointee_abi_size
+            /// and bit_offset=0, this must be represented with host_size=0 instead.
+            host_size: u16,
+            bit_offset: u16,
         };
 
         pub const Size = std.lang.Type.Pointer.Size;
@@ -815,6 +824,7 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, pt.child);
                 std.hash.autoHash(&hasher, pt.sentinel);
                 std.hash.autoHash(&hasher, @as(u32, @bitCast(pt.flags)));
+                std.hash.autoHash(&hasher, @as(u32, @bitCast(pt.packed_offset)));
             },
             .ptr => |p| {
                 std.hash.autoHash(&hasher, p.ty);
@@ -972,7 +982,8 @@ pub const Key = union(enum) {
                 const y = b.ptr_type;
                 if (x.child != y.child) break :blk false;
                 if (x.sentinel != y.sentinel) break :blk false;
-                break :blk @as(u32, @bitCast(x.flags)) == @as(u32, @bitCast(y.flags));
+                if (@as(u32, @bitCast(x.flags)) != @as(u32, @bitCast(y.flags))) break :blk false;
+                break :blk @as(u32, @bitCast(x.packed_offset)) == @as(u32, @bitCast(y.packed_offset));
             },
             .ptr => |x| blk: {
                 const y = b.ptr;
@@ -1224,6 +1235,7 @@ const TypePointer = struct {
     child: Index,
     sentinel: Index,
     flags: Key.PtrType.Flags,
+    packed_offset: Key.PtrType.PackedOffset,
 };
 
 const FuncTypeRepr = struct {
@@ -2447,6 +2459,7 @@ fn ptrTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .child = r.child,
         .sentinel = r.sentinel,
         .flags = r.flags,
+        .packed_offset = r.packed_offset,
     } };
 }
 
@@ -2664,6 +2677,7 @@ fn addExtra(pool: *InternPool, item: anytype) Allocator.Error!u32 {
             u32,
             i32,
             Key.PtrType.Flags,
+            Key.PtrType.PackedOffset,
             FuncTypeRepr.Flags,
             TypeStruct.Flags,
             TypeEnum.Flags,
@@ -2698,6 +2712,7 @@ fn extraDataTrail(pool: *const InternPool, comptime T: type, index: u32) struct 
             u32,
             i32,
             Key.PtrType.Flags,
+            Key.PtrType.PackedOffset,
             FuncTypeRepr.Flags,
             TypeStruct.Flags,
             TypeEnum.Flags,
@@ -2968,6 +2983,7 @@ fn emitPtrType(pool: *InternPool, pt: Key.PtrType) Allocator.Error!void {
         .child = pt.child,
         .sentinel = pt.sentinel,
         .flags = pt.flags,
+        .packed_offset = pt.packed_offset,
     });
     pool.items.appendAssumeCapacity(.{ .tag = .type_pointer, .data = extra_index });
 }
