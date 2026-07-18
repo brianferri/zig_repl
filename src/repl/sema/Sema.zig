@@ -463,15 +463,9 @@ fn evalStr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 fn internStringLiteral(sema: *Sema, bytes: []const u8) Error!Value {
     const ip = sema.intern_pool;
-    const u8_zero = try ip.internInt(.{ .ty = .u8_type, .storage = .{ .u64 = 0 } });
-    const array_ty = try ip.internArrayType(.{ .len = bytes.len, .child = .u8_type, .sentinel = u8_zero });
-
-    const elems = try sema.gpa.alloc(InternPool.Index, bytes.len + 1);
-    defer sema.gpa.free(elems);
-    for (bytes, 0..) |b, i| elems[i] = try ip.internInt(.{ .ty = .u8_type, .storage = .{ .u64 = b } });
-    elems[bytes.len] = u8_zero;
-
-    const array_val = try ip.internAggregate(.{ .ty = array_ty, .storage = .{ .elems = elems } });
+    const string = try ip.getOrPutString(sema.gpa, bytes, .maybe_embedded_nulls);
+    const array_ty = try ip.internArrayType(.{ .len = bytes.len, .child = .u8_type, .sentinel = .zero_u8 });
+    const array_val = try ip.internAggregate(.{ .ty = array_ty, .storage = .{ .bytes = string } });
     return try sema.materializeConstPtr(.{ .index = array_val });
 }
 
@@ -2529,8 +2523,8 @@ fn evalVectorComparison(sema: *Sema, op: std.math.CompareOperator, lhs: Value, r
     const elems = try sema.gpa.alloc(InternPool.Index, vp.len);
     defer sema.gpa.free(elems);
     for (elems, 0..) |*e, i| {
-        const l: Value = .{ .index = InternPool.aggregateElementAt(vp.lhs, i) };
-        const r: Value = .{ .index = InternPool.aggregateElementAt(vp.rhs, i) };
+        const l: Value = .{ .index = try ip.aggregateElementAt(vp.lhs, i) };
+        const r: Value = .{ .index = try ip.aggregateElementAt(vp.rhs, i) };
         e.* = (try sema.scalarCompare(op, l, r, op_name) orelse return null).index;
     }
     const vec_ty = try ip.internVectorType(.{ .len = @intCast(vp.len), .child = .bool_type });
@@ -3660,12 +3654,12 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
                 if (parent_info.child != sub.child) break :sub_array;
                 const count = ip.aggregateElementCount(child_ty);
                 const elems = try sema.arena.alloc(InternPool.Index, @intCast(count));
-                for (elems, 0..) |*e, i| e.* = InternPool.aggregateElementAt(agg, f.index + @as(u64, @intCast(i)));
+                for (elems, 0..) |*e, i| e.* = try ip.aggregateElementAt(agg, f.index + @as(u64, @intCast(i)));
                 return try sema.aggregateValue(Type.fromIndex(child_ty), elems);
             }
             return switch (parent_key) {
                 .un => try sema.loadUnionField(parent.index, @intCast(f.index)),
-                .aggregate => |agg| .{ .index = InternPool.aggregateElementAt(agg, @intCast(f.index)) },
+                .aggregate => |agg| .{ .index = try ip.aggregateElementAt(agg, @intCast(f.index)) },
                 else => unreachable,
             };
         },
@@ -4525,7 +4519,7 @@ fn coerceArrayLike(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_name
     defer sema.gpa.free(elems);
     const agg = ip.indexToKey(value.index).aggregate;
     for (elems, 0..) |*e, i| {
-        const elem: Value = .{ .index = InternPool.aggregateElementAt(agg, i) };
+        const elem: Value = .{ .index = try ip.aggregateElementAt(agg, i) };
         e.* = (try sema.coerceValueToType(elem, dst.child, op_name)).index;
     }
     return .{ .index = try ip.internAggregate(.{ .ty = dest_ty, .storage = .{ .elems = elems } }) };
@@ -4678,7 +4672,7 @@ fn evalReifyTuple(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Valu
     const field_types = try sema.gpa.alloc(InternPool.Index, fields_len);
     defer sema.gpa.free(field_types);
     for (field_types, 0..) |*field_ty, field_idx| {
-        const field_ty_val = InternPool.aggregateElementAt(array, field_idx);
+        const field_ty_val = try ip.aggregateElementAt(array, field_idx);
         if (ip.indexToKey(field_ty_val) == .undef) {
             return sema.fail(sema.block, sema.block.nodeOffset(.zero), "use of undefined value here causes illegal behavior", .{});
         }
@@ -4729,11 +4723,11 @@ fn evalReifyPointer(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Va
 
     const attrs_val = try sema.coerceValueToType(try sema.resolveInst(extra.attrs), attrs_ty, "pointer attributes");
     const attrs = ip.indexToKey(attrs_val.index).aggregate;
-    const is_const = InternPool.aggregateElementAt(attrs, 0) == .bool_true;
-    const is_volatile = InternPool.aggregateElementAt(attrs, 1) == .bool_true;
-    const is_allowzero = InternPool.aggregateElementAt(attrs, 2) == .bool_true;
-    const addrspace_opt = ip.indexToKey(InternPool.aggregateElementAt(attrs, 3)).opt.val;
-    const align_opt = ip.indexToKey(InternPool.aggregateElementAt(attrs, 4)).opt.val;
+    const is_const = try ip.aggregateElementAt(attrs, 0) == .bool_true;
+    const is_volatile = try ip.aggregateElementAt(attrs, 1) == .bool_true;
+    const is_allowzero = try ip.aggregateElementAt(attrs, 2) == .bool_true;
+    const addrspace_opt = ip.indexToKey(try ip.aggregateElementAt(attrs, 3)).opt.val;
+    const align_opt = ip.indexToKey(try ip.aggregateElementAt(attrs, 4)).opt.val;
 
     const address_space: std.lang.AddressSpace = if (addrspace_opt != .none)
         try sema.interpretStdLangEnum(std.lang.AddressSpace, try sema.getStdLangType(.AddressSpace), .{ .index = addrspace_opt }, "address space")
@@ -4841,16 +4835,16 @@ fn evalReifyFn(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
 
     const fn_attrs_val = try sema.coerceValueToType(try sema.resolveInst(extra.fn_attrs), try sema.getStdLangType(.@"Type.Fn.Attributes"), "fn attributes");
     const fn_attrs = ip.indexToKey(fn_attrs_val.index).aggregate;
-    const cc = try sema.interpretCallConv(.{ .index = InternPool.aggregateElementAt(fn_attrs, 0) });
-    const varargs = InternPool.aggregateElementAt(fn_attrs, 1) == .bool_true;
+    const cc = try sema.interpretCallConv(.{ .index = try ip.aggregateElementAt(fn_attrs, 0) });
+    const varargs = try ip.aggregateElementAt(fn_attrs, 1) == .bool_true;
 
     var noalias_bits: u32 = 0;
     const param_types = try sema.gpa.alloc(InternPool.Index, params_len);
     defer sema.gpa.free(param_types);
     for (param_types, 0..) |*param_ty, param_idx| {
-        param_ty.* = InternPool.aggregateElementAt(param_types_arr, param_idx);
-        const param_attr = ip.indexToKey(InternPool.aggregateElementAt(param_attrs_arr, param_idx)).aggregate;
-        if (InternPool.aggregateElementAt(param_attr, 0) == .bool_true) {
+        param_ty.* = try ip.aggregateElementAt(param_types_arr, param_idx);
+        const param_attr = ip.indexToKey(try ip.aggregateElementAt(param_attrs_arr, param_idx)).aggregate;
+        if (try ip.aggregateElementAt(param_attr, 0) == .bool_true) {
             if (param_idx > 31) {
                 return sema.fail(sema.block, sema.block.nodeOffset(.zero), "this compiler implementation only supports 'noalias' on the first 32 parameters", .{});
             }
@@ -4882,10 +4876,10 @@ fn sliceToIpString(sema: *Sema, slice_val: Value) Error!InternPool.NullTerminate
     const len: usize = @intCast(ip.indexToKey(agg.ty).array_type.len);
     const buf = try sema.gpa.alloc(u8, len);
     defer sema.gpa.free(buf);
-    for (buf, 0..) |*b, i| b.* = @intCast(sema.intAsI128(InternPool.aggregateElementAt(agg, i)) orelse {
+    for (buf, 0..) |*b, i| b.* = @intCast(sema.intAsI128(try ip.aggregateElementAt(agg, i)) orelse {
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "use of undefined value here causes illegal behavior", .{});
     });
-    return try ip.getOrPutString(sema.gpa, buf);
+    return try ip.getOrPutString(sema.gpa, buf, .no_embedded_nulls);
 }
 
 fn evalReifyEnumValueSliceTy(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
@@ -4926,11 +4920,11 @@ fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.In
 
     const names = try sema.gpa.alloc(InternPool.NullTerminatedString, fields_len);
     defer sema.gpa.free(names);
-    for (names, 0..) |*n, i| n.* = try sema.sliceToIpString(.{ .index = InternPool.aggregateElementAt(names_agg, i) });
+    for (names, 0..) |*n, i| n.* = try sema.sliceToIpString(.{ .index = try ip.aggregateElementAt(names_agg, i) });
     const values = try sema.gpa.alloc(InternPool.Index, fields_len);
     defer sema.gpa.free(values);
     for (values, 0..) |*v, i| {
-        v.* = InternPool.aggregateElementAt(values_agg, i);
+        v.* = try ip.aggregateElementAt(values_agg, i);
         if (ip.indexToKey(v.*) == .undef) {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
         }
@@ -4949,7 +4943,7 @@ fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.In
             const ctx = ip.stringSlice(sema.type_name_ctx);
             const text = try std.fmt.allocPrint(sema.gpa, "{s}__enum_{d}", .{ ctx, @intFromEnum(inst) });
             defer sema.gpa.free(text);
-            break :blk try ip.getOrPutString(sema.gpa, text);
+            break :blk try ip.getOrPutString(sema.gpa, text, .no_embedded_nulls);
         },
     };
 
@@ -5051,20 +5045,20 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
     std.hash.autoHash(&hasher, types_arr.index);
 
     for (names, types, 0..) |*name_out, *type_out, i| {
-        name_out.* = try sema.sliceToIpString(.{ .index = InternPool.aggregateElementAt(names_agg, i) });
-        type_out.* = InternPool.aggregateElementAt(types_agg, i);
+        name_out.* = try sema.sliceToIpString(.{ .index = try ip.aggregateElementAt(names_agg, i) });
+        type_out.* = try ip.aggregateElementAt(types_agg, i);
         if (ip.indexToKey(type_out.*) == .undef) {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
         }
-        const attr_elem = InternPool.aggregateElementAt(attrs_agg, i);
+        const attr_elem = try ip.aggregateElementAt(attrs_agg, i);
         if (ip.indexToKey(attr_elem) == .undef) {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
         }
         const attr = ip.indexToKey(attr_elem).aggregate;
-        const comptime_elem = InternPool.aggregateElementAt(attr, 0);
-        const align_elem = InternPool.aggregateElementAt(attr, 1);
+        const comptime_elem = try ip.aggregateElementAt(attr, 0);
+        const align_elem = try ip.aggregateElementAt(attr, 1);
         const align_opt = ip.indexToKey(align_elem).opt.val;
-        const default_ptr = ip.indexToKey(InternPool.aggregateElementAt(attr, 2)).opt.val;
+        const default_ptr = ip.indexToKey(try ip.aggregateElementAt(attr, 2)).opt.val;
 
         const field_default: InternPool.Index = if (default_ptr == .none) .none else (try sema.loadValue(.{ .index = default_ptr })).index;
         if (field_default != .none) {
@@ -5103,7 +5097,7 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
             const ctx = ip.stringSlice(sema.type_name_ctx);
             const text = try std.fmt.allocPrint(sema.gpa, "{s}__struct_{d}", .{ ctx, @intFromEnum(inst) });
             defer sema.gpa.free(text);
-            break :blk try ip.getOrPutString(sema.gpa, text);
+            break :blk try ip.getOrPutString(sema.gpa, text, .no_embedded_nulls);
         },
     };
 
@@ -5194,16 +5188,16 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
     std.hash.autoHash(&hasher, attrs_arr.index);
 
     for (names, types, 0..) |*name_out, *type_out, i| {
-        name_out.* = try sema.sliceToIpString(.{ .index = InternPool.aggregateElementAt(names_agg, i) });
-        type_out.* = InternPool.aggregateElementAt(types_agg, i);
+        name_out.* = try sema.sliceToIpString(.{ .index = try ip.aggregateElementAt(names_agg, i) });
+        type_out.* = try ip.aggregateElementAt(types_agg, i);
         if (ip.indexToKey(type_out.*) == .undef) {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
         }
-        const attr_elem = InternPool.aggregateElementAt(attrs_agg, i);
+        const attr_elem = try ip.aggregateElementAt(attrs_agg, i);
         if (ip.indexToKey(attr_elem) == .undef) {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "use of undefined value here causes illegal behavior", .{});
         }
-        const align_opt = ip.indexToKey(InternPool.aggregateElementAt(ip.indexToKey(attr_elem).aggregate, 0)).opt.val;
+        const align_opt = ip.indexToKey(try ip.aggregateElementAt(ip.indexToKey(attr_elem).aggregate, 0)).opt.val;
         if (align_opt != .none) {
             if (layout == .@"packed") {
                 return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "packed union fields cannot be aligned", .{});
@@ -5220,7 +5214,7 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
             const ctx = ip.stringSlice(sema.type_name_ctx);
             const text = try std.fmt.allocPrint(sema.gpa, "{s}__union_{d}", .{ ctx, @intFromEnum(inst) });
             defer sema.gpa.free(text);
-            break :blk try ip.getOrPutString(sema.gpa, text);
+            break :blk try ip.getOrPutString(sema.gpa, text, .no_embedded_nulls);
         },
     };
 
@@ -5335,8 +5329,8 @@ fn evalSelect(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
     const elems = try sema.gpa.alloc(InternPool.Index, @intCast(vec_len));
     defer sema.gpa.free(elems);
     for (elems, 0..) |*e, i| {
-        const chosen = if (InternPool.aggregateElementAt(pred_agg, i) == .bool_true) a_agg else b_agg;
-        e.* = InternPool.aggregateElementAt(chosen, i);
+        const chosen = if (try ip.aggregateElementAt(pred_agg, i) == .bool_true) a_agg else b_agg;
+        e.* = try ip.aggregateElementAt(chosen, i);
     }
     return .{ .index = try ip.internAggregate(.{ .ty = vec_ty, .storage = .{ .elems = elems } }) };
 }
@@ -5541,8 +5535,8 @@ fn evalArrayCat(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const lhs_agg = ip.indexToKey(lhs_info.array.index).aggregate;
     const rhs_agg = ip.indexToKey(rhs_info.array.index).aggregate;
     var i: u64 = 0;
-    while (i < lhs_info.len) : (i += 1) elems[@intCast(i)] = InternPool.aggregateElementAt(lhs_agg, i);
-    while (i < result_len) : (i += 1) elems[@intCast(i)] = InternPool.aggregateElementAt(rhs_agg, i - lhs_info.len);
+    while (i < lhs_info.len) : (i += 1) elems[@intCast(i)] = try ip.aggregateElementAt(lhs_agg, i);
+    while (i < result_len) : (i += 1) elems[@intCast(i)] = try ip.aggregateElementAt(rhs_agg, i - lhs_info.len);
 
     const agg: Value = .{ .index = try ip.internAggregate(.{ .ty = result_ty, .storage = .{ .elems = elems } }) };
     // Concatenating pointer operands (e.g. string literals) yields a pointer to the result, like a literal.
@@ -5566,11 +5560,11 @@ fn analyzeTupleCat(sema: *Sema, lhs: Value, rhs: Value) Error!Value {
     const rhs_agg = ip.indexToKey(rhs.index).aggregate;
     for (lhs_tuple.types, 0..) |t, i| {
         types[i] = t;
-        values[i] = InternPool.aggregateElementAt(lhs_agg, i);
+        values[i] = try ip.aggregateElementAt(lhs_agg, i);
     }
     for (rhs_tuple.types, 0..) |t, i| {
         types[lhs_tuple.types.len + i] = t;
-        values[lhs_tuple.types.len + i] = InternPool.aggregateElementAt(rhs_agg, i);
+        values[lhs_tuple.types.len + i] = try ip.aggregateElementAt(rhs_agg, i);
     }
 
     const field_vals = try sema.gpa.alloc(InternPool.Index, total);
@@ -5598,7 +5592,7 @@ fn evalStructInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     for (types, values, names) |*field_ty, *field_val, *field_name| {
         const item = sema.zir.extraData(Zir.Inst.StructInitAnon.Item, extra_index);
         extra_index = item.end;
-        field_name.* = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(item.data.field_name));
+        field_name.* = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(item.data.field_name), .no_embedded_nulls);
         const init = try sema.resolveInst(item.data.init);
         field_val.* = init.index;
         field_ty.* = init.typeOf(ip).index;
@@ -5622,7 +5616,7 @@ fn evalStructInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const name_text = try std.fmt.allocPrint(sema.gpa, "{s}__struct_{d}", .{ ctx, @intFromEnum(inst) });
     defer sema.gpa.free(name_text);
     const struct_ty = try ip.getReifiedStructType(.{
-        .name = try ip.getOrPutString(sema.gpa, name_text),
+        .name = try ip.getOrPutString(sema.gpa, name_text, .no_embedded_nulls),
         .id = .{ .reified = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst, .type_hash = hasher.final() } },
         .parent = sema.this_type,
         .layout = .auto,
@@ -5682,7 +5676,7 @@ fn rootModuleType(sema: *Sema) Error!InternPool.Index {
     const file_index: Session.Index = @intCast(session.files.items.len);
     try session.files.append(sema.gpa, .{ .zir = null, .tree = null, .wrapped = null, .sub_file_path = null });
     const ty = try sema.intern_pool.getDeclaredStructType(
-        try sema.intern_pool.getOrPutString(sema.gpa, "root"),
+        try sema.intern_pool.getOrPutString(sema.gpa, "root", .no_embedded_nulls),
         .{ .declared = .{ .source_zir_id = file_index, .decl_inst = .main_struct_inst } },
         .none,
         0,
@@ -5816,7 +5810,7 @@ fn getStdLangType(sema: *Sema, decl: StdLangDecl) Error!InternPool.Index {
 }
 
 fn resolveDeclType(sema: *Sema, container_ty: InternPool.Index, name: []const u8) Error!InternPool.Index {
-    const name_nts = try sema.intern_pool.getOrPutString(sema.gpa, name);
+    const name_nts = try sema.intern_pool.getOrPutString(sema.gpa, name, .no_embedded_nulls);
     const v = (try sema.containerDeclByName(container_ty, name_nts)) orelse {
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "std.lang: missing declaration '{s}'", .{name});
     };
@@ -5863,7 +5857,7 @@ fn evalStdLangValue(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Va
 
         .calling_convention_c => {
             const cc_ty = try sema.getStdLangType(.CallingConvention);
-            const name = try sema.intern_pool.getOrPutString(sema.gpa, "c");
+            const name = try sema.intern_pool.getOrPutString(sema.gpa, "c", .no_embedded_nulls);
             return (try sema.containerDeclByName(cc_ty, name)) orelse {
                 return sema.fail(sema.block, sema.block.nodeOffset(.zero), "std.lang is corrupt: CallingConvention.c", .{});
             };
@@ -5885,7 +5879,7 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         const it = Type.fromIndex(ty).intInfo(ip);
         const int_info_ty = try sema.getStdLangType(.@"Type.Int");
         const signedness_ty = try sema.getStdLangType(.Signedness);
-        const sign_idx = (try sema.enumFieldIndex(signedness_ty, try ip.getOrPutString(sema.gpa, @tagName(it.signedness)))).?;
+        const sign_idx = (try sema.enumFieldIndex(signedness_ty, try ip.getOrPutString(sema.gpa, @tagName(it.signedness), .no_embedded_nulls))).?;
         const sign_val = (try sema.enumValueFieldIndex(signedness_ty, sign_idx)).?;
         const bits_val = try ip.internInt(.{ .ty = .u16_type, .storage = .{ .u64 = it.bits } });
         var elems = [_]InternPool.Index{ sign_val.index, bits_val };
@@ -5995,7 +5989,7 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const decl_names_val = try sema.typeInfoDecls(ty);
 
             const mode_name = if (try sema.enumNonexhaustive(ty)) "nonexhaustive" else "exhaustive";
-            const mode_idx = (try sema.enumFieldIndex(mode_ty, try ip.getOrPutString(sema.gpa, mode_name))).?;
+            const mode_idx = (try sema.enumFieldIndex(mode_ty, try ip.getOrPutString(sema.gpa, mode_name, .no_embedded_nulls))).?;
             const mode_val = (try sema.enumValueFieldIndex(mode_ty, mode_idx)).?;
 
             var elems = [_]InternPool.Index{ try sema.enumIntTagTypeOf(ty), mode_val.index, field_names_val, field_values_val, decl_names_val };
@@ -6060,7 +6054,7 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
                 var default: InternPool.Index = .none;
                 if (tuple_types) |t| {
                     var buf: [16]u8 = undefined;
-                    name.* = try ip.getOrPutString(sema.gpa, std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable);
+                    name.* = try ip.getOrPutString(sema.gpa, std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable, .no_embedded_nulls);
                     field_ty.* = t[i];
                 } else {
                     name.* = (try sema.structFieldNameAt(ty, @intCast(i))).?;
@@ -6190,7 +6184,7 @@ fn typeInfoDecls(sema: *Sema, container_ty: InternPool.Index) Error!InternPool.I
         for (sema.zir.typeDecls(ns.decl_inst)) |decl_inst| {
             const unwrapped = sema.zir.getDeclaration(decl_inst);
             if (unwrapped.name == .empty or !unwrapped.is_pub) continue;
-            try names.append(sema.gpa, try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(unwrapped.name)));
+            try names.append(sema.gpa, try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(unwrapped.name), .no_embedded_nulls));
         }
     }
     return try sema.internStringSlice(names.items);
@@ -6228,7 +6222,7 @@ fn failTypeInfoUnsupported(sema: *Sema, ty: InternPool.Index) Error {
 }
 
 fn typeInfoUnion(sema: *Sema, type_info_ty: InternPool.Index, tag_enum: InternPool.Index, tag_name: []const u8, payload: InternPool.Index) Error!?Value {
-    const tag_idx = (try sema.enumFieldIndex(tag_enum, try sema.intern_pool.getOrPutString(sema.gpa, tag_name))).?;
+    const tag_idx = (try sema.enumFieldIndex(tag_enum, try sema.intern_pool.getOrPutString(sema.gpa, tag_name, .no_embedded_nulls))).?;
     const tag = (try sema.enumValueFieldIndex(tag_enum, tag_idx)).?;
     return .{ .index = try sema.intern_pool.internUnion(.{ .ty = type_info_ty, .tag = tag.index, .val = payload }) };
 }
@@ -6248,7 +6242,7 @@ fn moduleTypeName(sema: *Sema, sub_path: []const u8) Error!InternPool.NullTermin
     defer sema.gpa.free(buf);
     var writer: std.Io.Writer = .fixed(buf);
     renderModuleName(sub_path, &writer) catch unreachable;
-    return sema.intern_pool.getOrPutString(sema.gpa, writer.buffered());
+    return sema.intern_pool.getOrPutString(sema.gpa, writer.buffered(), .no_embedded_nulls);
 }
 
 fn buildArrayAggregate(sema: *Sema, inst: Zir.Inst.Index) Error!InternPool.Index {
@@ -6367,7 +6361,7 @@ fn evalShuffle(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const elems = try sema.gpa.alloc(InternPool.Index, @intCast(mask_len));
     defer sema.gpa.free(elems);
     for (elems, 0..) |*e, i| {
-        const raw = sema.intAsI128(InternPool.aggregateElementAt(mask_agg, i)) orelse {
+        const raw = sema.intAsI128(try ip.aggregateElementAt(mask_agg, i)) orelse {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@shuffle: mask element is not a comptime integer", .{});
         };
         const from_agg, const idx, const len = if (raw >= 0)
@@ -6377,7 +6371,7 @@ fn evalShuffle(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         if (idx >= len) {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "mask element at index '{d}' selects out-of-bounds index", .{i});
         }
-        e.* = InternPool.aggregateElementAt(from_agg, idx);
+        e.* = try ip.aggregateElementAt(from_agg, idx);
     }
     const result_ty = try ip.internVectorType(.{ .len = @intCast(mask_len), .child = elem_ty });
     return .{ .index = try ip.internAggregate(.{ .ty = result_ty, .storage = .{ .elems = elems } }) };
@@ -6536,7 +6530,7 @@ fn evalStructDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const ctx = sema.intern_pool.stringSlice(sema.type_name_ctx);
             const text = try std.fmt.allocPrint(sema.gpa, "{s}__struct_{d}", .{ ctx, @intFromEnum(inst) });
             defer sema.gpa.free(text);
-            break :blk try sema.intern_pool.getOrPutString(sema.gpa, text);
+            break :blk try sema.intern_pool.getOrPutString(sema.gpa, text, .no_embedded_nulls);
         },
     };
 
@@ -6570,7 +6564,7 @@ fn evalEnumDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const ctx = sema.intern_pool.stringSlice(sema.type_name_ctx);
             const text = try std.fmt.allocPrint(sema.gpa, "{s}__enum_{d}", .{ ctx, @intFromEnum(inst) });
             defer sema.gpa.free(text);
-            break :blk try sema.intern_pool.getOrPutString(sema.gpa, text);
+            break :blk try sema.intern_pool.getOrPutString(sema.gpa, text, .no_embedded_nulls);
         },
     };
 
@@ -6608,7 +6602,7 @@ fn evalUnionDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const ctx = sema.intern_pool.stringSlice(sema.type_name_ctx);
             const text = try std.fmt.allocPrint(sema.gpa, "{s}__union_{d}", .{ ctx, @intFromEnum(inst) });
             defer sema.gpa.free(text);
-            break :blk try sema.intern_pool.getOrPutString(sema.gpa, text);
+            break :blk try sema.intern_pool.getOrPutString(sema.gpa, text, .no_embedded_nulls);
         },
     };
 
@@ -6654,7 +6648,7 @@ fn evalOpaqueDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const ctx = sema.intern_pool.stringSlice(sema.type_name_ctx);
             const text = try std.fmt.allocPrint(sema.gpa, "{s}__opaque_{d}", .{ ctx, @intFromEnum(inst) });
             defer sema.gpa.free(text);
-            break :blk try sema.intern_pool.getOrPutString(sema.gpa, text);
+            break :blk try sema.intern_pool.getOrPutString(sema.gpa, text, .no_embedded_nulls);
         },
     };
 
@@ -6845,7 +6839,7 @@ pub fn structFieldByName(
         return try sema.anonStructFieldByName(cf.decl_inst, name);
     var it = sema.zir.getStructDecl(cf.decl_inst).iterateFields();
     while (it.next()) |field| {
-        if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name))) == name) {
+        if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name), .no_embedded_nulls)) == name) {
             return .{
                 .index = field.idx,
                 .ty = (try sema.resolveInlineBody(field.type_body, cf.decl_inst)).index,
@@ -6877,7 +6871,7 @@ pub fn structFieldDefault(
     if (sema.zir.instructions.items(.tag)[@intFromEnum(cf.decl_inst)] == .struct_init_anon) return .none;
     var it = sema.zir.getStructDecl(cf.decl_inst).iterateFields();
     while (it.next()) |field| {
-        if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name))) != name) continue;
+        if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name), .no_embedded_nulls)) != name) continue;
         const body = field.default_body orelse return .none;
         const ty = (try sema.resolveInlineBody(field.type_body, cf.decl_inst)).index;
         try sema.inst_map.put(sema.gpa, cf.decl_inst, .{ .index = ty });
@@ -6897,7 +6891,7 @@ fn anonStructFieldByName(sema: *Sema, decl_inst: Zir.Inst.Index, name: InternPoo
     while (i < extra.data.fields_len) : (i += 1) {
         const item = sema.zir.extraData(Zir.Inst.StructInitAnon.Item, extra_index);
         extra_index = item.end;
-        if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(item.data.field_name))) == name)
+        if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(item.data.field_name), .no_embedded_nulls)) == name)
             return .{ .index = i, .ty = .none };
     }
     return null;
@@ -6932,7 +6926,7 @@ pub fn unionFieldByName(
     defer cf.restore(sema);
     var it = sema.zir.getUnionDecl(cf.decl_inst).iterateFields();
     while (it.next()) |field| {
-        if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name))) == name) {
+        if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name), .no_embedded_nulls)) == name) {
             const ty = if (field.type_body) |body|
                 (try sema.resolveInlineBody(body, cf.decl_inst)).index
             else
@@ -6975,7 +6969,7 @@ fn callConvValue(sema: *Sema, cc: std.lang.CallingConvention) Error!InternPool.I
             if (@TypeOf(payload) != void) {
                 return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@typeInfo: calling convention '{s}' is not modelled", .{@tagName(tag)});
             }
-            const idx = (try sema.enumFieldIndex(tag_enum, try ip.getOrPutString(sema.gpa, @tagName(tag)))).?;
+            const idx = (try sema.enumFieldIndex(tag_enum, try ip.getOrPutString(sema.gpa, @tagName(tag), .no_embedded_nulls))).?;
             const tag_val = (try sema.enumValueFieldIndex(tag_enum, idx)).?;
             return try ip.internUnion(.{ .ty = cc_ty, .tag = tag_val.index, .val = .void_value });
         },
@@ -7002,14 +6996,14 @@ pub fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) E
         while (i < extra.data.fields_len) : (i += 1) {
             const item = sema.zir.extraData(Zir.Inst.StructInitAnon.Item, extra_index);
             extra_index = item.end;
-            if (i == index) return try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(item.data.field_name));
+            if (i == index) return try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(item.data.field_name), .no_embedded_nulls);
         }
         return null;
     }
     var it = sema.zir.getStructDecl(cf.decl_inst).iterateFields();
     while (it.next()) |field| {
         if (field.idx == index)
-            return try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
+            return try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name), .no_embedded_nulls);
     }
     return null;
 }
@@ -7040,7 +7034,7 @@ pub fn unionFieldNameAt(sema: *Sema, union_ty: InternPool.Index, index: u32) Err
     var it = sema.zir.getUnionDecl(cf.decl_inst).iterateFields();
     while (it.next()) |field| {
         if (field.idx == index)
-            return try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name));
+            return try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name), .no_embedded_nulls);
     }
     return null;
 }
@@ -7179,7 +7173,7 @@ fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Lo
     var it = decl.iterateFields();
     var next_auto: i128 = 0;
     while (it.next()) |field| {
-        try names.append(sema.gpa, try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name)));
+        try names.append(sema.gpa, try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name), .no_embedded_nulls));
         if (!have_values) continue;
         const cur: i128 = if (field.value_body) |body| blk: {
             const raw = try sema.resolveInlineBody(body, cf.decl_inst);
@@ -7379,14 +7373,14 @@ fn evalIntFromBool(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 fn evalEnumLiteral(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const bytes = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir);
-    const name = try sema.intern_pool.getOrPutString(sema.gpa, bytes);
+    const name = try sema.intern_pool.getOrPutString(sema.gpa, bytes, .no_embedded_nulls);
     return .{ .index = try sema.intern_pool.get(.{ .enum_literal = name }) };
 }
 
 fn evalDeclLiteral(sema: *Sema, inst: Zir.Inst.Index, comptime do_coerce: bool) Error!?Value {
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.Field, pl_node.payload_index).data;
-    const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.field_name_start));
+    const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.field_name_start), .no_embedded_nulls);
     const orig_ty = (try sema.resolveInst(extra.lhs)).index;
     return try sema.analyzeDeclLiteral(orig_ty, name, do_coerce);
 }
@@ -7488,7 +7482,7 @@ fn evalFieldPtr(sema: *Sema, inst: Zir.Inst.Index, comptime initializing: bool) 
     const ip = sema.intern_pool;
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.Field, pl_node.payload_index).data;
-    const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.field_name_start));
+    const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.field_name_start), .no_embedded_nulls);
     const object_ptr = try sema.resolveInst(extra.lhs);
     return sema.fieldPtr(object_ptr, name, initializing);
 }
@@ -7619,7 +7613,7 @@ fn scanNamespace(sema: *Sema, ns: InternPool.NamespaceIndex, ty: InternPool.Inde
     for (sema.zir.typeDecls(cn.decl_inst)) |decl_inst| {
         const unwrapped = sema.zir.getDeclaration(decl_inst);
         if (unwrapped.kind != .@"const" and unwrapped.kind != .@"var") continue;
-        const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(unwrapped.name));
+        const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(unwrapped.name), .no_embedded_nulls);
         const fqn = try ip.fullyQualifiedName(sema.gpa, ns, name);
         const nav = try ip.createNav(sema.gpa, name, fqn);
         ip.navPtr(nav).analysis = .{ .namespace = ns, .zir_index = decl_inst, .wanted = false };
@@ -7702,7 +7696,7 @@ fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.Field, pl_node.payload_index).data;
-    const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.field_name_start));
+    const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.field_name_start), .no_embedded_nulls);
     const object = try sema.loadValue(try sema.resolveInst(extra.lhs));
     return sema.fieldPtrLoad(object, name);
 }
@@ -7754,14 +7748,14 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
             if (name.eqlSlice("len", ip))
                 return .{ .index = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = tuple.types.len } }) };
             const field_index = try sema.tupleFieldIndex(inner_ty, name);
-            return .{ .index = InternPool.aggregateElementAt(ip.indexToKey(inner.index).aggregate, field_index) };
+            return .{ .index = try ip.aggregateElementAt(ip.indexToKey(inner.index).aggregate, field_index) };
         },
         .struct_type => {
             const fld = (try sema.structFieldByName(inner_ty, name)) orelse
                 return sema.failBadStructFieldAccess(inner_ty, name);
             switch (ip.indexToKey(inner.index)) {
                 .undef => return .{ .index = try ip.get(.{ .undef = fld.ty }) },
-                .aggregate => |agg| return .{ .index = InternPool.aggregateElementAt(agg, fld.index) },
+                .aggregate => |agg| return .{ .index = try ip.aggregateElementAt(agg, fld.index) },
                 .bitpack => |bp| {
                     const struct_ty: Type = .fromIndex(inner_ty);
                     var field_bit_offset: u16 = 0;
@@ -7883,10 +7877,10 @@ fn resolveConstStringIntern(sema: *Sema, ref: Zir.Inst.Ref) Error!InternPool.Nul
     const bytes = try sema.gpa.alloc(u8, len);
     defer sema.gpa.free(bytes);
     for (bytes, 0..) |*b, i| {
-        const elem = InternPool.aggregateElementAt(key.aggregate, start + i);
+        const elem = try ip.aggregateElementAt(key.aggregate, start + i);
         b.* = @intCast(ip.indexToKey(elem).int.storage.u64);
     }
-    return try ip.getOrPutString(sema.gpa, bytes);
+    return try ip.getOrPutString(sema.gpa, bytes, .no_embedded_nulls);
 }
 
 fn evalCompileError(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
@@ -8052,7 +8046,7 @@ fn containerHasDecl(sema: *Sema, container_ty: InternPool.Index, name: InternPoo
     for (sema.zir.typeDecls(ns.decl_inst)) |decl_inst| {
         const unwrapped = sema.zir.getDeclaration(decl_inst);
         if (unwrapped.name == .empty) continue;
-        if ((try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(unwrapped.name))) == name) return true;
+        if ((try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(unwrapped.name), .no_embedded_nulls)) == name) return true;
     }
     return false;
 }
@@ -8073,7 +8067,7 @@ fn setAggregateElement(
     defer sema.gpa.free(elems);
     const old_key = ip.indexToKey(old.index);
     if (old_key == .aggregate) {
-        for (elems, 0..) |*e, i| e.* = InternPool.aggregateElementAt(old_key.aggregate, i);
+        for (elems, 0..) |*e, i| e.* = try ip.aggregateElementAt(old_key.aggregate, i);
     } else {
         @memset(elems, .undef);
     }
@@ -8181,7 +8175,7 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     defer sema.gpa.free(stored);
     for (body, stored) |field_ptr, *n| {
         const fp = sema.zir.extraData(Zir.Inst.Field, datas[@intFromEnum(field_ptr)].pl_node.payload_index).data;
-        n.* = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(fp.field_name_start));
+        n.* = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(fp.field_name_start), .no_embedded_nulls);
     }
 
     const count = try sema.structFieldCount(struct_ty);
@@ -8215,7 +8209,7 @@ fn evalStructInitFieldType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const datas = sema.zir.instructions.items(.data);
     const ft = sema.zir.extraData(Zir.Inst.FieldType, datas[@intFromEnum(inst)].pl_node.payload_index).data;
     const container_ty = Type.fromIndex((try sema.resolveInst(ft.container_type)).index).optEuBaseType(sema.intern_pool).index;
-    const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(ft.name_start));
+    const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(ft.name_start), .no_embedded_nulls);
     const field_ty = switch (sema.intern_pool.indexToKey(container_ty)) {
         .struct_type => ((try sema.structFieldByName(container_ty, name)) orelse
             return sema.failBadStructFieldAccess(container_ty, name)).ty,
@@ -8255,7 +8249,7 @@ fn evalStructInit(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Erro
         const item = sema.zir.extraData(Zir.Inst.StructInit.Item, extra_index);
         extra_index = item.end;
         const ft = sema.zir.extraData(Zir.Inst.FieldType, datas[@intFromEnum(item.data.field_type)].pl_node.payload_index).data;
-        const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(ft.name_start));
+        const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(ft.name_start), .no_embedded_nulls);
         const field = (try sema.structFieldByName(struct_ty, name)) orelse
             return sema.failBadStructFieldAccess(struct_ty, name);
         const raw = try sema.resolveInst(item.data.init);
@@ -8275,7 +8269,7 @@ fn evalStructInitUnion(sema: *Sema, union_ty: InternPool.Index, result_ty: Inter
 
     const item = sema.zir.extraData(Zir.Inst.StructInit.Item, extra.end).data;
     const ft = sema.zir.extraData(Zir.Inst.FieldType, datas[@intFromEnum(item.field_type)].pl_node.payload_index).data;
-    const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(ft.name_start));
+    const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(ft.name_start), .no_embedded_nulls);
     const field = (try sema.unionFieldByName(union_ty, name)) orelse
         return sema.failBadUnionFieldAccess(union_ty, name);
 
@@ -8771,7 +8765,7 @@ fn aggregateElementByIndex(sema: *Sema, array_value: Value, index: u64) Error!Va
         .array_type => |at| if (at.sentinel != .none and logical_index == at.len) return .{ .index = at.sentinel },
         else => {},
     };
-    return .{ .index = InternPool.aggregateElementAt(agg_key.aggregate, logical_index) };
+    return .{ .index = try ip.aggregateElementAt(agg_key.aggregate, logical_index) };
 }
 
 fn memOperandType(sema: *Sema, value: Value) ?Type {
@@ -8988,7 +8982,7 @@ fn wellKnownRefToValue(ref: Zir.Inst.Ref) ?Value {
 
 fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     if (sema.this_type != .none) {
-        const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir));
+        const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir), .no_embedded_nulls);
         var container = sema.this_type;
         while (container != .none) : (container = sema.intern_pool.typeParent(container)) {
             if (try sema.containerDeclNav(container, name)) |val| return val;
@@ -9003,7 +8997,7 @@ fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     if (sema.this_type != .none) {
-        const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir));
+        const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir), .no_embedded_nulls);
         var container = sema.this_type;
         while (container != .none) : (container = sema.intern_pool.typeParent(container)) {
             if (try sema.containerDeclNav(container, name)) |val| return try sema.materializeConstPtr(val);
@@ -9036,7 +9030,7 @@ fn lookupDecl(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error!?Dec
 
     const data = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok;
     const name_bytes = data.get(sema.zir);
-    const name = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes);
+    const name = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes, .no_embedded_nulls);
 
     const ns_idx = sema.namespace orelse {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "{s} '{s}': no namespace in scope", .{ op_name, name_bytes });
@@ -9133,7 +9127,7 @@ fn bindOneDecl(
 
     if (std.mem.eql(u8, name_bytes, InputShape.expression_decl_name)) return;
 
-    const name = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes);
+    const name = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes, .no_embedded_nulls);
 
     if (try sema.lookupName(ns_idx, name)) |_| return;
 
@@ -9226,7 +9220,7 @@ fn bindAnonymousDecl(
             try sema.intern_pool.namespacePtr(ns_idx).comptime_decls.append(sema.gpa, id);
         },
         .unnamed_test => {
-            const synthesized = try sema.intern_pool.getOrPutString(sema.gpa, "");
+            const synthesized = try sema.intern_pool.getOrPutString(sema.gpa, "", .no_embedded_nulls);
             const nav_idx = try sema.intern_pool.createNav(sema.gpa, synthesized, synthesized);
             sema.intern_pool.navPtr(nav_idx).analysis = .{
                 .namespace = ns_idx,
@@ -9253,7 +9247,7 @@ fn evalErrorSetDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     for (names) |*slot| {
         const zir_name_idx: std.zig.Zir.NullTerminatedString = @enumFromInt(sema.zir.extra[extra_index]);
         const name_bytes = sema.zir.nullTerminatedString(zir_name_idx);
-        slot.* = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes);
+        slot.* = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes, .no_embedded_nulls);
         extra_index += 1;
     }
 
@@ -9266,7 +9260,7 @@ fn evalErrorValue(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const data = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok;
     const name_bytes = data.get(sema.zir);
-    const name = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes);
+    const name = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes, .no_embedded_nulls);
     const ty_idx = try sema.intern_pool.singletonErrorSetType(name);
     const err_idx = try sema.intern_pool.internErr(.{ .ty = ty_idx, .name = name });
     return .{ .index = err_idx };
@@ -9762,14 +9756,14 @@ fn validateSwitchBlock(sema: *Sema, inst: Zir.Inst.Index, item_ty: InternPool.In
                     return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "'_' prong only allowed when switching on non-exhaustive enums", .{});
                 },
                 .enum_literal => |n| blk: {
-                    const name = try ip.getOrPutString(gpa, sema.zir.nullTerminatedString(n));
+                    const name = try ip.getOrPutString(gpa, sema.zir.nullTerminatedString(n), .no_embedded_nulls);
                     if (ip.indexToKey(item_ty) != .enum_type) return sema.failBadMemberAccess(item_ty, name);
                     const field_index = (try sema.enumFieldIndex(item_ty, name)) orelse
                         return sema.failBadMemberAccess(item_ty, name);
                     break :blk markSwitchEnumField(seen_enum_fields, field_index);
                 },
                 .error_value => |n| blk: {
-                    const name = try ip.getOrPutString(gpa, sema.zir.nullTerminatedString(n));
+                    const name = try ip.getOrPutString(gpa, sema.zir.nullTerminatedString(n), .no_embedded_nulls);
                     break :blk (try seen_errors.getOrPut(gpa, name)).found_existing;
                 },
                 .body_len => |len| blk: {
@@ -9860,7 +9854,7 @@ fn uniformUnionCaptureType(
             .enum_literal => |n| n,
             else => return null,
         };
-        const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(name_idx));
+        const name = try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(name_idx), .no_embedded_nulls);
         const fld = (try sema.unionFieldByName(union_ty, name)) orelse return null;
         if (common) |c| {
             if (c != fld.ty) return null;
@@ -9897,7 +9891,7 @@ fn matchSwitchItems(
             .under => hit = true,
             .error_value => |item_err_name| {
                 if (op.err_name) |opn| {
-                    const item = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(item_err_name));
+                    const item = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(item_err_name), .no_embedded_nulls);
                     if (item == opn) hit = true;
                 }
             },
@@ -9906,7 +9900,7 @@ fn matchSwitchItems(
                 if (sema.intern_pool.indexToKey(op.ty) != .enum_type) {
                     return sema.failSwitch("enum-literal case on a non-enum operand");
                 }
-                const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(name_idx));
+                const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(name_idx), .no_embedded_nulls);
                 const tag = (try sema.enumTagByName(op.ty, name)) orelse
                     return sema.failBadMemberAccess(op.ty, name);
                 if (tag.index == op.value.index) hit = true;
@@ -10086,7 +10080,7 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
         .field => blk: {
             const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
             const extra = sema.zir.extraData(Zir.Inst.FieldCall, pl_node.payload_index);
-            const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.data.field_name_start));
+            const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(extra.data.field_name_start), .no_embedded_nulls);
             const object_ptr = try sema.resolveInst(extra.data.obj_ptr);
             const object = try sema.loadValue(object_ptr);
             const args_slice: []const Zir.Inst.Index = @ptrCast(sema.zir.extra[extra.end..]);
@@ -10591,7 +10585,7 @@ fn opvTestSema(gpa: std.mem.Allocator, pool: *InternPool, arena: *std.heap.Arena
 
 fn opvNames(sema: *Sema, names: []const []const u8) ![]InternPool.NullTerminatedString {
     const out = try sema.arena.alloc(InternPool.NullTerminatedString, names.len);
-    for (names, out) |n, *h| h.* = try sema.intern_pool.getOrPutString(sema.gpa, n);
+    for (names, out) |n, *h| h.* = try sema.intern_pool.getOrPutString(sema.gpa, n, .no_embedded_nulls);
     return out;
 }
 
@@ -10600,7 +10594,7 @@ fn opvEnum(sema: *Sema, hash: u64, names: []const []const u8) !Type {
     const handles = try opvNames(sema, names);
     const tag_ty = try sema.enumIntTagType(@intCast(names.len));
     const enum_ty = try pool.getReifiedEnumType(.{
-        .name = try pool.getOrPutString(sema.gpa, "E"),
+        .name = try pool.getOrPutString(sema.gpa, "E", .no_embedded_nulls),
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
         .parent = .none,
         .int_tag_type = tag_ty,
@@ -10618,7 +10612,7 @@ fn opvStruct(sema: *Sema, hash: u64, names: []const []const u8, types: []const I
     const pool = sema.intern_pool;
     const handles = try opvNames(sema, names);
     const struct_ty = try pool.getReifiedStructType(.{
-        .name = try pool.getOrPutString(sema.gpa, "S"),
+        .name = try pool.getOrPutString(sema.gpa, "S", .no_embedded_nulls),
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
         .parent = .none,
         .layout = .auto,
@@ -10640,7 +10634,7 @@ fn opvUnion(sema: *Sema, hash: u64, tag_hash: u64, names: []const []const u8, ty
     const tag_enum = try opvEnum(sema, tag_hash, names);
     const handles = try opvNames(sema, names);
     const union_ty = try pool.getReifiedUnionType(.{
-        .name = try pool.getOrPutString(sema.gpa, "U"),
+        .name = try pool.getOrPutString(sema.gpa, "U", .no_embedded_nulls),
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
         .parent = .none,
         .layout = .auto,

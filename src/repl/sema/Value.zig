@@ -137,6 +137,10 @@ pub fn writeToPackedMemory(val: Value, pool: *const InternPool, buffer: []u8, bi
             const len: usize = @intCast(ty.arrayLen(pool));
             var elem_bit_off: usize = bit_offset;
             switch (pool.indexToKey(val.index).aggregate.storage) {
+                .bytes => |bytes| for (0..len) |i| {
+                    std.mem.writeVarPackedInt(buffer, elem_bit_off, elem_bits, bytes.at(i, pool), endian);
+                    elem_bit_off += elem_bits;
+                },
                 .repeated_elem => |elem_val_ip| {
                     const elem_val: Value = .fromIndex(elem_val_ip);
                     for (0..len) |_| {
@@ -280,12 +284,9 @@ pub fn canMutateComptimeVarState(val: Value, pool: *const InternPool) bool {
             .none => false,
             else => |payload| Value.fromIndex(payload).canMutateComptimeVarState(pool),
         },
-        .aggregate => |aggregate| switch (aggregate.storage) {
-            .elems => |elems| for (elems) |elem| {
-                if (Value.fromIndex(elem).canMutateComptimeVarState(pool)) break true;
-            } else false,
-            .repeated_elem => |elem| Value.fromIndex(elem).canMutateComptimeVarState(pool),
-        },
+        .aggregate => |aggregate| for (aggregate.storage.values()) |elem| {
+            if (Value.fromIndex(elem).canMutateComptimeVarState(pool)) break true;
+        } else false,
         .un => |un| Value.fromIndex(un.val).canMutateComptimeVarState(pool),
         else => false,
     };
@@ -312,7 +313,7 @@ pub fn toFloat(val: Value, comptime T: type, pool: *const InternPool) T {
 pub fn elemValue(val: Value, pool: *InternPool, index: usize) std.mem.Allocator.Error!Value {
     switch (pool.indexToKey(val.index)) {
         .undef => |ty| return .fromIndex(try pool.get(.{ .undef = Type.fromIndex(ty).childType(pool).index })),
-        .aggregate => |aggregate| return .fromIndex(InternPool.aggregateElementAt(aggregate, index)),
+        .aggregate => |aggregate| return .fromIndex(try pool.aggregateElementAt(aggregate, index)),
         else => unreachable,
     }
 }
@@ -324,6 +325,10 @@ pub fn fieldValue(val: Value, index: usize, pool: *InternPool) std.mem.Allocator
             .undef = Type.fromIndex(ty).fieldType(index, pool).index,
         })),
         .aggregate => |aggregate| .fromIndex(switch (aggregate.storage) {
+            .bytes => |bytes| try pool.get(.{ .int = .{
+                .ty = .u8_type,
+                .storage = .{ .u64 = bytes.at(index, pool) },
+            } }),
             .elems => |elems| elems[index],
             .repeated_elem => |elem| elem,
         }),
@@ -930,13 +935,14 @@ pub fn compareAllWithZero(lhs: Value, op: std.math.CompareOperator, pool: *const
         .float => |float| switch (float.storage) {
             inline else => |x| std.math.compare(x, op, 0),
         },
-        .aggregate => |aggregate| {
-            const len = pool.indexToKey(aggregate.ty).vector_type.len;
-            var i: u64 = 0;
-            return while (i < len) : (i += 1) {
-                const elem = Value.fromIndex(InternPool.aggregateElementAt(aggregate, i));
-                if (!elem.compareAllWithZero(op, pool)) break false;
-            } else true;
+        .aggregate => |aggregate| switch (aggregate.storage) {
+            .bytes => |bytes| for (bytes.toSlice(lhs.typeOf(pool).arrayLenIncludingSentinel(pool), pool)) |byte| {
+                if (!std.math.compare(byte, op, 0)) break false;
+            } else true,
+            .elems => |elems| for (elems) |elem| {
+                if (!Value.fromIndex(elem).compareAllWithZero(op, pool)) break false;
+            } else true,
+            .repeated_elem => |elem| Value.fromIndex(elem).compareAllWithZero(op, pool),
         },
         else => {
             var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;

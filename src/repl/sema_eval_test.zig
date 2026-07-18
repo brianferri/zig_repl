@@ -1089,11 +1089,11 @@ test "struct_type: nominal identity keys on (source_zir_id, decl_inst)" {
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
 
-    const name_a = try pool.getOrPutString(gpa, "repl.A");
+    const name_a = try pool.getOrPutString(gpa, "repl.A", .no_embedded_nulls);
     const a1 = try pool.getDeclaredStructType(name_a, .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(2) } }, .none, 0, .auto, false, false);
     const a2 = try pool.getDeclaredStructType(name_a, .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(2) } }, .none, 0, .auto, false, false);
     const b = try pool.getDeclaredStructType(
-        try pool.getOrPutString(gpa, "repl.B"),
+        try pool.getOrPutString(gpa, "repl.B", .no_embedded_nulls),
         .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(3) } },
         .none,
         0,
@@ -1542,7 +1542,7 @@ test "decl: bindDecls populates the namespace with the right resolved value" {
     // priv_decls (Zig file-scope semantics). lookupNav walks both
     // pub_decls and priv_decls so callers don't care which.
     const ns = pool.namespacePtr(ns_idx);
-    const x_name = try pool.getOrPutString(gpa, "x");
+    const x_name = try pool.getOrPutString(gpa, "x", .no_embedded_nulls);
     const nav_idx = ns.lookupNav(&pool, x_name).?;
 
     const nav = pool.getNav(nav_idx);
@@ -1686,7 +1686,7 @@ test "decl: cross-line rebind preserves the original binding (silent-drop limita
 
     // Original binding still intact at value 1 -- AstGen rejected
     // the new decl, bindDecls never ran on it.
-    const z_name = try pool.getOrPutString(gpa, "z");
+    const z_name = try pool.getOrPutString(gpa, "z", .no_embedded_nulls);
     const nav_idx = pool.namespacePtr(ns).lookupNav(&pool, z_name).?;
     const resolved = pool.getNav(nav_idx).resolved.?;
     try testing.expectEqual(@as(u64, 1), pool.indexToKey(resolved.value).int.storage.u64);
@@ -1868,7 +1868,7 @@ test "fn decl: nullary void fn binds with correct FuncType" {
     }, &diag_buf);
 
     const ns = pool.namespacePtr(ns_idx);
-    const name = try pool.getOrPutString(gpa, "foo");
+    const name = try pool.getOrPutString(gpa, "foo", .no_embedded_nulls);
     const nav_idx = ns.lookupNav(&pool, name).?;
     const nav = pool.getNav(nav_idx);
     const resolved = nav.resolved.?;
@@ -1893,7 +1893,7 @@ test "fn decl: typed params populate FuncType.param_types in order" {
     }, &diag_buf);
 
     const ns = pool.namespacePtr(ns_idx);
-    const nav_idx = ns.lookupNav(&pool, try pool.getOrPutString(gpa, "add")).?;
+    const nav_idx = ns.lookupNav(&pool, try pool.getOrPutString(gpa, "add", .no_embedded_nulls)).?;
     const fn_key = pool.indexToKey(pool.getNav(nav_idx).resolved.?.value).func;
     const fn_ty = pool.indexToKey(fn_key.ty).func_type;
 
@@ -1916,7 +1916,7 @@ test "fn decl: comptime parameter sets comptime_bits" {
     }, &diag_buf);
 
     const ns = pool.namespacePtr(ns_idx);
-    const nav_idx = ns.lookupNav(&pool, try pool.getOrPutString(gpa, "pick")).?;
+    const nav_idx = ns.lookupNav(&pool, try pool.getOrPutString(gpa, "pick", .no_embedded_nulls)).?;
     const fn_key = pool.indexToKey(pool.getNav(nav_idx).resolved.?.value).func;
     const fn_ty = pool.indexToKey(fn_key.ty).func_type;
 
@@ -1939,8 +1939,8 @@ test "fn decl: dedup -- same signature reuses FuncType Index" {
     }, &diag_buf);
 
     const ns = pool.namespacePtr(ns_idx);
-    const fn_f = pool.indexToKey(pool.getNav(ns.lookupNav(&pool, try pool.getOrPutString(gpa, "f")).?).resolved.?.value).func;
-    const fn_g = pool.indexToKey(pool.getNav(ns.lookupNav(&pool, try pool.getOrPutString(gpa, "g")).?).resolved.?.value).func;
+    const fn_f = pool.indexToKey(pool.getNav(ns.lookupNav(&pool, try pool.getOrPutString(gpa, "f", .no_embedded_nulls)).?).resolved.?.value).func;
+    const fn_g = pool.indexToKey(pool.getNav(ns.lookupNav(&pool, try pool.getOrPutString(gpa, "g", .no_embedded_nulls)).?).resolved.?.value).func;
 
     // Same signature -> same fn_type Index.
     try testing.expectEqual(fn_f.ty, fn_g.ty);

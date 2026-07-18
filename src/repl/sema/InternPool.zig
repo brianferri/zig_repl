@@ -180,6 +180,36 @@ pub const Index = enum(u32) {
 
 const first_dynamic_index: u32 = @intFromEnum(Index.empty_tuple) + 1;
 
+const EmbeddedNulls = enum {
+    no_embedded_nulls,
+    maybe_embedded_nulls,
+
+    fn StringType(comptime embedded_nulls: EmbeddedNulls) type {
+        return switch (embedded_nulls) {
+            .no_embedded_nulls => NullTerminatedString,
+            .maybe_embedded_nulls => String,
+        };
+    }
+};
+
+/// A byte string whose length is known from context (e.g. an aggregate's array type) rather than
+/// NUL-termination, so it may contain embedded NUL bytes. Shares the string table with
+/// NullTerminatedString.
+pub const String = enum(u32) {
+    empty = 0,
+    _,
+
+    pub fn at(string: String, index: u64, pool: *const InternPool) u8 {
+        const start = pool.string_starts.items[@intFromEnum(string)];
+        return pool.string_bytes.items[@intCast(start + index)];
+    }
+
+    pub fn toSlice(string: String, len: u64, pool: *const InternPool) []const u8 {
+        const start = pool.string_starts.items[@intFromEnum(string)];
+        return pool.string_bytes.items[start..][0..@intCast(len)];
+    }
+};
+
 pub const NullTerminatedString = enum(u32) {
     empty = 0,
     _,
@@ -726,8 +756,17 @@ pub const Key = union(enum) {
         storage: Storage,
 
         pub const Storage = union(enum) {
+            bytes: String,
             repeated_elem: Index,
             elems: []const Index,
+
+            pub fn values(self: *const Storage) []const Index {
+                return switch (self.*) {
+                    .bytes => &.{},
+                    .elems => |elems| elems,
+                    .repeated_elem => |*elem| @as(*const [1]Index, elem),
+                };
+            }
         };
     };
 
@@ -903,10 +942,53 @@ pub const Key = union(enum) {
             },
             .aggregate => |agg| {
                 std.hash.autoHash(&hasher, agg.ty);
-                const count = aggregateLen(pool, agg);
-                var i: u64 = 0;
-                while (i < count) : (i += 1) {
-                    std.hash.autoHash(&hasher, aggregateElementAt(agg, i));
+                const len = pool.aggregateElementCount(agg.ty);
+                const KeyTag = @typeInfo(Key).@"union".tag_type.?;
+                const child = switch (pool.indexToKey(agg.ty)) {
+                    .array_type => |array_type| array_type.child,
+                    .vector_type => |vector_type| vector_type.child,
+                    .tuple_type, .struct_type => .none,
+                    else => unreachable,
+                };
+
+                if (child == .u8_type) {
+                    switch (agg.storage) {
+                        .bytes => |bytes| for (bytes.toSlice(len, pool)) |byte| {
+                            std.hash.autoHash(&hasher, KeyTag.int);
+                            std.hash.autoHash(&hasher, byte);
+                        },
+                        .elems => |elems| for (elems[0..@intCast(len)]) |elem| {
+                            const elem_key = pool.indexToKey(elem);
+                            std.hash.autoHash(&hasher, @as(KeyTag, elem_key));
+                            switch (elem_key) {
+                                .undef => {},
+                                .int => |int| std.hash.autoHash(&hasher, @as(u8, @intCast(int.storage.u64))),
+                                else => unreachable,
+                            }
+                        },
+                        .repeated_elem => |elem| {
+                            const elem_key = pool.indexToKey(elem);
+                            var remaining = len;
+                            while (remaining > 0) : (remaining -= 1) {
+                                std.hash.autoHash(&hasher, @as(KeyTag, elem_key));
+                                switch (elem_key) {
+                                    .undef => {},
+                                    .int => |int| std.hash.autoHash(&hasher, @as(u8, @intCast(int.storage.u64))),
+                                    else => unreachable,
+                                }
+                            }
+                        },
+                    }
+                    return hasher.final();
+                }
+
+                switch (agg.storage) {
+                    .bytes => unreachable,
+                    .elems => |elems| for (elems[0..@intCast(len)]) |elem| std.hash.autoHash(&hasher, elem),
+                    .repeated_elem => |elem| {
+                        var remaining = len;
+                        while (remaining > 0) : (remaining -= 1) std.hash.autoHash(&hasher, elem);
+                    },
                 }
             },
             .error_union => |eu| {
@@ -1054,15 +1136,44 @@ pub const Key = union(enum) {
             .aggregate => |x| blk: {
                 const y = b.aggregate;
                 if (x.ty != y.ty) break :blk false;
-                const count = aggregateLen(pool, x);
-                if (count != aggregateLen(pool, y)) break :blk false;
-                var i: u64 = 0;
-                while (i < count) : (i += 1) {
-                    if (aggregateElementAt(x, i) != aggregateElementAt(y, i)) {
-                        break :blk false;
+
+                const len = pool.aggregateElementCount(x.ty);
+                const StorageTag = @typeInfo(Key.Aggregate.Storage).@"union".tag_type.?;
+                if (@as(StorageTag, x.storage) != @as(StorageTag, y.storage)) {
+                    for (0..@intCast(len)) |elem_index| {
+                        const a_elem = switch (x.storage) {
+                            .bytes => |bytes| pool.getIfExists(.{ .int = .{
+                                .ty = .u8_type,
+                                .storage = .{ .u64 = bytes.at(elem_index, pool) },
+                            } }) orelse break :blk false,
+                            .elems => |elems| elems[elem_index],
+                            .repeated_elem => |elem| elem,
+                        };
+                        const b_elem = switch (y.storage) {
+                            .bytes => |bytes| pool.getIfExists(.{ .int = .{
+                                .ty = .u8_type,
+                                .storage = .{ .u64 = bytes.at(elem_index, pool) },
+                            } }) orelse break :blk false,
+                            .elems => |elems| elems[elem_index],
+                            .repeated_elem => |elem| elem,
+                        };
+                        if (a_elem != b_elem) break :blk false;
                     }
+                    break :blk true;
                 }
-                break :blk true;
+
+                switch (x.storage) {
+                    .bytes => |a_bytes| {
+                        const b_bytes = y.storage.bytes;
+                        break :blk a_bytes == b_bytes or
+                            std.mem.eql(u8, a_bytes.toSlice(len, pool), b_bytes.toSlice(len, pool));
+                    },
+                    .elems => |a_elems| {
+                        const b_elems = y.storage.elems;
+                        break :blk std.mem.eql(Index, a_elems[0..@intCast(len)], b_elems[0..@intCast(len)]);
+                    },
+                    .repeated_elem => |a_elem| break :blk a_elem == y.storage.repeated_elem,
+                }
             },
             .error_union => |x| blk: {
                 const y = b.error_union;
@@ -1229,6 +1340,7 @@ const Item = struct {
         type_array_small,
         type_array_big,
         aggregate,
+        aggregate_bytes,
         repeated,
         opt_payload,
         opt_null,
@@ -1294,6 +1406,11 @@ const Array = struct {
 const Repeated = struct {
     ty: Index,
     elem_val: Index,
+};
+
+const AggregateBytes = struct {
+    ty: Index,
+    bytes: String,
 };
 
 const captures_len_reified: u32 = std.math.maxInt(u32);
@@ -1817,8 +1934,9 @@ pub fn getOrPutString(
     pool: *InternPool,
     gpa: Allocator,
     bytes: []const u8,
-) Allocator.Error!NullTerminatedString {
-    assert(std.mem.indexOfScalar(u8, bytes, 0) == null);
+    comptime embedded_nulls: EmbeddedNulls,
+) Allocator.Error!embedded_nulls.StringType() {
+    if (embedded_nulls == .no_embedded_nulls) assert(std.mem.indexOfScalar(u8, bytes, 0) == null);
 
     if (bytes.len == 0) return .empty;
 
@@ -1908,7 +2026,7 @@ pub fn namespaceName(
     ns_idx: NamespaceIndex,
 ) Allocator.Error!NullTerminatedString {
     const ns = pool.namespacePtr(ns_idx);
-    if (ns.owner_type == .none) return pool.getOrPutString(gpa, root_namespace_name);
+    if (ns.owner_type == .none) return pool.getOrPutString(gpa, root_namespace_name, .no_embedded_nulls);
     return pool.typeName(ns.owner_type);
 }
 
@@ -1923,7 +2041,7 @@ pub fn fullyQualifiedName(
 
     const text = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ pool.stringSlice(ns_name), pool.stringSlice(name) });
     defer gpa.free(text);
-    return pool.getOrPutString(gpa, text);
+    return pool.getOrPutString(gpa, text, .no_embedded_nulls);
 }
 
 pub fn createComptimeUnit(
@@ -2124,6 +2242,14 @@ fn appendAnyframeType(pool: *InternPool, child: Index) void {
         .tag = .type_anyframe,
         .data = @intFromEnum(child),
     });
+}
+
+pub fn getIfExists(pool: *const InternPool, key: Key) ?Index {
+    const adapter: KeyAdapter = .{ .pool = pool };
+    const map_index = pool.map.getIndexAdapted(key, adapter) orelse return null;
+    const existing: u32 = @intCast(map_index);
+    assert(existing < pool.items.len);
+    return @enumFromInt(existing);
 }
 
 pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
@@ -2466,6 +2592,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .type_array_small => arrayTypeSmallFromExtra(pool, item.data),
         .type_array_big => arrayTypeBigFromExtra(pool, item.data),
         .aggregate => aggregateFromExtra(pool, item.data),
+        .aggregate_bytes => aggregateBytesFromExtra(pool, item.data),
         .repeated => repeatedFromExtra(pool, item.data),
     };
 }
@@ -2593,6 +2720,14 @@ fn aggregateFromExtra(pool: *const InternPool, extra_index: u32) Key {
     };
 }
 
+fn aggregateBytesFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const r = pool.extraData(AggregateBytes, extra_index);
+    return .{ .aggregate = .{
+        .ty = r.ty,
+        .storage = .{ .bytes = r.bytes },
+    } };
+}
+
 fn repeatedFromExtra(pool: *const InternPool, extra_index: u32) Key {
     const r = pool.extraData(Repeated, extra_index);
     return .{ .aggregate = .{
@@ -2696,6 +2831,7 @@ fn addExtra(pool: *InternPool, item: anytype) Allocator.Error!u32 {
             MapIndex,
             OptionalMapIndex,
             NullTerminatedString,
+            String,
             Key.ComptimeAllocIndex,
             std.zig.Zir.Inst.Index,
             => @intFromEnum(@field(item, field_name)),
@@ -2731,6 +2867,7 @@ fn extraDataTrail(pool: *const InternPool, comptime T: type, index: u32) struct 
             MapIndex,
             OptionalMapIndex,
             NullTerminatedString,
+            String,
             Key.ComptimeAllocIndex,
             std.zig.Zir.Inst.Index,
             => @enumFromInt(extra_item),
@@ -3558,15 +3695,9 @@ pub fn aggregateElementCount(pool: *const InternPool, ty: Index) u64 {
     };
 }
 
-fn aggregateLen(pool: *const InternPool, agg: Key.Aggregate) u64 {
+pub fn aggregateElementAt(pool: *InternPool, agg: Key.Aggregate, i: u64) Allocator.Error!Index {
     return switch (agg.storage) {
-        .elems => |es| es.len,
-        .repeated_elem => aggregateElementCount(pool, agg.ty),
-    };
-}
-
-pub fn aggregateElementAt(agg: Key.Aggregate, i: u64) Index {
-    return switch (agg.storage) {
+        .bytes => |bytes| try pool.get(.{ .int = .{ .ty = .u8_type, .storage = .{ .u64 = bytes.at(i, pool) } } }),
         .repeated_elem => |e| e,
         .elems => |es| blk: {
             assert(i < es.len);
@@ -3578,6 +3709,10 @@ pub fn aggregateElementAt(agg: Key.Aggregate, i: u64) Index {
 fn emitAggregate(pool: *InternPool, agg: Key.Aggregate) Allocator.Error!void {
     assert(agg.ty != .none);
     switch (agg.storage) {
+        .bytes => |bytes| {
+            const extra_index = try pool.addExtra(AggregateBytes{ .ty = agg.ty, .bytes = bytes });
+            pool.items.appendAssumeCapacity(.{ .tag = .aggregate_bytes, .data = extra_index });
+        },
         .repeated_elem => |elem| {
             const extra_index = try pool.addExtra(Repeated{ .ty = agg.ty, .elem_val = elem });
             pool.items.appendAssumeCapacity(.{ .tag = .repeated, .data = extra_index });
@@ -4409,6 +4544,7 @@ pub fn getCoerced(pool: *InternPool, val: Index, new_ty: Index) Allocator.Error!
                 };
                 if (old_ty_child != new_ty_child) break :direct;
                 switch (aggregate.storage) {
+                    .bytes => |bytes| return pool.get(.{ .aggregate = .{ .ty = new_ty, .storage = .{ .bytes = bytes } } }),
                     .elems => |elems| {
                         const elems_copy = try pool.gpa.dupe(Index, elems[0..new_len]);
                         defer pool.gpa.free(elems_copy);
@@ -4420,6 +4556,9 @@ pub fn getCoerced(pool: *InternPool, val: Index, new_ty: Index) Allocator.Error!
             const agg_elems = try pool.gpa.alloc(Index, new_len);
             defer pool.gpa.free(agg_elems);
             switch (aggregate.storage) {
+                .bytes => |bytes| for (agg_elems, 0..) |*elem, index| {
+                    elem.* = try pool.get(.{ .int = .{ .ty = .u8_type, .storage = .{ .u64 = bytes.at(index, pool) } } });
+                },
                 .elems => |elems| @memcpy(agg_elems, elems[0..new_len]),
                 .repeated_elem => |elem| @memset(agg_elems, elem),
             }
@@ -4854,7 +4993,7 @@ test "string interning: empty handle is the well-known sentinel" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    try std.testing.expectEqual(NullTerminatedString.empty, try pool.getOrPutString(pool.gpa, ""));
+    try std.testing.expectEqual(NullTerminatedString.empty, try pool.getOrPutString(pool.gpa, "", .no_embedded_nulls));
     try std.testing.expectEqualStrings("", pool.stringSlice(.empty));
 }
 
@@ -4862,7 +5001,7 @@ test "string interning: round-trip a single name" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const handle = try pool.getOrPutString(pool.gpa, "decl_name");
+    const handle = try pool.getOrPutString(pool.gpa, "decl_name", .no_embedded_nulls);
     try std.testing.expectEqualStrings("decl_name", pool.stringSlice(handle));
 }
 
@@ -4870,12 +5009,12 @@ test "string interning: identical bytes dedup to the same handle" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const first = try pool.getOrPutString(pool.gpa, "x");
-    const second = try pool.getOrPutString(pool.gpa, "x");
+    const first = try pool.getOrPutString(pool.gpa, "x", .no_embedded_nulls);
+    const second = try pool.getOrPutString(pool.gpa, "x", .no_embedded_nulls);
     try std.testing.expectEqual(first, second);
 
     const bytes_after_first = pool.string_bytes.items.len;
-    _ = try pool.getOrPutString(pool.gpa, "x");
+    _ = try pool.getOrPutString(pool.gpa, "x", .no_embedded_nulls);
     try std.testing.expectEqual(bytes_after_first, pool.string_bytes.items.len);
 }
 
@@ -4883,8 +5022,8 @@ test "string interning: distinct names occupy distinct handles" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const foo = try pool.getOrPutString(pool.gpa, "foo");
-    const bar = try pool.getOrPutString(pool.gpa, "bar");
+    const foo = try pool.getOrPutString(pool.gpa, "foo", .no_embedded_nulls);
+    const bar = try pool.getOrPutString(pool.gpa, "bar", .no_embedded_nulls);
     try std.testing.expect(foo != bar);
     try std.testing.expectEqualStrings("foo", pool.stringSlice(foo));
     try std.testing.expectEqualStrings("bar", pool.stringSlice(bar));
@@ -4894,7 +5033,7 @@ test "string interning: OptionalNullTerminatedString round-trips" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const handle = try pool.getOrPutString(pool.gpa, "thing");
+    const handle = try pool.getOrPutString(pool.gpa, "thing", .no_embedded_nulls);
     const opt = handle.toOptional();
     try std.testing.expect(opt != .none);
     try std.testing.expectEqual(handle, opt.unwrap().?);
@@ -4910,22 +5049,22 @@ test "string interning: many names round-trip and dedup correctly" {
 
     const names = [_][]const u8{ "alpha", "beta", "gamma", "delta", "epsilon" };
     var handles: [names.len]NullTerminatedString = undefined;
-    for (names, &handles) |name, *out| out.* = try pool.getOrPutString(pool.gpa, name);
+    for (names, &handles) |name, *out| out.* = try pool.getOrPutString(pool.gpa, name, .no_embedded_nulls);
 
     for (handles, names) |handle, expected| {
         try std.testing.expectEqualStrings(expected, pool.stringSlice(handle));
     }
 
-    try std.testing.expectEqual(handles[2], try pool.getOrPutString(pool.gpa, "gamma"));
-    try std.testing.expectEqual(handles[0], try pool.getOrPutString(pool.gpa, "alpha"));
-    try std.testing.expectEqual(handles[4], try pool.getOrPutString(pool.gpa, "epsilon"));
+    try std.testing.expectEqual(handles[2], try pool.getOrPutString(pool.gpa, "gamma", .no_embedded_nulls));
+    try std.testing.expectEqual(handles[0], try pool.getOrPutString(pool.gpa, "alpha", .no_embedded_nulls));
+    try std.testing.expectEqual(handles[4], try pool.getOrPutString(pool.gpa, "epsilon", .no_embedded_nulls));
 }
 
 test "Nav: createNav appends with analysis = null and resolved = null" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const name = try pool.getOrPutString(pool.gpa, "foo");
+    const name = try pool.getOrPutString(pool.gpa, "foo", .no_embedded_nulls);
     const fqn = name;
     const idx = try pool.createNav(pool.gpa, name, fqn);
 
@@ -4940,7 +5079,7 @@ test "Nav: navPtr lets bindDecls populate Resolved in place" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const name = try pool.getOrPutString(pool.gpa, "answer");
+    const name = try pool.getOrPutString(pool.gpa, "answer", .no_embedded_nulls);
     const idx = try pool.createNav(pool.gpa, name, name);
 
     pool.navPtr(idx).resolved = .{
@@ -4966,7 +5105,7 @@ test "Nav: createNav allocates a fresh handle each call (no dedup)" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const name = try pool.getOrPutString(pool.gpa, "x");
+    const name = try pool.getOrPutString(pool.gpa, "x", .no_embedded_nulls);
     const first = try pool.createNav(pool.gpa, name, name);
     const second = try pool.createNav(pool.gpa, name, name);
     try std.testing.expect(first != second);
@@ -4997,7 +5136,7 @@ test "fullyQualifiedName: a root-namespace decl qualifies under the session root
     defer pool.deinit();
 
     const ns = try pool.createNamespace(pool.gpa, .none);
-    const name = try pool.getOrPutString(pool.gpa, "P");
+    const name = try pool.getOrPutString(pool.gpa, "P", .no_embedded_nulls);
     const fqn = try pool.fullyQualifiedName(pool.gpa, ns, name);
     try std.testing.expectEqualStrings("repl.P", pool.stringSlice(fqn));
 }
@@ -5007,7 +5146,7 @@ test "fullyQualifiedName: a member of a named container nests under it" {
     defer pool.deinit();
 
     const outer = try pool.getDeclaredStructType(
-        try pool.getOrPutString(pool.gpa, "repl.Outer"),
+        try pool.getOrPutString(pool.gpa, "repl.Outer", .no_embedded_nulls),
         .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(1) } },
         .none,
         0,
@@ -5018,7 +5157,7 @@ test "fullyQualifiedName: a member of a named container nests under it" {
     const ns = try pool.createNamespace(pool.gpa, .none);
     pool.namespacePtr(ns).owner_type = outer;
 
-    const inner = try pool.getOrPutString(pool.gpa, "Inner");
+    const inner = try pool.getOrPutString(pool.gpa, "Inner", .no_embedded_nulls);
     const fqn = try pool.fullyQualifiedName(pool.gpa, ns, inner);
     try std.testing.expectEqualStrings("repl.Outer.Inner", pool.stringSlice(fqn));
 }
@@ -5027,8 +5166,8 @@ test "Namespace: NavNameContext dedups Nav.Index entries by interned name" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const x = try pool.getOrPutString(pool.gpa, "x");
-    const y = try pool.getOrPutString(pool.gpa, "y");
+    const x = try pool.getOrPutString(pool.gpa, "x", .no_embedded_nulls);
+    const y = try pool.getOrPutString(pool.gpa, "y", .no_embedded_nulls);
     const first_x = try pool.createNav(pool.gpa, x, x);
     const second_x = try pool.createNav(pool.gpa, x, x);
     const just_y = try pool.createNav(pool.gpa, y, y);
@@ -5053,7 +5192,7 @@ test "Namespace: NameAdapter looks up Nav.Index by interned name" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const x = try pool.getOrPutString(pool.gpa, "x");
+    const x = try pool.getOrPutString(pool.gpa, "x", .no_embedded_nulls);
     const nav_x = try pool.createNav(pool.gpa, x, x);
 
     const ns_idx = try pool.createNamespace(pool.gpa, .none);
@@ -5065,7 +5204,7 @@ test "Namespace: NameAdapter looks up Nav.Index by interned name" {
     const found_x = ns.pub_decls.getKeyAdapted(x, adapter);
     try std.testing.expectEqual(@as(?Nav.Index, nav_x), found_x);
 
-    const missing = try pool.getOrPutString(pool.gpa, "missing");
+    const missing = try pool.getOrPutString(pool.gpa, "missing", .no_embedded_nulls);
     try std.testing.expectEqual(@as(?Nav.Index, null), ns.pub_decls.getKeyAdapted(missing, adapter));
 }
 
@@ -5073,9 +5212,9 @@ test "Namespace.lookupNav: walks pub_decls then priv_decls, no parent chain" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const x = try pool.getOrPutString(pool.gpa, "x");
-    const y = try pool.getOrPutString(pool.gpa, "y");
-    const missing = try pool.getOrPutString(pool.gpa, "z");
+    const x = try pool.getOrPutString(pool.gpa, "x", .no_embedded_nulls);
+    const y = try pool.getOrPutString(pool.gpa, "y", .no_embedded_nulls);
+    const missing = try pool.getOrPutString(pool.gpa, "z", .no_embedded_nulls);
     const nav_x = try pool.createNav(pool.gpa, x, x);
     const nav_y = try pool.createNav(pool.gpa, y, y);
 
@@ -5094,7 +5233,7 @@ test "Namespace.lookupNav: pub_decls takes precedence over priv_decls" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const x = try pool.getOrPutString(pool.gpa, "x");
+    const x = try pool.getOrPutString(pool.gpa, "x", .no_embedded_nulls);
     const nav_pub = try pool.createNav(pool.gpa, x, x);
     const nav_priv = try pool.createNav(pool.gpa, x, x);
 
@@ -5111,9 +5250,9 @@ test "error_set_type: round-trip + sort discipline" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const foo = try pool.getOrPutString(pool.gpa, "Foo");
-    const bar = try pool.getOrPutString(pool.gpa, "Bar");
-    const baz = try pool.getOrPutString(pool.gpa, "Baz");
+    const foo = try pool.getOrPutString(pool.gpa, "Foo", .no_embedded_nulls);
+    const bar = try pool.getOrPutString(pool.gpa, "Bar", .no_embedded_nulls);
+    const baz = try pool.getOrPutString(pool.gpa, "Baz", .no_embedded_nulls);
 
     const idx_a = try pool.internErrorSetType(&.{ baz, foo, bar });
     const idx_b = try pool.internErrorSetType(&.{ foo, bar, baz });
@@ -5129,9 +5268,9 @@ test "error_set_type: distinct membership produces distinct indices" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const foo = try pool.getOrPutString(pool.gpa, "Foo");
-    const bar = try pool.getOrPutString(pool.gpa, "Bar");
-    const baz = try pool.getOrPutString(pool.gpa, "Baz");
+    const foo = try pool.getOrPutString(pool.gpa, "Foo", .no_embedded_nulls);
+    const bar = try pool.getOrPutString(pool.gpa, "Bar", .no_embedded_nulls);
+    const baz = try pool.getOrPutString(pool.gpa, "Baz", .no_embedded_nulls);
 
     const fb = try pool.internErrorSetType(&.{ foo, bar });
     const fz = try pool.internErrorSetType(&.{ foo, baz });
@@ -5142,7 +5281,7 @@ test "singletonErrorSetType: one-name set round-trips" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const foo = try pool.getOrPutString(pool.gpa, "Foo");
+    const foo = try pool.getOrPutString(pool.gpa, "Foo", .no_embedded_nulls);
     const idx = try pool.singletonErrorSetType(foo);
 
     const round = pool.indexToKey(idx).error_set_type;
@@ -5154,7 +5293,7 @@ test "internErr: same {ty, name} dedups" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const foo = try pool.getOrPutString(pool.gpa, "Foo");
+    const foo = try pool.getOrPutString(pool.gpa, "Foo", .no_embedded_nulls);
     const ty = try pool.singletonErrorSetType(foo);
     const a = try pool.internErr(.{ .ty = ty, .name = foo });
     const b = try pool.internErr(.{ .ty = ty, .name = foo });
@@ -5169,7 +5308,7 @@ test "error_union_type: round-trip + dedup by (error_set, payload)" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const bad = try pool.getOrPutString(pool.gpa, "Bad");
+    const bad = try pool.getOrPutString(pool.gpa, "Bad", .no_embedded_nulls);
     const es = try pool.singletonErrorSetType(bad);
 
     const eu_a = try pool.internErrorUnionType(.{ .error_set_type = es, .payload_type = .u32_type });
@@ -5188,7 +5327,7 @@ test "error_union value: both arms round-trip and dedup independently" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const bad = try pool.getOrPutString(pool.gpa, "Bad");
+    const bad = try pool.getOrPutString(pool.gpa, "Bad", .no_embedded_nulls);
     const es = try pool.singletonErrorSetType(bad);
     const eu_ty = try pool.internErrorUnionType(.{ .error_set_type = es, .payload_type = .u32_type });
 

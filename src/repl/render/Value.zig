@@ -134,7 +134,7 @@ fn renderAggregate(
         .vector_type => |vt| vt.len,
         else => switch (agg.storage) {
             .elems => |es| es.len,
-            .repeated_elem => pool.aggregateElementCount(agg.ty),
+            .bytes, .repeated_elem => pool.aggregateElementCount(agg.ty),
         },
     };
     var i: u64 = 0;
@@ -144,11 +144,7 @@ fn renderAggregate(
             if (structFieldName(pool, session.?, agg.ty, @intCast(i))) |name|
                 try writer.print(".{s} = ", .{name});
         }
-        const elem_idx: InternPool.Index = switch (agg.storage) {
-            .repeated_elem => |e| e,
-            .elems => |es| es[@intCast(i)],
-        };
-        try render(.{ .index = elem_idx }, pool, session, writer);
+        try render(.{ .index = try pool.aggregateElementAt(agg, i) }, pool, session, writer);
     }
     try writer.writeAll(" }");
 }
@@ -194,40 +190,41 @@ fn byteValue(pool: *const InternPool, elem: InternPool.Index) ?u8 {
     return @intCast(v);
 }
 
-fn aggElem(agg: InternPool.Key.Aggregate, i: u64) InternPool.Index {
-    return switch (agg.storage) {
-        .repeated_elem => |e| e,
-        .elems => |es| es[@intCast(i)],
-    };
-}
-
 /// Whether an interned value is the `.ref` (pointer to the array) or `.value`
 /// (the array itself) form of a bytes container -- the compiler's `is_ref`
 /// distinction, which decides the trailing `.*` (src/print_value.zig
 /// printAggregate).
 const BytesForm = enum { ref, value };
 
-/// Render aggregate `agg` as a quoted Zig string when it is an all-concrete-byte
-/// `[N]u8` array, stripping one trailing `0` as the compiler does, appending `.*`
-/// for the `.value` form. Returns false without writing otherwise, so the caller
-/// renders positionally. The REPL interns each byte as its own `u8` slot rather
-/// than the compiler's packed `.bytes` storage, so string form keys on the
-/// element type and concreteness: a single `undefined` element falls back to the
-/// positional `{ ... }`, mirroring that `.bytes` cannot encode undef.
-fn renderBytes(pool: *const InternPool, writer: *std.Io.Writer, agg: InternPool.Key.Aggregate, form: BytesForm) Error!bool {
+/// Render aggregate `agg` as a quoted Zig string when it is a `[N]u8` array,
+/// appending `.*` for the `.value` form. `.bytes` storage is the concrete byte
+/// run and always qualifies; the element storage forms qualify only when every
+/// element is a concrete `u8` (a single `undefined` element, which `.bytes`
+/// cannot encode, falls back to the positional `{ ... }`). Returns false without
+/// writing otherwise, so the caller renders positionally.
+fn renderBytes(pool: *InternPool, writer: *std.Io.Writer, agg: InternPool.Key.Aggregate, form: BytesForm) Error!bool {
     const ty_key = pool.indexToKey(agg.ty);
     if (ty_key != .array_type or ty_key.array_type.child != .u8_type) return false;
     const count = ty_key.array_type.len;
-    var i: u64 = 0;
-    while (i < count) : (i += 1) {
-        if (byteValue(pool, aggElem(agg, i)) == null) return false;
+    switch (agg.storage) {
+        .bytes => |bytes| {
+            try writer.writeByte('"');
+            try std.zig.stringEscape(bytes.toSlice(count, pool), writer);
+            try writer.writeByte('"');
+        },
+        .elems, .repeated_elem => {
+            var i: u64 = 0;
+            while (i < count) : (i += 1) {
+                if (byteValue(pool, try pool.aggregateElementAt(agg, i)) == null) return false;
+            }
+            try writer.writeByte('"');
+            i = 0;
+            while (i < count) : (i += 1) {
+                try std.zig.stringEscape(&.{byteValue(pool, try pool.aggregateElementAt(agg, i)).?}, writer);
+            }
+            try writer.writeByte('"');
+        },
     }
-    try writer.writeByte('"');
-    i = 0;
-    while (i < count) : (i += 1) {
-        try std.zig.stringEscape(&.{byteValue(pool, aggElem(agg, i)).?}, writer);
-    }
-    try writer.writeByte('"');
     if (form == .value) try writer.writeAll(".*");
     return true;
 }
@@ -263,6 +260,7 @@ fn renderIndexable(pool: *InternPool, session: ?*const Session, writer: *std.Io.
     const agg = pool.indexToKey(backing.array).aggregate;
     const total: u64 = switch (agg.storage) {
         .elems => |es| es.len,
+        .bytes => pool.aggregateElementCount(agg.ty),
         .repeated_elem => std.math.maxInt(u64),
     };
     if (backing.start + len > total) return false;
@@ -270,12 +268,12 @@ fn renderIndexable(pool: *InternPool, session: ?*const Session, writer: *std.Io.
     if (child == .u8_type) bytes: {
         var i: u64 = 0;
         while (i < len) : (i += 1) {
-            if (byteValue(pool, aggElem(agg, backing.start + i)) == null) break :bytes;
+            if (byteValue(pool, try pool.aggregateElementAt(agg, backing.start + i)) == null) break :bytes;
         }
         try writer.writeByte('"');
         i = 0;
         while (i < len) : (i += 1) {
-            try std.zig.stringEscape(&.{byteValue(pool, aggElem(agg, backing.start + i)).?}, writer);
+            try std.zig.stringEscape(&.{byteValue(pool, try pool.aggregateElementAt(agg, backing.start + i)).?}, writer);
         }
         try writer.writeByte('"');
         return true;
@@ -285,7 +283,7 @@ fn renderIndexable(pool: *InternPool, session: ?*const Session, writer: *std.Io.
     var i: u64 = 0;
     while (i < len) : (i += 1) {
         if (i > 0) try writer.writeAll(", ");
-        try render(.{ .index = aggElem(agg, backing.start + i) }, pool, session, writer);
+        try render(.{ .index = try pool.aggregateElementAt(agg, backing.start + i) }, pool, session, writer);
     }
     try writer.writeAll(" }");
     return true;
