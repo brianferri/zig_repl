@@ -253,33 +253,7 @@ pub fn print(val: Value, pool: *const InternPool, writer: *std.Io.Writer) std.Io
 }
 
 pub fn typeOf(val: Value, pool: *const InternPool) Type {
-    const key = pool.indexToKey(val.index);
-    return switch (key) {
-        .simple_value => |sv| switch (sv) {
-            .void => .void_type,
-            .true, .false => .bool_type,
-            .null => .{ .index = .null_type },
-            .@"unreachable" => .{ .index = .noreturn_type },
-        },
-        .int => |iv| .{ .index = iv.ty },
-        .float => |fv| .{ .index = fv.ty },
-        .undef => |ty| .{ .index = ty },
-        .ptr => |p| .{ .index = p.ty },
-        .slice => |s| .{ .index = s.ty },
-        .err => |e| .{ .index = e.ty },
-        .error_union => |eu| .{ .index = eu.ty },
-        .func => |f| .{ .index = f.ty },
-        .opt => |o| .{ .index = o.ty },
-        .aggregate => |agg| .{ .index = agg.ty },
-        .enum_tag => |et| .{ .index = et.ty },
-        .enum_literal => .{ .index = .enum_literal_type },
-        .un => |uv| .{ .index = uv.ty },
-        .bitpack => |bp| .{ .index = bp.ty },
-        else => blk: {
-            assert(key.isType());
-            break :blk .type_type;
-        },
-    };
+    return .fromIndex(pool.typeOf(val.index));
 }
 
 pub fn errorUnionIsPayload(val: Value, pool: *const InternPool) bool {

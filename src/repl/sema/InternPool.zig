@@ -4237,6 +4237,224 @@ fn isFloatType(ty: Index) bool {
     };
 }
 
+pub fn typeOf(pool: *const InternPool, val: Index) Index {
+    return switch (pool.indexToKey(val)) {
+        .simple_value => |sv| switch (sv) {
+            .void => .void_type,
+            .true, .false => .bool_type,
+            .null => .null_type,
+            .@"unreachable" => .noreturn_type,
+        },
+        .int => |iv| iv.ty,
+        .float => |fv| fv.ty,
+        .undef => |ty| ty,
+        .ptr => |p| p.ty,
+        .slice => |s| s.ty,
+        .err => |e| e.ty,
+        .error_union => |eu| eu.ty,
+        .func => |f| f.ty,
+        .opt => |o| o.ty,
+        .aggregate => |agg| agg.ty,
+        .enum_tag => |et| et.ty,
+        .enum_literal => .enum_literal_type,
+        .un => |uv| uv.ty,
+        .bitpack => |bp| bp.ty,
+        else => |k| blk: {
+            assert(k.isType());
+            break :blk .type_type;
+        },
+    };
+}
+
+pub fn isOptionalType(pool: *const InternPool, ty: Index) bool {
+    return pool.indexToKey(ty) == .opt_type;
+}
+
+pub fn isPointerType(pool: *const InternPool, ty: Index) bool {
+    return pool.indexToKey(ty) == .ptr_type;
+}
+
+pub fn isErrorSetType(pool: *const InternPool, ty: Index) bool {
+    return switch (ty) {
+        .anyerror_type, .adhoc_inferred_error_set_type => true,
+        else => pool.indexToKey(ty) == .error_set_type,
+    };
+}
+
+pub fn isErrorUnionType(pool: *const InternPool, ty: Index) bool {
+    return pool.indexToKey(ty) == .error_union_type;
+}
+
+pub fn slicePtrType(pool: *InternPool, index: Index) Allocator.Error!Index {
+    const p = pool.indexToKey(index).ptr_type;
+    var flags = p.flags;
+    flags.size = .many;
+    return pool.internPtrType(.{ .child = p.child, .sentinel = p.sentinel, .flags = flags, .packed_offset = p.packed_offset });
+}
+
+pub fn getCoercedInts(pool: *InternPool, int: Key.Int, new_ty: Index) Allocator.Error!Index {
+    return pool.get(.{ .int = .{ .ty = new_ty, .storage = int.storage } });
+}
+
+pub fn getCoerced(pool: *InternPool, val: Index, new_ty: Index) Allocator.Error!Index {
+    const old_ty = pool.typeOf(val);
+    if (old_ty == new_ty) return val;
+
+    switch (val) {
+        .undef => return pool.get(.{ .undef = new_ty }),
+        .null_value => {
+            if (pool.isOptionalType(new_ty)) return pool.get(.{ .opt = .{ .ty = new_ty, .val = .none } });
+            if (pool.isPointerType(new_ty)) switch (pool.indexToKey(new_ty).ptr_type.flags.size) {
+                .one, .many, .c => return pool.get(.{ .ptr = .{ .ty = new_ty, .base_addr = .int, .byte_offset = 0 } }),
+                .slice => return pool.get(.{ .slice = .{
+                    .ty = new_ty,
+                    .ptr = try pool.get(.{ .ptr = .{ .ty = try pool.slicePtrType(new_ty), .base_addr = .int, .byte_offset = 0 } }),
+                    .len = .undef_usize,
+                } }),
+            };
+        },
+        else => {},
+    }
+
+    switch (pool.indexToKey(val)) {
+        .undef => return pool.get(.{ .undef = new_ty }),
+        .func => unreachable,
+
+        .int => |int| switch (pool.indexToKey(new_ty)) {
+            .enum_type => return pool.get(.{ .enum_tag = .{
+                .ty = new_ty,
+                .int = try pool.getCoerced(val, pool.loadEnumType(new_ty).int_tag_type),
+            } }),
+            .ptr_type => switch (int.storage) {
+                inline .u64, .i64 => |int_val| return pool.get(.{ .ptr = .{ .ty = new_ty, .base_addr = .int, .byte_offset = @intCast(int_val) } }),
+                .big_int => unreachable,
+            },
+            else => if (pool.isIntegerType(new_ty)) return pool.getCoercedInts(int, new_ty),
+        },
+        .float => |float| switch (pool.indexToKey(new_ty)) {
+            .simple_type => |simple| switch (simple) {
+                .f16, .f32, .f64, .f80, .f128, .c_longdouble, .comptime_float => return pool.get(.{ .float = .{ .ty = new_ty, .storage = float.storage } }),
+                else => {},
+            },
+            else => {},
+        },
+        .enum_tag => |enum_tag| if (pool.isIntegerType(new_ty)) return pool.getCoercedInts(pool.indexToKey(enum_tag.int).int, new_ty),
+        .enum_literal => |enum_literal| switch (pool.indexToKey(new_ty)) {
+            .enum_type => {
+                const enum_type = pool.loadEnumType(new_ty);
+                const index = enum_type.nameIndex(pool, enum_literal).?;
+                return pool.get(.{ .enum_tag = .{
+                    .ty = new_ty,
+                    .int = if (enum_type.field_values.len != 0)
+                        enum_type.field_values[index]
+                    else
+                        try pool.get(.{ .int = .{ .ty = enum_type.int_tag_type, .storage = .{ .u64 = index } } }),
+                } });
+            },
+            else => {},
+        },
+        .slice => |slice| if (pool.isPointerType(new_ty) and pool.indexToKey(new_ty).ptr_type.flags.size == .slice)
+            return pool.get(.{ .slice = .{
+                .ty = new_ty,
+                .ptr = try pool.getCoerced(slice.ptr, try pool.slicePtrType(new_ty)),
+                .len = slice.len,
+            } })
+        else if (pool.isIntegerType(new_ty))
+            return pool.getCoerced(slice.ptr, new_ty),
+        .ptr => |ptr| if (pool.isPointerType(new_ty) and pool.indexToKey(new_ty).ptr_type.flags.size != .slice)
+            return pool.get(.{ .ptr = .{ .ty = new_ty, .base_addr = ptr.base_addr, .byte_offset = ptr.byte_offset } })
+        else if (pool.isIntegerType(new_ty)) switch (ptr.base_addr) {
+            .int => return pool.get(.{ .int = .{ .ty = .usize_type, .storage = .{ .u64 = @intCast(ptr.byte_offset) } } }),
+            else => {},
+        },
+        .opt => |opt| switch (pool.indexToKey(new_ty)) {
+            .ptr_type => |ptr_type| return switch (opt.val) {
+                .none => switch (ptr_type.flags.size) {
+                    .one, .many, .c => try pool.get(.{ .ptr = .{ .ty = new_ty, .base_addr = .int, .byte_offset = 0 } }),
+                    .slice => try pool.get(.{ .slice = .{
+                        .ty = new_ty,
+                        .ptr = try pool.get(.{ .ptr = .{ .ty = try pool.slicePtrType(new_ty), .base_addr = .int, .byte_offset = 0 } }),
+                        .len = .undef_usize,
+                    } }),
+                },
+                else => try pool.getCoerced(opt.val, new_ty),
+            },
+            .opt_type => |child_type| return pool.get(.{ .opt = .{
+                .ty = new_ty,
+                .val = switch (opt.val) {
+                    .none => .none,
+                    else => try pool.getCoerced(opt.val, child_type),
+                },
+            } }),
+            else => {},
+        },
+        .err => |err| if (pool.isErrorSetType(new_ty))
+            return pool.get(.{ .err = .{ .ty = new_ty, .name = err.name } })
+        else if (pool.isErrorUnionType(new_ty))
+            return pool.get(.{ .error_union = .{ .ty = new_ty, .val = .{ .err_name = err.name } } }),
+        .error_union => |error_union| if (pool.isErrorUnionType(new_ty))
+            return pool.get(.{ .error_union = .{ .ty = new_ty, .val = error_union.val } }),
+        .aggregate => |aggregate| {
+            const new_len: usize = @intCast(pool.aggregateElementCount(new_ty));
+            direct: {
+                const old_ty_child = switch (pool.indexToKey(old_ty)) {
+                    inline .array_type, .vector_type => |seq_type| seq_type.child,
+                    .tuple_type, .struct_type => break :direct,
+                    else => unreachable,
+                };
+                const new_ty_child = switch (pool.indexToKey(new_ty)) {
+                    inline .array_type, .vector_type => |seq_type| seq_type.child,
+                    .tuple_type, .struct_type => break :direct,
+                    else => unreachable,
+                };
+                if (old_ty_child != new_ty_child) break :direct;
+                switch (aggregate.storage) {
+                    .elems => |elems| {
+                        const elems_copy = try pool.gpa.dupe(Index, elems[0..new_len]);
+                        defer pool.gpa.free(elems_copy);
+                        return pool.get(.{ .aggregate = .{ .ty = new_ty, .storage = .{ .elems = elems_copy } } });
+                    },
+                    .repeated_elem => |elem| return pool.get(.{ .aggregate = .{ .ty = new_ty, .storage = .{ .repeated_elem = elem } } }),
+                }
+            }
+            const agg_elems = try pool.gpa.alloc(Index, new_len);
+            defer pool.gpa.free(agg_elems);
+            switch (aggregate.storage) {
+                .elems => |elems| @memcpy(agg_elems, elems[0..new_len]),
+                .repeated_elem => |elem| @memset(agg_elems, elem),
+            }
+            for (agg_elems, 0..) |*elem, i| {
+                const new_elem_ty = switch (pool.indexToKey(new_ty)) {
+                    inline .array_type, .vector_type => |seq_type| seq_type.child,
+                    .tuple_type => |tuple_type| tuple_type.types[i],
+                    .struct_type => pool.loadStructType(new_ty).field_types[i],
+                    else => unreachable,
+                };
+                elem.* = try pool.getCoerced(elem.*, new_elem_ty);
+            }
+            return pool.get(.{ .aggregate = .{ .ty = new_ty, .storage = .{ .elems = agg_elems } } });
+        },
+        else => {},
+    }
+
+    switch (pool.indexToKey(new_ty)) {
+        .opt_type => |child_type| switch (val) {
+            .null_value => return pool.get(.{ .opt = .{ .ty = new_ty, .val = .none } }),
+            else => return pool.get(.{ .opt = .{ .ty = new_ty, .val = try pool.getCoerced(val, child_type) } }),
+        },
+        .error_union_type => |error_union_type| return pool.get(.{ .error_union = .{
+            .ty = new_ty,
+            .val = .{ .payload = try pool.getCoerced(val, error_union_type.payload_type) },
+        } }),
+        else => {},
+    }
+    std.debug.panic("InternPool.getCoerced of {s} not implemented from {s} to {s}", .{
+        @tagName(pool.indexToKey(val)),
+        @tagName(pool.indexToKey(old_ty)),
+        @tagName(pool.indexToKey(new_ty)),
+    });
+}
+
 fn isIntegerType(pool: *const InternPool, ty: Index) bool {
     return switch (ty) {
         .comptime_int_type,

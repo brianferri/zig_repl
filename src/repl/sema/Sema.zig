@@ -1242,9 +1242,11 @@ fn resolvePeerTypesInner(sema: *Sema, peer_tys: []?Type, peer_vals: []?Value) Er
                 ptr_info.child = ((try sema.resolvePairInMemoryCoercible(.fromIndex(ptr_info.child), .fromIndex(peer_info.child))) orelse {
                     return .{ .conflict = .{ .peer_idx_a = first_idx, .peer_idx_b = i } };
                 }).index;
-                // The compiler coerces both sentinels to the child via getCoerced; the REPL lacks it, so
-                // compare the interned sentinels directly (correct when they share a type).
-                if (ptr_info.sentinel != .none and peer_info.sentinel != .none and ptr_info.sentinel == peer_info.sentinel) {} else {
+                if (ptr_info.sentinel != .none and peer_info.sentinel != .none) {
+                    const peer_sent = try ip.getCoerced(ptr_info.sentinel, ptr_info.child);
+                    const ptr_sent = try ip.getCoerced(peer_info.sentinel, ptr_info.child);
+                    ptr_info.sentinel = if (ptr_sent == peer_sent) ptr_sent else .none;
+                } else {
                     ptr_info.sentinel = .none;
                 }
                 ptr_info.flags.alignment = a: {
@@ -1448,18 +1450,26 @@ fn resolvePeerTypesInner(sema: *Sema, peer_tys: []?Type, peer_vals: []?Value) Er
                     }
                 }
 
+                const sentinel_ty = switch (ptr_info.flags.size) {
+                    .one => switch (ip.indexToKey(ptr_info.child)) {
+                        .array_type => |array_type| array_type.child,
+                        else => ptr_info.child,
+                    },
+                    .many, .slice, .c => ptr_info.child,
+                };
+
                 sentinel: {
                     no_sentinel: {
                         if (peer_sentinel == .none) break :no_sentinel;
                         if (cur_sentinel == .none) break :no_sentinel;
-                        // The compiler coerces both sentinels via getCoerced before comparing; the REPL
-                        // lacks it, so compare the interned sentinels directly (correct when same-typed).
-                        if (peer_sentinel != cur_sentinel) break :no_sentinel;
+                        const peer_sent_coerced = try ip.getCoerced(peer_sentinel, sentinel_ty);
+                        const cur_sent_coerced = try ip.getCoerced(cur_sentinel, sentinel_ty);
+                        if (peer_sent_coerced != cur_sent_coerced) break :no_sentinel;
                         if (ptr_info.flags.size == .one) switch (ip.indexToKey(ptr_info.child)) {
-                            .array_type => |array_type| ptr_info.child = try ip.internArrayType(.{ .len = array_type.len, .child = array_type.child, .sentinel = cur_sentinel }),
+                            .array_type => |array_type| ptr_info.child = try ip.internArrayType(.{ .len = array_type.len, .child = array_type.child, .sentinel = cur_sent_coerced }),
                             else => unreachable,
                         } else {
-                            ptr_info.sentinel = cur_sentinel;
+                            ptr_info.sentinel = cur_sent_coerced;
                         }
                         break :sentinel;
                     }
