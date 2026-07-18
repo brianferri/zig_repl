@@ -6753,6 +6753,12 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
                 return .{ .index = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = at.len } }) };
             return sema.failNoMember(inner_ty, name);
         },
+        .tuple_type => |tuple| {
+            if (name.eqlSlice("len", ip))
+                return .{ .index = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = tuple.types.len } }) };
+            const field_index = try sema.tupleFieldIndex(inner_ty, name);
+            return .{ .index = InternPool.aggregateElementAt(ip.indexToKey(inner.index).aggregate, field_index) };
+        },
         .struct_type => {
             const fld = (try sema.structFieldByName(inner_ty, name)) orelse
                 return sema.failBadStructFieldAccess(inner_ty, name);
@@ -6810,7 +6816,6 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
         .vector_type,
         .opt_type,
         .opt,
-        .tuple_type,
         .enum_type,
         .opaque_type,
         .aggregate,
@@ -6823,6 +6828,18 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
 
 fn failNoMember(sema: *Sema, ty: InternPool.Index, name: InternPool.NullTerminatedString) Error {
     return sema.fail(sema.block, sema.block.nodeOffset(.zero), "no member named '{s}' in '{f}'", .{ sema.intern_pool.stringSlice(name), Type.fromIndex(ty).fmt(sema.intern_pool) });
+}
+
+/// The numeric index of a tuple field named `field_name` (e.g. `@"0"`); errors otherwise.
+/// `.len` is handled by the caller. Mirrors the compiler's `tupleFieldIndex`.
+fn tupleFieldIndex(sema: *Sema, tuple_ty: InternPool.Index, field_name: InternPool.NullTerminatedString) Error!u32 {
+    const ip = sema.intern_pool;
+    assert(!field_name.eqlSlice("len", ip));
+    if (field_name.toUnsigned(ip)) |field_index| {
+        if (field_index < ip.indexToKey(tuple_ty).tuple_type.types.len) return field_index;
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index '{s}' out of bounds of tuple '{f}'", .{ ip.stringSlice(field_name), Type.fromIndex(tuple_ty).fmt(ip) });
+    }
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "no field named '{s}' in tuple '{f}'", .{ ip.stringSlice(field_name), Type.fromIndex(tuple_ty).fmt(ip) });
 }
 
 fn evalFieldPtrNamedLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
