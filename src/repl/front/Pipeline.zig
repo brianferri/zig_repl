@@ -130,7 +130,7 @@ pub fn runWithInjection(
     // diagnostic paths handle it rather than the input trapping the host.
     if (exceedsNestingDepth(wrapped.text)) return error.ParseError;
 
-    var tree = try std.zig.Ast.parse(gpa, wrapped.text, .zig);
+    var tree = try std.zig.Ast.parse(gpa, wrapped.text, .{ .mode = .zig });
     errdefer tree.deinit(gpa);
 
     var zir = try std.zig.AstGen.generate(gpa, tree);

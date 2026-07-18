@@ -106,11 +106,10 @@ test "fuzz: the evaluator survives arbitrary zig source" {
 
 fn fuzzEval(_: void, smith: *std.testing.Smith) anyerror!void {
     const gpa = std.testing.allocator;
-    const ast_smith = try gpa.create(std.zig.AstSmith);
-    defer gpa.destroy(ast_smith);
-    ast_smith.* = .init(smith);
-    ast_smith.generateSource() catch return;
-    const src = ast_smith.source();
+    const token_smith = try gpa.create(std.zig.TokenSmith);
+    defer gpa.destroy(token_smith);
+    token_smith.* = .gen(smith);
+    const src = token_smith.source();
     if (src.len == 0) return; // eval.run requires non-empty input (the REPL never feeds it a blank line)
     const out = replRun(gpa, &.{src}) catch return;
     gpa.free(out);
