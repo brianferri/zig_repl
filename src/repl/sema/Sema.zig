@@ -6392,7 +6392,6 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
         ip.indexToKey(object_ty).ptr_type.flags.size == .one;
     const container_ty = if (is_pointer_to) ip.indexToKey(object_ty).ptr_type.child else object_ty;
     const base_ptr = if (is_pointer_to) try sema.loadValue(object_ptr) else object_ptr;
-    const attr_ptr_ty = if (is_pointer_to) object_ty else parent_ty;
 
     if (container_ty == .type_type) {
         const container = try sema.loadValue(base_ptr);
@@ -6416,12 +6415,10 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
         else => {},
     }
 
-    const fld: FieldInfo = switch (ip.indexToKey(container_ty)) {
-        .union_type => blk: {
-            const f = (try sema.unionFieldByName(container_ty, name)) orelse
-                return sema.failBadUnionFieldAccess(container_ty, name);
-            if (!initializing) _ = try sema.loadUnionField((try sema.loadValue(base_ptr)).index, f.index);
-            break :blk f;
+    switch (ip.indexToKey(container_ty)) {
+        .union_type => {
+            try sema.ensureLayoutResolved(container_ty);
+            return try sema.unionFieldPtr(base_ptr, name, .fromIndex(container_ty), initializing);
         },
         .struct_type => {
             const f = (try sema.structFieldByName(container_ty, name)) orelse
@@ -6432,21 +6429,7 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
         else => {
             return sema.fail(sema.block, sema.block.nodeOffset(.zero), "type '{f}' does not support field access", .{Type.fromIndex(container_ty).fmt(ip)});
         },
-    };
-    // A union field pointer (the compiler's unionFieldPtr); structs/tuples went through structFieldPtrByIndex.
-    const field_ty = if (fld.ty != .none) fld.ty else blk: {
-        const agg = ip.indexToKey((try sema.loadValue(base_ptr)).index).aggregate;
-        break :blk Value.typeOf(.{ .index = InternPool.aggregateElementAt(agg, fld.index) }, ip).index;
-    };
-    const field_ptr_ty = try ip.internPtrType(.{
-        .child = field_ty,
-        .flags = .{ .size = .one, .is_const = ip.indexToKey(attr_ptr_ty).ptr_type.flags.is_const },
-    });
-    return .{ .index = try ip.internPtr(.{
-        .ty = field_ptr_ty,
-        .base_addr = .{ .field = .{ .base = base_ptr.index, .index = fld.index } },
-        .byte_offset = 0,
-    }) };
+    }
 }
 
 const ContainerNamespace = struct { source_zir_id: u32, decl_inst: Zir.Inst.Index };
@@ -7316,6 +7299,27 @@ fn evalArrayInitElemPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const extra = sema.zir.extraData(Zir.Inst.ElemPtrImm, datas[@intFromEnum(inst)].pl_node.payload_index).data;
     const array_ptr = try sema.resolveInst(extra.ptr);
     return try sema.elemPtr(array_ptr, extra.index);
+}
+
+fn unionFieldPtr(sema: *Sema, union_ptr: Value, field_name: InternPool.NullTerminatedString, union_ty: Type, comptime initializing: bool) Error!Value {
+    const ip = sema.intern_pool;
+    ip.assertLayoutResolved(union_ty.index);
+    const field = (try sema.unionFieldByName(union_ty.index, field_name)) orelse
+        return sema.failBadUnionFieldAccess(union_ty.index, field_name);
+
+    if (initializing and Type.fromIndex(field.ty).classify(ip) == .no_possible_value) {
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "cannot initialize union field with uninstantiable type '{f}'", .{Type.fromIndex(field.ty).fmt(ip)});
+    }
+
+    switch (union_ty.containerLayout(ip)) {
+        // Reading a union field asserts it is the active one; an initializing store sets the tag when the
+        // field pointer is written (storeElement), so no tag store is needed here.
+        .auto => if (!initializing) {
+            _ = try sema.loadUnionField((try sema.loadValue(union_ptr)).index, field.index);
+        },
+        .@"packed", .@"extern" => {},
+    }
+    return try union_ptr.ptrField(field.index, ip);
 }
 
 fn structFieldPtrByIndex(sema: *Sema, struct_ptr: Value, field_index: u32, struct_ty: Type) Error!Value {
