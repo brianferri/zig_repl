@@ -3550,6 +3550,7 @@ pub fn aggregateElementCount(pool: *const InternPool, ty: Index) u64 {
     assert(ty != .none);
     const key = pool.indexToKey(ty);
     return switch (key) {
+        .struct_type => pool.loadStructType(ty).field_types.len,
         .array_type => |at| at.lenIncludingSentinel(),
         .vector_type => |vt| vt.len,
         .tuple_type => |tt| tt.types.len,

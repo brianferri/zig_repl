@@ -3032,7 +3032,7 @@ fn evalByteSwap(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     if (bits % 8 != 0) {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@byteSwap requires the number of bits to be evenly divisible by 8, but '{f}' has {d} bits", .{ scalar_ty.fmt(ip), bits });
     }
-    return try sema.byteSwap(operand, operand_ty);
+    return try arith.byteSwap(sema, operand, operand_ty);
 }
 
 fn evalBitReverse(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
@@ -3041,73 +3041,7 @@ fn evalBitReverse(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand = try sema.resolveInst(un_node.operand);
     const operand_ty = operand.typeOf(ip);
     _ = try sema.checkIntOrVector(operand);
-    return try sema.bitReverse(operand, operand_ty);
-}
-
-fn byteSwap(sema: *Sema, val: Value, ty: Type) Error!Value {
-    const ip = sema.intern_pool;
-    if (ip.indexToKey(val.index) == .undef) return val;
-    switch (ty.zigTypeTag(ip)) {
-        .int => return sema.intByteSwap(val, ty),
-        .vector => {
-            const elem_ty = ty.childType(ip);
-            const len = ty.vectorLen(ip);
-            const elem_vals = try sema.arena.alloc(InternPool.Index, len);
-            for (elem_vals, 0..) |*result_elem, elem_idx| {
-                const elem_val = try val.elemValue(ip, elem_idx);
-                result_elem.* = if (ip.indexToKey(elem_val.index) == .undef)
-                    elem_val.index
-                else
-                    (try sema.intByteSwap(elem_val, elem_ty)).index;
-            }
-            return .{ .index = try ip.internAggregate(.{ .ty = ty.index, .storage = .{ .elems = elem_vals } }) };
-        },
-        else => unreachable,
-    }
-}
-
-fn bitReverse(sema: *Sema, val: Value, ty: Type) Error!Value {
-    const ip = sema.intern_pool;
-    if (ip.indexToKey(val.index) == .undef) return val;
-    switch (ty.zigTypeTag(ip)) {
-        .int => return sema.intBitReverse(val, ty),
-        .vector => {
-            const elem_ty = ty.childType(ip);
-            const len = ty.vectorLen(ip);
-            const elem_vals = try sema.arena.alloc(InternPool.Index, len);
-            for (elem_vals, 0..) |*result_elem, elem_idx| {
-                const elem_val = try val.elemValue(ip, elem_idx);
-                result_elem.* = if (ip.indexToKey(elem_val.index) == .undef)
-                    elem_val.index
-                else
-                    (try sema.intBitReverse(elem_val, elem_ty)).index;
-            }
-            return .{ .index = try ip.internAggregate(.{ .ty = ty.index, .storage = .{ .elems = elem_vals } }) };
-        },
-        else => unreachable,
-    }
-}
-
-fn intByteSwap(sema: *Sema, val: Value, ty: Type) Error!Value {
-    const ip = sema.intern_pool;
-    const info = ty.intInfo(ip);
-    var val_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const val_bigint = val.toBigInt(&val_space, ip);
-    const limbs = try sema.arena.alloc(std.math.big.Limb, std.math.big.int.calcTwosCompLimbCount(info.bits));
-    var result_bigint: BigIntMutable = .{ .limbs = limbs, .positive = undefined, .len = undefined };
-    result_bigint.byteSwap(val_bigint, info.signedness, @divExact(info.bits, 8));
-    return .{ .index = try ip.internIntValue(ty.index, result_bigint.toConst()) };
-}
-
-fn intBitReverse(sema: *Sema, val: Value, ty: Type) Error!Value {
-    const ip = sema.intern_pool;
-    const info = ty.intInfo(ip);
-    var val_space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-    const val_bigint = val.toBigInt(&val_space, ip);
-    const limbs = try sema.arena.alloc(std.math.big.Limb, std.math.big.int.calcTwosCompLimbCount(info.bits));
-    var result_bigint: BigIntMutable = .{ .limbs = limbs, .positive = undefined, .len = undefined };
-    result_bigint.bitReverse(val_bigint, info.signedness, info.bits);
-    return .{ .index = try ip.internIntValue(ty.index, result_bigint.toConst()) };
+    return try arith.bitReverse(sema, operand, operand_ty);
 }
 
 fn nextSyntheticAddress(sema: *Sema, align_bytes: u64, size: u64) u64 {

@@ -1322,6 +1322,73 @@ fn intBitwiseNot(sema: *Sema, val: Value, ty: Type) !Value {
     result_bigint.bitNotWrap(val_bigint, info.signedness, info.bits);
     return sema.intValue_big(ty, result_bigint.toConst());
 }
+
+pub fn byteSwap(sema: *Sema, val: Value, ty: Type) !Value {
+    const pool = sema.intern_pool;
+    if (pool.indexToKey(val.index) == .undef) return val;
+    switch (ty.zigTypeTag(pool)) {
+        .int => return intByteSwap(sema, val, ty),
+        .vector => {
+            const elem_ty = ty.childType(pool);
+            const len = ty.vectorLen(pool);
+            const elem_vals = try sema.arena.alloc(InternPool.Index, len);
+            for (elem_vals, 0..) |*result_elem, elem_idx| {
+                const elem_val = try val.elemValue(pool, elem_idx);
+                result_elem.* = if (pool.indexToKey(elem_val.index) == .undef)
+                    elem_val.index
+                else
+                    (try intByteSwap(sema, elem_val, elem_ty)).index;
+            }
+            return .{ .index = try pool.internAggregate(.{ .ty = ty.index, .storage = .{ .elems = elem_vals } }) };
+        },
+        else => unreachable,
+    }
+}
+
+pub fn bitReverse(sema: *Sema, val: Value, ty: Type) !Value {
+    const pool = sema.intern_pool;
+    if (pool.indexToKey(val.index) == .undef) return val;
+    switch (ty.zigTypeTag(pool)) {
+        .int => return intBitReverse(sema, val, ty),
+        .vector => {
+            const elem_ty = ty.childType(pool);
+            const len = ty.vectorLen(pool);
+            const elem_vals = try sema.arena.alloc(InternPool.Index, len);
+            for (elem_vals, 0..) |*result_elem, elem_idx| {
+                const elem_val = try val.elemValue(pool, elem_idx);
+                result_elem.* = if (pool.indexToKey(elem_val.index) == .undef)
+                    elem_val.index
+                else
+                    (try intBitReverse(sema, elem_val, elem_ty)).index;
+            }
+            return .{ .index = try pool.internAggregate(.{ .ty = ty.index, .storage = .{ .elems = elem_vals } }) };
+        },
+        else => unreachable,
+    }
+}
+
+fn intByteSwap(sema: *Sema, val: Value, ty: Type) !Value {
+    const pool = sema.intern_pool;
+    const info = ty.intInfo(pool);
+    var val_space: BigIntSpace = undefined;
+    const val_bigint = val.toBigInt(&val_space, pool);
+    const limbs = try sema.arena.alloc(Limb, std.math.big.int.calcTwosCompLimbCount(info.bits));
+    var result_bigint: BigIntMutable = .{ .limbs = limbs, .positive = undefined, .len = undefined };
+    result_bigint.byteSwap(val_bigint, info.signedness, @divExact(info.bits, 8));
+    return .{ .index = try pool.internIntValue(ty.index, result_bigint.toConst()) };
+}
+
+fn intBitReverse(sema: *Sema, val: Value, ty: Type) !Value {
+    const pool = sema.intern_pool;
+    const info = ty.intInfo(pool);
+    var val_space: BigIntSpace = undefined;
+    const val_bigint = val.toBigInt(&val_space, pool);
+    const limbs = try sema.arena.alloc(Limb, std.math.big.int.calcTwosCompLimbCount(info.bits));
+    var result_bigint: BigIntMutable = .{ .limbs = limbs, .positive = undefined, .len = undefined };
+    result_bigint.bitReverse(val_bigint, info.signedness, info.bits);
+    return .{ .index = try pool.internIntValue(ty.index, result_bigint.toConst()) };
+}
+
 fn intValueAa(sema: *Sema, ty: Type) !Value {
     const pool = sema.intern_pool;
     if (ty.index == .bool_type) return Value.bool_true;
