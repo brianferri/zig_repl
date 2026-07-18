@@ -9102,7 +9102,11 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
         },
     };
 
-    const callee_key = sema.intern_pool.indexToKey(callee_value.index);
+    // A callee may be a pointer to a function -- a stored `*const fn(...)` or a vtable entry.
+    // Dereference to the function value it points to before calling.
+    var callee_resolved = callee_value;
+    while (sema.intern_pool.indexToKey(callee_resolved.index) == .ptr) callee_resolved = try sema.loadValue(callee_resolved);
+    const callee_key = sema.intern_pool.indexToKey(callee_resolved.index);
     if (callee_key != .func) {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "call: callee is not a function value", .{});
     }
