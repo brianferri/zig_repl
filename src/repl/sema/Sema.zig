@@ -5470,16 +5470,17 @@ fn arrayInitAnon(sema: *Sema, operands: []const Zir.Inst.Ref) Error!InternPool.I
     defer sema.gpa.free(types);
     const values = try sema.gpa.alloc(InternPool.Index, operands.len);
     defer sema.gpa.free(values);
+    const field_vals = try sema.gpa.alloc(InternPool.Index, operands.len);
+    defer sema.gpa.free(field_vals);
 
-    for (operands, types, values) |operand, *ty, *val| {
+    for (operands, types, values, field_vals) |operand, *ty, *val, *fv| {
         const elem = try sema.resolveInst(operand);
         ty.* = Value.typeOf(elem, ip).index;
         val.* = elem.index;
+        // A field whose value is comptime-known is a comptime field of the tuple type.
+        fv.* = if (elem.is_comptime) elem.index else .none;
     }
 
-    const field_vals = try sema.gpa.alloc(InternPool.Index, operands.len);
-    defer sema.gpa.free(field_vals);
-    @memset(field_vals, .none);
     const tuple_ty = try ip.internTupleType(types, field_vals);
     return try ip.internAggregate(.{ .ty = tuple_ty, .storage = .{ .elems = values } });
 }

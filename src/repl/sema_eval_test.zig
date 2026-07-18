@@ -1061,12 +1061,11 @@ test "tuple: array_init_anon infers a tuple_type from element types + dedups" {
     const again = try evalSource(gpa, &pool, ".{ 1, 2.5 }", &diag_buf);
     try testing.expectEqual(value.index, again.index);
 
-    // Identity rides on the aggregate's elements, not just the tuple
-    // type: same field types but different values must stay distinct
-    // (otherwise one tuple would read the other's elements).
+    // A comptime-known field is a comptime field of the tuple type, so its value is part of the type:
+    // same field types but different values are distinct types (not just distinct aggregate values).
     const other = try evalSource(gpa, &pool, ".{ 3, 4.5 }", &diag_buf);
     try testing.expect(value.index != other.index);
-    try testing.expectEqual(key.aggregate.ty, pool.indexToKey(other.index).aggregate.ty);
+    try testing.expect(key.aggregate.ty != pool.indexToKey(other.index).aggregate.ty);
 }
 
 test "tuple_decl: explicit `struct { i32, f128 }` interns its annotated field types" {
