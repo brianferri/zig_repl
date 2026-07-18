@@ -377,3 +377,17 @@ test "compliance: an anonymous array literal initializes through ?/! result type
         } },
     });
 }
+
+// A single-item pointer to a sentinel-terminated array drops the sentinel through the pointer
+// (`*const [n:s]T` -> `*const [n]T`), the special case in coerceInMemoryAllowedPtrs.
+test "compliance: a pointer to a sentinel array coerces to the same pointer without the sentinel" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const p: *const [5]u8 = \"hello\"; break :blk p[1]; }"}, .want = blk: {
+            const p: *const [5]u8 = "hello";
+            break :blk p[1];
+        } },
+        // The coerced pointer keeps the byte-string display form (deliberate `.rendered`
+        // divergence from `{any}`, like any `*const [n]u8`; see string_render_test).
+        .{ .src = &.{"@as(*const [5]u8, \"hello\")"}, .rendered = "\"hello\"" },
+    });
+}

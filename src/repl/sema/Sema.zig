@@ -4384,6 +4384,14 @@ fn coerceExtra(
         return .{ .index = idx };
     }
 
+    // In-memory-coercible types re-type the value directly (e.g. `*[n:s]T` -> `*[n]T`, error-set
+    // widening, distinct-but-layout-identical types). The REPL only ever holds comptime values, so
+    // the compiler's runtime bit_cast/ptr_cast branch collapses to `getCoerced`.
+    switch (try sema.coerceInMemoryAllowed(.fromIndex(dest_ty), value_type, false, value)) {
+        .ok => return .{ .index = try ip.getCoerced(value.index, dest_ty) },
+        else => {},
+    }
+
     switch (ip.indexToKey(dest_ty)) {
         .int_type => if (try sema.coerceToFixedWidthInt(value, dest_ty, op_name)) |c| return c,
         .simple_type => |s| switch (s) {
