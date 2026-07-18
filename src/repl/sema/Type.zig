@@ -1168,6 +1168,29 @@ pub fn floatBits(ty: Type) u16 {
     };
 }
 
+pub fn isArrayOrVector(ty: Type, pool: *const InternPool) bool {
+    return switch (ty.zigTypeTag(pool)) {
+        .array, .vector => true,
+        else => false,
+    };
+}
+
+pub fn floatSignificandBits(ty: Type) u16 {
+    return switch (ty.floatBits()) {
+        16 => 11,
+        32 => 24,
+        64 => 53,
+        80 => 64,
+        128 => 113,
+        else => unreachable,
+    };
+}
+
+pub fn unionTagTypeHypothetical(ty: Type, pool: *const InternPool) Type {
+    pool.assertLayoutResolved(ty.index);
+    return .fromIndex(pool.unionFields(ty.index).enum_tag_type);
+}
+
 pub fn isPtrAtRuntime(ty: Type, pool: *const InternPool) bool {
     return switch (pool.indexToKey(ty.index)) {
         .ptr_type => |ptr_type| switch (ptr_type.flags.size) {

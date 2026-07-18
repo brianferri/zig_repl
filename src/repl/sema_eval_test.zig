@@ -778,10 +778,9 @@ test "fixed-width int + comptime_float is rejected" {
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
 
-    // Real Zig: "incompatible types: 'i32' and 'comptime_float'". Our
-    // diagnostic groups this under the fixed-width-int arith axis.
-    try expectEvalFails(gpa, &pool, "@as(i32, 5) + 1.5", "incompatible numeric operands");
-    try expectEvalFails(gpa, &pool, "1.5 + @as(i32, 5)", "incompatible numeric operands");
+    // Peer type resolution reports the conflict as Zig does: "incompatible types: 'i32' and 'comptime_float'".
+    try expectEvalFails(gpa, &pool, "@as(i32, 5) + 1.5", "incompatible types");
+    try expectEvalFails(gpa, &pool, "1.5 + @as(i32, 5)", "incompatible types");
 }
 
 test "fixed-width int arithmetic same width" {

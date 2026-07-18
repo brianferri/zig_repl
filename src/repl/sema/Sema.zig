@@ -732,33 +732,752 @@ fn isUnsignedIntType(ty: Type, pool: *const InternPool) bool {
     return ty.zigTypeTag(pool) == .int and ty.intInfo(pool).signedness == .unsigned;
 }
 
-fn resolveArithPeerType(sema: *Sema, lhs: Value, rhs: Value, op_name: []const u8) Error!Type {
-    const ip = sema.intern_pool;
-    const lt_key = ip.indexToKey(Value.typeOf(lhs, ip).index);
-    const rt_key = ip.indexToKey(Value.typeOf(rhs, ip).index);
-    if (lt_key == .vector_type or rt_key == .vector_type) {
-        if (lt_key != .vector_type or rt_key != .vector_type) {
-            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: mixed scalar and vector operands", .{op_name});
+/// The strategy chosen for peer type resolution, mirroring the compiler's PeerResolveStrategy.
+const PeerResolveStrategy = enum {
+    unknown,
+    error_set,
+    error_union,
+    nullable,
+    optional,
+    array,
+    vector,
+    c_ptr,
+    ptr,
+    func,
+    enum_or_union,
+    comptime_int,
+    comptime_float,
+    fixed_int,
+    fixed_float,
+    tuple,
+    exact,
+
+    fn merge(a: PeerResolveStrategy, b: PeerResolveStrategy, reason_peer: *usize, b_peer_idx: usize) PeerResolveStrategy {
+        const s0_is_a = @intFromEnum(a) <= @intFromEnum(b);
+        const s0 = if (s0_is_a) a else b;
+        const s1 = if (s0_is_a) b else a;
+
+        const ReasonMethod = enum { all_s0, all_s1, either };
+
+        const reason_method: ReasonMethod, const strat: PeerResolveStrategy = switch (s0) {
+            .unknown => .{ .all_s1, s1 },
+            .error_set => switch (s1) {
+                .error_set => .{ .either, .error_set },
+                else => .{ .all_s0, .error_union },
+            },
+            .error_union => switch (s1) {
+                .error_union => .{ .either, .error_union },
+                else => .{ .all_s0, .error_union },
+            },
+            .nullable => switch (s1) {
+                .nullable => .{ .either, .nullable },
+                .c_ptr => .{ .all_s1, .c_ptr },
+                else => .{ .all_s0, .optional },
+            },
+            .optional => switch (s1) {
+                .optional => .{ .either, .optional },
+                .c_ptr => .{ .all_s1, .c_ptr },
+                else => .{ .all_s0, .optional },
+            },
+            .array => switch (s1) {
+                .array => .{ .either, .array },
+                .vector => .{ .all_s1, .vector },
+                else => .{ .all_s0, .array },
+            },
+            .vector => switch (s1) {
+                .vector => .{ .either, .vector },
+                else => .{ .all_s0, .vector },
+            },
+            .c_ptr => switch (s1) {
+                .c_ptr => .{ .either, .c_ptr },
+                else => .{ .all_s0, .c_ptr },
+            },
+            .ptr => switch (s1) {
+                .ptr => .{ .either, .ptr },
+                else => .{ .all_s0, .ptr },
+            },
+            .func => switch (s1) {
+                .func => .{ .either, .func },
+                else => .{ .all_s1, s1 },
+            },
+            .enum_or_union => switch (s1) {
+                .enum_or_union => .{ .either, .enum_or_union },
+                else => .{ .all_s0, .enum_or_union },
+            },
+            .comptime_int => switch (s1) {
+                .comptime_int => .{ .either, .comptime_int },
+                else => .{ .all_s1, s1 },
+            },
+            .comptime_float => switch (s1) {
+                .comptime_float => .{ .either, .comptime_float },
+                else => .{ .all_s1, s1 },
+            },
+            .fixed_int => switch (s1) {
+                .fixed_int => .{ .either, .fixed_int },
+                else => .{ .all_s1, s1 },
+            },
+            .fixed_float => switch (s1) {
+                .fixed_float => .{ .either, .fixed_float },
+                else => .{ .all_s1, s1 },
+            },
+            .tuple => switch (s1) {
+                .exact => .{ .all_s1, .exact },
+                else => .{ .all_s0, .tuple },
+            },
+            .exact => .{ .all_s0, .exact },
+        };
+
+        switch (reason_method) {
+            .all_s0 => if (!s0_is_a) {
+                reason_peer.* = b_peer_idx;
+            },
+            .all_s1 => if (s0_is_a) {
+                reason_peer.* = b_peer_idx;
+            },
+            .either => {
+                reason_peer.* = @min(reason_peer.*, b_peer_idx);
+            },
         }
-        if (lt_key.vector_type.len != rt_key.vector_type.len) {
-            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: vector length mismatch", .{op_name});
-        }
-        const lhs_agg = ip.indexToKey(lhs.index).aggregate;
-        const rhs_agg = ip.indexToKey(rhs.index).aggregate;
-        const elem_ty = try sema.resolveScalarNumericPeer(
-            ip.indexToKey(InternPool.aggregateElementAt(lhs_agg, 0)),
-            ip.indexToKey(InternPool.aggregateElementAt(rhs_agg, 0)),
-            op_name,
-        );
-        return sema.vectorType(.{ .len = lt_key.vector_type.len, .child = elem_ty.index });
+
+        return strat;
     }
-    return sema.resolveScalarNumericPeer(ip.indexToKey(lhs.index), ip.indexToKey(rhs.index), op_name);
+
+    fn select(ty: Type, pool: *const InternPool) PeerResolveStrategy {
+        return switch (ty.zigTypeTag(pool)) {
+            .type, .void, .bool, .@"opaque", .spirv, .frame, .@"anyframe" => .exact,
+            .noreturn, .undefined => .unknown,
+            .null => .nullable,
+            .comptime_int => .comptime_int,
+            .int => .fixed_int,
+            .comptime_float => .comptime_float,
+            .float => .fixed_float,
+            .pointer => if (ty.ptrInfo(pool).flags.size == .c) .c_ptr else .ptr,
+            .array => .array,
+            .vector => .vector,
+            .optional => .optional,
+            .error_set => .error_set,
+            .error_union => .error_union,
+            .enum_literal, .@"enum", .@"union" => .enum_or_union,
+            .@"struct" => if (ty.isTuple(pool)) .tuple else .exact,
+            .@"fn" => .func,
+        };
+    }
+};
+
+/// The outcome of peer type resolution, mirroring the compiler's PeerResolveResult.
+const PeerResolveResult = union(enum) {
+    success: Type,
+    conflict: struct {
+        peer_idx_a: usize,
+        peer_idx_b: usize,
+    },
+    field_error: struct {
+        field_name: InternPool.NullTerminatedString,
+        field_types: []Type,
+        sub_result: *PeerResolveResult,
+    },
+
+    /// Report a conflict as a REPL diagnostic. The compiler additionally attaches per-candidate source
+    /// notes via a PeerTypeCandidateSrc; the REPL has no per-peer source surface here, so it reports the
+    /// conflicting types (and the field chain) without those notes.
+    fn report(result: PeerResolveResult, sema: *Sema, peer_tys_in: []const Type) Error!*ErrorMsg {
+        const ip = sema.intern_pool;
+        const src = sema.block.nodeOffset(.zero);
+        var opt_msg: ?*ErrorMsg = null;
+        errdefer if (opt_msg) |msg| msg.destroy(sema.gpa);
+
+        var peer_tys = peer_tys_in;
+        var cur = result;
+        while (true) {
+            var conflict_idx: [2]usize = undefined;
+            switch (cur) {
+                .success => unreachable,
+                .conflict => |conflict| {
+                    conflict_idx = .{ conflict.peer_idx_a, conflict.peer_idx_b };
+                },
+                .field_error => |field_error| {
+                    const fmt = "struct field '{s}' has conflicting types";
+                    const args = .{ip.stringSlice(field_error.field_name)};
+                    if (opt_msg) |msg| {
+                        try sema.errNote(src, msg, fmt, args);
+                    } else {
+                        opt_msg = try sema.errMsg(src, fmt, args);
+                    }
+                    cur = field_error.sub_result.*;
+                    peer_tys = field_error.field_types;
+                    continue;
+                },
+            }
+
+            if (conflict_idx[1] < conflict_idx[0]) std.mem.swap(usize, &conflict_idx[0], &conflict_idx[1]);
+            const conflict_tys: [2]Type = .{ peer_tys[conflict_idx[0]], peer_tys[conflict_idx[1]] };
+            const fmt = "incompatible types: '{f}' and '{f}'";
+            const args = .{ conflict_tys[0].fmt(ip), conflict_tys[1].fmt(ip) };
+            if (opt_msg) |msg| {
+                try sema.errNote(src, msg, fmt, args);
+            } else {
+                opt_msg = try sema.errMsg(src, fmt, args);
+            }
+            break;
+        }
+        return opt_msg.?;
+    }
+};
+
+const ArrayLike = struct {
+    len: u64,
+    /// `noreturn` indicates that this type is `struct{}` so can coerce to anything.
+    elem_ty: Type,
+};
+
+fn typeIsArrayLike(sema: *Sema, ty: Type) ?ArrayLike {
+    const ip = sema.intern_pool;
+    return switch (ty.zigTypeTag(ip)) {
+        .array => .{ .len = ty.arrayLen(ip), .elem_ty = ty.childType(ip) },
+        .@"struct" => {
+            if (!ty.isTuple(ip)) return null;
+            const field_count = sema.structFieldCount(ty.index) catch return null;
+            if (field_count == 0) return .{ .len = 0, .elem_ty = .fromIndex(.noreturn_type) };
+            const elem_ty = ty.fieldType(0, ip);
+            for (1..field_count) |i| {
+                if (ty.fieldType(i, ip).index != elem_ty.index) return null;
+            }
+            return .{ .len = field_count, .elem_ty = elem_ty };
+        },
+        else => null,
+    };
 }
 
-fn resolveScalarNumericPeer(sema: *Sema, lhs_key: InternPool.Key, rhs_key: InternPool.Key, op_name: []const u8) Error!Type {
-    if (resolveNumericPairToInt(sema.intern_pool, lhs_key, rhs_key)) |triple| return .fromIndex(triple.ty);
-    if (coerceNumericPairToFloat(lhs_key, rhs_key)) |pair| return .fromIndex(pair[0].ty);
-    return sema.failNumericOperands(op_name, lhs_key, rhs_key);
+fn maybeMergeErrorSets(sema: *Sema, e0: Type, e1: Type) Error!Type {
+    // e0 -> e1
+    if (.ok == try sema.coerceInMemoryAllowedErrorSets(e1, e0)) return e1;
+    // e1 -> e0
+    if (.ok == try sema.coerceInMemoryAllowedErrorSets(e0, e1)) return e0;
+    return sema.errorSetMerge(e0.index, e1.index);
+}
+
+fn resolvePairInMemoryCoercible(sema: *Sema, ty_a: Type, ty_b: Type) Error!?Type {
+    // ty_b -> ty_a
+    if (.ok == try sema.coerceInMemoryAllowed(ty_a, ty_b, false, null)) return ty_a;
+    // ty_a -> ty_b
+    if (.ok == try sema.coerceInMemoryAllowed(ty_b, ty_a, false, null)) return ty_b;
+    return null;
+}
+
+/// Resolve the common type of a set of peer values, mirroring the compiler's resolvePeerTypes.
+fn resolvePeerTypes(sema: *Sema, instructions: []const Value) Error!Type {
+    const ip = sema.intern_pool;
+    switch (instructions.len) {
+        0 => return .fromIndex(.noreturn_type),
+        1 => return Value.typeOf(instructions[0], ip),
+        else => {},
+    }
+
+    // Fast path: everything the same type.
+    same_type: {
+        const ty = Value.typeOf(instructions[0], ip);
+        for (instructions[1..]) |inst| {
+            if (Value.typeOf(inst, ip).index != ty.index) break :same_type;
+        }
+        return ty;
+    }
+
+    const peer_tys = try sema.arena.alloc(?Type, instructions.len);
+    const peer_vals = try sema.arena.alloc(?Value, instructions.len);
+    for (instructions, peer_tys, peer_vals) |inst, *ty, *val| {
+        ty.* = Value.typeOf(inst, ip);
+        val.* = if (inst.is_comptime) inst else null;
+    }
+
+    switch (try sema.resolvePeerTypesInner(peer_tys, peer_vals)) {
+        .success => |ty| return ty,
+        else => |result| {
+            const buf_tys = try sema.arena.alloc(Type, instructions.len);
+            for (buf_tys, instructions) |*ty, inst| ty.* = Value.typeOf(inst, ip);
+            const msg = try result.report(sema, buf_tys);
+            return sema.failWithOwnedErrorMsg(sema.block, msg);
+        },
+    }
+}
+
+fn resolvePeerTypesInner(sema: *Sema, peer_tys: []?Type, peer_vals: []?Value) Error!PeerResolveResult {
+    const ip = sema.intern_pool;
+
+    var strat_reason: usize = 0;
+    var s: PeerResolveStrategy = .unknown;
+    for (peer_tys, 0..) |opt_ty, i| {
+        const ty = opt_ty orelse continue;
+        s = s.merge(PeerResolveStrategy.select(ty, ip), &strat_reason, i);
+    }
+
+    if (s == .unknown) {
+        s = .exact;
+    } else {
+        for (peer_tys) |*ty_ptr| {
+            const ty = ty_ptr.* orelse continue;
+            switch (ty.zigTypeTag(ip)) {
+                .noreturn, .undefined => ty_ptr.* = null,
+                else => {},
+            }
+        }
+    }
+
+    switch (s) {
+        .unknown => unreachable,
+
+        .error_set => {
+            var final_set: ?Type = null;
+            for (peer_tys, 0..) |opt_ty, i| {
+                const ty = opt_ty orelse continue;
+                if (ty.zigTypeTag(ip) != .error_set) return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } };
+                if (final_set) |cur_set| {
+                    final_set = try sema.maybeMergeErrorSets(cur_set, ty);
+                } else {
+                    final_set = ty;
+                }
+            }
+            return .{ .success = final_set.? };
+        },
+
+        .error_union => {
+            var final_set: ?Type = null;
+            for (peer_tys, peer_vals) |*ty_ptr, *val_ptr| {
+                const ty = ty_ptr.* orelse continue;
+                const set_ty = switch (ty.zigTypeTag(ip)) {
+                    .error_set => blk: {
+                        ty_ptr.* = null;
+                        val_ptr.* = null;
+                        break :blk ty;
+                    },
+                    .error_union => blk: {
+                        const set_ty = ty.errorUnionSet(ip);
+                        ty_ptr.* = ty.errorUnionPayload(ip);
+                        if (val_ptr.*) |eu_val| switch (ip.indexToKey(eu_val.index)) {
+                            .error_union => |eu| switch (eu.val) {
+                                .payload => |payload_ip| val_ptr.* = Value.fromIndex(payload_ip),
+                                .err_name => val_ptr.* = null,
+                            },
+                            .undef => val_ptr.* = Value.fromIndex(try ip.get(.{ .undef = ty_ptr.*.?.index })),
+                            else => unreachable,
+                        };
+                        break :blk set_ty;
+                    },
+                    else => continue,
+                };
+                if (final_set) |cur_set| {
+                    final_set = try sema.maybeMergeErrorSets(cur_set, set_ty);
+                } else {
+                    final_set = set_ty;
+                }
+            }
+            assert(final_set != null);
+            const final_payload = switch (try sema.resolvePeerTypesInner(peer_tys, peer_vals)) {
+                .success => |ty| ty,
+                else => |result| return result,
+            };
+            return .{ .success = .fromIndex(try ip.internErrorUnionType(.{ .error_set_type = final_set.?.index, .payload_type = final_payload.index })) };
+        },
+
+        .nullable => {
+            for (peer_tys, 0..) |opt_ty, i| {
+                const ty = opt_ty orelse continue;
+                if (ty.index != .null_type) return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } };
+            }
+            return .{ .success = .fromIndex(.null_type) };
+        },
+
+        .optional => {
+            for (peer_tys, peer_vals) |*ty_ptr, *val_ptr| {
+                const ty = ty_ptr.* orelse continue;
+                switch (ty.zigTypeTag(ip)) {
+                    .null => {
+                        ty_ptr.* = null;
+                        val_ptr.* = null;
+                    },
+                    .optional => {
+                        ty_ptr.* = ty.optionalChild(ip);
+                        if (val_ptr.*) |opt_val| {
+                            if (!opt_val.isUndef(ip)) {
+                                const ov = ip.indexToKey(opt_val.index).opt.val;
+                                val_ptr.* = if (ov == .none) null else Value.fromIndex(ov);
+                            } else val_ptr.* = null;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            const child_ty = switch (try sema.resolvePeerTypesInner(peer_tys, peer_vals)) {
+                .success => |ty| ty,
+                else => |result| return result,
+            };
+            return .{ .success = .fromIndex(try ip.internOptionalType(child_ty.index)) };
+        },
+
+        .array => {
+            var opt_first_idx: ?usize = null;
+            var opt_first_arr_idx: ?usize = null;
+            var len: u64 = undefined;
+            var sentinel: ?Value = undefined;
+            var elem_ty: Type = undefined;
+
+            for (peer_tys, 0..) |*ty_ptr, i| {
+                const ty = ty_ptr.* orelse continue;
+
+                if (!ty.isArrayOrVector(ip)) {
+                    const arr_like = sema.typeIsArrayLike(ty) orelse return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } };
+                    if (opt_first_idx) |first_idx| {
+                        if (arr_like.len != len) return .{ .conflict = .{ .peer_idx_a = first_idx, .peer_idx_b = i } };
+                    } else {
+                        opt_first_idx = i;
+                        len = arr_like.len;
+                    }
+                    sentinel = null;
+                    continue;
+                }
+
+                const first_arr_idx = opt_first_arr_idx orelse {
+                    if (opt_first_idx == null) {
+                        opt_first_idx = i;
+                        len = ty.arrayLen(ip);
+                        sentinel = ty.sentinel(ip);
+                    }
+                    opt_first_arr_idx = i;
+                    elem_ty = ty.childType(ip);
+                    continue;
+                };
+
+                if (ty.arrayLen(ip) != len) return .{ .conflict = .{ .peer_idx_a = first_arr_idx, .peer_idx_b = i } };
+
+                const peer_elem_ty = ty.childType(ip);
+                if (peer_elem_ty.index != elem_ty.index) coerce: {
+                    if (.ok == try sema.coerceInMemoryAllowed(elem_ty, peer_elem_ty, false, null)) break :coerce;
+                    if (.ok == try sema.coerceInMemoryAllowed(peer_elem_ty, elem_ty, false, null)) {
+                        elem_ty = peer_elem_ty;
+                        break :coerce;
+                    }
+                    return .{ .conflict = .{ .peer_idx_a = first_arr_idx, .peer_idx_b = i } };
+                }
+
+                if (sentinel) |cur_sent| {
+                    if (ty.sentinel(ip)) |peer_sent| {
+                        if (peer_sent.index != cur_sent.index) sentinel = null;
+                    } else {
+                        sentinel = null;
+                    }
+                }
+            }
+
+            assert(opt_first_arr_idx != null);
+            return .{ .success = .fromIndex(try ip.internArrayType(.{
+                .len = len,
+                .child = elem_ty.index,
+                .sentinel = if (sentinel) |sent_val| sent_val.index else .none,
+            })) };
+        },
+
+        .vector => {
+            var len: ?u64 = null;
+            var first_idx: usize = undefined;
+            for (peer_tys, peer_vals, 0..) |*ty_ptr, *val_ptr, i| {
+                const ty = ty_ptr.* orelse continue;
+                if (!ty.isArrayOrVector(ip)) {
+                    const arr_like = sema.typeIsArrayLike(ty) orelse return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } };
+                    if (len) |expect_len| {
+                        if (arr_like.len != expect_len) return .{ .conflict = .{ .peer_idx_a = first_idx, .peer_idx_b = i } };
+                    } else {
+                        len = arr_like.len;
+                        first_idx = i;
+                    }
+                    ty_ptr.* = null;
+                    val_ptr.* = null;
+                    continue;
+                }
+                if (len) |expect_len| {
+                    if (ty.arrayLen(ip) != expect_len) return .{ .conflict = .{ .peer_idx_a = first_idx, .peer_idx_b = i } };
+                } else {
+                    len = ty.arrayLen(ip);
+                    first_idx = i;
+                }
+                ty_ptr.* = ty.childType(ip);
+                val_ptr.* = null;
+            }
+            const child_ty = switch (try sema.resolvePeerTypesInner(peer_tys, peer_vals)) {
+                .success => |ty| ty,
+                else => |result| return result,
+            };
+            return .{ .success = try sema.vectorType(.{ .len = @intCast(len.?), .child = child_ty.index }) };
+        },
+
+        // Pointer peer resolution is a focused follow-up (needs the packed_offset-aware ptr_info merge);
+        // until then, pointer peers report a conflict rather than resolving.
+        .c_ptr, .ptr => return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = strat_reason } },
+
+        .func => {
+            var opt_cur_ty: ?Type = null;
+            var first_idx: usize = undefined;
+            for (peer_tys, 0..) |opt_ty, i| {
+                const ty = opt_ty orelse continue;
+                const cur_ty = opt_cur_ty orelse {
+                    opt_cur_ty = ty;
+                    first_idx = i;
+                    continue;
+                };
+                if (ty.zigTypeTag(ip) != .@"fn") return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } };
+                if (.ok == try sema.coerceInMemoryAllowedFns(cur_ty, ty, false)) continue;
+                if (.ok == try sema.coerceInMemoryAllowedFns(ty, cur_ty, false)) {
+                    opt_cur_ty = ty;
+                    continue;
+                }
+                return .{ .conflict = .{ .peer_idx_a = first_idx, .peer_idx_b = i } };
+            }
+            return .{ .success = opt_cur_ty.? };
+        },
+
+        .enum_or_union => {
+            var opt_cur_ty: ?Type = null;
+            var cur_ty_idx: usize = undefined;
+            for (peer_tys, 0..) |opt_ty, i| {
+                const ty = opt_ty orelse continue;
+                switch (ty.zigTypeTag(ip)) {
+                    .enum_literal, .@"enum", .@"union" => {},
+                    else => return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } },
+                }
+                const cur_ty = opt_cur_ty orelse {
+                    opt_cur_ty = ty;
+                    cur_ty_idx = i;
+                    continue;
+                };
+                const generic_err: PeerResolveResult = .{ .conflict = .{ .peer_idx_a = cur_ty_idx, .peer_idx_b = i } };
+                switch (cur_ty.zigTypeTag(ip)) {
+                    .enum_literal => {
+                        opt_cur_ty = ty;
+                        cur_ty_idx = i;
+                    },
+                    .@"enum" => switch (ty.zigTypeTag(ip)) {
+                        .enum_literal => {},
+                        .@"enum" => if (ty.index != cur_ty.index) return generic_err,
+                        .@"union" => {
+                            if (ty.unionTagTypeHypothetical(ip).index != cur_ty.index) return generic_err;
+                            opt_cur_ty = ty;
+                            cur_ty_idx = i;
+                        },
+                        else => unreachable,
+                    },
+                    .@"union" => switch (ty.zigTypeTag(ip)) {
+                        .enum_literal => {},
+                        .@"enum" => if (ty.index != cur_ty.unionTagTypeHypothetical(ip).index) return generic_err,
+                        .@"union" => if (ty.index != cur_ty.index) return generic_err,
+                        else => unreachable,
+                    },
+                    else => unreachable,
+                }
+            }
+            return .{ .success = opt_cur_ty.? };
+        },
+
+        .comptime_int => {
+            for (peer_tys, 0..) |opt_ty, i| {
+                const ty = opt_ty orelse continue;
+                switch (ty.zigTypeTag(ip)) {
+                    .comptime_int => {},
+                    else => return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } },
+                }
+            }
+            return .{ .success = .fromIndex(.comptime_int_type) };
+        },
+
+        .comptime_float => {
+            for (peer_tys, 0..) |opt_ty, i| {
+                const ty = opt_ty orelse continue;
+                switch (ty.zigTypeTag(ip)) {
+                    .comptime_int, .comptime_float => {},
+                    else => return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } },
+                }
+            }
+            return .{ .success = .fromIndex(.comptime_float_type) };
+        },
+
+        .fixed_int => {
+            var idx_unsigned: ?usize = null;
+            var idx_signed: ?usize = null;
+            var any_comptime_known = false;
+
+            for (peer_tys, peer_vals, 0..) |opt_ty, *ptr_opt_val, i| {
+                const ty = opt_ty orelse continue;
+                const opt_val = ptr_opt_val.*;
+                switch (ty.zigTypeTag(ip)) {
+                    .comptime_int => {
+                        if (opt_val == null or opt_val.?.isUndef(ip)) return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } };
+                        any_comptime_known = true;
+                        continue;
+                    },
+                    .int => {},
+                    else => return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } },
+                }
+                if (opt_val != null) any_comptime_known = true;
+                const info = ty.intInfo(ip);
+                const idx_ptr = switch (info.signedness) {
+                    .unsigned => &idx_unsigned,
+                    .signed => &idx_signed,
+                };
+                const largest_idx = idx_ptr.* orelse {
+                    idx_ptr.* = i;
+                    continue;
+                };
+                const cur_info = peer_tys[largest_idx].?.intInfo(ip);
+                if (info.bits > cur_info.bits) idx_ptr.* = i;
+            }
+
+            if (idx_signed == null) return .{ .success = peer_tys[idx_unsigned.?].? };
+            if (idx_unsigned == null) return .{ .success = peer_tys[idx_signed.?].? };
+
+            const unsigned_info = peer_tys[idx_unsigned.?].?.intInfo(ip);
+            const signed_info = peer_tys[idx_signed.?].?.intInfo(ip);
+            if (signed_info.bits > unsigned_info.bits) return .{ .success = peer_tys[idx_signed.?].? };
+
+            // Legacy compatibility: comptime-known values get coerced down to the smallest fitting type.
+            if (any_comptime_known) {
+                if (unsigned_info.bits > signed_info.bits) return .{ .success = peer_tys[idx_unsigned.?].? };
+                const idx = @min(idx_unsigned.?, idx_signed.?);
+                return .{ .success = peer_tys[idx].? };
+            }
+            return .{ .conflict = .{ .peer_idx_a = idx_unsigned.?, .peer_idx_b = idx_signed.? } };
+        },
+
+        .fixed_float => {
+            var opt_cur_ty: ?Type = null;
+            for (peer_tys, 0..) |opt_ty, i| {
+                const ty = opt_ty orelse continue;
+                switch (ty.zigTypeTag(ip)) {
+                    .comptime_float, .comptime_int, .int => {},
+                    .float => {
+                        if (opt_cur_ty) |cur_ty| {
+                            if (cur_ty.index != ty.index) {
+                                const bits = @max(cur_ty.floatBits(), ty.floatBits());
+                                opt_cur_ty = switch (bits) {
+                                    16 => .fromIndex(.f16_type),
+                                    32 => .fromIndex(.f32_type),
+                                    64 => .fromIndex(.f64_type),
+                                    80 => .fromIndex(.f80_type),
+                                    128 => .fromIndex(.f128_type),
+                                    else => unreachable,
+                                };
+                            }
+                        } else {
+                            opt_cur_ty = ty;
+                        }
+                    },
+                    else => return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } },
+                }
+            }
+            const cur_ty = opt_cur_ty.?;
+            for (peer_tys, peer_vals, 0..) |opt_ty, opt_val, i| {
+                const ty = opt_ty orelse continue;
+                switch (ty.zigTypeTag(ip)) {
+                    .comptime_float, .comptime_int, .float => {},
+                    .int => {
+                        if (opt_val != null) continue;
+                        const int_info = ty.intInfo(ip);
+                        const int_precision = int_info.bits - @intFromBool(int_info.signedness == .signed);
+                        if (int_precision > cur_ty.floatSignificandBits()) return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } };
+                    },
+                    else => unreachable,
+                }
+            }
+            return .{ .success = cur_ty };
+        },
+
+        .tuple => {
+            var opt_first_idx: ?usize = null;
+            var field_count: usize = undefined;
+            for (peer_tys, 0..) |opt_ty, i| {
+                const ty = opt_ty orelse continue;
+                if (!ty.isTuple(ip)) return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } };
+                const first_idx = opt_first_idx orelse {
+                    opt_first_idx = i;
+                    field_count = try sema.structFieldCount(ty.index);
+                    continue;
+                };
+                if (try sema.structFieldCount(ty.index) != field_count) return .{ .conflict = .{ .peer_idx_a = first_idx, .peer_idx_b = i } };
+            }
+            assert(opt_first_idx != null);
+
+            const field_types = try sema.arena.alloc(InternPool.Index, field_count);
+            const field_vals = try sema.arena.alloc(InternPool.Index, field_count);
+            const sub_peer_tys = try sema.arena.alloc(?Type, peer_tys.len);
+            const sub_peer_vals = try sema.arena.alloc(?Value, peer_vals.len);
+
+            for (field_types, field_vals, 0..) |*field_ty, *field_val, field_index| {
+                for (peer_tys, peer_vals, sub_peer_tys, sub_peer_vals) |opt_ty, opt_val, *peer_field_ty, *peer_field_val| {
+                    const ty = opt_ty orelse {
+                        peer_field_ty.* = null;
+                        peer_field_val.* = null;
+                        continue;
+                    };
+                    peer_field_ty.* = ty.fieldType(field_index, ip);
+                    peer_field_val.* = if (opt_val) |val| try val.fieldValue(field_index, ip) else null;
+                }
+                // The REPL has no non-reporting coerce, so comptime-tuple-field folding across peers is
+                // not performed here; the field is left runtime (`.none`). On a field-type conflict the
+                // inner result is propagated directly rather than wrapped with a field-name note.
+                field_ty.* = switch (try sema.resolvePeerTypesInner(sub_peer_tys, sub_peer_vals)) {
+                    .success => |ty| ty.index,
+                    else => |result| return result,
+                };
+                field_val.* = .none;
+            }
+
+            return .{ .success = .fromIndex(try ip.internTupleType(field_types, field_vals)) };
+        },
+
+        .exact => {
+            var expect_ty: ?Type = null;
+            var first_idx: usize = undefined;
+            for (peer_tys, 0..) |opt_ty, i| {
+                const ty = opt_ty orelse continue;
+                if (expect_ty) |expect| {
+                    if (ty.index != expect.index) return .{ .conflict = .{ .peer_idx_a = first_idx, .peer_idx_b = i } };
+                } else {
+                    expect_ty = ty;
+                    first_idx = i;
+                }
+            }
+            return .{ .success = expect_ty.? };
+        },
+    }
+}
+
+/// The compiler's checkVectorizableBinaryOperands: arithmetic rejects a vector paired with a scalar,
+/// or two vectors of differing length, before peer resolution runs.
+fn checkVectorizableBinaryOperands(sema: *Sema, lhs_ty: Type, rhs_ty: Type) Error!void {
+    const ip = sema.intern_pool;
+    const lhs_tag = lhs_ty.zigTypeTag(ip);
+    const rhs_tag = rhs_ty.zigTypeTag(ip);
+    if (lhs_tag != .vector and rhs_tag != .vector) return;
+
+    const lhs_is_vector = switch (lhs_tag) {
+        .vector, .array => true,
+        else => false,
+    };
+    const rhs_is_vector = switch (rhs_tag) {
+        .vector, .array => true,
+        else => false,
+    };
+    const src = sema.block.nodeOffset(.zero);
+    if (lhs_is_vector and rhs_is_vector) {
+        if (lhs_ty.arrayLen(ip) != rhs_ty.arrayLen(ip)) {
+            return sema.fail(sema.block, src, "vector length mismatch", .{});
+        }
+    } else {
+        return sema.fail(sema.block, src, "mixed scalar and vector operands: '{f}' and '{f}'", .{ lhs_ty.fmt(ip), rhs_ty.fmt(ip) });
+    }
+}
+
+fn resolveArithPeerType(sema: *Sema, lhs: Value, rhs: Value, op_name: []const u8) Error!Type {
+    _ = op_name;
+    const ip = sema.intern_pool;
+    try sema.checkVectorizableBinaryOperands(Value.typeOf(lhs, ip), Value.typeOf(rhs, ip));
+    return sema.resolvePeerTypes(&.{ lhs, rhs });
 }
 
 fn failNumericOperands(sema: *Sema, op_name: []const u8, lhs_key: InternPool.Key, rhs_key: InternPool.Key) Error {
@@ -783,49 +1502,6 @@ fn vectorBinaryOperands(sema: *Sema, lhs: Value, rhs: Value, op_name: []const u8
     return .{ .len = @intCast(lhs_vt.len), .lhs = ip.indexToKey(lhs.index).aggregate, .rhs = ip.indexToKey(rhs.index).aggregate };
 }
 
-fn resolveNumericPairToInt(
-    pool: *const InternPool,
-    lhs_key: InternPool.Key,
-    rhs_key: InternPool.Key,
-) ?struct { ty: InternPool.Index, lhs: InternPool.Key.Int, rhs: InternPool.Key.Int } {
-    if (lhs_key != .int or rhs_key != .int) return null;
-    const lhs_int = lhs_key.int;
-    const rhs_int = rhs_key.int;
-
-    const lhs_is_cti = lhs_int.ty == .comptime_int_type;
-    const rhs_is_cti = rhs_int.ty == .comptime_int_type;
-    const lhs_info: ?std.lang.Type.Int = if (lhs_is_cti) null else intTypeInfo(pool, lhs_int.ty);
-    const rhs_info: ?std.lang.Type.Int = if (rhs_is_cti) null else intTypeInfo(pool, rhs_int.ty);
-
-    if (!lhs_is_cti and lhs_info == null) return null;
-    if (!rhs_is_cti and rhs_info == null) return null;
-
-    if (lhs_is_cti and rhs_is_cti) {
-        return .{ .ty = .comptime_int_type, .lhs = lhs_int, .rhs = rhs_int };
-    }
-    if (lhs_is_cti) return .{ .ty = rhs_int.ty, .lhs = lhs_int, .rhs = rhs_int };
-    if (rhs_is_cti) return .{ .ty = lhs_int.ty, .lhs = lhs_int, .rhs = rhs_int };
-
-    const li = lhs_info.?;
-    const ri = rhs_info.?;
-    if (li.signedness == ri.signedness) {
-        const wider_ty = if (li.bits >= ri.bits) lhs_int.ty else rhs_int.ty;
-        return .{ .ty = wider_ty, .lhs = lhs_int, .rhs = rhs_int };
-    }
-
-    const signed_ty = if (li.signedness == .signed) lhs_int.ty else rhs_int.ty;
-    const signed_bits = if (li.signedness == .signed) li.bits else ri.bits;
-    const unsigned_ty = if (li.signedness == .signed) rhs_int.ty else lhs_int.ty;
-    const unsigned_bits = if (li.signedness == .signed) ri.bits else li.bits;
-    if (signed_bits > unsigned_bits) {
-        return .{ .ty = signed_ty, .lhs = lhs_int, .rhs = rhs_int };
-    }
-    if (unsigned_bits > signed_bits) {
-        return .{ .ty = unsigned_ty, .lhs = lhs_int, .rhs = rhs_int };
-    }
-    return .{ .ty = lhs_int.ty, .lhs = lhs_int, .rhs = rhs_int };
-}
-
 fn intTypeInfo(pool: *const InternPool, ty: InternPool.Index) ?std.lang.Type.Int {
     return switch (ty) {
         .usize_type => @typeInfo(usize).int,
@@ -847,56 +1523,6 @@ fn intTypeInfo(pool: *const InternPool, ty: InternPool.Index) ?std.lang.Type.Int
     };
 }
 
-fn coerceNumericPairToFloat(
-    lhs_key: InternPool.Key,
-    rhs_key: InternPool.Key,
-) ?[2]InternPool.Key.Float {
-    const lhs_fw: ?InternPool.Index = fixedWidthFloatType(lhs_key);
-    const rhs_fw: ?InternPool.Index = fixedWidthFloatType(rhs_key);
-
-    if (lhs_fw != null and rhs_fw != null) {
-        const target = widerFloatType(lhs_fw.?, rhs_fw.?);
-        return .{
-            coerceToTargetFloat(lhs_key, target) orelse return null,
-            coerceToTargetFloat(rhs_key, target) orelse return null,
-        };
-    }
-    if (lhs_fw orelse rhs_fw) |target| {
-        return .{
-            coerceToTargetFloat(lhs_key, target) orelse return null,
-            coerceToTargetFloat(rhs_key, target) orelse return null,
-        };
-    }
-
-    const lhs_is_ctf = lhs_key == .float and lhs_key.float.ty == .comptime_float_type;
-    const rhs_is_ctf = rhs_key == .float and rhs_key.float.ty == .comptime_float_type;
-    if (!lhs_is_ctf and !rhs_is_ctf) return null;
-    return .{
-        coerceToTargetFloat(lhs_key, .comptime_float_type) orelse return null,
-        coerceToTargetFloat(rhs_key, .comptime_float_type) orelse return null,
-    };
-}
-
-fn fixedWidthFloatType(key: InternPool.Key) ?InternPool.Index {
-    if (key != .float) return null;
-    if (!isFixedWidthFloatType(key.float.ty)) return null;
-    return key.float.ty;
-}
-
-fn widerFloatType(a: InternPool.Index, b: InternPool.Index) InternPool.Index {
-    return if (floatTypeBits(a) >= floatTypeBits(b)) a else b;
-}
-
-fn floatTypeBits(ty: InternPool.Index) u16 {
-    return switch (ty) {
-        .f16_type => 16,
-        .f32_type => 32,
-        .f64_type => 64,
-        .f80_type => 80,
-        .f128_type => 128,
-        else => unreachable,
-    };
-}
 
 fn coerceToTargetFloat(
     key: InternPool.Key,
@@ -9442,7 +10068,6 @@ fn evalOverflowArithmetic(sema: *Sema, extended: Zir.Inst.Extended.InstData, opc
 }
 
 fn evalTypeofPeer(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.Inst.Index) Error!?Value {
-    const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.TypeOfPeer, extended.operand);
     const body = sema.zir.bodySlice(extra.data.body_index, extra.data.body_len);
     _ = try sema.resolveInlineBody(body, inst);
@@ -9450,26 +10075,10 @@ fn evalTypeofPeer(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
     const args = sema.zir.refSlice(extra.end, extended.small);
     assert(args.len > 0);
 
-    var acc = try sema.resolveInst(args[0]);
-    for (args[1..]) |arg_ref| {
-        acc = try sema.peerResolvePair(acc, try sema.resolveInst(arg_ref));
-    }
-    return Value{ .index = Value.typeOf(acc, ip).index };
-}
-
-fn peerResolvePair(sema: *Sema, a: Value, b: Value) Error!Value {
-    const ip = sema.intern_pool;
-    const a_key = ip.indexToKey(a.index);
-    const b_key = ip.indexToKey(b.index);
-    const a_ty = Value.typeOf(a, ip).index;
-    if (a_ty == Value.typeOf(b, ip).index) return a;
-    if (resolveNumericPairToInt(ip, a_key, b_key)) |peer| {
-        return if (a_ty == peer.ty) a else b;
-    }
-    if (coerceNumericPairToFloat(a_key, b_key)) |pair| {
-        return if (a_ty == pair[0].ty) a else b;
-    }
-    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@TypeOf: no peer type for the given operands", .{});
+    const insts = try sema.arena.alloc(Value, args.len);
+    for (insts, args) |*v, arg_ref| v.* = try sema.resolveInst(arg_ref);
+    const ty = try sema.resolvePeerTypes(insts);
+    return Value{ .index = ty.index };
 }
 
 fn evalTypeofBuiltin(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
