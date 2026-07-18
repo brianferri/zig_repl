@@ -1308,7 +1308,12 @@ fn intTruncate(sema: *Sema, val: Value, dest_ty: Type, dest_signedness: std.lang
 }
 fn intBitwiseNot(sema: *Sema, val: Value, ty: Type) !Value {
     const pool = sema.intern_pool;
-    if (ty.index == .bool_type) return Value.makeBool(!val.toBool());
+    if (val.isUndef(pool)) return .fromIndex(try pool.get(.{ .undef = ty.index }));
+    switch (ty.index) {
+        .bool_type => return Value.makeBool(!val.toBool()),
+        .u0_type => return val,
+        else => {},
+    }
     const info = ty.intInfo(pool);
     var val_space: BigIntSpace = undefined;
     const val_bigint = val.toBigInt(&val_space, pool);

@@ -148,18 +148,14 @@ pub fn onePossibleValue(ty: Type, sema: *Sema) Sema.Error!?Value {
                 },
             }
             if (ty.classify(ip) != .one_possible_value) return null;
-            const count = try sema.structFieldCount(ty.index);
-            const field_vals = try sema.arena.alloc(InternPool.Index, count);
+            const field_vals = try sema.arena.alloc(InternPool.Index, struct_obj.field_types.len);
             for (field_vals, 0..) |*field_val, i| {
-                const name = (try sema.structFieldNameAt(ty.index, @intCast(i))).?;
-                const field = (try sema.structFieldByName(ty.index, name)).?;
-                if (field.is_comptime) {
-                    const default = try sema.structFieldDefault(ty.index, name);
-                    assert(default != .none);
-                    field_val.* = default;
+                if (ty.structFieldIsComptime(i, ip)) {
+                    field_val.* = struct_obj.field_defaults[i];
+                    assert(field_val.* != .none);
                     continue;
                 }
-                field_val.* = (try Type.fromIndex(field.ty).onePossibleValue(sema)).?.index;
+                field_val.* = (try Type.fromIndex(struct_obj.field_types[i]).onePossibleValue(sema)).?.index;
             }
             return try sema.aggregateValue(ty, field_vals);
         },
@@ -171,18 +167,15 @@ pub fn onePossibleValue(ty: Type, sema: *Sema) Sema.Error!?Value {
                 return try sema.bitpackValue(ty, backing_val);
             }
             if (ty.classify(ip) != .one_possible_value) return null;
-            const count = try sema.unionFieldCount(ty.index);
-            var i: u32 = 0;
-            while (i < count) : (i += 1) {
-                const name = (try sema.unionFieldNameAt(ty.index, i)).?;
-                const field_ty = (try sema.unionFieldByName(ty.index, name)).?.ty;
-                switch (Type.fromIndex(field_ty).classify(ip)) {
+            for (union_obj.field_types, 0..) |field_ty_ip, field_index| {
+                const field_ty: Type = .fromIndex(field_ty_ip);
+                switch (field_ty.classify(ip)) {
                     .no_possible_value => continue,
                     .one_possible_value => {},
                     else => unreachable,
                 }
-                const tag_val = (try sema.enumValueFieldIndex(try sema.unionTagEnumType(ty.index), i)).?;
-                const payload = (try Type.fromIndex(field_ty).onePossibleValue(sema)).?;
+                const tag_val = (try sema.enumValueFieldIndex(union_obj.enum_tag_type, @intCast(field_index))).?;
+                const payload = (try field_ty.onePossibleValue(sema)).?;
                 return .{ .index = try ip.internUnion(.{ .ty = ty.index, .tag = tag_val.index, .val = payload.index }) };
             } else unreachable;
         },

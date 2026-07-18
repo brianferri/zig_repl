@@ -790,7 +790,14 @@ pub fn truncScalar(val: Value, float_type: Type, pool: *InternPool) std.mem.Allo
 }
 
 pub fn toBigInt(val: Value, space: *InternPool.Key.Int.Storage.BigIntSpace, pool: *const InternPool) std.math.big.int.Const {
-    return pool.indexToKey(val.index).int.storage.toBigInt(space);
+    if (val.getUnsignedInt(pool)) |x| return std.math.big.int.Mutable.init(&space.limbs, x).toConst();
+    const int_key = switch (pool.indexToKey(val.index)) {
+        .enum_tag => |enum_tag| pool.indexToKey(enum_tag.int).int,
+        .bitpack => |bitpack| pool.indexToKey(bitpack.backing_int_val).int,
+        .int => |int| int,
+        else => unreachable,
+    };
+    return int_key.storage.toBigInt(space);
 }
 
 pub fn clz(val: Value, ty: Type, pool: *const InternPool) u64 {
