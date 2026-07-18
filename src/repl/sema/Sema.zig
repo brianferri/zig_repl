@@ -4625,14 +4625,25 @@ fn lowerModule(sema: *Sema, canonical: []const u8, bytes: [:0]const u8) Error!In
     const file_index: Session.Index = @intCast(session.files.items.len - 1);
     try session.import_table.put(sema.gpa, sub_path, file_index);
 
+    // A file whose root is a struct-with-fields (e.g. std/Target.zig) needs its field count set here,
+    // just like any other struct decl; a namespace-only file's root simply has zero fields.
+    const root_decl = zir.getStructDecl(.main_struct_inst);
+    var any_field_aligns = false;
+    var any_comptime_fields = false;
+    var it = root_decl.iterateFields();
+    while (it.next()) |field| {
+        if (field.align_body != null) any_field_aligns = true;
+        if (field.is_comptime) any_comptime_fields = true;
+    }
+
     const root_type = try sema.intern_pool.getDeclaredStructType(
         try sema.moduleTypeName(canonical),
         .{ .declared = .{ .source_zir_id = file_index, .decl_inst = .main_struct_inst } },
         .none,
-        0,
+        @intCast(root_decl.field_names.len),
         .auto,
-        false,
-        false,
+        any_field_aligns,
+        any_comptime_fields,
     );
     session.files.items[file_index].root_type = root_type;
     return root_type;
@@ -6412,12 +6423,17 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
             if (!initializing) _ = try sema.loadUnionField((try sema.loadValue(base_ptr)).index, f.index);
             break :blk f;
         },
-        .struct_type => (try sema.structFieldByName(container_ty, name)) orelse
-            return sema.failBadStructFieldAccess(container_ty, name),
+        .struct_type => {
+            const f = (try sema.structFieldByName(container_ty, name)) orelse
+                return sema.failBadStructFieldAccess(container_ty, name);
+            try sema.ensureLayoutResolved(container_ty);
+            return try sema.structFieldPtrByIndex(base_ptr, f.index, .fromIndex(container_ty));
+        },
         else => {
             return sema.fail(sema.block, sema.block.nodeOffset(.zero), "type '{f}' does not support field access", .{Type.fromIndex(container_ty).fmt(ip)});
         },
     };
+    // A union field pointer (the compiler's unionFieldPtr); structs/tuples went through structFieldPtrByIndex.
     const field_ty = if (fld.ty != .none) fld.ty else blk: {
         const agg = ip.indexToKey((try sema.loadValue(base_ptr)).index).aggregate;
         break :blk Value.typeOf(.{ .index = InternPool.aggregateElementAt(agg, fld.index) }, ip).index;
@@ -6603,14 +6619,7 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
     const ip = sema.intern_pool;
 
     switch (ip.indexToKey(object.index)) {
-        .struct_type, .union_type, .opaque_type => {
-            if (try sema.containerDeclByName(object.index, name)) |v| return v;
-            return sema.failBadMemberAccess(object.index, name);
-        },
-        .enum_type => {
-            if (try sema.enumTagByName(object.index, name)) |v| return v;
-            return sema.failBadMemberAccess(object.index, name);
-        },
+        .struct_type, .union_type, .enum_type, .opaque_type => return try sema.fieldValOnType(object.index, name),
         .simple_type,
         .simple_value,
         .enum_literal,

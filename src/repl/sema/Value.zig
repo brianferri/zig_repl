@@ -66,14 +66,15 @@ pub fn ptrField(parent_ptr: Value, field_idx: u32, pool: *InternPool) std.mem.Al
 
     switch (aggregate_ty.zigTypeTag(pool)) {
         .pointer => assert(aggregate_ty.isSlice(pool)),
+        // A packed field has no `packed_offset` in the REPL's pointer flags; it is read through a `.field`
+        // pointer over the backing integer (the bitpack load/store path), so it uses the `.auto` form below.
         .@"struct" => switch (aggregate_ty.containerLayout(pool)) {
-            .auto => {},
+            .auto, .@"packed" => {},
             .@"extern" => return parent_ptr.getOffsetPtr(aggregate_ty.structFieldOffset(pool, field_idx), field_ptr_ty, pool),
-            .@"packed" => return parent_ptr.getOffsetPtr(0, field_ptr_ty, pool),
         },
         .@"union" => switch (aggregate_ty.containerLayout(pool)) {
-            .auto => {},
-            .@"packed", .@"extern" => return parent_ptr.getOffsetPtr(0, field_ptr_ty, pool),
+            .auto, .@"packed" => {},
+            .@"extern" => return parent_ptr.getOffsetPtr(0, field_ptr_ty, pool),
         },
         else => unreachable,
     }
