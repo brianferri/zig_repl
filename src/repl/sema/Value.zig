@@ -282,6 +282,36 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
     };
 }
 
+pub fn canMutateComptimeVarState(val: Value, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(val.index)) {
+        .error_union => |error_union| switch (error_union.val) {
+            .err_name => false,
+            .payload => |payload| Value.fromIndex(payload).canMutateComptimeVarState(pool),
+        },
+        .ptr => |ptr| switch (ptr.base_addr) {
+            .nav => false, // The value of a Nav can never reference a comptime alloc.
+            .comptime_alloc => true, // A comptime alloc is either mutable or references comptime-mutable memory.
+            .comptime_field => true, // Comptime field pointers are comptime-mutable, albeit only to the "correct" value.
+            .eu_payload, .opt_payload => |base| Value.fromIndex(base).canMutateComptimeVarState(pool),
+            .uav => |uav| Value.fromIndex(uav.val).canMutateComptimeVarState(pool),
+            .arr_elem, .field => |base_index| Value.fromIndex(base_index.base).canMutateComptimeVarState(pool),
+        },
+        .slice => |slice| Value.fromIndex(slice.ptr).canMutateComptimeVarState(pool),
+        .opt => |opt| switch (opt.val) {
+            .none => false,
+            else => |payload| Value.fromIndex(payload).canMutateComptimeVarState(pool),
+        },
+        .aggregate => |aggregate| switch (aggregate.storage) {
+            .elems => |elems| for (elems) |elem| {
+                if (Value.fromIndex(elem).canMutateComptimeVarState(pool)) break true;
+            } else false,
+            .repeated_elem => |elem| Value.fromIndex(elem).canMutateComptimeVarState(pool),
+        },
+        .un => |un| Value.fromIndex(un.val).canMutateComptimeVarState(pool),
+        else => false,
+    };
+}
+
 pub fn toFloat(val: Value, comptime T: type, pool: *const InternPool) T {
     return switch (pool.indexToKey(val.index)) {
         .int => |int| switch (int.storage) {
@@ -306,6 +336,50 @@ pub fn elemValue(val: Value, pool: *InternPool, index: usize) std.mem.Allocator.
         .aggregate => |aggregate| return .fromIndex(InternPool.aggregateElementAt(aggregate, index)),
         else => unreachable,
     }
+}
+
+/// Asserts the value is an aggregate/union, and returns the value of the field at `index`.
+pub fn fieldValue(val: Value, index: usize, pool: *InternPool) std.mem.Allocator.Error!Value {
+    return switch (pool.indexToKey(val.index)) {
+        .undef => |ty| .fromIndex(try pool.get(.{
+            .undef = Type.fromIndex(ty).fieldType(index, pool).index,
+        })),
+        .aggregate => |aggregate| .fromIndex(switch (aggregate.storage) {
+            .elems => |elems| elems[index],
+            .repeated_elem => |elem| elem,
+        }),
+        .un => |un| blk: {
+            switch (Type.fromIndex(un.ty).containerLayout(pool)) {
+                .auto, .@"extern" => {}, // TODO assert the tag is correct
+                .@"packed" => unreachable,
+            }
+            break :blk .fromIndex(un.val);
+        },
+        .bitpack => |bitpack| blk: {
+            const ty: Type = .fromIndex(bitpack.ty);
+            assert(ty.containerLayout(pool) == .@"packed");
+            const int_val: Value = .fromIndex(bitpack.backing_int_val);
+            assert(!int_val.isUndef(pool));
+            const field_ty = ty.fieldType(index, pool);
+            const field_bit_offset: u16 = switch (ty.zigTypeTag(pool)) {
+                .@"union" => 0,
+                .@"struct" => off: {
+                    var off: u16 = 0;
+                    for (0..index) |preceding_field_index| {
+                        off += @intCast(ty.fieldType(preceding_field_index, pool).bitSize(pool));
+                    }
+                    break :off off;
+                },
+                else => unreachable,
+            };
+            const buf = try pool.gpa.alloc(u8, @intCast((ty.bitSize(pool) + 7) / 8));
+            defer pool.gpa.free(buf);
+            @memset(buf, 0);
+            int_val.writeToPackedMemory(pool, buf, 0);
+            break :blk try readFromPackedMemory(field_ty, pool, buf, field_bit_offset);
+        },
+        else => unreachable,
+    };
 }
 
 pub fn mulAdd(

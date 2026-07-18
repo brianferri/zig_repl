@@ -700,6 +700,30 @@ pub fn structFieldDefaultValue(ty: Type, index: usize, pool: *const InternPool) 
     }
 }
 
+/// The comptime-known value of struct/tuple field `index`, if the field is comptime or its type has
+/// one possible value; null for a runtime field. Mirrors the compiler's Type.structFieldValueComptime.
+pub fn structFieldValueComptime(ty: Type, sema: *Sema, index: usize) Sema.Error!?Value {
+    const pool = sema.intern_pool;
+    switch (pool.indexToKey(ty.index)) {
+        .struct_type => {
+            if (ty.structFieldIsComptime(index, pool)) {
+                return .fromIndex(pool.loadStructType(ty.index).field_defaults[index]);
+            } else {
+                return try Type.fromIndex(pool.loadStructType(ty.index).field_types[index]).onePossibleValue(sema);
+            }
+        },
+        .tuple_type => |tuple| {
+            const val = tuple.values[index];
+            if (val == .none) {
+                return try Type.fromIndex(tuple.types[index]).onePossibleValue(sema);
+            } else {
+                return .fromIndex(val);
+            }
+        },
+        else => unreachable,
+    }
+}
+
 pub fn isAbiInt(ty: Type, pool: *const InternPool) bool {
     return switch (ty.zigTypeTag(pool)) {
         .int, .@"enum", .error_set => true,

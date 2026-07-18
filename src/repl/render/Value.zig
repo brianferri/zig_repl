@@ -67,15 +67,27 @@ pub fn render(
                 if (pointee == .aggregate)
                     if (try renderBytes(pool, writer, pointee.aggregate, .ref)) return;
             }
+            // `{any}` renders a single-item pointer to an array/vector as the `[]const T` it points
+            // at (Writer.printValue's `.one` -> `@as([]const child, value)`), so show the pointee.
+            const pty = pool.indexToKey(p.ty);
+            if (pty == .ptr_type and pty.ptr_type.flags.size == .one) {
+                switch (pool.indexToKey(pty.ptr_type.child)) {
+                    .array_type => |at| if (try renderIndexable(pool, session, writer, value.index, at.child, at.len)) return,
+                    .vector_type => |vt| if (try renderIndexable(pool, session, writer, value.index, vt.child, vt.len)) return,
+                    else => {},
+                }
+            }
             return writer.print("ptr@{d}+{d}", .{ @intFromEnum(p.ty), p.byte_offset });
         },
         .slice => |s| {
-            if (try renderByteSlice(pool, writer, s)) return;
+            const child = pool.indexToKey(s.ty).ptr_type.child;
+            const len = intOf(pool, s.len) orelse -1;
+            if (len >= 0 and try renderIndexable(pool, session, writer, s.ptr, child, @intCast(len))) return;
             // Otherwise the elements live behind the slice's `ptr` in a Sema
             // comptime alloc the renderer cannot reach, so render just the length.
             var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-            const len = pool.indexToKey(s.len).int.storage.toBigInt(&space);
-            return writer.print("slice[{f}]", .{len});
+            const slice_len = pool.indexToKey(s.len).int.storage.toBigInt(&space);
+            return writer.print("slice[{f}]", .{slice_len});
         },
         .err => |e| writer.print("error.{s}", .{pool.stringSlice(e.name)}),
         .error_union => |eu| renderErrorUnion(eu, pool, session, writer),
@@ -221,35 +233,33 @@ fn renderBytes(pool: *const InternPool, writer: *std.Io.Writer, agg: InternPool.
     return true;
 }
 
-/// The backing array and start element for a slice's pointer when it is a
-/// self-contained const ref the read-only renderer can follow: a `.uav` (the
-/// whole array) or an `.arr_elem` into one (the `arr[0..]` shape `coerceToSlice`
-/// builds). Null for `comptime_alloc`/`nav`/`field` bases, whose storage lives in
+/// The backing array and start element for a pointer when it names a const value the read-only
+/// renderer can follow: a `.uav` or `.nav` (the whole value) or an `.arr_elem` into one (the
+/// `arr[0..]`/`arr[a..b]` shape). Null for `comptime_alloc`/`field` bases, whose storage lives in
 /// Sema out of the renderer's reach.
-fn sliceBacking(pool: *const InternPool, slice: InternPool.Key.Slice) ?struct { array: InternPool.Index, start: u64 } {
-    if (pool.indexToKey(slice.ptr) != .ptr) return null;
-    switch (pool.indexToKey(slice.ptr).ptr.base_addr) {
+fn ptrBacking(pool: *const InternPool, ptr_index: InternPool.Index) ?struct { array: InternPool.Index, start: u64 } {
+    if (pool.indexToKey(ptr_index) != .ptr) return null;
+    switch (pool.indexToKey(ptr_index).ptr.base_addr) {
         .uav => |u| return .{ .array = u.val, .start = 0 },
+        .nav => |nav| {
+            const r = pool.getNav(nav).resolved orelse return null;
+            return .{ .array = r.value, .start = 0 };
+        },
         .arr_elem => |ae| {
-            if (pool.indexToKey(ae.base) != .ptr) return null;
-            const base = pool.indexToKey(ae.base).ptr.base_addr;
-            if (base != .uav) return null;
-            return .{ .array = base.uav.val, .start = ae.index };
+            const base = ptrBacking(pool, ae.base) orelse return null;
+            return .{ .array = base.array, .start = base.start + ae.index };
         },
         else => return null,
     }
 }
 
-/// Render a `[]u8`/`[:0]u8` slice as a quoted string when its backing array is a
-/// reachable const ref of concrete bytes over the sliced range; false (no output)
-/// otherwise, so the caller falls back to the length placeholder.
-fn renderByteSlice(pool: *const InternPool, writer: *std.Io.Writer, slice: InternPool.Key.Slice) Error!bool {
-    const slice_ty = pool.indexToKey(slice.ty);
-    if (slice_ty != .ptr_type or slice_ty.ptr_type.child != .u8_type) return false;
-    const backing = sliceBacking(pool, slice) orelse return false;
-    const len_i = intOf(pool, slice.len) orelse return false;
-    if (len_i < 0) return false;
-    const len: u64 = @intCast(len_i);
+/// Render the `len` elements a pointer indexes -- for both a slice's `ptr` and a single-item
+/// pointer to an array (`{any}` treats `*[N]T` as `[]const T`). An all-concrete `u8` run renders
+/// as a quoted string (the REPL's byte convention, like renderBytes); otherwise positionally
+/// `{ v0, v1, ... }`. False (no output) when the backing is out of the renderer's reach, so the
+/// caller falls back to the length placeholder / raw address.
+fn renderIndexable(pool: *InternPool, session: ?*const Session, writer: *std.Io.Writer, ptr_index: InternPool.Index, child: InternPool.Index, len: u64) Error!bool {
+    const backing = ptrBacking(pool, ptr_index) orelse return false;
     if (pool.indexToKey(backing.array) != .aggregate) return false;
     const agg = pool.indexToKey(backing.array).aggregate;
     const total: u64 = switch (agg.storage) {
@@ -257,16 +267,28 @@ fn renderByteSlice(pool: *const InternPool, writer: *std.Io.Writer, slice: Inter
         .repeated_elem => std.math.maxInt(u64),
     };
     if (backing.start + len > total) return false;
+
+    if (child == .u8_type) bytes: {
+        var i: u64 = 0;
+        while (i < len) : (i += 1) {
+            if (byteValue(pool, aggElem(agg, backing.start + i)) == null) break :bytes;
+        }
+        try writer.writeByte('"');
+        i = 0;
+        while (i < len) : (i += 1) {
+            try std.zig.stringEscape(&.{byteValue(pool, aggElem(agg, backing.start + i)).?}, writer);
+        }
+        try writer.writeByte('"');
+        return true;
+    }
+
+    try writer.writeAll("{ ");
     var i: u64 = 0;
     while (i < len) : (i += 1) {
-        if (byteValue(pool, aggElem(agg, backing.start + i)) == null) return false;
+        if (i > 0) try writer.writeAll(", ");
+        try render(.{ .index = aggElem(agg, backing.start + i) }, pool, session, writer);
     }
-    try writer.writeByte('"');
-    i = 0;
-    while (i < len) : (i += 1) {
-        try std.zig.stringEscape(&.{byteValue(pool, aggElem(agg, backing.start + i)).?}, writer);
-    }
-    try writer.writeByte('"');
+    try writer.writeAll(" }");
     return true;
 }
 

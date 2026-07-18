@@ -333,3 +333,47 @@ test "compliance: compound assignment" {
         } },
     });
 }
+
+// A tuple coerces element-wise to an array or vector of matching length (coerceTupleToArray).
+test "compliance: a tuple coerces to an array or vector" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const t = .{ @as(i32, 1), @as(i32, 2), @as(i32, 3) }; const arr: [3]i32 = t; break :blk arr; }"}, .want = blk: {
+            const t = .{ @as(i32, 1), @as(i32, 2), @as(i32, 3) };
+            const arr: [3]i32 = t;
+            break :blk arr;
+        } },
+        .{ .src = &.{"blk: { const arr: [3]i32 = .{ 1, 2, 3 }; break :blk arr[2]; }"}, .want = blk: {
+            const arr: [3]i32 = .{ 1, 2, 3 };
+            break :blk arr[2];
+        } },
+        .{ .src = &.{"blk: { const v: @Vector(3, i32) = .{ 1, 2, 3 }; break :blk v[1]; }"}, .want = blk: {
+            const v: @Vector(3, i32) = .{ 1, 2, 3 };
+            break :blk v[1];
+        } },
+        .{ .src = &.{"blk: { const t = .{ @as(u8, 1), @as(u8, 2), @as(u8, 3) }; const arr: [3:0]u8 = t; break :blk arr[3]; }"}, .want = blk: {
+            const t = .{ @as(u8, 1), @as(u8, 2), @as(u8, 3) };
+            const arr: [3:0]u8 = t;
+            break :blk arr[3];
+        } },
+        .{ .src = &.{"blk: { const arr: [2]i32 = .{ 1, 2, 3 }; break :blk arr[0]; }"}, .reject = {} },
+    });
+}
+
+// An anonymous array literal reaches its element type through an optional/error-union result type
+// (`array_init_elem_type`/`zirArrayInit` peel via optEuBaseType).
+test "compliance: an anonymous array literal initializes through ?/! result types" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const x: ?[2]i32 = .{ 1, 2 }; break :blk x.?[1]; }"}, .want = blk: {
+            const x: ?[2]i32 = .{ 1, 2 };
+            break :blk x.?[1];
+        } },
+        .{ .src = &.{"blk: { const x: anyerror![2]i32 = .{ 7, 8 }; break :blk (x catch unreachable)[0]; }"}, .want = blk: {
+            const x: anyerror![2]i32 = .{ 7, 8 };
+            break :blk (x catch unreachable)[0];
+        } },
+        .{ .src = &.{"blk: { const x: ?[2]i32 = .{ 1, 2 }; break :blk x; }"}, .want = blk: {
+            const x: ?[2]i32 = .{ 1, 2 };
+            break :blk x;
+        } },
+    });
+}

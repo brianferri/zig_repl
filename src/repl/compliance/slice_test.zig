@@ -218,6 +218,29 @@ test "compliance: storing through a pointer-to-array writes the sub-array range"
     });
 }
 
+// A whole slice or single-item pointer to an array displays its elements the way `{any}` does
+// (`*[N]T` prints as the `[]const T` it points at); a byte slice keeps its string form.
+test "compliance: a slice or pointer-to-array renders its elements" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const arr = [_]i32{ 1, 2, 3, 4, 5 }; break :blk arr[1..3]; }"}, .want = blk: {
+            const arr = [_]i32{ 1, 2, 3, 4, 5 };
+            break :blk arr[1..3];
+        } },
+        .{ .src = &.{"blk: { const arr = [_]i32{ 1, 2, 3, 4, 5 }; break :blk &arr; }"}, .want = blk: {
+            const arr = [_]i32{ 1, 2, 3, 4, 5 };
+            break :blk &arr;
+        } },
+        .{ .src = &.{"blk: { const s: []const i32 = &.{ 7, 8, 9 }; break :blk s; }"}, .want = blk: {
+            const s: []const i32 = &.{ 7, 8, 9 };
+            break :blk s;
+        } },
+        .{ .src = &.{"blk: { const flags = [_]bool{ true, false, true }; break :blk flags[0..2]; }"}, .want = blk: {
+            const flags = [_]bool{ true, false, true };
+            break :blk flags[0..2];
+        } },
+    });
+}
+
 test "compliance: out-of-bounds and mismatched-sentinel slices are rejected" {
     try compliance.check(a, .{
         .{ .src = &.{"(&[_]i32{ 1, 2, 3 })[1..5].*"}, .reject = {} },

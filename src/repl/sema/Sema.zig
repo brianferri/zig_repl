@@ -2527,10 +2527,21 @@ fn evalMakePtrConst(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const old = ip.indexToKey(p.ty).ptr_type;
     if (p.base_addr == .comptime_alloc) try sema.fillComptimeAllocFields(p, old.child);
     sema.freezeBacking(p);
-    if (old.flags.is_const) return ptr;
+
     var flags = old.flags;
     flags.is_const = true;
     const const_ty = try ip.internPtrType(.{ .child = old.child, .sentinel = old.sentinel, .flags = flags });
+
+    // A frozen comptime alloc whose value does not reference comptime-mutable memory is promoted to an
+    // anonymous decl (uav), so the const pointer names a stable, self-contained value -- mirrors
+    // zirMakePtrConst. A value that can still mutate comptime-var state keeps its comptime_alloc base.
+    if (p.base_addr == .comptime_alloc and p.byte_offset == 0) {
+        const alloc = try sema.lookupComptimeAlloc(p);
+        if (!alloc.val.canMutateComptimeVarState(ip))
+            return .{ .index = try sema.uavPtr(const_ty, alloc.val.index) };
+    }
+
+    if (old.flags.is_const) return ptr;
     const const_ptr = try ip.internPtr(.{ .ty = const_ty, .base_addr = p.base_addr, .byte_offset = p.byte_offset });
     return .{ .index = const_ptr };
 }
@@ -3485,7 +3496,13 @@ fn coerceValueToType(
                 return try sema.materializeConstPtr(value),
             .c => {},
         },
-        .array_type, .vector_type => if (try sema.coerceArrayLike(value, dest_ty, op_name)) |c| return c,
+        .array_type, .vector_type => {
+            // The compiler dispatches an array/vector destination by source shape: an array/vector
+            // source coerces element-wise (coerceArrayLike), a tuple source through coerceTupleToArray.
+            if (Type.fromIndex(Value.typeOf(value, ip).index).isTuple(ip))
+                return try sema.coerceTupleToArray(value, dest_ty, op_name);
+            if (try sema.coerceArrayLike(value, dest_ty, op_name)) |c| return c;
+        },
         .enum_type => switch (ip.indexToKey(value.index)) {
             .enum_literal => |name| {
                 if (try sema.enumTagByName(dest_ty, name)) |tag| return tag;
@@ -3587,6 +3604,72 @@ fn coerceArrayLike(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_name
         const elem: Value = .{ .index = InternPool.aggregateElementAt(agg, i) };
         e.* = (try sema.coerceValueToType(elem, dst.child, op_name)).index;
     }
+    return .{ .index = try ip.internAggregate(.{ .ty = dest_ty, .storage = .{ .elems = elems } }) };
+}
+
+/// The comptime value of tuple field `field_index`, with the tuple's bounds validated. Mirrors the
+/// compiler's tupleField; the compiler's runtime path collapses here because a tuple value is always
+/// comptime-known.
+fn tupleField(sema: *Sema, tuple: Value, field_index: u32) Error!Value {
+    const ip = sema.intern_pool;
+    const tuple_ty = Value.typeOf(tuple, ip);
+    const field_count = try sema.structFieldCount(tuple_ty.index);
+
+    if (field_count == 0) {
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "indexing into empty tuple is not allowed", .{});
+    }
+
+    if (field_index >= field_count) {
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index {d} outside tuple of length {d}", .{ field_index, field_count });
+    }
+
+    const field_ty = tuple_ty.fieldType(field_index, ip);
+
+    if (try tuple_ty.structFieldValueComptime(sema, field_index)) |default_value| {
+        return default_value; // comptime field
+    }
+
+    if (tuple.isUndef(ip)) return .{ .index = try ip.get(.{ .undef = field_ty.index }) };
+    return try tuple.fieldValue(field_index, ip);
+}
+
+/// Coerce a tuple to an array/vector of matching length by coercing each element to the destination
+/// element type (compiler: coerceTupleToArray). The REPL stores an array sentinel as a trailing
+/// aggregate element (its storage convention; the compiler leaves it implied by the type).
+fn coerceTupleToArray(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_name: []const u8) Error!Value {
+    const ip = sema.intern_pool;
+    const inst_len = ip.aggregateElementCount(Value.typeOf(value, ip).index);
+    const dest_key = ip.indexToKey(dest_ty);
+    const dest_len = switch (dest_key) {
+        .array_type => |at| at.len,
+        .vector_type => |vt| vt.len,
+        else => unreachable,
+    };
+    if (dest_len != inst_len) {
+        const src = sema.block.nodeOffset(.zero);
+        const msg = msg: {
+            const msg = try sema.errMsg(src, "{s}: expected type '{f}', found '{f}'", .{ op_name, Type.fromIndex(dest_ty).fmt(ip), Value.typeOf(value, ip).fmt(ip) });
+            errdefer msg.destroy(sema.gpa);
+            try sema.errNote(src, msg, "destination has length {d}", .{dest_len});
+            try sema.errNote(src, msg, "source has length {d}", .{inst_len});
+            break :msg msg;
+        };
+        return sema.failWithOwnedErrorMsg(sema.block, msg);
+    }
+    const dest_elem_ty = switch (dest_key) {
+        .array_type => |at| at.child,
+        .vector_type => |vt| vt.child,
+        else => unreachable,
+    };
+    const sentinel = if (dest_key == .array_type) dest_key.array_type.sentinel else .none;
+    const total: usize = @intCast(ip.aggregateElementCount(dest_ty));
+    const elems = try sema.gpa.alloc(InternPool.Index, total);
+    defer sema.gpa.free(elems);
+    for (0..@intCast(dest_len)) |i| {
+        const elem_val = try sema.tupleField(value, @intCast(i));
+        elems[i] = (try sema.coerceValueToType(elem_val, dest_elem_ty, op_name)).index;
+    }
+    if (sentinel != .none) elems[total - 1] = sentinel;
     return .{ .index = try ip.internAggregate(.{ .ty = dest_ty, .storage = .{ .elems = elems } }) };
 }
 
@@ -5258,10 +5341,13 @@ fn buildArrayAggregate(sema: *Sema, inst: Zir.Inst.Index) Error!InternPool.Index
     assert(operands.len >= 1);
 
     const ip = sema.intern_pool;
-    const array_ty = try sema.resolveDestType(operands[0], "array_init");
+    const result_ty = try sema.resolveDestType(operands[0], "array_init");
     // A generic (`anytype`) result type is unknown; build an anonymous tuple of the elements, as
     // the compiler's zirArrayInit does (`resolveTypeOrPoison ... orelse arrayInitAnon(args[1..])`).
-    if (array_ty == .generic_poison_type) return try sema.arrayInitAnon(operands[1..]);
+    if (result_ty == .generic_poison_type) return try sema.arrayInitAnon(operands[1..]);
+    // Peel an optional/error-union result type (`?[N]T`, `E![N]T`) to the array it wraps; the wrapping
+    // happens at the coercion of the built aggregate.
+    const array_ty = sema.optEuBaseType(result_ty);
     const array_key = ip.indexToKey(array_ty);
 
     const elems = operands[1..];
@@ -5305,9 +5391,11 @@ fn evalArrayInitElemType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const bin = sema.zir.instructions.items(.data)[@intFromEnum(inst)].bin;
-    const indexable_ty = try sema.resolveDestType(bin.lhs, "array_init_elem_type");
+    const maybe_wrapped = try sema.resolveDestType(bin.lhs, "array_init_elem_type");
     // A generic (`anytype`) aggregate has a generic element type; the element resolves on coercion.
-    if (indexable_ty == .generic_poison_type) return .{ .index = .generic_poison_type };
+    if (maybe_wrapped == .generic_poison_type) return .{ .index = .generic_poison_type };
+    // Peel an optional/error-union result type (`?[N]T`, `E![N]T`) to the aggregate it wraps.
+    const indexable_ty = sema.optEuBaseType(maybe_wrapped);
     const index: usize = @intFromEnum(bin.rhs);
     const elem_ty = try sema.arrayInitElemType(
         sema.intern_pool.indexToKey(indexable_ty),
@@ -6473,7 +6561,9 @@ fn evalTagName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 pub fn structFieldCount(sema: *Sema, struct_ty: InternPool.Index) Error!u32 {
-    switch (sema.intern_pool.indexToKey(struct_ty).struct_type) {
+    const key = sema.intern_pool.indexToKey(struct_ty);
+    if (key == .tuple_type) return @intCast(key.tuple_type.types.len);
+    switch (key.struct_type) {
         .reified => return @intCast(sema.intern_pool.loadStructType(struct_ty).field_names.len),
         .declared => {},
         .generated_union_tag => unreachable,
