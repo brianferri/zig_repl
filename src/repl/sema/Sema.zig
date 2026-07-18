@@ -19,6 +19,7 @@ pub const Error = Allocator.Error || std.Io.Writer.Error || error{
     AnalysisFail,
     ComptimeBreak,
     ComptimeReturn,
+    NotCoercible,
 };
 
 gpa: Allocator,
@@ -1699,14 +1700,35 @@ fn resolvePeerTypesInner(sema: *Sema, peer_tys: []?Type, peer_vals: []?Value) Er
                     peer_field_ty.* = ty.fieldType(field_index, ip);
                     peer_field_val.* = if (opt_val) |val| try val.fieldValue(field_index, ip) else null;
                 }
-                // The REPL has no non-reporting coerce, so comptime-tuple-field folding across peers is
-                // not performed here; the field is left runtime (`.none`). On a field-type conflict the
-                // inner result is propagated directly rather than wrapped with a field-name note.
                 field_ty.* = switch (try sema.resolvePeerTypesInner(sub_peer_tys, sub_peer_vals)) {
                     .success => |ty| ty.index,
                     else => |result| return result,
                 };
-                field_val.* = .none;
+
+                var comptime_val: ?Value = null;
+                for (peer_tys) |opt_ty| {
+                    const struct_ty = opt_ty orelse continue;
+                    const uncoerced_field_val = (try struct_ty.structFieldValueComptime(sema, field_index)) orelse {
+                        comptime_val = null;
+                        break;
+                    };
+                    const coerced_val = sema.coerceExtra(uncoerced_field_val, field_ty.*, "peer", false) catch |err| switch (err) {
+                        error.NotCoercible => {
+                            comptime_val = null;
+                            break;
+                        },
+                        else => |e| return e,
+                    };
+                    const existing = comptime_val orelse {
+                        comptime_val = coerced_val;
+                        continue;
+                    };
+                    if (coerced_val.index != existing.index) {
+                        comptime_val = null;
+                        break;
+                    }
+                }
+                field_val.* = if (comptime_val) |v| v.index else .none;
             }
 
             return .{ .success = .fromIndex(try ip.internTupleType(field_types, field_vals)) };
@@ -4343,11 +4365,16 @@ fn coerceInMemoryAllowedErrorSets(sema: *Sema, dest_ty: Type, src_ty: Type) Erro
     return .{ .ok = .error_cast };
 }
 
-fn coerceValueToType(
+fn coerceValueToType(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_name: []const u8) Error!Value {
+    return sema.coerceExtra(value, dest_ty, op_name, true);
+}
+
+fn coerceExtra(
     sema: *Sema,
     value: Value,
     dest_ty: InternPool.Index,
     op_name: []const u8,
+    report_err: bool,
 ) Error!Value {
     assert(dest_ty != .none);
     assert(value.index != .none);
@@ -4415,6 +4442,7 @@ fn coerceValueToType(
         else => {},
     }
 
+    if (!report_err) return error.NotCoercible;
     return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}: cannot coerce value to destination type", .{op_name});
 }
 
