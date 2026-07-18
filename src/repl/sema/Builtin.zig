@@ -149,5 +149,13 @@ pub fn generate(gpa: Allocator) Allocator.Error![:0]u8 {
         native.omit_frame_pointer,
     });
 
+    if (target.os.tag == .wasi) {
+        try buffer.print("pub const wasi_exec_model: std.lang.WasiExecModel = .{f};\n", .{std.zig.fmtIdPU(@tagName(native.wasi_exec_model))});
+    }
+
+    if (native.is_test) {
+        try buffer.appendSlice("pub var test_functions: []const std.lang.TestFn = &.{}; // overwritten later\n");
+    }
+
     return buffer.toOwnedSliceSentinel(0);
 }
