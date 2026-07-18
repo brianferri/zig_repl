@@ -4585,15 +4585,12 @@ fn coerceTupleToArray(sema: *Sema, value: Value, dest_ty: InternPool.Index, op_n
         .vector_type => |vt| vt.child,
         else => unreachable,
     };
-    const sentinel = if (dest_key == .array_type) dest_key.array_type.sentinel else .none;
-    const total: usize = @intCast(ip.aggregateElementCount(dest_ty));
-    const elems = try sema.gpa.alloc(InternPool.Index, total);
+    const elems = try sema.gpa.alloc(InternPool.Index, @intCast(dest_len));
     defer sema.gpa.free(elems);
     for (0..@intCast(dest_len)) |i| {
         const elem_val = try sema.tupleField(value, @intCast(i));
         elems[i] = (try sema.coerceValueToType(elem_val, dest_elem_ty, op_name)).index;
     }
-    if (sentinel != .none) elems[total - 1] = sentinel;
     return .{ .index = try ip.internAggregate(.{ .ty = dest_ty, .storage = .{ .elems = elems } }) };
 }
 
@@ -5539,16 +5536,13 @@ fn evalArrayCat(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const result_len = lhs_info.len + rhs_info.len;
     const result_ty = try ip.internArrayType(.{ .len = result_len, .child = elem_ty.index, .sentinel = sentinel });
 
-    // A sentinel array's aggregate stores the sentinel as a trailing element (see internStringLiteral).
-    const stored_len = result_len + @as(u64, if (sentinel != .none) 1 else 0);
-    const elems = try sema.gpa.alloc(InternPool.Index, @intCast(stored_len));
+    const elems = try sema.gpa.alloc(InternPool.Index, @intCast(result_len));
     defer sema.gpa.free(elems);
     const lhs_agg = ip.indexToKey(lhs_info.array.index).aggregate;
     const rhs_agg = ip.indexToKey(rhs_info.array.index).aggregate;
     var i: u64 = 0;
     while (i < lhs_info.len) : (i += 1) elems[@intCast(i)] = InternPool.aggregateElementAt(lhs_agg, i);
     while (i < result_len) : (i += 1) elems[@intCast(i)] = InternPool.aggregateElementAt(rhs_agg, i - lhs_info.len);
-    if (sentinel != .none) elems[@intCast(result_len)] = sentinel;
 
     const agg: Value = .{ .index = try ip.internAggregate(.{ .ty = result_ty, .storage = .{ .elems = elems } }) };
     // Concatenating pointer operands (e.g. string literals) yields a pointer to the result, like a literal.
@@ -6276,11 +6270,7 @@ fn buildArrayAggregate(sema: *Sema, inst: Zir.Inst.Index) Error!InternPool.Index
     const array_key = ip.indexToKey(array_ty);
 
     const elems = operands[1..];
-    const sentinel: InternPool.Index = switch (array_key) {
-        .array_type => |at| at.sentinel,
-        else => .none,
-    };
-    const buf = try sema.gpa.alloc(InternPool.Index, elems.len + @intFromBool(sentinel != .none));
+    const buf = try sema.gpa.alloc(InternPool.Index, elems.len);
     defer sema.gpa.free(buf);
     for (elems, 0..) |elem_ref, i| {
         const elem = try sema.resolveInst(elem_ref);
@@ -6288,7 +6278,6 @@ fn buildArrayAggregate(sema: *Sema, inst: Zir.Inst.Index) Error!InternPool.Index
         const coerced = try sema.coerceValueToType(elem, elem_ty, "array_init");
         buf[i] = coerced.index;
     }
-    if (sentinel != .none) buf[elems.len] = sentinel;
 
     return try ip.internAggregate(.{ .ty = array_ty, .storage = .{ .elems = buf } });
 }
@@ -6350,18 +6339,7 @@ fn evalSplat(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const dest_ty = sema.optEuBaseType(try sema.resolveDestType(bin.lhs, "@splat"));
     const info = try sema.expectArrayOrVector(dest_ty);
     const scalar = try sema.coerceValueToType(try sema.resolveInst(bin.rhs), info.child, "@splat");
-
-    const dest_key = ip.indexToKey(dest_ty);
-    const sentinel = if (dest_key == .array_type) dest_key.array_type.sentinel else .none;
-    if (sentinel == .none)
-        return .{ .index = try ip.internAggregate(.{ .ty = dest_ty, .storage = .{ .repeated_elem = scalar.index } }) };
-
-    const count: usize = @intCast(ip.aggregateElementCount(dest_ty));
-    const elems = try sema.gpa.alloc(InternPool.Index, count);
-    defer sema.gpa.free(elems);
-    @memset(elems, scalar.index);
-    elems[count - 1] = sentinel;
-    return .{ .index = try ip.internAggregate(.{ .ty = dest_ty, .storage = .{ .elems = elems } }) };
+    return .{ .index = try ip.internAggregate(.{ .ty = dest_ty, .storage = .{ .repeated_elem = scalar.index } }) };
 }
 
 fn evalShuffle(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
@@ -8780,11 +8758,20 @@ fn aggregateElementByIndex(sema: *Sema, array_value: Value, index: u64) Error!Va
     if (agg_key != .aggregate) {
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "elem access: operand is not an indexable aggregate", .{});
     }
-    const count = slice_len orelse ip.aggregateElementCount(agg_key.aggregate.ty);
+    const array_ty = agg_key.aggregate.ty;
+    const count = slice_len orelse switch (ip.indexToKey(array_ty)) {
+        .array_type => |at| at.lenIncludingSentinel(),
+        else => ip.aggregateElementCount(array_ty),
+    };
     if (index >= count) {
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index {d} outside array of length {d}", .{ index, count });
     }
-    return .{ .index = InternPool.aggregateElementAt(agg_key.aggregate, start_offset + index) };
+    const logical_index = start_offset + index;
+    if (slice_len == null) switch (ip.indexToKey(array_ty)) {
+        .array_type => |at| if (at.sentinel != .none and logical_index == at.len) return .{ .index = at.sentinel },
+        else => {},
+    };
+    return .{ .index = InternPool.aggregateElementAt(agg_key.aggregate, logical_index) };
 }
 
 fn memOperandType(sema: *Sema, value: Value) ?Type {

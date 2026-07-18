@@ -217,12 +217,11 @@ const BytesForm = enum { ref, value };
 fn renderBytes(pool: *const InternPool, writer: *std.Io.Writer, agg: InternPool.Key.Aggregate, form: BytesForm) Error!bool {
     const ty_key = pool.indexToKey(agg.ty);
     if (ty_key != .array_type or ty_key.array_type.child != .u8_type) return false;
-    var count = ty_key.array_type.lenIncludingSentinel();
+    const count = ty_key.array_type.len;
     var i: u64 = 0;
     while (i < count) : (i += 1) {
         if (byteValue(pool, aggElem(agg, i)) == null) return false;
     }
-    if (count > 0 and byteValue(pool, aggElem(agg, count - 1)).? == 0) count -= 1;
     try writer.writeByte('"');
     i = 0;
     while (i < count) : (i += 1) {
