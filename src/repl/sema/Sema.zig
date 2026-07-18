@@ -2341,12 +2341,22 @@ fn evalComparison(
     var lhs_key = ip.indexToKey(lhs_value.index);
     var rhs_key = ip.indexToKey(rhs_value.index);
 
-    if (lhs_key == .un and rhs_key == .enum_literal) {
-        if (try sema.cmpUnionTagNoValue(Value.typeOf(lhs_value, ip).index, rhs_key.enum_literal, op)) |v| return v;
+    if (lhs_key == .un and (rhs_key == .enum_literal or rhs_key == .enum_tag)) {
+        const tag_name = switch (rhs_key) {
+            .enum_literal => |n| n,
+            .enum_tag => |et| (try sema.enumFieldName(et.ty, (try sema.enumTagFieldIndex(et.ty, rhs_value)).?)).?,
+            else => unreachable,
+        };
+        if (try sema.cmpUnionTagNoValue(Value.typeOf(lhs_value, ip).index, tag_name, op)) |v| return v;
         lhs_value = .{ .index = lhs_key.un.tag };
         lhs_key = ip.indexToKey(lhs_value.index);
-    } else if (rhs_key == .un and lhs_key == .enum_literal) {
-        if (try sema.cmpUnionTagNoValue(Value.typeOf(rhs_value, ip).index, lhs_key.enum_literal, op)) |v| return v;
+    } else if (rhs_key == .un and (lhs_key == .enum_literal or lhs_key == .enum_tag)) {
+        const tag_name = switch (lhs_key) {
+            .enum_literal => |n| n,
+            .enum_tag => |et| (try sema.enumFieldName(et.ty, (try sema.enumTagFieldIndex(et.ty, lhs_value)).?)).?,
+            else => unreachable,
+        };
+        if (try sema.cmpUnionTagNoValue(Value.typeOf(rhs_value, ip).index, tag_name, op)) |v| return v;
         rhs_value = .{ .index = rhs_key.un.tag };
         rhs_key = ip.indexToKey(rhs_value.index);
     }
