@@ -151,3 +151,29 @@ test "compliance: slices nested in structs and arrays of slices" {
         } },
     });
 }
+
+// Array/string/tuple concatenation via `++` (array_cat).
+test "compliance: concatenation with ++" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const x = [_]i32{ 1, 2, 3 } ++ [_]i32{ 4, 5 }; break :blk x[3]; }"}, .want = blk: {
+            const x = [_]i32{ 1, 2, 3 } ++ [_]i32{ 4, 5 };
+            break :blk x[3];
+        } },
+        .{ .src = &.{"blk: { const x = [_]i32{ 1, 2, 3 } ++ [_]i32{ 4, 5 }; break :blk x.len; }"}, .want = blk: {
+            const x = [_]i32{ 1, 2, 3 } ++ [_]i32{ 4, 5 };
+            break :blk x.len;
+        } },
+        .{ .src = &.{"blk: { const s = \"ab\" ++ \"cd\"; break :blk s[3]; }"}, .want = blk: {
+            const s = "ab" ++ "cd";
+            break :blk s[3];
+        } },
+        .{ .src = &.{"blk: { const s = \"ab\" ++ \"cd\"; break :blk s.len; }"}, .want = blk: {
+            const s = "ab" ++ "cd";
+            break :blk s.len;
+        } },
+        .{ .src = &.{"blk: { const t = .{ 1, 2 } ++ .{3.5}; break :blk t[2]; }"}, .want = blk: {
+            const t = .{ 1, 2 } ++ .{3.5};
+            break :blk t[2];
+        } },
+    });
+}

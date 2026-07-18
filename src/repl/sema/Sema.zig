@@ -266,6 +266,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .sub_sat,
         .mul_sat,
         => sema.evalBinaryArith(inst, tag),
+        .array_cat => sema.evalArrayCat(inst),
         .bit_and, .bit_or, .xor => sema.evalBitwise(inst, tag),
         .shl, .shr, .shl_exact, .shr_exact, .shl_sat => sema.evalShift(inst, tag),
         .typeof_log2_int_type => sema.evalTypeofLog2IntType(inst),
@@ -4467,6 +4468,107 @@ fn evalArrayInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const tuple_ty = try ip.internTupleType(types, field_vals);
     const agg = try ip.internAggregate(.{ .ty = tuple_ty, .storage = .{ .elems = values } });
     return .{ .index = agg };
+}
+
+const ArrayCatInfo = struct { elem_type: Type, sentinel: InternPool.Index, len: u64, array: Value };
+
+fn getArrayCatInfo(sema: *Sema, operand: Value) Error!?ArrayCatInfo {
+    const ip = sema.intern_pool;
+    const operand_ty = operand.typeOf(ip);
+    switch (operand_ty.zigTypeTag(ip)) {
+        .array => {
+            const ai = operand_ty.arrayInfo(ip);
+            return .{ .elem_type = ai.elem_type, .sentinel = ai.sentinel orelse .none, .len = ai.len, .array = operand };
+        },
+        .pointer => {
+            const ptr_info = ip.indexToKey(operand_ty.index).ptr_type;
+            if (ptr_info.flags.size == .one and Type.fromIndex(ptr_info.child).zigTypeTag(ip) == .array) {
+                const ai = Type.fromIndex(ptr_info.child).arrayInfo(ip);
+                return .{ .elem_type = ai.elem_type, .sentinel = ai.sentinel orelse .none, .len = ai.len, .array = try sema.loadValue(operand) };
+            }
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn evalArrayCat(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const bin = sema.binData(inst);
+    const lhs = try sema.resolveInst(bin.lhs);
+    const rhs = try sema.resolveInst(bin.rhs);
+    const lhs_ty = lhs.typeOf(ip);
+    const rhs_ty = rhs.typeOf(ip);
+    const src = sema.block.nodeOffset(sema.srcNodeOffset(inst));
+
+    if (lhs_ty.isTuple(ip) and rhs_ty.isTuple(ip)) return try sema.analyzeTupleCat(lhs, rhs);
+
+    const lhs_info = (try sema.getArrayCatInfo(lhs)) orelse
+        return sema.fail(sema.block, src, "expected indexable; found '{f}'", .{lhs_ty.fmt(ip)});
+    const rhs_info = (try sema.getArrayCatInfo(rhs)) orelse
+        return sema.fail(sema.block, src, "expected indexable; found '{f}'", .{rhs_ty.fmt(ip)});
+
+    if (lhs_info.elem_type.index != rhs_info.elem_type.index) {
+        return sema.fail(sema.block, src, "array concatenation requires matching element types, found '{f}' and '{f}'", .{ lhs_info.elem_type.fmt(ip), rhs_info.elem_type.fmt(ip) });
+    }
+    const elem_ty = lhs_info.elem_type;
+
+    // With a sentinel mismatch the result has no sentinel; otherwise use whichever operand supplies one.
+    const sentinel: InternPool.Index = blk: {
+        if (lhs_info.sentinel != .none and rhs_info.sentinel != .none)
+            break :blk if (lhs_info.sentinel == rhs_info.sentinel) lhs_info.sentinel else .none;
+        if (lhs_info.sentinel != .none) break :blk lhs_info.sentinel;
+        break :blk rhs_info.sentinel;
+    };
+
+    const result_len = lhs_info.len + rhs_info.len;
+    const result_ty = try ip.internArrayType(.{ .len = result_len, .child = elem_ty.index, .sentinel = sentinel });
+
+    // A sentinel array's aggregate stores the sentinel as a trailing element (see internStringLiteral).
+    const stored_len = result_len + @as(u64, if (sentinel != .none) 1 else 0);
+    const elems = try sema.gpa.alloc(InternPool.Index, @intCast(stored_len));
+    defer sema.gpa.free(elems);
+    const lhs_agg = ip.indexToKey(lhs_info.array.index).aggregate;
+    const rhs_agg = ip.indexToKey(rhs_info.array.index).aggregate;
+    var i: u64 = 0;
+    while (i < lhs_info.len) : (i += 1) elems[@intCast(i)] = InternPool.aggregateElementAt(lhs_agg, i);
+    while (i < result_len) : (i += 1) elems[@intCast(i)] = InternPool.aggregateElementAt(rhs_agg, i - lhs_info.len);
+    if (sentinel != .none) elems[@intCast(result_len)] = sentinel;
+
+    const agg: Value = .{ .index = try ip.internAggregate(.{ .ty = result_ty, .storage = .{ .elems = elems } }) };
+    // Concatenating pointer operands (e.g. string literals) yields a pointer to the result, like a literal.
+    if (lhs_ty.zigTypeTag(ip) == .pointer or rhs_ty.zigTypeTag(ip) == .pointer)
+        return try sema.materializeConstPtr(agg);
+    return agg;
+}
+
+fn analyzeTupleCat(sema: *Sema, lhs: Value, rhs: Value) Error!Value {
+    const ip = sema.intern_pool;
+    const lhs_tuple = ip.indexToKey(lhs.typeOf(ip).index).tuple_type;
+    const rhs_tuple = ip.indexToKey(rhs.typeOf(ip).index).tuple_type;
+    const total = lhs_tuple.types.len + rhs_tuple.types.len;
+
+    const types = try sema.gpa.alloc(InternPool.Index, total);
+    defer sema.gpa.free(types);
+    const values = try sema.gpa.alloc(InternPool.Index, total);
+    defer sema.gpa.free(values);
+
+    const lhs_agg = ip.indexToKey(lhs.index).aggregate;
+    const rhs_agg = ip.indexToKey(rhs.index).aggregate;
+    for (lhs_tuple.types, 0..) |t, i| {
+        types[i] = t;
+        values[i] = InternPool.aggregateElementAt(lhs_agg, i);
+    }
+    for (rhs_tuple.types, 0..) |t, i| {
+        types[lhs_tuple.types.len + i] = t;
+        values[lhs_tuple.types.len + i] = InternPool.aggregateElementAt(rhs_agg, i);
+    }
+
+    const field_vals = try sema.gpa.alloc(InternPool.Index, total);
+    defer sema.gpa.free(field_vals);
+    @memset(field_vals, .none);
+    const tuple_ty = try ip.internTupleType(types, field_vals);
+    return .{ .index = try ip.internAggregate(.{ .ty = tuple_ty, .storage = .{ .elems = values } }) };
 }
 
 fn evalStructInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
