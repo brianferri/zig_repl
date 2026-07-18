@@ -8754,10 +8754,12 @@ fn aggregateElementByIndex(sema: *Sema, array_value: Value, index: u64) Error!Va
     const ip = sema.intern_pool;
     var agg = array_value;
     var slice_len: ?u64 = null;
+    var slice_sentinel: InternPool.Index = .none;
     var start_offset: u64 = 0;
     if (ip.indexToKey(agg.index) == .slice) {
         const s = ip.indexToKey(agg.index).slice;
         slice_len = try sema.resolveUsizeInt(.{ .index = s.len }, "slice len");
+        slice_sentinel = ip.indexToKey(s.ty).ptr_type.sentinel;
         const ptr = ip.indexToKey(s.ptr).ptr;
         if (ptr.base_addr == .arr_elem) {
             start_offset = ptr.base_addr.arr_elem.index;
@@ -8772,7 +8774,9 @@ fn aggregateElementByIndex(sema: *Sema, array_value: Value, index: u64) Error!Va
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "elem access: operand is not an indexable aggregate", .{});
     }
     const array_ty = agg_key.aggregate.ty;
-    const count = slice_len orelse switch (ip.indexToKey(array_ty)) {
+    const count = if (slice_len) |sl|
+        sl + @intFromBool(slice_sentinel != .none)
+    else switch (ip.indexToKey(array_ty)) {
         .array_type => |at| at.lenIncludingSentinel(),
         else => ip.aggregateElementCount(array_ty),
     };
@@ -8780,10 +8784,14 @@ fn aggregateElementByIndex(sema: *Sema, array_value: Value, index: u64) Error!Va
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index {d} outside array of length {d}", .{ index, count });
     }
     const logical_index = start_offset + index;
-    if (slice_len == null) switch (ip.indexToKey(array_ty)) {
+    // Indexing a sentinel-terminated aggregate at its length reads the sentinel, which the storage
+    // does not hold (it lives in the type).
+    if (slice_len) |sl| {
+        if (slice_sentinel != .none and index == sl) return .{ .index = slice_sentinel };
+    } else switch (ip.indexToKey(array_ty)) {
         .array_type => |at| if (at.sentinel != .none and logical_index == at.len) return .{ .index = at.sentinel },
         else => {},
-    };
+    }
     return .{ .index = try ip.aggregateElementAt(agg_key.aggregate, logical_index) };
 }
 

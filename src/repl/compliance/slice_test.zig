@@ -251,3 +251,16 @@ test "compliance: out-of-bounds and mismatched-sentinel slices are rejected" {
         .{ .src = &.{"blk: { var x: i32 = 5; _ = &x; const p: *i32 = &x; break :blk p[0..1 :0]; }"}, .reject = {} },
     });
 }
+
+// Indexing a sentinel-terminated slice at its length reads the sentinel (one past the last element);
+// going further, or indexing a plain slice at its length, is out of bounds.
+test "compliance: indexing a sentinel slice at its length reads the sentinel" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const s: [:0]const u8 = \"abc\"; break :blk s[3]; }"}, .want = blk: {
+            const s: [:0]const u8 = "abc";
+            break :blk s[3];
+        } },
+        .{ .src = &.{"blk: { const s: [:0]const u8 = \"abc\"; break :blk s[4]; }"}, .reject = {} },
+        .{ .src = &.{"blk: { const a2 = [_]u8{ 1, 2, 3 }; const s: []const u8 = &a2; break :blk s[3]; }"}, .reject = {} },
+    });
+}
