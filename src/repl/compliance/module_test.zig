@@ -347,7 +347,7 @@ test "reify constructors: value paths and rejected inputs" {
     }
 }
 
-test "render: a struct value prints TypeName{ .field = val }" {
+test "render: a struct value prints .{ .field = val }" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
@@ -362,11 +362,10 @@ test "render: a struct value prints TypeName{ .field = val }" {
 
     var buf: [256]u8 = undefined;
     var w = Io.Writer.fixed(&buf);
-    // With the session, the struct prints shaped and named (a type defined in a
-    // decl body takes the decl's name -- the `type_name_ctx` set in `analyzeNavVal`);
-    // without it, positionally.
+    // A struct prints `.{ .field = val }` (no type-name prefix), matching `{any}` and the
+    // compiler's `printAggregate`; without a session to read field names, positionally.
     try render.render(value, &pool, &session, &w);
-    try testing.expectEqualStrings("repl.P{ .x = 3, .y = 7 }", w.buffered());
+    try testing.expectEqualStrings(".{ .x = 3, .y = 7 }", w.buffered());
 
     var buf2: [256]u8 = undefined;
     var w2 = Io.Writer.fixed(&buf2);
@@ -387,7 +386,7 @@ test "render: enum and union values print their names" {
     const cases = [_]struct { decl: []const u8, expr: []const u8, want: []const u8 }{
         .{ .decl = "const E1 = enum { a, b, c };", .expr = "E1.b", .want = ".b" },
         .{ .decl = "const E2 = enum(u8) { a = 10, b = 20 };", .expr = "E2.b", .want = ".b" },
-        .{ .decl = "const U = union(enum) { a: u8, b: bool };", .expr = "U{ .b = true }", .want = "repl.U{ .b = true }" },
+        .{ .decl = "const U = union(enum) { a: u8, b: bool };", .expr = "U{ .b = true }", .want = ".{ .b = true }" },
     };
     for (cases) |c| {
         _ = try eval.run(&session, c.decl, &diag.writer);
@@ -415,7 +414,7 @@ test "render: a packed struct value unpacks its fields; a packed union shows the
     var sbuf: [128]u8 = undefined;
     var sw = Io.Writer.fixed(&sbuf);
     try render.render(s, &pool, &session, &sw);
-    try testing.expectEqualStrings("repl.S{ .a = 1, .b = 2 }", sw.buffered());
+    try testing.expectEqualStrings(".{ .a = 1, .b = 2 }", sw.buffered());
 
     // A packed union has no active field, so it prints the backing integer as an explicit @bitCast.
     _ = try eval.run(&session, "const U = packed union { a: u8, b: u8 };", &diag.writer);

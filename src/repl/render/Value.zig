@@ -108,9 +108,10 @@ fn renderAggregate(
     if (try renderBytes(pool, writer, agg, .value)) return;
     const ty_key = pool.indexToKey(agg.ty);
     const shaped = ty_key == .struct_type and session != null;
-    // A named struct prints `TypeName{ ... }`; a tuple `.{ ... }`; an array or
-    // vector positionally `{ ... }`.
-    if (shaped) try renderTypeRef(agg.ty, pool, writer) else if (ty_key == .tuple_type) try writer.writeByte('.');
+    // A struct (named or anonymous) and a tuple both print `.{ ... }` -- matching `{any}` and
+    // the compiler's `printAggregate`, which never prefix a type name; a struct additionally
+    // shows field names. Arrays and vectors print positionally `{ ... }`.
+    if (shaped or ty_key == .tuple_type) try writer.writeByte('.');
     try writer.writeAll("{ ");
     // Arrays and vectors display their declared length, which excludes the
     // sentinel slot the aggregate stores (`printAggregate` iterates `arrayLen`, not
@@ -296,8 +297,7 @@ fn renderEnumTag(et: InternPool.Key.EnumTag, pool: *InternPool, session: ?*const
 fn renderUnion(uv: InternPool.Key.Union, pool: *InternPool, session: ?*const Session, writer: *std.Io.Writer) Error!void {
     const tag_key = pool.indexToKey(uv.tag);
     if (tag_key == .enum_tag) if (enumTagName(pool, tag_key.enum_tag.ty, tag_key.enum_tag.int)) |name| {
-        try renderTypeRef(uv.ty, pool, writer);
-        try writer.print("{{ .{s} = ", .{name});
+        try writer.print(".{{ .{s} = ", .{name});
         try render(.{ .index = uv.val }, pool, session, writer);
         return writer.writeAll(" }");
     };
