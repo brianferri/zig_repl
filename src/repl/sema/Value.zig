@@ -282,6 +282,10 @@ pub fn typeOf(val: Value, pool: *const InternPool) Type {
     };
 }
 
+pub fn errorUnionIsPayload(val: Value, pool: *const InternPool) bool {
+    return pool.indexToKey(val.index).error_union.val == .payload;
+}
+
 pub fn canMutateComptimeVarState(val: Value, pool: *const InternPool) bool {
     return switch (pool.indexToKey(val.index)) {
         .error_union => |error_union| switch (error_union.val) {

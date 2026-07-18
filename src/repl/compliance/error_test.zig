@@ -161,3 +161,29 @@ test "compliance: @errorCast recasts across error sets and unions" {
     try compliance.expectDiagnostic(a, &.{"@as(error{B}, @errorCast(@as(error{A}, error.A)))"}, "have no common errors");
     try compliance.expectDiagnostic(a, &.{"@as(error{A}!u16, @errorCast(@as(error{A}!u8, error.A)))"}, "payload types of error unions must match");
 }
+
+// Equality of error sets folds on the error name; error-union vs error-set unwraps the code, and a
+// payload never equals an error -- bool_false for both == and != (op-independent), matching Zig.
+test "compliance: error-set and error-union equality" {
+    try compliance.check(a, .{
+        .{ .src = &.{"error.A == error.B"}, .want = error.A == error.B },
+        .{ .src = &.{"error.A == error.A"}, .want = error.A == error.A },
+        .{ .src = &.{"error.A != error.B"}, .want = error.A != error.B },
+        .{ .src = &.{"blk: { const z: anyerror!i32 = error.A; break :blk z == error.A; }"}, .want = blk: {
+            const z: anyerror!i32 = error.A;
+            break :blk z == error.A;
+        } },
+        .{ .src = &.{"blk: { const z: anyerror!i32 = error.A; break :blk z != error.B; }"}, .want = blk: {
+            const z: anyerror!i32 = error.A;
+            break :blk z != error.B;
+        } },
+        .{ .src = &.{"blk: { const y: anyerror!i32 = 5; break :blk y == error.A; }"}, .want = blk: {
+            const y: anyerror!i32 = 5;
+            break :blk y == error.A;
+        } },
+        .{ .src = &.{"blk: { const y: anyerror!i32 = 5; break :blk y != error.A; }"}, .want = blk: {
+            const y: anyerror!i32 = 5;
+            break :blk y != error.A;
+        } },
+    });
+}

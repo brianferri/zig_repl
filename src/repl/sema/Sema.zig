@@ -2116,6 +2116,36 @@ fn evalComparison(
         }
     }
 
+    {
+        const lhs_ty_tag = Value.typeOf(lhs_value, ip).zigTypeTag(ip);
+        const rhs_ty_tag = Value.typeOf(rhs_value, ip).zigTypeTag(ip);
+
+        // error_union == error_set (either order), equality only: a payload is never an error, so the
+        // result is bool_false regardless of the operator; otherwise unwrap the error code and let the
+        // error_set fold below compare it. Compiler analyzeCmp is_equality_cmp arms (errorUnionIsPayload
+        // -> analyzeErrUnionCode -> cmpSelf).
+        if (op == .eq or op == .neq) {
+            if (lhs_ty_tag == .error_union and rhs_ty_tag == .error_set) {
+                if (lhs_value.errorUnionIsPayload(ip)) return boolValue(false);
+                lhs_value = try sema.analyzeErrUnionCode(lhs_value);
+                lhs_key = ip.indexToKey(lhs_value.index);
+            } else if (lhs_ty_tag == .error_set and rhs_ty_tag == .error_union) {
+                if (rhs_value.errorUnionIsPayload(ip)) return boolValue(false);
+                rhs_value = try sema.analyzeErrUnionCode(rhs_value);
+                rhs_key = ip.indexToKey(rhs_value.index);
+            }
+        }
+
+        // error_set == error_set: fold on the interned error names (compiler zirCmpEq error_set arm).
+        if (Value.typeOf(lhs_value, ip).zigTypeTag(ip) == .error_set and Value.typeOf(rhs_value, ip).zigTypeTag(ip) == .error_set) {
+            if (op != .eq and op != .neq) {
+                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "{s}: operator not allowed for error set operands", .{op_name});
+            }
+            if (lhs_value.isUndef(ip) or rhs_value.isUndef(ip)) return .{ .index = try ip.get(.{ .undef = .bool_type }) };
+            return boolValue((lhs_key.err.name == rhs_key.err.name) == (op == .eq));
+        }
+    }
+
     if (lhs_key == .enum_literal and rhs_key == .enum_tag) {
         lhs_value = try sema.coerceValueToType(lhs_value, rhs_key.enum_tag.ty, op_name);
         lhs_key = ip.indexToKey(lhs_value.index);
@@ -2154,6 +2184,19 @@ fn evalComparison(
     }
 
     return sema.scalarCompare(op, lhs_value, rhs_value, op_name);
+}
+
+fn analyzeErrUnionCode(sema: *Sema, operand: Value) Error!Value {
+    const ip = sema.intern_pool;
+    const operand_ty = Value.typeOf(operand, ip);
+    if (operand_ty.zigTypeTag(ip) != .error_union) {
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected error union type, found '{f}'", .{operand_ty.fmt(ip)});
+    }
+    const result_ty = operand_ty.errorUnionSet(ip);
+    switch (ip.indexToKey(operand.index).error_union.val) {
+        .payload => return .{ .index = .unreachable_value },
+        .err_name => |name| return .{ .index = try ip.internErr(.{ .ty = result_ty.index, .name = name }) },
+    }
 }
 
 fn scalarCompare(sema: *Sema, op: std.math.CompareOperator, lhs: Value, rhs: Value, op_name: []const u8) Error!?Value {
