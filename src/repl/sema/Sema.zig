@@ -1208,9 +1208,276 @@ fn resolvePeerTypesInner(sema: *Sema, peer_tys: []?Type, peer_vals: []?Value) Er
             return .{ .success = try sema.vectorType(.{ .len = @intCast(len.?), .child = child_ty.index }) };
         },
 
-        // Pointer peer resolution is a focused follow-up (needs the packed_offset-aware ptr_info merge);
-        // until then, pointer peers report a conflict rather than resolving.
-        .c_ptr, .ptr => return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = strat_reason } },
+        .c_ptr => {
+            const target = @import("builtin").target;
+            var opt_ptr_info: ?InternPool.Key.PtrType = null;
+            var first_idx: usize = undefined;
+            for (peer_tys, peer_vals, 0..) |opt_ty, opt_val, i| {
+                const ty = opt_ty orelse continue;
+                switch (ty.zigTypeTag(ip)) {
+                    .comptime_int => continue,
+                    .int => {
+                        if (opt_val != null) {
+                            continue;
+                        } else {
+                            if (ty.intInfo(ip).bits <= target.ptrBitWidth()) continue;
+                        }
+                    },
+                    .null => continue,
+                    else => {},
+                }
+                if (!ty.isPtrAtRuntime(ip)) return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } };
+                const peer_info = ty.ptrInfo(ip);
+                var ptr_info = opt_ptr_info orelse {
+                    opt_ptr_info = peer_info;
+                    opt_ptr_info.?.flags.size = .c;
+                    first_idx = i;
+                    continue;
+                };
+                ptr_info.child = ((try sema.resolvePairInMemoryCoercible(.fromIndex(ptr_info.child), .fromIndex(peer_info.child))) orelse {
+                    return .{ .conflict = .{ .peer_idx_a = first_idx, .peer_idx_b = i } };
+                }).index;
+                // The compiler coerces both sentinels to the child via getCoerced; the REPL lacks it, so
+                // compare the interned sentinels directly (correct when they share a type).
+                if (ptr_info.sentinel != .none and peer_info.sentinel != .none and ptr_info.sentinel == peer_info.sentinel) {} else {
+                    ptr_info.sentinel = .none;
+                }
+                ptr_info.flags.alignment = a: {
+                    if (ptr_info.flags.alignment == .none and peer_info.flags.alignment == .none) break :a .none;
+                    const cur_align = switch (ptr_info.flags.alignment) {
+                        .none => Type.fromIndex(ptr_info.child).abiAlignment(ip),
+                        else => ptr_info.flags.alignment,
+                    };
+                    const new_align = switch (peer_info.flags.alignment) {
+                        .none => Type.fromIndex(peer_info.child).abiAlignment(ip),
+                        else => peer_info.flags.alignment,
+                    };
+                    break :a .minStrict(cur_align, new_align);
+                };
+                if (ptr_info.flags.address_space != peer_info.flags.address_space) return .{ .conflict = .{ .peer_idx_a = first_idx, .peer_idx_b = i } };
+                if (ptr_info.packed_offset.bit_offset != peer_info.packed_offset.bit_offset or
+                    ptr_info.packed_offset.host_size != peer_info.packed_offset.host_size) return .{ .conflict = .{ .peer_idx_a = first_idx, .peer_idx_b = i } };
+                ptr_info.flags.is_const = ptr_info.flags.is_const or peer_info.flags.is_const;
+                ptr_info.flags.is_volatile = ptr_info.flags.is_volatile or peer_info.flags.is_volatile;
+                opt_ptr_info = ptr_info;
+            }
+            return .{ .success = .fromIndex(try ip.internPtrType(opt_ptr_info.?)) };
+        },
+
+        .ptr => {
+            var opt_slice_idx: ?usize = null;
+            var opt_ptr_info: ?InternPool.Key.PtrType = null;
+            var first_idx: usize = undefined;
+            var other_idx: usize = undefined;
+
+            for (peer_tys, 0..) |opt_ty, i| {
+                const ty = opt_ty orelse continue;
+                const peer_info: InternPool.Key.PtrType = switch (ty.zigTypeTag(ip)) {
+                    .pointer => ty.ptrInfo(ip),
+                    .@"fn" => .{ .child = ty.index, .flags = .{ .address_space = .generic } },
+                    else => return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } },
+                };
+                switch (peer_info.flags.size) {
+                    .one, .many => {},
+                    .slice => opt_slice_idx = i,
+                    .c => return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } },
+                }
+
+                var ptr_info = opt_ptr_info orelse {
+                    opt_ptr_info = peer_info;
+                    first_idx = i;
+                    continue;
+                };
+                other_idx = i;
+                const generic_err: PeerResolveResult = .{ .conflict = .{ .peer_idx_a = first_idx, .peer_idx_b = i } };
+
+                ptr_info.flags.alignment = a: {
+                    if (ptr_info.flags.alignment == .none and peer_info.flags.alignment == .none) break :a .none;
+                    const cur_align = switch (ptr_info.flags.alignment) {
+                        .none => Type.fromIndex(ptr_info.child).abiAlignment(ip),
+                        else => ptr_info.flags.alignment,
+                    };
+                    const new_align = switch (peer_info.flags.alignment) {
+                        .none => Type.fromIndex(peer_info.child).abiAlignment(ip),
+                        else => peer_info.flags.alignment,
+                    };
+                    break :a .minStrict(cur_align, new_align);
+                };
+                if (ptr_info.flags.address_space != peer_info.flags.address_space) return generic_err;
+                if (ptr_info.packed_offset.bit_offset != peer_info.packed_offset.bit_offset or
+                    ptr_info.packed_offset.host_size != peer_info.packed_offset.host_size) return generic_err;
+                ptr_info.flags.is_const = ptr_info.flags.is_const or peer_info.flags.is_const;
+                ptr_info.flags.is_volatile = ptr_info.flags.is_volatile or peer_info.flags.is_volatile;
+                ptr_info.flags.is_allowzero = ptr_info.flags.is_allowzero or peer_info.flags.is_allowzero;
+
+                const peer_sentinel: InternPool.Index = switch (peer_info.flags.size) {
+                    .one => switch (ip.indexToKey(peer_info.child)) {
+                        .array_type => |array_type| array_type.sentinel,
+                        else => .none,
+                    },
+                    .many, .slice => peer_info.sentinel,
+                    .c => unreachable,
+                };
+                const cur_sentinel: InternPool.Index = switch (ptr_info.flags.size) {
+                    .one => switch (ip.indexToKey(ptr_info.child)) {
+                        .array_type => |array_type| array_type.sentinel,
+                        else => .none,
+                    },
+                    .many, .slice => ptr_info.sentinel,
+                    .c => unreachable,
+                };
+
+                const peer_pointee_array = sema.typeIsArrayLike(.fromIndex(peer_info.child));
+                const cur_pointee_array = sema.typeIsArrayLike(.fromIndex(ptr_info.child));
+
+                good: {
+                    switch (peer_info.flags.size) {
+                        .one => switch (ptr_info.flags.size) {
+                            .one => {
+                                if (try sema.resolvePairInMemoryCoercible(.fromIndex(ptr_info.child), .fromIndex(peer_info.child))) |pointee| {
+                                    ptr_info.child = pointee.index;
+                                    break :good;
+                                }
+                                const cur_arr = cur_pointee_array orelse return generic_err;
+                                const peer_arr = peer_pointee_array orelse return generic_err;
+                                if (try sema.resolvePairInMemoryCoercible(cur_arr.elem_ty, peer_arr.elem_ty)) |elem_ty| {
+                                    if (cur_arr.len == peer_arr.len) {
+                                        ptr_info.child = try ip.internArrayType(.{ .len = cur_arr.len, .child = elem_ty.index });
+                                        break :good;
+                                    }
+                                    ptr_info.flags.size = .slice;
+                                    ptr_info.child = elem_ty.index;
+                                    break :good;
+                                }
+                                if (peer_arr.elem_ty.index == .noreturn_type) {
+                                    ptr_info.flags.size = .slice;
+                                    ptr_info.child = cur_arr.elem_ty.index;
+                                    break :good;
+                                }
+                                if (cur_arr.elem_ty.index == .noreturn_type) {
+                                    ptr_info.flags.size = .slice;
+                                    ptr_info.child = peer_arr.elem_ty.index;
+                                    break :good;
+                                }
+                                return generic_err;
+                            },
+                            .many => {
+                                const arr = peer_pointee_array orelse return generic_err;
+                                if (try sema.resolvePairInMemoryCoercible(.fromIndex(ptr_info.child), arr.elem_ty)) |pointee| {
+                                    ptr_info.child = pointee.index;
+                                    break :good;
+                                }
+                                if (arr.elem_ty.index == .noreturn_type) break :good;
+                                return generic_err;
+                            },
+                            .slice => {
+                                const arr = peer_pointee_array orelse return generic_err;
+                                if (try sema.resolvePairInMemoryCoercible(.fromIndex(ptr_info.child), arr.elem_ty)) |pointee| {
+                                    ptr_info.child = pointee.index;
+                                    break :good;
+                                }
+                                if (arr.elem_ty.index == .noreturn_type) break :good;
+                                return generic_err;
+                            },
+                            .c => unreachable,
+                        },
+                        .many => switch (ptr_info.flags.size) {
+                            .one => {
+                                const arr = cur_pointee_array orelse return generic_err;
+                                if (try sema.resolvePairInMemoryCoercible(arr.elem_ty, .fromIndex(peer_info.child))) |pointee| {
+                                    ptr_info.flags.size = .many;
+                                    ptr_info.child = pointee.index;
+                                    break :good;
+                                }
+                                if (arr.elem_ty.index == .noreturn_type) {
+                                    ptr_info.flags.size = .many;
+                                    ptr_info.child = peer_info.child;
+                                    break :good;
+                                }
+                                return generic_err;
+                            },
+                            .many => {
+                                if (try sema.resolvePairInMemoryCoercible(.fromIndex(ptr_info.child), .fromIndex(peer_info.child))) |pointee| {
+                                    ptr_info.child = pointee.index;
+                                    break :good;
+                                }
+                                return generic_err;
+                            },
+                            .slice => {
+                                if (opt_slice_idx) |slice_idx| return .{ .conflict = .{ .peer_idx_a = slice_idx, .peer_idx_b = i } };
+                                if (try sema.resolvePairInMemoryCoercible(.fromIndex(ptr_info.child), .fromIndex(peer_info.child))) |pointee| {
+                                    ptr_info.flags.size = .many;
+                                    ptr_info.child = pointee.index;
+                                    break :good;
+                                }
+                                return generic_err;
+                            },
+                            .c => unreachable,
+                        },
+                        .slice => switch (ptr_info.flags.size) {
+                            .one => {
+                                const arr = cur_pointee_array orelse return generic_err;
+                                if (try sema.resolvePairInMemoryCoercible(arr.elem_ty, .fromIndex(peer_info.child))) |pointee| {
+                                    ptr_info.flags.size = .slice;
+                                    ptr_info.child = pointee.index;
+                                    break :good;
+                                }
+                                if (arr.elem_ty.index == .noreturn_type) {
+                                    ptr_info.flags.size = .slice;
+                                    ptr_info.child = peer_info.child;
+                                    break :good;
+                                }
+                                return generic_err;
+                            },
+                            .many => return generic_err,
+                            .slice => {
+                                if (try sema.resolvePairInMemoryCoercible(.fromIndex(ptr_info.child), .fromIndex(peer_info.child))) |pointee| {
+                                    ptr_info.child = pointee.index;
+                                    break :good;
+                                }
+                                return generic_err;
+                            },
+                            .c => unreachable,
+                        },
+                        .c => unreachable,
+                    }
+                }
+
+                sentinel: {
+                    no_sentinel: {
+                        if (peer_sentinel == .none) break :no_sentinel;
+                        if (cur_sentinel == .none) break :no_sentinel;
+                        // The compiler coerces both sentinels via getCoerced before comparing; the REPL
+                        // lacks it, so compare the interned sentinels directly (correct when same-typed).
+                        if (peer_sentinel != cur_sentinel) break :no_sentinel;
+                        if (ptr_info.flags.size == .one) switch (ip.indexToKey(ptr_info.child)) {
+                            .array_type => |array_type| ptr_info.child = try ip.internArrayType(.{ .len = array_type.len, .child = array_type.child, .sentinel = cur_sentinel }),
+                            else => unreachable,
+                        } else {
+                            ptr_info.sentinel = cur_sentinel;
+                        }
+                        break :sentinel;
+                    }
+                    ptr_info.sentinel = .none;
+                    if (ptr_info.flags.size == .one) switch (ip.indexToKey(ptr_info.child)) {
+                        .array_type => |array_type| ptr_info.child = try ip.internArrayType(.{ .len = array_type.len, .child = array_type.child, .sentinel = .none }),
+                        else => {},
+                    };
+                }
+
+                opt_ptr_info = ptr_info;
+            }
+
+            const pointee = opt_ptr_info.?.child;
+            switch (pointee) {
+                .noreturn_type => return .{ .conflict = .{ .peer_idx_a = first_idx, .peer_idx_b = other_idx } },
+                else => switch (ip.indexToKey(pointee)) {
+                    .array_type => |array_type| if (array_type.child == .noreturn_type) return .{ .conflict = .{ .peer_idx_a = first_idx, .peer_idx_b = other_idx } },
+                    else => {},
+                },
+            }
+            return .{ .success = .fromIndex(try ip.internPtrType(opt_ptr_info.?)) };
+        },
 
         .func => {
             var opt_cur_ty: ?Type = null;
