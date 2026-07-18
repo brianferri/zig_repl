@@ -1000,6 +1000,11 @@ fn resolvePeerTypes(sema: *Sema, instructions: []const Value) Error!Type {
     }
 }
 
+fn defaultAddressSpace(context: enum { global_constant, global_mutable, local, function }) std.lang.AddressSpace {
+    if (context == .function and @import("builtin").target.cpu.arch == .avr) return .flash;
+    return .generic;
+}
+
 fn resolvePeerTypesInner(sema: *Sema, peer_tys: []?Type, peer_vals: []?Value) Error!PeerResolveResult {
     const ip = sema.intern_pool;
 
@@ -1274,7 +1279,7 @@ fn resolvePeerTypesInner(sema: *Sema, peer_tys: []?Type, peer_vals: []?Value) Er
                 const ty = opt_ty orelse continue;
                 const peer_info: InternPool.Key.PtrType = switch (ty.zigTypeTag(ip)) {
                     .pointer => ty.ptrInfo(ip),
-                    .@"fn" => .{ .child = ty.index, .flags = .{ .address_space = .generic } },
+                    .@"fn" => .{ .child = ty.index, .flags = .{ .address_space = defaultAddressSpace(.global_constant) } },
                     else => return .{ .conflict = .{ .peer_idx_a = strat_reason, .peer_idx_b = i } },
                 };
                 switch (peer_info.flags.size) {
