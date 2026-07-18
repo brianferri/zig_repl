@@ -214,3 +214,35 @@ test "compliance: var mutation and pointer store/load" {
         } },
     });
 }
+
+// A field pointer routes through structFieldPtrByIndex / unionFieldPtr, then loads or stores through it.
+test "compliance: struct and union field pointers" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const S = struct { a: u32, b: u32 }; const s: S = .{ .a = 3, .b = 4 }; const p = &s.b; break :blk p.*; }"}, .want = blk: {
+            const S = struct { a: u32, b: u32 };
+            const s: S = .{ .a = 3, .b = 4 };
+            const p = &s.b;
+            break :blk p.*;
+        } },
+        .{ .src = &.{"blk: { const S = struct { a: u32, b: u32 }; var s: S = .{ .a = 3, .b = 4 }; const p = &s.a; p.* = 10; break :blk s.a + s.b; }"}, .want = blk: {
+            const S = struct { a: u32, b: u32 };
+            var s: S = .{ .a = 3, .b = 4 };
+            const p = &s.a;
+            p.* = 10;
+            break :blk s.a + s.b;
+        } },
+        .{ .src = &.{"blk: { const Inner = struct { x: u32 }; const S = struct { inner: Inner }; const s: S = .{ .inner = .{ .x = 7 } }; break :blk (&s.inner.x).*; }"}, .want = blk: {
+            const Inner = struct { x: u32 };
+            const S = struct { inner: Inner };
+            const s: S = .{ .inner = .{ .x = 7 } };
+            break :blk (&s.inner.x).*;
+        } },
+        .{ .src = &.{"blk: { const U = union(enum) { a: u32, b: u32 }; const u: U = .{ .a = 9 }; break :blk (&u.a).*; }"}, .want = blk: {
+            const U = union(enum) { a: u32, b: u32 };
+            const u: U = .{ .a = 9 };
+            break :blk (&u.a).*;
+        } },
+        // A pointer to an inactive union field is rejected, like the value access.
+        .{ .src = &.{"blk: { const U = union(enum) { a: u32, b: u32 }; const u: U = .{ .a = 9 }; break :blk (&u.b).*; }"}, .reject = {} },
+    });
+}

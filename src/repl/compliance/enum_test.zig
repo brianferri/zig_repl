@@ -41,6 +41,35 @@ test "compliance: enum declarations, tag access, and @intFromEnum" {
     });
 }
 
+// Member access on an enum type resolves the namespace declarations, not only the tags.
+test "compliance: enum member declarations (E.decl)" {
+    try compliance.check(a, .{
+        .{
+            .src = &.{"blk: { const E = enum(u8) { a, b, const N: u8 = 42; }; break :blk E.N; }"},
+            .want = blk: {
+                const E = enum(u8) {
+                    a,
+                    b,
+                    const N: u8 = 42;
+                };
+                break :blk E.N;
+            },
+        },
+        .{
+            .src = &.{"@sizeOf(blk: { const E = enum(u8) { a, b, const Inner = struct { x: u16 }; }; break :blk E.Inner; })"},
+            .want = @sizeOf(blk: {
+                const E = enum(u8) {
+                    a,
+                    b,
+                    const Inner = struct { x: u16 };
+                };
+                break :blk E.Inner;
+            }),
+        },
+        .{ .src = &.{"blk: { const E = enum { a, b, const N = 42; }; break :blk E.missing; }"}, .reject = {} },
+    });
+}
+
 test "compliance: @enumFromInt and result-typed enum literals" {
     try compliance.check(a, .{
         .{
