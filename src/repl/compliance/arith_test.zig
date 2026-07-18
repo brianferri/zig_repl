@@ -45,6 +45,15 @@ test "compliance: fixed-width int arithmetic and peer resolution" {
     });
 }
 
+test "compliance: @divCeil rounds toward positive infinity" {
+    try compliance.check(a, .{
+        .{ .src = &.{"@divCeil(7, 2)"}, .want = @divCeil(7, 2) },
+        .{ .src = &.{"@divCeil(@as(i32, -7), 2)"}, .want = @divCeil(@as(i32, -7), 2) },
+        .{ .src = &.{"@divCeil(@as(f32, 7.0), 2.0)"}, .want = @divCeil(@as(f32, 7.0), 2.0) },
+        .{ .src = &.{"@divCeil(@as(i32, 8), 4)"}, .want = @divCeil(@as(i32, 8), 4) },
+    });
+}
+
 test "compliance: float arithmetic and widening" {
     try compliance.check(a, .{
         .{

@@ -557,6 +557,11 @@ fn divScalar(sema: *Sema, ty: Type, lhs_val: Value, rhs_val: Value, op: DivOp, i
                 if (res.overflow) return sema.failWithIntegerOverflow(ty, res.val);
                 return res.val;
             },
+            .div_ceil => {
+                const res = try intDivCeil(sema, lhs_val, rhs_val, ty);
+                if (res.overflow) return sema.failWithIntegerOverflow(ty, res.val);
+                return res.val;
+            },
             .div_exact => switch (try intDivExact(sema, lhs_val, rhs_val, ty)) {
                 .remainder => {
                     return sema.fail(sema.block, sema.block.nodeOffset(.zero), "exact division produced remainder", .{});
@@ -567,7 +572,7 @@ fn divScalar(sema: *Sema, ty: Type, lhs_val: Value, rhs_val: Value, op: DivOp, i
         }
     } else {
         const allow_div_zero = switch (op) {
-            .div, .div_trunc, .div_floor => ty.index != .comptime_float_type,
+            .div, .div_trunc, .div_floor, .div_ceil => ty.index != .comptime_float_type,
             .div_exact => false,
         };
         if (!allow_div_zero) {
@@ -587,6 +592,7 @@ fn divScalar(sema: *Sema, ty: Type, lhs_val: Value, rhs_val: Value, op: DivOp, i
             .div => return floatDiv(sema, lhs_val, rhs_val, ty),
             .div_trunc => return floatDivTrunc(sema, lhs_val, rhs_val, ty),
             .div_floor => return floatDivFloor(sema, lhs_val, rhs_val, ty),
+            .div_ceil => return floatDivCeil(sema, lhs_val, rhs_val, ty),
             .div_exact => {
                 if (!floatDivIsExact(sema, lhs_val, rhs_val, ty)) {
                     return sema.fail(sema.block, sema.block.nodeOffset(.zero), "exact division produced remainder", .{});
@@ -957,6 +963,19 @@ pub fn floatDivFloor(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value {
     return .fromIndex(try pool.internFloat(.{ .ty = ty.index, .storage = storage }));
 }
 
+pub fn floatDivCeil(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value {
+    const pool = sema.intern_pool;
+    const storage: InternPool.Key.Float.Storage = switch (ty.floatBits()) {
+        16 => .{ .f16 = @divCeil(lhs.toFloat(f16, pool), rhs.toFloat(f16, pool)) },
+        32 => .{ .f32 = @divCeil(lhs.toFloat(f32, pool), rhs.toFloat(f32, pool)) },
+        64 => .{ .f64 = @divCeil(lhs.toFloat(f64, pool), rhs.toFloat(f64, pool)) },
+        80 => .{ .f80 = @divCeil(lhs.toFloat(f80, pool), rhs.toFloat(f80, pool)) },
+        128 => .{ .f128 = @divCeil(lhs.toFloat(f128, pool), rhs.toFloat(f128, pool)) },
+        else => unreachable,
+    };
+    return .fromIndex(try pool.internFloat(.{ .ty = ty.index, .storage = storage }));
+}
+
 pub fn floatDivIsExact(sema: *Sema, lhs: Value, rhs: Value, ty: Type) bool {
     const pool = sema.intern_pool;
     return switch (ty.floatBits()) {
@@ -1269,6 +1288,37 @@ fn intDivFloorInner(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value {
     }
     return sema.intValue_big(ty, result_q.toConst());
 }
+fn intDivCeil(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !struct { overflow: bool, val: Value } {
+    const result = intDivCeilInner(sema, lhs, rhs, ty) catch |err| switch (err) {
+        error.Overflow => {
+            const result = intDivCeilInner(sema, lhs, rhs, comptime_int_ty) catch |err1| switch (err1) {
+                error.Overflow => unreachable,
+                else => |e| return e,
+            };
+            return .{ .overflow = true, .val = result };
+        },
+        else => |e| return e,
+    };
+    return .{ .overflow = false, .val = result };
+}
+fn intDivCeilInner(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value {
+    const pool = sema.intern_pool;
+    var lhs_space: BigIntSpace = undefined;
+    var rhs_space: BigIntSpace = undefined;
+    const lhs_bigint = lhs.toBigInt(&lhs_space, pool);
+    const rhs_bigint = rhs.toBigInt(&rhs_space, pool);
+    const limbs_q = try sema.arena.alloc(Limb, lhs_bigint.limbs.len);
+    const limbs_r = try sema.arena.alloc(Limb, rhs_bigint.limbs.len);
+    const limbs_buf = try sema.arena.alloc(Limb, std.math.big.int.calcDivLimbsBufferLen(lhs_bigint.limbs.len, rhs_bigint.limbs.len));
+    var result_q: BigIntMutable = .{ .limbs = limbs_q, .positive = undefined, .len = undefined };
+    var result_r: BigIntMutable = .{ .limbs = limbs_r, .positive = undefined, .len = undefined };
+    result_q.divCeil(&result_r, lhs_bigint, rhs_bigint, limbs_buf);
+    if (ty.index != .comptime_int_type) {
+        const info = ty.intInfo(pool);
+        if (!result_q.toConst().fitsInTwosComp(info.signedness, info.bits)) return error.Overflow;
+    }
+    return sema.intValue_big(ty, result_q.toConst());
+}
 fn intMod(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value {
     const pool = sema.intern_pool;
     var lhs_space: BigIntSpace = undefined;
@@ -1454,7 +1504,7 @@ fn intBitwiseXor(sema: *Sema, lhs: Value, rhs: Value, ty: Type) !Value {
 
 pub const ShlOp = enum { shl, shl_sat, shl_exact };
 pub const ShrOp = enum { shr, shr_exact };
-pub const DivOp = enum { div, div_trunc, div_floor, div_exact };
+pub const DivOp = enum { div, div_trunc, div_floor, div_ceil, div_exact };
 pub const ModRemOp = enum { mod, rem };
 pub const BitwiseBinOp = enum { @"and", nand, @"or", xor };
 

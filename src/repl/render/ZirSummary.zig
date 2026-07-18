@@ -32,6 +32,7 @@ pub fn write(
         .cmp_neq,
         .coerce_ptr_elem_ty,
         .div,
+        .div_ceil,
         .div_exact,
         .div_floor,
         .div_trunc,

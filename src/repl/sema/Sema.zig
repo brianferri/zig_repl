@@ -256,6 +256,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .div,
         .div_exact,
         .div_floor,
+        .div_ceil,
         .div_trunc,
         .mod,
         .rem,
@@ -700,6 +701,7 @@ fn evalBinaryArith(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?
         .div => try arith.div(sema, resolved_type, lhs, rhs, .div),
         .div_trunc => try arith.div(sema, resolved_type, lhs, rhs, .div_trunc),
         .div_floor => try arith.div(sema, resolved_type, lhs, rhs, .div_floor),
+        .div_ceil => try arith.div(sema, resolved_type, lhs, rhs, .div_ceil),
         .div_exact => try arith.div(sema, resolved_type, lhs, rhs, .div_exact),
         .mod => try arith.modRem(sema, resolved_type, lhs, rhs, .mod),
         .rem => try arith.modRem(sema, resolved_type, lhs, rhs, .rem),
@@ -2316,7 +2318,7 @@ fn checkArithmeticOp(sema: *Sema, scalar_tag: std.lang.TypeId, lhs_zig_ty_tag: s
 
 fn floatOpAllowed(tag: Zir.Inst.Tag) bool {
     return switch (tag) {
-        .add, .add_unsafe, .sub, .mul, .div, .div_exact, .div_trunc, .div_floor, .mod, .rem, .mod_rem => true,
+        .add, .add_unsafe, .sub, .mul, .div, .div_exact, .div_trunc, .div_floor, .div_ceil, .mod, .rem, .mod_rem => true,
         else => false,
     };
 }
@@ -5726,7 +5728,7 @@ fn loadModuleFile(sema: *Sema, canonical: []const u8) Error!InternPool.Index {
 
 fn lowerModule(sema: *Sema, canonical: []const u8, bytes: [:0]const u8) Error!InternPool.Index {
     const session = sema.session.?;
-    var tree = try std.zig.Ast.parse(sema.gpa, bytes, .zig);
+    var tree = try std.zig.Ast.parse(sema.gpa, bytes, .{ .mode = .zig });
     defer tree.deinit(sema.gpa);
     var zir = try std.zig.AstGen.generate(sema.gpa, tree);
     if (zir.hasCompileErrors()) {
