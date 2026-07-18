@@ -3147,6 +3147,7 @@ fn evalIntFromPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             try sema.synthetic_addresses.put(sema.gpa, ptr.index, aligned);
             break :addr aligned;
         },
+        .int => 0,
         .field, .arr_elem, .opt_payload, .eu_payload, .comptime_field => {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@intFromPtr: address of an aggregate element is not supported", .{});
         },
@@ -3182,7 +3183,7 @@ fn freezeBacking(sema: *Sema, ptr: InternPool.Key.Ptr) void {
         .comptime_alloc => |idx| sema.comptime_allocs.items[@intFromEnum(idx)].is_const = true,
         .field, .arr_elem => |f| sema.freezeBacking(ip.indexToKey(f.base).ptr),
         .opt_payload, .eu_payload => |base| sema.freezeBacking(ip.indexToKey(base).ptr),
-        .nav, .uav, .comptime_field => {},
+        .nav, .uav, .comptime_field, .int => {},
     }
 }
 
@@ -7904,6 +7905,9 @@ fn storePointee(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
         },
         .nav, .uav => {
             return sema.fail(sema.block, sema.block.nodeOffset(.zero), "unable to evaluate comptime expression: store through a pointer to a declaration", .{});
+        },
+        .int => {
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "unable to evaluate comptime expression: store through an integer-address pointer", .{});
         },
     }
 }

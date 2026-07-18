@@ -294,6 +294,7 @@ pub fn canMutateComptimeVarState(val: Value, pool: *const InternPool) bool {
         },
         .ptr => |ptr| switch (ptr.base_addr) {
             .nav => false, // The value of a Nav can never reference a comptime alloc.
+            .int => false,
             .comptime_alloc => true, // A comptime alloc is either mutable or references comptime-mutable memory.
             .comptime_field => true, // Comptime field pointers are comptime-mutable, albeit only to the "correct" value.
             .eu_payload, .opt_payload => |base| Value.fromIndex(base).canMutateComptimeVarState(pool),
@@ -918,6 +919,19 @@ pub fn getUnsignedInt(val: Value, pool: *const InternPool) ?u64 {
                 .big_int => |big_int| big_int.toInt(u64) catch null,
                 .u64 => |x| x,
                 .i64 => |x| std.math.cast(u64, x),
+            },
+            .ptr => |ptr| switch (ptr.base_addr) {
+                .int => ptr.byte_offset,
+                .field => |field| {
+                    const base_addr = Value.fromIndex(field.base).getUnsignedInt(pool) orelse return null;
+                    const struct_ty = Value.fromIndex(field.base).typeOf(pool).childType(pool);
+                    return base_addr + struct_ty.structFieldOffset(pool, @intCast(field.index)) + ptr.byte_offset;
+                },
+                else => null,
+            },
+            .opt => |opt| switch (opt.val) {
+                .none => 0,
+                else => |payload| Value.fromIndex(payload).getUnsignedInt(pool),
             },
             else => null,
         },

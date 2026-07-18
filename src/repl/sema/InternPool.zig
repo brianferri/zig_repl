@@ -611,6 +611,7 @@ pub const Key = union(enum) {
             nav: Nav.Index,
             uav: Uav,
             comptime_field: Index,
+            int,
             field: BaseIndex,
             arr_elem: BaseIndex,
             opt_payload: Index,
@@ -839,6 +840,7 @@ pub const Key = union(enum) {
                         std.hash.autoHash(&hasher, uav.orig_ty);
                     },
                     .comptime_field => |val| std.hash.autoHash(&hasher, val),
+                    .int => {},
                     .field, .arr_elem => |f| {
                         std.hash.autoHash(&hasher, f.base);
                         std.hash.autoHash(&hasher, f.index);
@@ -996,6 +998,7 @@ pub const Key = union(enum) {
                     .nav => |nav| nav == y.base_addr.nav,
                     .uav => |uav| uav.val == y.base_addr.uav.val and uav.orig_ty == y.base_addr.uav.orig_ty,
                     .comptime_field => |val| val == y.base_addr.comptime_field,
+                    .int => true,
                     .field => |f| f.base == y.base_addr.field.base and f.index == y.base_addr.field.index,
                     .arr_elem => |f| f.base == y.base_addr.arr_elem.base and f.index == y.base_addr.arr_elem.index,
                     .opt_payload => |base| base == y.base_addr.opt_payload,
@@ -1198,6 +1201,7 @@ const Item = struct {
         ptr_nav,
         ptr_uav,
         ptr_comptime_field,
+        ptr_int,
         ptr_field,
         ptr_arr_elem,
         ptr_opt_payload,
@@ -1502,6 +1506,18 @@ const PtrBase = struct {
         return .{ .ty = ty, .base = base, .byte_offset_a = @intCast(byte_offset >> 32), .byte_offset_b = @truncate(byte_offset) };
     }
     fn byteOffset(data: PtrBase) u64 {
+        return @as(u64, data.byte_offset_a) << 32 | data.byte_offset_b;
+    }
+};
+
+const PtrInt = struct {
+    ty: Index,
+    byte_offset_a: u32,
+    byte_offset_b: u32,
+    fn init(ty: Index, byte_offset: u64) PtrInt {
+        return .{ .ty = ty, .byte_offset_a = @intCast(byte_offset >> 32), .byte_offset_b = @truncate(byte_offset) };
+    }
+    fn byteOffset(data: PtrInt) u64 {
         return @as(u64, data.byte_offset_a) << 32 | data.byte_offset_b;
     }
 };
@@ -2420,6 +2436,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .ptr_nav => ptrNavFromExtra(pool, item.data),
         .ptr_uav => ptrUavFromExtra(pool, item.data),
         .ptr_comptime_field => ptrComptimeFieldFromExtra(pool, item.data),
+        .ptr_int => ptrIntFromExtra(pool, item.data),
         .ptr_field => ptrFieldFromExtra(pool, item.data),
         .ptr_opt_payload => ptrOptPayloadFromExtra(pool, item.data, false),
         .ptr_eu_payload => ptrOptPayloadFromExtra(pool, item.data, true),
@@ -2643,6 +2660,15 @@ fn ptrComptimeFieldFromExtra(pool: *const InternPool, extra_index: u32) Key {
     return .{ .ptr = .{
         .ty = r.ty,
         .base_addr = .{ .comptime_field = r.base },
+        .byte_offset = r.byteOffset(),
+    } };
+}
+
+fn ptrIntFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    const r = pool.extraData(PtrInt, extra_index);
+    return .{ .ptr = .{
+        .ty = r.ty,
+        .base_addr = .int,
         .byte_offset = r.byteOffset(),
     } };
 }
@@ -3006,6 +3032,10 @@ fn emitPtr(pool: *InternPool, p: Key.Ptr) Allocator.Error!void {
         .comptime_field => |val| {
             const extra_index = try pool.addExtra(PtrBase.init(p.ty, val, p.byte_offset));
             pool.items.appendAssumeCapacity(.{ .tag = .ptr_comptime_field, .data = extra_index });
+        },
+        .int => {
+            const extra_index = try pool.addExtra(PtrInt.init(p.ty, p.byte_offset));
+            pool.items.appendAssumeCapacity(.{ .tag = .ptr_int, .data = extra_index });
         },
         .field, .arr_elem => |f| {
             const extra_index = try pool.addExtra(PtrBaseIndex.init(p.ty, f.base, f.index, p.byte_offset));
