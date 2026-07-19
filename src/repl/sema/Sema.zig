@@ -10193,15 +10193,20 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
                         (try sema.uniformUnionCaptureType(uv.ty, case.item_infos)) == null)
                         return sema.failSwitch("capture group across differing field types");
                 }
-                const payload: ?Value = if (union_operand) |uv| .{ .index = uv.val } else null;
-                try sema.bindSwitchCapture(inst, sw, case.prong_info.capture, payload);
+                // A union capture binds the active field payload; a scalar switch binds the operand.
+                const capture_val: Value = if (union_operand) |uv| .{ .index = uv.val } else operand;
+                try sema.bindSwitchCapture(inst, sw, case.prong_info.capture, capture_val);
             }
             return try sema.resolveInlineBody(prong_body, inst);
         }
     }
 
     if (sw.else_case) |else_case| {
-        if (else_case.capture != .none) return sema.failSwitch("else capture");
+        if (else_case.has_tag_capture) return sema.failSwitch("tag capture");
+        if (else_case.capture != .none) {
+            const capture_val: Value = if (union_operand) |uv| .{ .index = uv.val } else operand;
+            try sema.bindSwitchCapture(inst, sw, else_case.capture, capture_val);
+        }
         return try sema.resolveInlineBody(else_case.body, inst);
     }
 
@@ -10452,14 +10457,13 @@ fn bindSwitchCapture(
     inst: Zir.Inst.Index,
     sw: Zir.UnwrappedSwitchBlock,
     capture: Zir.Inst.SwitchBlock.ProngInfo.Capture,
-    union_payload: ?Value,
+    capture_val: Value,
 ) Error!void {
-    const payload = union_payload orelse return sema.failSwitch("prong capture");
     const capture_inst = sw.payload_capture_placeholder.unwrap() orelse inst;
     const cap: Value = switch (capture) {
         .none => unreachable,
-        .by_val => payload,
-        .by_ref => try sema.materializeConstPtr(payload),
+        .by_val => capture_val,
+        .by_ref => try sema.materializeConstPtr(capture_val),
     };
     try sema.inst_map.put(sema.gpa, capture_inst, cap);
 }
