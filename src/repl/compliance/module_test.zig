@@ -99,6 +99,23 @@ test "@import loads a module container and resolves its decls" {
     try expectReplValue(&session, "@hasDecl(@import(\"std\"), \"nope\")", "false");
 }
 
+test "@hasDecl on the root namespace resolves session decls" {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .{});
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+
+    // The root namespace's decls are bound across line files and it keeps no ZIR of its
+    // own, so @hasDecl must look them up through the namespace rather than a defining ZIR.
+    var diag: std.Io.Writer.Allocating = .init(gpa);
+    defer diag.deinit();
+    _ = try eval.run(&session, "const marker = 42;", &diag.writer);
+    try expectReplValue(&session, "@hasDecl(@import(\"root\"), \"marker\")", "true");
+    try expectReplValue(&session, "@hasDecl(@import(\"root\"), \"nope\")", "false");
+}
+
 test "@import(std) reaches std.lang across files" {
     const gpa = testing.allocator;
     var io_instance: Io.Threaded = .init(gpa, .{});

@@ -8633,19 +8633,15 @@ fn evalHasDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     if (sema.containerNamespace(container_type) == null) {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected struct, enum, union, or opaque; found '{f}'", .{Type.fromIndex(container_type).fmt(sema.intern_pool)});
     }
-    return .{ .index = if (try sema.containerHasDecl(container_type, decl_name)) .bool_true else .bool_false };
-}
-
-fn containerHasDecl(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!bool {
-    const ns = sema.containerNamespace(container_ty) orelse return false;
-    const frame = try sema.enterSourceZir(ns.source_zir_id, "container decl");
-    defer frame.restore(sema);
-    for (sema.zir.typeDecls(ns.decl_inst)) |decl_inst| {
-        const unwrapped = sema.zir.getDeclaration(decl_inst);
-        if (unwrapped.name == .empty) continue;
-        if ((try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(unwrapped.name), .no_embedded_nulls)) == name) return true;
+    // Resolve through the namespace's decls, not by re-walking one defining ZIR: the root
+    // namespace's decls are bound across many line files (its own ZIR is absent), and a
+    // regular container's decls are scanned lazily on lookup. A private decl is only a hit
+    // from within its own file, matching the compiler's accessibility check.
+    const namespace = sema.getNamespaceIndex(container_type) orelse return .{ .index = .bool_false };
+    if (try sema.lookupInNamespace(namespace, decl_name)) |lookup| {
+        if (lookup.accessible) return .{ .index = .bool_true };
     }
-    return false;
+    return .{ .index = .bool_false };
 }
 
 fn setAggregateElement(
