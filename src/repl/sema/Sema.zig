@@ -368,6 +368,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .ensure_err_union_payload_void => sema.evalEnsureErrUnionPayloadVoid(inst),
         .@"try" => sema.evalTry(inst),
         .try_ptr => sema.evalTryPtr(inst),
+        .@"unreachable" => sema.evalUnreachable(inst),
         .loop => sema.evalLoop(inst),
         .for_len => sema.evalForLen(inst),
         .switch_block,
@@ -10015,6 +10016,14 @@ fn evalTryPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .payload => try sema.errUnionPayloadPtr(operand, false),
         .err_name => try sema.evalBody(body),
     };
+}
+
+fn evalUnreachable(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const inst_data = sema.zir.instructions.items(.data)[@intFromEnum(inst)].@"unreachable";
+    const src = sema.block.nodeOffset(inst_data.src_node);
+    // Every body evaluates at comptime here, so reaching `unreachable` is always a
+    // compile error; the compiler's runtime path instead lowers a trap.
+    return sema.fail(sema.block, src, "reached unreachable code", .{});
 }
 
 fn evalEnsureErrUnionPayloadVoid(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {

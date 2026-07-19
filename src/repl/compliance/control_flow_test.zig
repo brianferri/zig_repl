@@ -104,3 +104,19 @@ test "compliance: nested aggregate init and element store" {
         } },
     });
 }
+
+test "compliance: unreachable errors only when reached" {
+    try compliance.check(a, .{
+        // The taken arm returns; the `unreachable` arm is never evaluated.
+        .{ .src = &.{"blk: { const x: u8 = 3; break :blk switch (x) { 3 => @as(i32, 7), else => unreachable }; }"}, .want = blk: {
+            const x: u8 = 3;
+            break :blk switch (x) {
+                3 => @as(i32, 7),
+                else => unreachable,
+            };
+        } },
+        // Reaching it is a compile error, matching a comptime `unreachable` in the compiler.
+        .{ .src = &.{"blk: { const x: u8 = 9; break :blk switch (x) { 3 => @as(i32, 7), else => unreachable }; }"}, .reject = {} },
+    });
+    try compliance.expectDiagnostic(a, &.{"blk: { const x: u8 = 9; break :blk switch (x) { 3 => @as(i32, 7), else => unreachable }; }"}, "reached unreachable code");
+}
