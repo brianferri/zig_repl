@@ -141,3 +141,18 @@ test "compliance: defer runs at scope exit in LIFO order over live state" {
         },
     });
 }
+
+test "compliance: a later arg's result type resolves from an earlier comptime param" {
+    try compliance.check(a, .{
+        // @intCast's destination is the dependent param type T, bound by the first arg.
+        .{ .src = &.{"blk: { const F = struct { fn f(comptime T: type, x: T) T { return x; } }; break :blk F.f(u32, @intCast(@as(u64, 7))); }"}, .want = blk: {
+            const F = struct {
+                fn f(comptime T: type, x: T) T {
+                    return x;
+                }
+            };
+            break :blk F.f(u32, @intCast(@as(u64, 7)));
+        } },
+        .{ .src = &.{ "const std = @import(\"std\");", "std.math.log2(@as(u32, 48))" }, .want = std.math.log2(@as(u32, 48)) },
+    });
+}

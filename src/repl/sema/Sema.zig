@@ -10749,47 +10749,81 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     if (func_ty.param_types.len != args_len) {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected {d} argument(s), found {d}", .{ func_ty.param_types.len, args_len });
     }
-    const raw_args = try sema.evalCallArgs(inst, self_val, explicit_len, args_body, func_ty.param_types);
-    defer sema.gpa.free(raw_args);
-
     const target_ty = if (func.parent != .none) func.parent else enclosing_ty;
     var call_block: Block = .{
         .namespace = if (target_ty != .none) sema.getNamespaceIndex(target_ty) else sema.block.namespace,
         .src_base_inst = sema.block.src_base_inst,
         .type_name_ctx = sema.block.type_name_ctx,
     };
-    const prev_block = sema.block;
-    sema.block = &call_block;
-    defer {
-        call_block.deinit(sema.gpa);
-        sema.block = prev_block;
+    const caller_block = sema.block;
+    defer call_block.deinit(sema.gpa);
+
+    // The fn info, param instructions, and param-type ZIR all live in the callee's ZIR.
+    const info, const param_insts, const callee_param_tags = fetch: {
+        const info_frame = try sema.enterSourceZir(func.source_zir_id, "call");
+        defer info_frame.restore(sema);
+        const fi = sema.zir.getFnInfo(func.zir_body_inst);
+        break :fetch .{ fi, try sema.collectParamInsts(fi, args_len), sema.zir.instructions.items(.tag) };
+    };
+    defer sema.gpa.free(param_insts);
+
+    // Evaluate arguments and bind parameters in lockstep, like the compiler's call loop: a generic
+    // parameter's type is evaluated in the callee frame with the already-bound earlier parameters,
+    // so a later argument can use that resolved type as its result location.
+    var generic_inst_map: std.AutoHashMapUnmanaged(Zir.Inst.Index, Value) = .empty;
+    errdefer generic_inst_map.deinit(sema.gpa);
+    const base: u32 = @intFromBool(self_val != null);
+    for (0..args_len) |arg_idx_usize| {
+        const arg_idx: u32 = @intCast(arg_idx_usize);
+        const p_inst = param_insts[arg_idx];
+        const declared = func_ty.param_types[arg_idx];
+        const param_ty: InternPool.Index = if (declared != .generic_poison_type)
+            declared
+        else switch (callee_param_tags[@intFromEnum(p_inst)]) {
+            .param_anytype, .param_anytype_comptime => .generic_poison_type,
+            else => blk: {
+                const tframe = try sema.enterSourceZir(func.source_zir_id, "call param type");
+                const saved_im = sema.inst_map;
+                sema.inst_map = generic_inst_map;
+                sema.block = &call_block;
+                defer {
+                    generic_inst_map = sema.inst_map;
+                    sema.inst_map = saved_im;
+                    sema.block = caller_block;
+                    tframe.restore(sema);
+                }
+                break :blk try sema.resolveParamType(p_inst);
+            },
+        };
+
+        const raw: Value = if (self_val != null and arg_idx == 0)
+            self_val.?
+        else raw: {
+            const i = arg_idx - base;
+            const start = if (i == 0) explicit_len else @intFromEnum(args_body[i - 1]);
+            const end = @intFromEnum(args_body[i]);
+            try sema.inst_map.put(sema.gpa, inst, .{ .index = param_ty });
+            break :raw try sema.resolveInlineBody(args_body[start..end], inst);
+        };
+
+        const final_ty = if (param_ty == .generic_poison_type) raw.typeOf(sema.intern_pool).toIndex() else param_ty;
+        var val = try sema.coerceValueToType(raw, final_ty, "call arg");
+        val.is_comptime = func_ty.paramIsComptime(@intCast(arg_idx));
+        try generic_inst_map.put(sema.gpa, p_inst, val);
     }
+
+    sema.block = &call_block;
+    defer sema.block = caller_block;
 
     const frame = try sema.enterSourceZir(func.source_zir_id, "call");
     defer frame.restore(sema);
 
-    const info = sema.zir.getFnInfo(func.zir_body_inst);
-    const param_insts = try sema.collectParamInsts(info, args_len);
-    defer sema.gpa.free(param_insts);
-
     const old_inst_map = sema.inst_map;
-    sema.inst_map = .empty;
+    sema.inst_map = generic_inst_map;
+    generic_inst_map = .empty;
     defer {
         sema.inst_map.deinit(sema.gpa);
         sema.inst_map = old_inst_map;
-    }
-    const param_tags = sema.zir.instructions.items(.tag);
-    for (param_insts, raw_args, 0..) |p_inst, raw, i| {
-        const declared = func_ty.param_types[i];
-        const param_ty = if (declared != .generic_poison_type)
-            declared
-        else switch (param_tags[@intFromEnum(p_inst)]) {
-            .param_anytype, .param_anytype_comptime => raw.typeOf(sema.intern_pool).toIndex(),
-            else => try sema.resolveParamType(p_inst),
-        };
-        var val = try sema.coerceValueToType(raw, param_ty, "call arg");
-        val.is_comptime = func_ty.paramIsComptime(@intCast(i));
-        try sema.inst_map.put(sema.gpa, p_inst, val);
     }
 
     const saved_ret_ty = sema.fn_ret_ty;
@@ -10805,29 +10839,6 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
         error.ComptimeReturn => return try sema.coerceValueToType(sema.return_value, sema.fn_ret_ty, "return"),
         else => |e| return e,
     }
-}
-
-fn evalCallArgs(
-    sema: *Sema,
-    inst: Zir.Inst.Index,
-    self_val: ?Value,
-    explicit_len: u32,
-    args_body: []const Zir.Inst.Index,
-    param_types: []const InternPool.Index,
-) Error![]Value {
-    const base: u32 = @intFromBool(self_val != null);
-    const arg_values = try sema.gpa.alloc(Value, base + explicit_len);
-    errdefer sema.gpa.free(arg_values);
-    if (self_val) |s| arg_values[0] = s;
-    for (0..explicit_len) |i| {
-        const start = if (i == 0) explicit_len else @intFromEnum(args_body[i - 1]);
-        const end = @intFromEnum(args_body[i]);
-        const param_idx = base + i;
-        const param_ty: InternPool.Index = if (param_idx < param_types.len) param_types[param_idx] else .generic_poison_type;
-        try sema.inst_map.put(sema.gpa, inst, .{ .index = param_ty });
-        arg_values[param_idx] = try sema.resolveInlineBody(args_body[start..end], inst);
-    }
-    return arg_values;
 }
 
 fn collectParamInsts(sema: *Sema, info: Zir.FnInfo, args_len: u32) Error![]Zir.Inst.Index {
