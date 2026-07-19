@@ -808,6 +808,23 @@ pub fn isUndef(val: Value, pool: *const InternPool) bool {
     return pool.indexToKey(val.index) == .undef;
 }
 
+pub fn isNull(val: Value, pool: *const InternPool) bool {
+    return switch (val.index) {
+        .undef => unreachable,
+        .unreachable_value => unreachable,
+        .null_value => true,
+        else => switch (pool.indexToKey(val.index)) {
+            .undef => unreachable,
+            .ptr => |ptr| switch (ptr.base_addr) {
+                .int => ptr.byte_offset == 0,
+                else => false,
+            },
+            .opt => |opt| opt.val == .none,
+            else => false,
+        },
+    };
+}
+
 pub fn isFloat(self: Value, pool: *const InternPool) bool {
     return switch (pool.indexToKey(self.index)) {
         .undef => unreachable,

@@ -274,3 +274,24 @@ test "compliance: a pointer coerces to *anyopaque" {
         } },
     });
 }
+
+test "compliance: pointer-cast family" {
+    try compliance.check(a, .{
+        // @ptrCast changes element type; result type is the destination.
+        .{ .src = &.{"blk: { const p: *const u32 = @ptrFromInt(0x1000); const q: *const u8 = @ptrCast(p); break :blk @intFromPtr(q); }"}, .want = blk: {
+            const p: *const u32 = @ptrFromInt(0x1000);
+            const q: *const u8 = @ptrCast(p);
+            break :blk @intFromPtr(q);
+        } },
+        // @constCast / @volatileCast need no result type; they clear a qualifier.
+        .{ .src = &.{ "const p: *const u32 = @ptrFromInt(0x1000);", "@TypeOf(@constCast(p))" }, .want = *u32 },
+        .{ .src = &.{ "const p: *volatile u32 = @ptrFromInt(0x1000);", "@TypeOf(@volatileCast(p))" }, .want = *u32 },
+        // @alignCast asserts a higher alignment; the address already satisfies it.
+        .{ .src = &.{ "const p: *u32 = @ptrFromInt(0x1000);", "@intFromPtr(@as(*align(4) u32, @alignCast(p)))" }, .want = @intFromPtr(@as(*align(4) u32, @alignCast(@as(*u32, @ptrFromInt(0x1000))))) },
+        // A slice @ptrCast recomputes the length from element sizes.
+        .{ .src = &.{ "var arr = [_]u32{ 1, 2, 3 };", "const s: []u32 = &arr;", "@as([]const u8, @ptrCast(s)).len" }, .rendered = "12" },
+        // Rejections: each qualifier/alignment change requires its own builtin.
+        .{ .src = &.{"blk: { const p: *const u32 = @ptrFromInt(0x1000); const q: *u32 = @ptrCast(p); break :blk @intFromPtr(q); }"}, .reject = {} },
+        .{ .src = &.{"blk: { const p: *volatile u32 = @ptrFromInt(0x1000); const q: *u32 = @ptrCast(p); break :blk @intFromPtr(q); }"}, .reject = {} },
+    });
+}

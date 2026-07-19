@@ -35,6 +35,12 @@ pub const lines = [_][]const u8{
     "@intFromBool(true)",
     "@as(i32, @intFromFloat(3.9))",
     "@bitCast(@as(u32, 0x3f800000))",
+    // Pointer-cast family: element retype, qualifier drop, alignment assert, slice retype.
+    "blk: { const p: *const u32 = @ptrFromInt(0x1000); const q: *const u8 = @ptrCast(p); break :blk @intFromPtr(q); }",
+    "blk: { const p: *const u32 = @ptrFromInt(0x1000); break :blk @intFromPtr(@constCast(p)); }",
+    "blk: { const p: *volatile u32 = @ptrFromInt(0x1000); break :blk @intFromPtr(@volatileCast(p)); }",
+    "blk: { const p: *u32 = @ptrFromInt(0x1000); break :blk @intFromPtr(@as(*align(4) u32, @alignCast(p))); }",
+    "blk: { var arr = [_]u32{ 1, 2, 3 }; const s: []u32 = &arr; break :blk @as([]const u8, @ptrCast(s)).len; }",
     // Arrays, slices, strings.
     "[_]u8{ 1, 2, 3 }",
     "[_]u8{ 1, 2, 3 }.len",

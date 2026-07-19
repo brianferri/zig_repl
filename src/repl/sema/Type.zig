@@ -1284,6 +1284,16 @@ pub fn arrayLenIncludingSentinel(ty: Type, pool: *const InternPool) u64 {
     return pool.aggregateTypeLenIncludingSentinel(ty.index);
 }
 
+pub fn arrayBase(ty: Type, pool: *const InternPool) struct { Type, u64 } {
+    var cur_ty: Type = ty;
+    var cur_len: u64 = 1;
+    while (cur_ty.zigTypeTag(pool) == .array) {
+        cur_len *= cur_ty.arrayLenIncludingSentinel(pool);
+        cur_ty = cur_ty.childType(pool);
+    }
+    return .{ cur_ty, cur_len };
+}
+
 pub fn sentinel(ty: Type, pool: *const InternPool) ?Value {
     return switch (pool.indexToKey(ty.index)) {
         .vector_type, .struct_type, .tuple_type => null,
