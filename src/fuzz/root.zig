@@ -2,10 +2,14 @@
 //! module (imported by name, not by `../` path), so it is fully decoupled from the
 //! interpreter's internals -- `zig build fuzz` builds and runs it on its own.
 //!
-//! It runs as its own build step only because the pinned toolchain's coverage-
-//! guided fuzzer (`--fuzz`) segfaults in its runtime (`fuzzer.zig:ensureCorpusLoaded`);
-//! see ziglang/zig#25352. Once that is fixed upstream, drop the `fuzz` step and add
-//! this module to the normal `test` step -- no code here changes.
+//! `stress_test.zig` holds a `std.testing.fuzz` target (the proper std mechanism,
+//! coverage-guided under `zig build fuzz --fuzz`) alongside a deterministic
+//! corpus-mutation loop. It runs as its own build step, not folded into `test`,
+//! because the sanitizer coverage the coverage-guided runtime needs (`Module.fuzz`)
+//! still segfaults that runtime (`fuzzer.zig` `fuzzer_new_input`) in the pinned
+//! toolchain -- the ensureCorpusLoaded crash of ziglang/zig#25352 is fixed, this is
+//! a later one. The corpus replay and mutation paths need no instrumentation and run
+//! clean; fold into `test` once the runtime is stable.
 
 test {
     _ = @import("regression_test.zig");

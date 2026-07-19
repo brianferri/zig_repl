@@ -166,11 +166,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(terminal_tests).step);
 
     // The fuzz suite is a standalone module that imports `repl` by name, so it is
-    // fully decoupled from the interpreter's internals. It runs as its own step
-    // only because the pinned toolchain's `--fuzz` runtime segfaults (see
-    // src/fuzz/root.zig); to fold it into `test` once that is fixed, drop this
-    // step and `test_step.dependOn(&b.addRunArtifact(fuzz_tests).step)` -- no code
-    // change. Scale with `-Dfuzz-iterations`; reproduce a failure with `-Dfuzz-seed`.
+    // fully decoupled from the interpreter's internals. It holds a `std.testing.fuzz`
+    // target (coverage-guided when driven by `zig build fuzz --fuzz`) plus a
+    // deterministic corpus-mutation stress loop scaled by `-Dfuzz-iterations` and
+    // reproduced with `-Dfuzz-seed`. It runs as its own step, not folded into `test`,
+    // because enabling the sanitizer coverage the coverage-guided runtime needs
+    // (`Module.fuzz = true`) segfaults that runtime (`fuzzer.zig` `fuzzer_new_input`)
+    // in the pinned toolchain; the corpus-replay and mutation paths above do not need
+    // it and run clean. Fold into `test` once the runtime is stable upstream.
     const fuzz_module = b.createModule(.{
         .root_source_file = b.path("src/fuzz/root.zig"),
         .target = target,
