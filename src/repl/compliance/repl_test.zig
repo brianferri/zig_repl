@@ -24,7 +24,7 @@ test "diagnostic: a Sema error renders a source-anchored caret with notes" {
     const gpa = std.testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
 

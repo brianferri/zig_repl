@@ -26,7 +26,7 @@ const gpa = std.testing.allocator;
 fn evalUnderOom(allocator: std.mem.Allocator, input: []const u8) !void {
     var pool = try InternPool.init(allocator);
     defer pool.deinit();
-    const ns = try pool.createNamespace(allocator, .none);
+    const ns = try pool.createNamespace(allocator, .{});
     var session = Session.init(allocator, &pool, ns);
     defer session.deinit();
 
@@ -66,7 +66,7 @@ test "OOM: eval releases all memory on any allocation failure" {
 test "no per-eval leak into the pool across a repeated line" {
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
 
@@ -94,7 +94,7 @@ test "no leak loading and re-importing modules across a session" {
 
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
     session.module_source = &native.interface;

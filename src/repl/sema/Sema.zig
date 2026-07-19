@@ -7741,6 +7741,19 @@ fn containerNamespace(sema: *Sema, container_ty: InternPool.Index) ?ContainerNam
     };
 }
 
+/// Populate a namespace's decls from its owner type's ZIR on first access, the way the compiler's
+/// `ensureNamespaceUpToDate` re-scans a stale namespace. `generation` 0 marks a never-scanned
+/// namespace; reified and generated-union-tag namespaces carry no ZIR decls and stay empty.
+fn ensureNamespaceUpToDate(sema: *Sema, ns: InternPool.NamespaceIndex) Error!void {
+    const ns_ptr = sema.intern_pool.namespacePtr(ns);
+    if (ns_ptr.generation != 0) return;
+    ns_ptr.generation = 1;
+    // The root namespace's decls are bound directly (bindDecls), not scanned from ZIR.
+    if (ns_ptr.owner_type == .none) return;
+    if (sema.containerNamespace(ns_ptr.owner_type) == null) return;
+    try sema.scanNamespace(ns, ns_ptr.owner_type);
+}
+
 fn getNamespaceIndex(sema: *Sema, ty: InternPool.Index) Error!?InternPool.NamespaceIndex {
     const ip = sema.intern_pool;
     if (ip.typeNamespace(ty).unwrap()) |ns| return ns;
@@ -7750,12 +7763,12 @@ fn getNamespaceIndex(sema: *Sema, ty: InternPool.Index) Error!?InternPool.Namesp
         .init(try sema.getNamespaceIndex(parent_ty))
     else
         .none;
-    const ns = try ip.createNamespace(sema.gpa, parent_ns);
-    const ns_ptr = ip.namespacePtr(ns);
-    ns_ptr.owner_type = ty;
-    ns_ptr.file_scope = sema.namespaceFileScope(cn.source_zir_id);
+    const ns = try ip.createNamespace(sema.gpa, .{
+        .parent = parent_ns,
+        .owner_type = ty,
+        .file_scope = sema.namespaceFileScope(cn.source_zir_id),
+    });
     ip.setNamespace(ty, ns);
-    try sema.scanNamespace(ns, ty);
     return ns;
 }
 
@@ -9187,7 +9200,7 @@ fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         const name = try ip.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir), .no_embedded_nulls);
         var ns_opt = try sema.getNamespaceIndex(sema.this_type);
         while (ns_opt) |ns| {
-            if (sema.lookupInNamespace(ns, name)) |lookup| return try sema.analyzeNavVal(lookup.nav);
+            if (try sema.lookupInNamespace(ns, name)) |lookup| return try sema.analyzeNavVal(lookup.nav);
             ns_opt = ip.namespacePtr(ns).parent.unwrap();
         }
     }
@@ -9204,7 +9217,7 @@ fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         const name = try ip.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir), .no_embedded_nulls);
         var ns_opt = try sema.getNamespaceIndex(sema.this_type);
         while (ns_opt) |ns| {
-            if (sema.lookupInNamespace(ns, name)) |lookup| return try sema.materializeConstPtr(try sema.analyzeNavVal(lookup.nav));
+            if (try sema.lookupInNamespace(ns, name)) |lookup| return try sema.materializeConstPtr(try sema.analyzeNavVal(lookup.nav));
             ns_opt = ip.namespacePtr(ns).parent.unwrap();
         }
     }
@@ -9263,7 +9276,7 @@ fn lookupName(
     var depth: u32 = 0;
     while (current) |idx| : (depth += 1) {
         assert(depth < max_namespace_chain);
-        if (sema.lookupInNamespace(idx, name)) |lookup| return lookup.nav;
+        if (try sema.lookupInNamespace(idx, name)) |lookup| return lookup.nav;
         current = sema.intern_pool.namespacePtr(idx).parent.unwrap();
     }
     return null;
@@ -9273,11 +9286,12 @@ fn lookupInNamespace(
     sema: *Sema,
     namespace_index: InternPool.NamespaceIndex,
     ident_name: InternPool.NullTerminatedString,
-) ?struct {
+) Error!?struct {
     nav: InternPool.Nav.Index,
     accessible: bool,
 } {
     const ip = sema.intern_pool;
+    try sema.ensureNamespaceUpToDate(namespace_index);
     const namespace = ip.namespacePtr(namespace_index);
     const adapter: InternPool.Namespace.NameAdapter = .{ .pool = ip };
     const src_file = if (sema.namespace) |cur| ip.namespacePtr(cur).file_scope else .none;
@@ -9294,7 +9308,7 @@ fn namespaceLookup(
     namespace: InternPool.NamespaceIndex,
     decl_name: InternPool.NullTerminatedString,
 ) Error!?InternPool.Nav.Index {
-    if (sema.lookupInNamespace(namespace, decl_name)) |lookup| {
+    if (try sema.lookupInNamespace(namespace, decl_name)) |lookup| {
         if (!lookup.accessible) {
             const msg = try sema.errMsg(sema.block.nodeOffset(.zero), "'{f}' is not marked 'pub'", .{decl_name.fmt(sema.intern_pool)});
             return sema.failWithOwnedErrorMsg(sema.block, msg);

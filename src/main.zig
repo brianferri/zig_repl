@@ -10,7 +10,7 @@ pub fn main(init: std.process.Init) !void {
     // which.
     var pool = try repl.sema.InternPool.init(init.gpa);
     defer pool.deinit();
-    const root_namespace = try pool.createNamespace(init.gpa, .none);
+    const root_namespace = try pool.createNamespace(init.gpa, .{});
 
     var session = repl.Session.init(init.gpa, &pool, root_namespace);
     defer session.deinit();

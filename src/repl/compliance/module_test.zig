@@ -86,7 +86,7 @@ test "@import loads a module container and resolves its decls" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
 
@@ -110,7 +110,7 @@ test "@import(std) reaches std.lang across files" {
 
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
     session.module_source = &native.interface;
@@ -132,7 +132,7 @@ test "@import(std) broad access probes" {
 
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
     session.module_source = &native.interface;
@@ -301,7 +301,7 @@ test "reify constructors: value paths and rejected inputs" {
     var native: NativeModuleSource = .{ .io = io, .root = root };
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
     session.module_source = &native.interface;
@@ -353,7 +353,7 @@ test "render: a struct value prints .{ .field = val }" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
 
@@ -379,7 +379,7 @@ test "render: enum and union values print their names" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
     var diag: std.Io.Writer.Allocating = .init(gpa);
@@ -404,7 +404,7 @@ test "render: a packed struct value unpacks its fields; a packed union shows the
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
     var diag: std.Io.Writer.Allocating = .init(gpa);

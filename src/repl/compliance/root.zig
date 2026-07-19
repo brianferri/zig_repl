@@ -71,7 +71,7 @@ pub fn expectDiagnostic(gpa: std.mem.Allocator, inputs: []const []const u8, need
 
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
     session.module_source = &native.interface;
@@ -128,7 +128,7 @@ fn replRun(gpa: std.mem.Allocator, inputs: []const []const u8) ![]u8 {
 
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
     session.module_source = &native.interface;

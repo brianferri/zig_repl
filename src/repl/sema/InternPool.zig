@@ -2020,14 +2020,18 @@ pub fn navPtr(pool: *InternPool, index: Nav.Index) *Nav {
 pub fn createNamespace(
     pool: *InternPool,
     gpa: Allocator,
-    parent: OptionalNamespaceIndex,
+    initialization: struct {
+        parent: OptionalNamespaceIndex = .none,
+        owner_type: Index = .none,
+        file_scope: OptionalFileIndex = .none,
+    },
 ) Allocator.Error!NamespaceIndex {
     const new_index_raw: u32 = @intCast(pool.namespaces.items.len);
     try pool.namespaces.append(gpa, .{
-        .parent = parent,
-        .file_scope = .none,
+        .parent = initialization.parent,
+        .file_scope = initialization.file_scope,
         .generation = 0,
-        .owner_type = .none,
+        .owner_type = initialization.owner_type,
         .pub_decls = .empty,
         .priv_decls = .empty,
         .test_decls = .empty,
@@ -5143,7 +5147,7 @@ test "Namespace: createNamespace seeds an empty parent-less scope" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const ns_idx = try pool.createNamespace(pool.gpa, .none);
+    const ns_idx = try pool.createNamespace(pool.gpa, .{});
     const ns = pool.namespacePtr(ns_idx);
 
     try std.testing.expectEqual(OptionalNamespaceIndex.none, ns.parent);
@@ -5161,7 +5165,7 @@ test "fullyQualifiedName: a root-namespace decl qualifies under the session root
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const ns = try pool.createNamespace(pool.gpa, .none);
+    const ns = try pool.createNamespace(pool.gpa, .{});
     const name = try pool.getOrPutString(pool.gpa, "P", .no_embedded_nulls);
     const fqn = try pool.fullyQualifiedName(pool.gpa, ns, name);
     try std.testing.expectEqualStrings("repl.P", pool.stringSlice(fqn));
@@ -5180,7 +5184,7 @@ test "fullyQualifiedName: a member of a named container nests under it" {
         false,
         false,
     );
-    const ns = try pool.createNamespace(pool.gpa, .none);
+    const ns = try pool.createNamespace(pool.gpa, .{});
     pool.namespacePtr(ns).owner_type = outer;
 
     const inner = try pool.getOrPutString(pool.gpa, "Inner", .no_embedded_nulls);
@@ -5198,7 +5202,7 @@ test "Namespace: NavNameContext dedups Nav.Index entries by interned name" {
     const second_x = try pool.createNav(pool.gpa, x, x);
     const just_y = try pool.createNav(pool.gpa, y, y);
 
-    const ns_idx = try pool.createNamespace(pool.gpa, .none);
+    const ns_idx = try pool.createNamespace(pool.gpa, .{});
     const ns = pool.namespacePtr(ns_idx);
     const ctx: Namespace.NavNameContext = .{ .pool = &pool };
 
@@ -5221,7 +5225,7 @@ test "Namespace: NameAdapter looks up Nav.Index by interned name" {
     const x = try pool.getOrPutString(pool.gpa, "x", .no_embedded_nulls);
     const nav_x = try pool.createNav(pool.gpa, x, x);
 
-    const ns_idx = try pool.createNamespace(pool.gpa, .none);
+    const ns_idx = try pool.createNamespace(pool.gpa, .{});
     const ns = pool.namespacePtr(ns_idx);
     const ctx: Namespace.NavNameContext = .{ .pool = &pool };
     _ = try ns.pub_decls.getOrPutContext(pool.gpa, nav_x, ctx);
@@ -5244,7 +5248,7 @@ test "Namespace.lookupNav: walks pub_decls then priv_decls, no parent chain" {
     const nav_x = try pool.createNav(pool.gpa, x, x);
     const nav_y = try pool.createNav(pool.gpa, y, y);
 
-    const ns_idx = try pool.createNamespace(pool.gpa, .none);
+    const ns_idx = try pool.createNamespace(pool.gpa, .{});
     const ns = pool.namespacePtr(ns_idx);
     const ctx: Namespace.NavNameContext = .{ .pool = &pool };
     _ = try ns.pub_decls.getOrPutContext(pool.gpa, nav_x, ctx);
@@ -5263,7 +5267,7 @@ test "Namespace.lookupNav: pub_decls takes precedence over priv_decls" {
     const nav_pub = try pool.createNav(pool.gpa, x, x);
     const nav_priv = try pool.createNav(pool.gpa, x, x);
 
-    const ns_idx = try pool.createNamespace(pool.gpa, .none);
+    const ns_idx = try pool.createNamespace(pool.gpa, .{});
     const ns = pool.namespacePtr(ns_idx);
     const ctx: Namespace.NavNameContext = .{ .pool = &pool };
 
@@ -5474,7 +5478,7 @@ test "ComptimeUnit: createComptimeUnit + getComptimeUnit round-trip" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const ns_idx = try pool.createNamespace(pool.gpa, .none);
+    const ns_idx = try pool.createNamespace(pool.gpa, .{});
     const zir_inst: std.zig.Zir.Inst.Index = @enumFromInt(42);
     const id = try pool.createComptimeUnit(pool.gpa, ns_idx, zir_inst);
 

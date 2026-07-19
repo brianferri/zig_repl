@@ -41,7 +41,7 @@ var ready = false;
 export fn replInit() bool {
     if (ready) return true;
     pool = InternPool.init(gpa) catch return false;
-    const root_namespace = pool.createNamespace(gpa, .none) catch return false;
+    const root_namespace = pool.createNamespace(gpa, .{}) catch return false;
     session = Session.init(gpa, &pool, root_namespace);
     module_source = repl.module.Buffer.init(gpa, embedded_std) catch return false;
     session.module_source = &module_source.interface;
@@ -112,7 +112,7 @@ fn preview(input: []const u8) !void {
 
     var preview_pool = try InternPool.init(gpa);
     defer preview_pool.deinit();
-    const root_namespace = try preview_pool.createNamespace(gpa, .none);
+    const root_namespace = try preview_pool.createNamespace(gpa, .{});
     var preview_session = Session.init(gpa, &preview_pool, root_namespace);
     preview_session.module_source = &module_source.interface;
     defer preview_session.deinit();
@@ -168,7 +168,7 @@ fn buildOutline(input: []const u8) !void {
 
     var preview_pool = try InternPool.init(gpa);
     defer preview_pool.deinit();
-    const root_namespace = try preview_pool.createNamespace(gpa, .none);
+    const root_namespace = try preview_pool.createNamespace(gpa, .{});
     var preview_session = Session.init(gpa, &preview_pool, root_namespace);
     preview_session.module_source = &module_source.interface;
     defer preview_session.deinit();

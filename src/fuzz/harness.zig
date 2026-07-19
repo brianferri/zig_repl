@@ -32,7 +32,7 @@ pub const SessionRunner = struct {
             gpa.destroy(pool);
             return null;
         };
-        const root_namespace = pool.createNamespace(gpa, .none) catch {
+        const root_namespace = pool.createNamespace(gpa, .{}) catch {
             pool.deinit();
             gpa.destroy(pool);
             return null;

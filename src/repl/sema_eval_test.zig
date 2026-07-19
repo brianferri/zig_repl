@@ -46,7 +46,7 @@ fn evalSource(
     try testing.expect(!result.hasParseErrors());
     try testing.expect(!result.hasZirErrors());
 
-    const ns = try intern_pool.createNamespace(gpa, .none);
+    const ns = try intern_pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, intern_pool, ns);
     defer session.deinit();
 
@@ -88,7 +88,7 @@ test "eval.report: value for an expression, null otherwise, errors swallowed" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
 
@@ -279,7 +279,7 @@ fn expectEvalFails(
     var taken = false;
     defer if (!taken) result.deinit(gpa);
 
-    const ns = try intern_pool.createNamespace(gpa, .none);
+    const ns = try intern_pool.createNamespace(gpa, .{});
     var session = Session.init(gpa, intern_pool, ns);
     defer session.deinit();
 
@@ -329,7 +329,7 @@ test "fn return rejects a runtime value whose type does not coerce" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     // `a` and `b` are non-comptime params, so `a + b` is a runtime u32; u32
     // does not coerce to the i32 return type (type-based, regardless of the
@@ -345,7 +345,7 @@ test "fn return coerces a runtime value that widens, and a comptime value that f
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     // Runtime u8 widens to u32 (type-based: u32 represents every u8).
     var buf1: [4096]u8 = undefined;
@@ -357,7 +357,7 @@ test "fn return coerces a runtime value that widens, and a comptime value that f
 
     // Comptime-known u32 coerces to i32 by the value-fits rule (no runtime
     // operand involved), exactly as `const c: i32 = u;` does in Zig.
-    const ns2 = try pool.createNamespace(gpa, .none);
+    const ns2 = try pool.createNamespace(gpa, .{});
     var buf2: [4096]u8 = undefined;
     const narrowed = (try evalSessionLines(gpa, &pool, ns2, &.{"@as(i32, @as(u32, 42))"}, &buf2)).?;
     try testing.expectEqual(InternPool.Index.i32_type, pool.indexToKey(narrowed.index).int.ty);
@@ -1413,7 +1413,7 @@ test "store through a pointer to a declaration is a comptime-only rejection" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = @splat(0);
     const result = evalSessionLines(gpa, &pool, ns, &.{
@@ -1450,7 +1450,7 @@ test "struct_decl: `const P = struct {...}` evaluates to a struct_type named aft
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     const value = (try evalSessionLines(gpa, &pool, ns, &.{
@@ -1467,7 +1467,7 @@ test "decl: top-level const binds and is readable on the next line" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     const value = (try evalSessionLines(gpa, &pool, ns, &.{
@@ -1483,7 +1483,7 @@ test "decl: typed binding survives + participates in arith" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     const value = (try evalSessionLines(gpa, &pool, ns, &.{
@@ -1500,7 +1500,7 @@ test "decl: multiple bindings across lines compose" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     const value = (try evalSessionLines(gpa, &pool, ns, &.{
@@ -1518,7 +1518,7 @@ test "decl: declaration-shape input returns null (no value to print)" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     const value = try evalSessionLines(gpa, &pool, ns, &.{
@@ -1531,7 +1531,7 @@ test "decl: bindDecls populates the namespace with the right resolved value" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns_idx = try pool.createNamespace(gpa, .none);
+    const ns_idx = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     _ = try evalSessionLines(gpa, &pool, ns_idx, &.{
@@ -1557,7 +1557,7 @@ test "decl: rebinding the same name fails with duplicate-member error" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     _ = try evalSessionLines(gpa, &pool, ns, &.{"const x = 10;"}, &diag_buf);
@@ -1574,7 +1574,7 @@ test "decl: a test decl binds into test_decls, not pub_decls" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns_idx = try pool.createNamespace(gpa, .none);
+    const ns_idx = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     _ = try evalSessionLines(gpa, &pool, ns_idx, &.{
@@ -1594,7 +1594,7 @@ test "decl: comptime block binds into comptime_decls" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns_idx = try pool.createNamespace(gpa, .none);
+    const ns_idx = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     _ = try evalSessionLines(gpa, &pool, ns_idx, &.{
@@ -1634,7 +1634,7 @@ test "diagnostic: shadow rejection renders main error in user frame" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     _ = try evalSessionLines(gpa, &pool, ns, &.{"const w = 10;"}, &diag_buf);
@@ -1664,7 +1664,7 @@ test "decl: cross-line rebind preserves the original binding (silent-drop limita
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     _ = try evalSessionLines(gpa, &pool, ns, &.{"const z = 1;"}, &diag_buf);
@@ -1827,7 +1827,7 @@ test "error_union_type: cross-line E!T via const-bound error set" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     const value = (try evalSessionLines(gpa, &pool, ns, &.{
@@ -1844,7 +1844,7 @@ test "error_set: cross-line const E = error{...} binds the type" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     const value = (try evalSessionLines(gpa, &pool, ns, &.{
@@ -1860,7 +1860,7 @@ test "fn decl: nullary void fn binds with correct FuncType" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns_idx = try pool.createNamespace(gpa, .none);
+    const ns_idx = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     _ = try evalSessionLines(gpa, &pool, ns_idx, &.{
@@ -1885,7 +1885,7 @@ test "fn decl: typed params populate FuncType.param_types in order" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns_idx = try pool.createNamespace(gpa, .none);
+    const ns_idx = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     _ = try evalSessionLines(gpa, &pool, ns_idx, &.{
@@ -1908,7 +1908,7 @@ test "fn decl: comptime parameter sets comptime_bits" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns_idx = try pool.createNamespace(gpa, .none);
+    const ns_idx = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     _ = try evalSessionLines(gpa, &pool, ns_idx, &.{
@@ -1930,7 +1930,7 @@ test "fn decl: dedup -- same signature reuses FuncType Index" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns_idx = try pool.createNamespace(gpa, .none);
+    const ns_idx = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     _ = try evalSessionLines(gpa, &pool, ns_idx, &.{
@@ -1952,7 +1952,7 @@ test "fn call: cross-line call returns the right value" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     const value = (try evalSessionLines(gpa, &pool, ns, &.{
@@ -1968,7 +1968,7 @@ test "fn call: cross-line recursion (fib)" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .none);
+    const ns = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     const value = (try evalSessionLines(gpa, &pool, ns, &.{
@@ -1982,7 +1982,7 @@ test "fn decl: cross-line retrieval round-trips the Func value" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    const ns_idx = try pool.createNamespace(gpa, .none);
+    const ns_idx = try pool.createNamespace(gpa, .{});
 
     var diag_buf: [4096]u8 = undefined;
     const value = (try evalSessionLines(gpa, &pool, ns_idx, &.{
