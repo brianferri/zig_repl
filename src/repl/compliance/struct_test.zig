@@ -286,6 +286,24 @@ test "compliance: a struct value method binds the receiver (p.method())" {
                 break :blk p.addk(5);
             },
         },
+        // A method whose receiver is already a pointer (`self: *T`) calls a sibling method on
+        // that pointer; resolution peels the pointer to the container (the iterator pattern).
+        .{
+            .src = &.{"blk: { const P = struct { x: u8, fn peek(self: *@This()) u8 { return self.x; } fn next(self: *@This()) u8 { return self.peek(); } }; var p: P = .{ .x = 7 }; break :blk p.next(); }"},
+            .want = blk: {
+                const P = struct {
+                    x: u8,
+                    fn peek(self: *@This()) u8 {
+                        return self.x;
+                    }
+                    fn next(self: *@This()) u8 {
+                        return self.peek();
+                    }
+                };
+                var p: P = .{ .x = 7 };
+                break :blk p.next();
+            },
+        },
     });
 }
 
