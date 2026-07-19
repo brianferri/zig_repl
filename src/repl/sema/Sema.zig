@@ -4422,14 +4422,27 @@ fn coerceExtra(
         .error_set_type => return try sema.coerceToErrorSet(value, dest_ty, op_name),
         .error_union_type => return try sema.coerceToErrorUnion(value, dest_ty, op_name),
         .opt_type => return try sema.coerceToOptional(value, dest_ty, op_name),
-        .ptr_type => |p| switch (p.flags.size) {
-            .slice => if (try sema.coerceToSlice(value, dest_ty)) |c| return c,
-            .many => if (try sema.coerceToManyPtr(value, dest_ty)) |c| return c,
-            // A function value coerces to a pointer-to-function (`fn(...)` -> `*const fn(...)`) by
-            // taking its address, like `&f` -- the coercion that builds a vtable of method pointers.
-            .one => if (ip.indexToKey(p.child) == .func_type and ip.indexToKey(value.index) == .func)
-                return try sema.materializeConstPtr(value),
-            .c => {},
+        .ptr_type => |p| {
+            // `*T`/`[*]T` -> `*anyopaque`/`[*]anyopaque`: coerce the pointer, not the pointee
+            // (the compiler's to_anyopaque -> coerceCompatiblePtrs). Reject a double-pointer source;
+            // a slice destination falls through to the slice coercion below.
+            if (p.child == .anyopaque_type and p.flags.size != .slice) {
+                const val_ty = Value.typeOf(value, ip);
+                if (val_ty.zigTypeTag(ip) == .pointer and !val_ty.isSlice(ip)) {
+                    const src_child = ip.indexToKey(val_ty.index).ptr_type.child;
+                    if (ip.indexToKey(src_child) != .ptr_type and !Type.fromIndex(src_child).isPtrLikeOptional(ip))
+                        return .{ .index = try ip.getCoerced(value.index, dest_ty) };
+                }
+            }
+            switch (p.flags.size) {
+                .slice => if (try sema.coerceToSlice(value, dest_ty)) |c| return c,
+                .many => if (try sema.coerceToManyPtr(value, dest_ty)) |c| return c,
+                // A function value coerces to a pointer-to-function (`fn(...)` -> `*const fn(...)`) by
+                // taking its address, like `&f` -- the coercion that builds a vtable of method pointers.
+                .one => if (ip.indexToKey(p.child) == .func_type and ip.indexToKey(value.index) == .func)
+                    return try sema.materializeConstPtr(value),
+                .c => {},
+            }
         },
         .array_type, .vector_type => {
             // The compiler dispatches an array/vector destination by source shape: an array/vector
@@ -6486,8 +6499,11 @@ fn evalCoercePtrElemTy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     switch (ptr_ty.flags.size) {
         .one => {
             if (ip.indexToKey(elem_ty) == .array_type and ip.indexToKey(elem_ty).array_type.child == val_ty) {
+                // Initializing a `*[1]T` with a reference to a `T` -- no coercion.
                 return uncoerced;
             }
+            // A destination element of `anyopaque` does not coerce the value; the pointer coerces instead.
+            if (elem_ty == .anyopaque_type) return uncoerced;
             return try sema.coerceValueToType(uncoerced, elem_ty, "coerce_ptr_elem_ty");
         },
         .slice, .many => {

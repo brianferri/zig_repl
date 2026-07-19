@@ -266,6 +266,8 @@ test "@import(std) broad access probes" {
         .{ .src = "@typeInfo(@Struct(.auto, null, &.{ \"a\", \"b\" }, &.{ u8, u16 }, &.{ .{}, .{} })).@\"struct\".field_types[1] == u16", .want = "true" },
         .{ .src = "@typeInfo(@Struct(.auto, null, &.{\"x\"}, &.{u8}, &.{.{}})).@\"struct\".is_tuple", .want = "false" },
         .{ .src = "(@Struct(.auto, null, &.{\"x\"}, &.{u8}, &.{.{}}){ .x = 5 }).x == 5", .want = "true" },
+        .{ .src = "(@Struct(.auto, null, &.{ \"a\", \"b\" }, &.{ u8, u16 }, &.{ .{ .default_value_ptr = &@as(u8, 9) }, .{} }){ .b = 2 }).a == 9", .want = "true" },
+        .{ .src = "@alignOf(@Struct(.auto, null, &.{ \"a\", \"b\" }, &.{ u8, u32 }, &.{ .{ .@\"align\" = 16 }, .{} })) == 16", .want = "true" },
         .{ .src = "@typeInfo(@Union(.auto, null, &.{ \"a\", \"b\" }, &.{ u8, u16 }, &.{ .{}, .{} })).@\"union\".field_types.len == 2", .want = "true" },
         .{ .src = "@typeInfo(@Union(.auto, null, &.{ \"a\", \"b\" }, &.{ u8, u16 }, &.{ .{}, .{} })).@\"union\".field_types[1] == u16", .want = "true" },
         .{ .src = "@typeInfo(@Union(.auto, null, &.{\"x\"}, &.{u8}, &.{.{}})).@\"union\".tag_type == null", .want = "true" },

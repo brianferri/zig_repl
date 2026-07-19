@@ -246,3 +246,15 @@ test "compliance: struct and union field pointers" {
         .{ .src = &.{"blk: { const U = union(enum) { a: u32, b: u32 }; const u: U = .{ .a = 9 }; break :blk (&u.b).*; }"}, .reject = {} },
     });
 }
+
+// A single-item pointer coerces to `*anyopaque` by re-typing the pointer, not the
+// pointee (the compiler's to_anyopaque). This is the coercion a reified struct's
+// `default_value_ptr` (a `?*const anyopaque`) relies on.
+test "compliance: a pointer coerces to *anyopaque" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const p: ?*const anyopaque = &@as(u32, 5); break :blk @as(u8, @intFromBool(p != null)); }"}, .want = blk: {
+            const p: ?*const anyopaque = &@as(u32, 5);
+            break :blk @as(u8, @intFromBool(p != null));
+        } },
+    });
+}
