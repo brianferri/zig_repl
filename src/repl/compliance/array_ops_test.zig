@@ -110,6 +110,24 @@ test "compliance: typed array initialization ([N]T = .{ ... })" {
     });
 }
 
+test "compliance: empty init to array and slice-via-address-of" {
+    try compliance.check(a, .{
+        // `T{}` on an array type yields an empty array.
+        .{ .src = &.{"([0]u8{}).len"}, .want = ([0]u8{}).len },
+        .{ .src = &.{"@as([0]u8, .{}).len"}, .want = @as([0]u8, .{}).len },
+        // `&.{}` builds a zero-length array behind a slice, carrying the slice's sentinel.
+        .{ .src = &.{"@as([]const u8, &.{}).len"}, .want = @as([]const u8, &.{}).len },
+        .{ .src = &.{"@as([:0]const u8, &.{}).len"}, .want = @as([:0]const u8, &.{}).len },
+        // The std.process.Environ.PosixBlock.empty shape: a sentinel slice of optional many-ptrs.
+        .{ .src = &.{"@as([:null]const ?[*:0]const u8, &.{}).len"}, .want = @as([:null]const ?[*:0]const u8, &.{}).len },
+        .{ .src = &.{"blk: { const S = struct { slice: [:null]const ?[*:0]const u8 }; const e: S = .{ .slice = &.{} }; break :blk e.slice.len; }"}, .want = blk: {
+            const S = struct { slice: [:null]const ?[*:0]const u8 };
+            const e: S = .{ .slice = &.{} };
+            break :blk e.slice.len;
+        } },
+    });
+}
+
 test "compliance: sentinel array types ([N:S]T)" {
     try compliance.check(a, .{
         .{ .src = &.{"[3:0]u8"}, .want = [3:0]u8 },

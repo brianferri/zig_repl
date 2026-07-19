@@ -8892,11 +8892,14 @@ fn evalStructInitUnion(sema: *Sema, union_ty: InternPool.Index, result_ty: Inter
 
 fn evalStructInitEmpty(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
-    const struct_ty = (try sema.resolveInst(un_node.operand)).index;
-    if (sema.intern_pool.indexToKey(struct_ty) != .struct_type) {
-        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "struct init: type does not support struct initialization syntax", .{});
-    }
-    return try sema.structInitEmpty(struct_ty);
+    const obj_ty = (try sema.resolveInst(un_node.operand)).index;
+    try sema.ensureLayoutResolved(obj_ty);
+    return switch (sema.intern_pool.indexToKey(obj_ty)) {
+        .struct_type, .tuple_type => try sema.structInitEmpty(obj_ty),
+        .array_type, .vector_type => try sema.arrayInitEmpty(obj_ty),
+        .union_type => sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "union initializer must initialize one field", .{}),
+        else => sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "struct init: type does not support struct initialization syntax", .{}),
+    };
 }
 
 fn structInitEmpty(sema: *Sema, struct_ty: InternPool.Index) Error!Value {
@@ -8908,14 +8911,36 @@ fn structInitEmpty(sema: *Sema, struct_ty: InternPool.Index) Error!Value {
 }
 
 fn evalStructInitEmptyResult(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref: bool) Error!?Value {
+    const ip = sema.intern_pool;
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
-    const init_ty = try sema.resolveDestType(un_node.operand, "struct init");
-    if (init_ty == .generic_poison_type) {
+    // Generic poison means an untyped anonymous empty init.
+    const ty_operand = try sema.resolveDestType(un_node.operand, "struct init");
+    if (ty_operand == .generic_poison_type) {
         const empty: Value = .{ .index = .empty_tuple };
         return if (is_ref) try sema.materializeConstPtr(empty) else empty;
     }
-    const obj_ty = Type.fromIndex(init_ty).optEuBaseType(sema.intern_pool).index;
-    const base: Value = switch (sema.intern_pool.indexToKey(obj_ty)) {
+    // For `&.{}` the operand is the pointer result type; the init itself is the pointee,
+    // a zero-length array for a slice/many-ptr (carrying its sentinel) or the child type
+    // for a single/C pointer.
+    const init_ty = if (is_ref) blk: {
+        const ptr_ty = sema.optEuBaseType(ty_operand);
+        const ptr_info = ip.indexToKey(ptr_ty).ptr_type;
+        switch (ptr_info.flags.size) {
+            .slice, .many => break :blk try ip.internArrayType(.{
+                .len = 0,
+                .child = ptr_info.child,
+                .sentinel = ptr_info.sentinel,
+            }),
+            .one, .c => {
+                if (ptr_info.child == .anyopaque_type) {
+                    return try sema.materializeConstPtr(.{ .index = .empty_tuple });
+                }
+                break :blk ptr_info.child;
+            },
+        }
+    } else ty_operand;
+    const obj_ty = sema.optEuBaseType(init_ty);
+    const base: Value = switch (ip.indexToKey(obj_ty)) {
         .struct_type, .tuple_type => try sema.structInitEmpty(obj_ty),
         .array_type, .vector_type => try sema.arrayInitEmpty(obj_ty),
         .union_type => {
