@@ -6860,7 +6860,7 @@ pub fn structFieldByName(
         if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name), .no_embedded_nulls)) == name) {
             return .{
                 .index = field.idx,
-                .ty = (try sema.resolveInlineBody(field.type_body, cf.decl_inst)).index,
+                .ty = (try sema.coerceValueToType(try sema.resolveInlineBody(field.type_body, cf.decl_inst), .type_type, "struct field type")).index,
                 .is_comptime = field.is_comptime,
                 .align_bytes = try sema.fieldAlignBytes(field.align_body, cf.decl_inst),
             };
@@ -6891,7 +6891,7 @@ pub fn structFieldDefault(
     while (it.next()) |field| {
         if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name), .no_embedded_nulls)) != name) continue;
         const body = field.default_body orelse return .none;
-        const ty = (try sema.resolveInlineBody(field.type_body, cf.decl_inst)).index;
+        const ty = (try sema.coerceValueToType(try sema.resolveInlineBody(field.type_body, cf.decl_inst), .type_type, "struct field type")).index;
         try sema.inst_map.put(sema.gpa, cf.decl_inst, .{ .index = ty });
         const raw = sema.resolveInlineBody(body, cf.decl_inst);
         _ = sema.inst_map.remove(cf.decl_inst);
@@ -6946,7 +6946,7 @@ pub fn unionFieldByName(
     while (it.next()) |field| {
         if ((try ip.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(field.name), .no_embedded_nulls)) == name) {
             const ty = if (field.type_body) |body|
-                (try sema.resolveInlineBody(body, cf.decl_inst)).index
+                (try sema.coerceValueToType(try sema.resolveInlineBody(body, cf.decl_inst), .type_type, "union field type")).index
             else
                 .void_type;
             return .{
@@ -7677,7 +7677,7 @@ fn analyzeNavVal(sema: *Sema, nav_idx: InternPool.Nav.Index) Error!Value {
         sema.inst_map = old_inst_map;
     }
     const declared_type: ?InternPool.Index = if (unwrapped.type_body) |tb| blk: {
-        const t = (try sema.resolveInlineBody(tb, decl_inst)).index;
+        const t = (try sema.coerceValueToType(try sema.resolveInlineBody(tb, decl_inst), .type_type, "variable type")).index;
         try sema.inst_map.put(sema.gpa, decl_inst, .{ .index = t });
         break :blk t;
     } else null;
@@ -9179,7 +9179,7 @@ fn bindValueDecl(
     };
 
     const declared_type: ?InternPool.Index = if (unwrapped.type_body) |tb| blk: {
-        const t = (try sema.resolveInlineBody(tb, decl_inst)).index;
+        const t = (try sema.coerceValueToType(try sema.resolveInlineBody(tb, decl_inst), .type_type, "variable type")).index;
         try sema.inst_map.put(sema.gpa, decl_inst, .{ .index = t });
         break :blk t;
     } else null;
@@ -10005,7 +10005,7 @@ fn resolveParamType(sema: *Sema, param_inst: Zir.Inst.Index) Error!InternPool.In
     const pl_tok = sema.zir.instructions.items(.data)[@intFromEnum(param_inst)].pl_tok;
     const extra = sema.zir.extraData(Zir.Inst.Param, pl_tok.payload_index);
     const body = sema.zir.bodySlice(extra.end, extra.data.type.body_len);
-    return (try sema.resolveInlineBody(body, param_inst)).index;
+    return (try sema.coerceValueToType(try sema.resolveInlineBody(body, param_inst), .type_type, "parameter type")).index;
 }
 
 fn evalParamAnytype(sema: *Sema, tag: Zir.Inst.Tag) Error!?Value {
@@ -10022,8 +10022,8 @@ fn evalRetType(sema: *Sema) Error!?Value {
 }
 
 fn resolveDeclaredRetType(sema: *Sema, info: Zir.FnInfo, break_target: Zir.Inst.Index) Error!InternPool.Index {
-    if (info.ret_ty_ref != .none) return (try sema.resolveInst(info.ret_ty_ref)).index;
-    if (info.ret_ty_body.len > 0) return (try sema.resolveInlineBody(info.ret_ty_body, break_target)).index;
+    if (info.ret_ty_ref != .none) return (try sema.coerceValueToType(try sema.resolveInst(info.ret_ty_ref), .type_type, "return type")).index;
+    if (info.ret_ty_body.len > 0) return (try sema.coerceValueToType(try sema.resolveInlineBody(info.ret_ty_body, break_target), .type_type, "return type")).index;
     return .void_type;
 }
 

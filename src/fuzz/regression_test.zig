@@ -51,6 +51,14 @@ test "survives adversarial single-line inputs" {
         // (`@as(4, .{...})` must not reach `zigTypeTag` on a value).
         "@as(4, .{ .a = 3 }).a",
         "@as(0, .{})",
+        // A value in a type-declaration position (struct/union field, variable,
+        // parameter, return type) must be rejected when that position is resolved,
+        // not reach `coerceInMemoryAllowed`'s `zigTypeTag` on a value.
+        "(struct { x: 5 }){ .x = 1 }",
+        "(union { x: 5 }){ .x = 1 }",
+        "const x: 5 = 1;",
+        "fn f(x: 5) void { _ = x; }",
+        "fn f() 5 { return 1; }",
         // Bitwise operators on non-integer operands: a type error, not a panic
         // (`bitwiseBin`'s `else => unreachable` assumes validated operands).
         "3.5 & 3",

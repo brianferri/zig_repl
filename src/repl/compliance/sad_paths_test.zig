@@ -15,6 +15,16 @@ test "sad paths: numeric coercion and casts are rejected" {
     });
 }
 
+test "sad paths: a value in a type position is rejected" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const S = struct { x: 5 }; break :blk S{ .x = 1 }; }"}, .reject = {} },
+        .{ .src = &.{"blk: { const U = union { x: 5 }; break :blk U{ .x = 1 }; }"}, .reject = {} },
+        .{ .src = &.{"blk: { const x: 5 = 1; break :blk x; }"}, .reject = {} },
+        .{ .src = &.{"blk: { const f = struct { fn g(x: 5) void { _ = x; } }.g; f(1); break :blk 0; }"}, .reject = {} },
+        .{ .src = &.{"blk: { const f = struct { fn g() 5 { return 1; } }.g; break :blk f(); }"}, .reject = {} },
+    });
+}
+
 test "sad paths: operator type mismatches are rejected" {
     try compliance.check(a, .{
         .{ .src = &.{"blk: { break :blk true + 1; }"}, .reject = {} },
