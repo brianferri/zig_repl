@@ -82,6 +82,16 @@ test "compliance: for loops (range and array)" {
             }
             break :blk arr[2];
         } },
+        // The length of a `&array` operand comes from the array type, so an
+        // as-yet-undefined destination is a valid loop operand (std.enums.valuesFromFields).
+        .{ .src = &.{"blk: { var result: [3]u8 = undefined; const src = [_]u8{ 4, 5, 6 }; for (&result, src) |*r, v| { r.* = v; } break :blk result[0] + result[2]; }"}, .want = blk: {
+            var result: [3]u8 = undefined;
+            const src = [_]u8{ 4, 5, 6 };
+            for (&result, src) |*r, v| {
+                r.* = v;
+            }
+            break :blk result[0] + result[2];
+        } },
     });
 }
 

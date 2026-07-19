@@ -10139,16 +10139,18 @@ fn evalForLen(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     for (pairs) |pair| {
         if (pair[0] == .none) continue;
         const arg_len: u64 = if (pair[1] == .none) blk: {
-            var obj = try sema.resolveInst(pair[0]);
+            const obj = try sema.resolveInst(pair[0]);
             const ip = sema.intern_pool;
             if (ip.indexToKey(obj.index) == .slice)
                 break :blk try sema.resolveUsizeInt(.{ .index = ip.indexToKey(obj.index).slice.len }, "for slice len");
-            while (ip.indexToKey(obj.index) == .ptr) obj = try sema.loadValue(obj);
-            const key = ip.indexToKey(obj.index);
-            if (key != .aggregate) {
-                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "for: operand is not a range or indexable", .{});
+            // Length is a property of the operand's type, not its (possibly undefined) value;
+            // a pointer operand (`&array`) iterates its pointee.
+            var operand_ty = obj.typeOf(ip).toIndex();
+            while (ip.indexToKey(operand_ty) == .ptr_type) operand_ty = ip.indexToKey(operand_ty).ptr_type.child;
+            switch (ip.indexToKey(operand_ty)) {
+                .array_type, .vector_type, .tuple_type => break :blk ip.aggregateElementCount(operand_ty),
+                else => return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "for: operand is not a range or indexable", .{}),
             }
-            break :blk ip.aggregateElementCount(key.aggregate.ty);
         } else blk: {
             const start = try sema.resolveUsizeInt(try sema.resolveInst(pair[0]), "for range start");
             const end = try sema.resolveUsizeInt(try sema.resolveInst(pair[1]), "for range end");
