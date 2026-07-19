@@ -118,16 +118,41 @@ fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !O
                 session.failed_analysis = null;
             }
             const err_file = &session.files.items[em.file];
-            if (err_file.zir) |file_zir| if (err_file.tree) |tree| if (err_file.wrapped) |*wrapped| {
+            // The diagnostic path comes from the error's own file, the way the compiler reads
+            // it from `src_loc.file_scope.path`; a REPL line has no on-disk path.
+            const src_path = err_file.sub_file_path orelse Diagnostic.repl_source_path;
+            const rendered = caret: {
+                const file_zir = err_file.zir orelse break :caret false;
                 const node = em.src_loc.resolveNode(file_zir);
                 var notes_buf: [16]Diagnostic.Note = undefined;
                 const n = @min(em.notes.len, notes_buf.len);
                 for (notes_buf[0..n], em.notes[0..n]) |*dst, note| {
                     dst.* = .{ .node = note.src_loc.resolveNode(file_zir), .msg = note.msg };
                 }
-                const view: Pipeline.UserView = .{ .text = wrapped.userText(), .offset_in_source = wrapped.user_offset };
-                Diagnostic.renderSemaError(session.gpa, tree, view, node, em.msg, notes_buf[0..n], diag) catch {};
+                // A REPL line keeps its wrapped source + tree in the `File`. A loaded module
+                // keeps only ZIR; re-read and re-parse it on demand -- the compiler's
+                // `File.getSource`/`getTree` -- so a std error carets against std's own source.
+                if (err_file.wrapped) |*wrapped| {
+                    const tree = err_file.tree orelse break :caret false;
+                    const view: Pipeline.UserView = .{ .text = wrapped.userText(), .offset_in_source = wrapped.user_offset };
+                    Diagnostic.renderSemaError(session.gpa, src_path, tree, view, node, em.msg, notes_buf[0..n], diag) catch {};
+                    break :caret true;
+                }
+                const provider = session.module_source orelse break :caret false;
+                const src = provider.read(session.gpa, src_path) catch break :caret false;
+                defer session.gpa.free(src);
+                var tree = std.zig.Ast.parse(session.gpa, src, .{ .mode = .zig }) catch break :caret false;
+                defer tree.deinit(session.gpa);
+                const view: Pipeline.UserView = .{ .text = src, .offset_in_source = 0 };
+                Diagnostic.renderSemaError(session.gpa, src_path, tree, view, node, em.msg, notes_buf[0..n], diag) catch {};
+                break :caret true;
             };
+            // No source anywhere (e.g. the reserved root file, zir==null); print the message
+            // alone, the way renderZirErrors falls back when it cannot locate a diagnostic.
+            if (!rendered) {
+                diag.print("error: {s}\n", .{em.msg}) catch {};
+                for (em.notes) |note| diag.print("note: {s}\n", .{note.msg}) catch {};
+            }
         }
         // Tombstone the failed line: free its ZIR but keep the `File` slot (and
         // any modules it loaded, at later indices) so `File.Index` values stay

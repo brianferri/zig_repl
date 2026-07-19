@@ -5,7 +5,7 @@ const Pipeline = @import("../front/Pipeline.zig");
 const ZirErrors = @import("../front/ZirErrors.zig");
 
 const max_renderable_parse_errors: u32 = 64;
-const repl_source_path: []const u8 = "<repl>";
+pub const repl_source_path: []const u8 = "<repl>";
 
 /// A sub-note on a Sema error: the compiler's `ErrorMsg.notes`, each already
 /// resolved to an absolute AST node by the driver (which holds the ZIR).
@@ -21,6 +21,7 @@ pub const Note = struct {
 /// source location.
 pub fn renderSemaError(
     gpa: std.mem.Allocator,
+    src_path: []const u8,
     tree: std.zig.Ast,
     view: Pipeline.UserView,
     node: std.zig.Ast.Node.Index,
@@ -37,14 +38,14 @@ pub fn renderSemaError(
     for (note_ems, notes) |*ne, n| {
         ne.* = .{
             .msg = try wip.addString(n.msg),
-            .src_loc = try sourceLocation(&wip, tree, view, n.node),
+            .src_loc = try sourceLocation(&wip, src_path, tree, view, n.node),
             .notes_len = 0,
         };
     }
 
     try wip.addRootErrorMessageWithNotes(.{
         .msg = try wip.addString(msg),
-        .src_loc = try sourceLocation(&wip, tree, view, node),
+        .src_loc = try sourceLocation(&wip, src_path, tree, view, node),
         .notes_len = @intCast(notes.len),
     }, note_ems);
 
@@ -57,6 +58,7 @@ pub fn renderSemaError(
 /// or `.none` when `node` anchors entirely in the injected wrap prefix.
 fn sourceLocation(
     wip: *std.zig.ErrorBundle.Wip,
+    src_path: []const u8,
     tree: std.zig.Ast,
     view: Pipeline.UserView,
     node: std.zig.Ast.Node.Index,
@@ -64,7 +66,7 @@ fn sourceLocation(
     const span = view.translate(tree.nodeToSpan(node)) orelse return .none;
     const loc = view.findLoc(span.main);
     return try wip.addSourceLocation(.{
-        .src_path = try wip.addString(repl_source_path),
+        .src_path = try wip.addString(src_path),
         .span_start = span.start,
         .span_main = span.main,
         .span_end = span.end,

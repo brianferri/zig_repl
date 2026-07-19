@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const testing = std.testing;
 const Io = std.Io;
 
+const compliance = @import("root.zig");
 const eval = @import("../eval.zig");
 const Session = @import("../Session.zig");
 const InternPool = @import("../sema/InternPool.zig");
@@ -426,4 +427,10 @@ test "render: a packed struct value unpacks its fields; a packed union shows the
     var uw = Io.Writer.fixed(&ubuf);
     try render.render(u, &pool, &session, &uw);
     try testing.expectEqualStrings("@bitCast(@as(u8, 33))", uw.buffered());
+}
+
+test "compliance: a failure raised inside a loaded module still surfaces its message" {
+    // The error is raised in std's ZIR, which keeps no AST/source for a caret; the
+    // message must still render rather than vanish into an empty result.
+    try compliance.expectDiagnostic(testing.allocator, &.{ "const std = @import(\"std\");", "std.math.pow(f64, 2.0, 10.0)" }, "incompatible types");
 }
