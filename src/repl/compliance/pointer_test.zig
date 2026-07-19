@@ -247,6 +247,22 @@ test "compliance: struct and union field pointers" {
     });
 }
 
+test "compliance: @ptrFromInt builds a pointer at an address" {
+    try compliance.check(a, .{
+        .{ .src = &.{"@intFromPtr(@as(*const u8, @ptrFromInt(0x1000)))"}, .want = @intFromPtr(@as(*const u8, @ptrFromInt(0x1000))) },
+        .{ .src = &.{"blk: { const p: ?*const u8 = @ptrFromInt(0); break :blk p == null; }"}, .want = blk: {
+            const p: ?*const u8 = @ptrFromInt(0);
+            break :blk p == null;
+        } },
+        // Address zero for a non-optional, non-allowzero pointer is rejected.
+        .{ .src = &.{"@as(*const u8, @ptrFromInt(0))"}, .reject = {} },
+        // An address that does not satisfy the pointee alignment is rejected.
+        .{ .src = &.{"@as(*const u32, @ptrFromInt(0x1001))"}, .reject = {} },
+        // The destination must be a pointer type.
+        .{ .src = &.{"@as(u32, @ptrFromInt(0x10))"}, .reject = {} },
+    });
+}
+
 // A single-item pointer coerces to `*anyopaque` by re-typing the pointer, not the
 // pointee (the compiler's to_anyopaque). This is the coercion a reified struct's
 // `default_value_ptr` (a `?*const anyopaque`) relies on.

@@ -3,6 +3,16 @@ const compliance = @import("root.zig");
 
 const a = std.testing.allocator;
 
+test "compliance: @offsetOf and @bitOffsetOf report field layout" {
+    try compliance.check(a, .{
+        .{ .src = &.{"@offsetOf(extern struct { a: u8, b: u32 }, \"b\")"}, .want = @offsetOf(extern struct { a: u8, b: u32 }, "b") },
+        .{ .src = &.{"@offsetOf(struct { a: u8, b: u32 }, \"b\")"}, .want = @offsetOf(struct { a: u8, b: u32 }, "b") },
+        .{ .src = &.{"@bitOffsetOf(packed struct { a: u4, b: u4 }, \"b\")"}, .want = @bitOffsetOf(packed struct { a: u4, b: u4 }, "b") },
+        .{ .src = &.{"@bitOffsetOf(packed struct { a: u1, b: u3, c: u4 }, \"c\")"}, .want = @bitOffsetOf(packed struct { a: u1, b: u3, c: u4 }, "c") },
+        .{ .src = &.{"@bitOffsetOf(extern struct { a: u8, b: u32 }, \"b\")"}, .want = @bitOffsetOf(extern struct { a: u8, b: u32 }, "b") },
+    });
+}
+
 test "compliance: anonymous struct (.{ .a = ... }) field access" {
     try compliance.check(a, .{
         .{

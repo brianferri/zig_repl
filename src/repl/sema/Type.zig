@@ -1379,6 +1379,26 @@ pub fn ptrInfo(ty: Type, pool: *const InternPool) InternPool.Key.PtrType {
     };
 }
 
+pub fn ptrAlignment(ptr_ty: Type, pool: *const InternPool) InternPool.Alignment {
+    const ptr_key = ptr_ty.ptrInfo(pool);
+    if (ptr_key.flags.alignment != .none) return ptr_key.flags.alignment;
+    return Type.fromIndex(ptr_key.child).abiAlignment(pool);
+}
+
+pub fn nullablePtrElem(ty: Type, pool: *const InternPool) Type {
+    switch (ty.zigTypeTag(pool)) {
+        .pointer => return ty.childType(pool),
+        .optional => {
+            const ptr_ty = ty.childType(pool);
+            const ptr_info = pool.indexToKey(ptr_ty.index).ptr_type;
+            assert(ptr_info.flags.size != .c);
+            assert(!ptr_info.flags.is_allowzero);
+            return .fromIndex(ptr_info.child);
+        },
+        else => unreachable,
+    }
+}
+
 pub fn comptimeOnly(ty: Type, pool: *const InternPool) bool {
     if (ty.index == .generic_poison_type) return false;
     if (ty.zigTypeTag(pool) == .error_union and ty.errorUnionPayload(pool).index == .generic_poison_type) return false;

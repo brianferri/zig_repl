@@ -368,6 +368,11 @@ pub const Alignment = enum(u6) {
         };
     }
 
+    pub fn check(a: Alignment, addr: u64) bool {
+        assert(a != .none);
+        return @ctz(addr) >= @intFromEnum(a);
+    }
+
     pub fn compare(lhs: Alignment, op: std.math.CompareOperator, rhs: Alignment) bool {
         return std.math.compare(lhs.toRelaxedCompareUnits(), op, rhs.toRelaxedCompareUnits());
     }

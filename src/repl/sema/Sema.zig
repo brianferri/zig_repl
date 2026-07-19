@@ -410,6 +410,8 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .import => sema.evalImport(inst),
         .type_info => sema.evalTypeInfo(inst),
         .offset_of => sema.evalOffsetOf(inst),
+        .bit_offset_of => sema.evalBitOffsetOf(inst),
+        .ptr_from_int => sema.evalPtrFromInt(inst),
         .array_init_elem_type => sema.evalArrayInitElemType(inst),
         .elem_type => sema.evalElemType(inst),
         .splat_op_result_ty => sema.evalSplatOpResultType(inst),
@@ -3262,6 +3264,109 @@ fn evalOffsetOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     }
     const offset = Type.fromIndex(ty).structFieldOffset(ip, field.index);
     return .{ .index = try ip.internInt(.{ .ty = .comptime_int_type, .storage = .{ .u64 = offset } }) };
+}
+
+fn evalBitOffsetOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const ip = sema.intern_pool;
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const ty = try sema.resolveDestType(extra.lhs, "@bitOffsetOf");
+    const field_name = try sema.resolveConstStringIntern(extra.rhs);
+    if (Type.fromIndex(ty).zigTypeTag(ip) != .@"struct") {
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected struct type, found '{f}'", .{Type.fromIndex(ty).fmt(ip)});
+    }
+    try sema.ensureLayoutResolved(ty);
+    const field = (try sema.structFieldByName(ty, field_name)) orelse return sema.failNoMember(ty, field_name);
+    if (field.is_comptime) {
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "no offset available for comptime field", .{});
+    }
+    const bit_offset: u64 = switch (Type.fromIndex(ty).containerLayout(ip)) {
+        .@"packed" => blk: {
+            var bit_sum: u64 = 0;
+            var preceding: u32 = 0;
+            while (preceding < field.index) : (preceding += 1) {
+                const pname = (try sema.structFieldNameAt(ty, preceding)).?;
+                const pf = (try sema.structFieldByName(ty, pname)).?;
+                bit_sum += Type.fromIndex(pf.ty).bitSize(ip);
+            }
+            break :blk bit_sum;
+        },
+        else => Type.fromIndex(ty).structFieldOffset(ip, field.index) * 8,
+    };
+    return .{ .index = try ip.internInt(.{ .ty = .comptime_int_type, .storage = .{ .u64 = bit_offset } }) };
+}
+
+fn checkPtrType(sema: *Sema, ty: Type, allow_slice: bool) Error!void {
+    const ip = sema.intern_pool;
+    switch (ty.zigTypeTag(ip)) {
+        .pointer => if (allow_slice or !ty.isSlice(ip)) return,
+        .optional => if (ty.childType(ip).zigTypeTag(ip) == .pointer) return,
+        else => {},
+    }
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected pointer type, found '{f}'", .{ty.fmt(ip)});
+}
+
+/// The fn-pointer address mask (`fnPtrMaskOrNull`) is not modeled, so alignment is checked against the
+/// raw address; for data pointers the compiler's mask is a no-op.
+fn ptrFromIntVal(sema: *Sema, operand_val: Value, ptr_ty: Type, ptr_align: InternPool.Alignment) Error!Value {
+    const ip = sema.intern_pool;
+    if (operand_val.isUndef(ip)) {
+        if (ptr_ty.ptrAllowsZero(ip) and ptr_align == .@"1") return .fromIndex(try ip.get(.{ .undef = ptr_ty.index }));
+        return sema.failWithUseOfUndef();
+    }
+    const addr = operand_val.toUnsignedInt(ip);
+    if (!ptr_ty.ptrAllowsZero(ip) and addr == 0)
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "pointer type '{f}' does not allow address zero", .{ptr_ty.fmt(ip)});
+    if (addr != 0 and ptr_align != .none) {
+        if (!ptr_align.check(addr))
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "pointer type '{f}' requires aligned address", .{ptr_ty.fmt(ip)});
+    }
+    return switch (ptr_ty.zigTypeTag(ip)) {
+        .optional => .fromIndex(try ip.get(.{ .opt = .{
+            .ty = ptr_ty.index,
+            .val = if (addr == 0) .none else try ip.internPtr(.{ .ty = ptr_ty.childType(ip).index, .base_addr = .int, .byte_offset = addr }),
+        } })),
+        .pointer => .fromIndex(try ip.internPtr(.{ .ty = ptr_ty.index, .base_addr = .int, .byte_offset = addr })),
+        else => unreachable,
+    };
+}
+
+fn evalPtrFromInt(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const ip = sema.intern_pool;
+    const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
+    const extra = sema.zir.extraData(Zir.Inst.Bin, pl_node.payload_index).data;
+    const operand = try sema.resolveInst(extra.rhs);
+    const uncoerced_operand_ty = operand.typeOf(ip);
+    const dest_ty = try sema.resolveDestType(extra.lhs, "@ptrFromInt");
+    try sema.checkVectorizableBinaryOperands(Type.fromIndex(dest_ty), uncoerced_operand_ty);
+
+    const is_vector = Type.fromIndex(dest_ty).zigTypeTag(ip) == .vector;
+    const operand_ty: InternPool.Index = if (is_vector)
+        try ip.internVectorType(.{ .child = .usize_type, .len = Type.fromIndex(dest_ty).vectorLen(ip) })
+    else
+        .usize_type;
+    const operand_coerced = try sema.coerceValueToType(operand, operand_ty, "@ptrFromInt");
+
+    const ptr_ty = Type.fromIndex(dest_ty).scalarType(ip);
+    try sema.checkPtrType(ptr_ty, true);
+    const elem_ty = ptr_ty.nullablePtrElem(ip);
+    try sema.ensureLayoutResolved(elem_ty.index);
+    const ptr_align = ptr_ty.ptrAlignment(ip);
+
+    if (ptr_ty.isSlice(ip))
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "integer cannot be converted to slice type '{f}'", .{ptr_ty.fmt(ip)});
+
+    if (!is_vector) return try sema.ptrFromIntVal(operand_coerced, ptr_ty, ptr_align);
+
+    const len = Type.fromIndex(dest_ty).vectorLen(ip);
+    const new_elems = try sema.arena.alloc(InternPool.Index, len);
+    for (new_elems, 0..) |*new_elem, elem_idx| {
+        const elem = try operand_coerced.elemValue(ip, elem_idx);
+        new_elem.* = (try sema.ptrFromIntVal(elem, ptr_ty, ptr_align)).index;
+    }
+    return try sema.aggregateValue(Type.fromIndex(dest_ty), new_elems);
 }
 
 fn evalBitSizeOf(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
