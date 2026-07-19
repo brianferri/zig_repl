@@ -154,5 +154,8 @@ test "compliance: a later arg's result type resolves from an earlier comptime pa
             break :blk F.f(u32, @intCast(@as(u64, 7)));
         } },
         .{ .src = &.{ "const std = @import(\"std\");", "std.math.log2(@as(u32, 48))" }, .want = std.math.log2(@as(u32, 48)) },
+        .{ .src = &.{ "const std = @import(\"std\");", "std.math.gcd(@as(u32, 48), 36)" }, .want = std.math.gcd(@as(u32, 48), 36) },
+        // A comptime-only arg to an anytype param stays comptime-known, so u16 + (comptime int) peers.
+        .{ .src = &.{ "const std = @import(\"std\");", "std.math.IntFittingRange(0, 48)" }, .want = std.math.IntFittingRange(0, 48) },
     });
 }

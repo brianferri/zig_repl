@@ -10808,7 +10808,9 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
 
         const final_ty = if (param_ty == .generic_poison_type) raw.typeOf(sema.intern_pool).toIndex() else param_ty;
         var val = try sema.coerceValueToType(raw, final_ty, "call arg");
-        val.is_comptime = func_ty.paramIsComptime(@intCast(arg_idx));
+        // A comptime-only argument (e.g. comptime_int, type) is comptime-known even for a
+        // non-`comptime` parameter, matching the compiler's `declared or arg_ty.comptimeOnly`.
+        val.is_comptime = func_ty.paramIsComptime(@intCast(arg_idx)) or Type.fromIndex(final_ty).comptimeOnly(sema.intern_pool);
         try generic_inst_map.put(sema.gpa, p_inst, val);
     }
 
