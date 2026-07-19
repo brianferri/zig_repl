@@ -8780,8 +8780,11 @@ fn evalValidatePtrStructInit(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         if (default == .none) {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "missing struct field: {s}", .{ip.stringSlice(name)});
         }
-        const alloc = try sema.lookupComptimeAlloc(ip.indexToKey(object_ptr.index).ptr);
-        alloc.val = try sema.setAggregateElement(alloc.val, struct_ty, i, .{ .index = default });
+        // Store the default through the field pointer, not by poking the alloc directly: the
+        // init target may be a field of an aggregate (a nested init), whose base is not a
+        // comptime_alloc. Mirrors the compiler's storePtr2 in validateStructInit.
+        const default_field_ptr = try sema.structFieldPtrByIndex(object_ptr, i, .fromIndex(struct_ty));
+        try sema.storePointee(ip.indexToKey(default_field_ptr.index).ptr, .{ .index = default });
     }
     return null;
 }

@@ -148,6 +148,17 @@ test "compliance: struct init and field access" {
                 break :blk r.a + 5;
             },
         },
+        // An omitted default is stored through the field pointer; when the init target is
+        // itself a field (a nested init), that pointer's base is not a comptime alloc.
+        .{
+            .src = &.{"blk: { const Inner = struct { x: u8, y: u8 = 9 }; const Outer = struct { inner: Inner, z: u8 = 3 }; const o: Outer = .{ .inner = .{ .x = 1 } }; break :blk o.inner.y + o.z; }"},
+            .want = blk: {
+                const Inner = struct { x: u8, y: u8 = 9 };
+                const Outer = struct { inner: Inner, z: u8 = 3 };
+                const o: Outer = .{ .inner = .{ .x = 1 } };
+                break :blk o.inner.y + o.z;
+            },
+        },
     });
 }
 
