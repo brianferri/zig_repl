@@ -11143,7 +11143,8 @@ fn evalExtended(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .restore_err_ret_index,
         => return null,
 
-        .in_comptime => return Value.bool_false,
+        // Every block in the REPL is comptime, so `block.isComptime()` (zirInComptime) is always true.
+        .in_comptime => return Value.bool_true,
 
         .select => return sema.evalSelect(extended),
         .add_with_overflow,

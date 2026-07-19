@@ -36,3 +36,16 @@ test "compliance: @compileError fails on both sides" {
         .{ .src = &.{"blk: { @compileError(\"boom\"); break :blk 1; }"}, .reject = {} },
     });
 }
+
+test "compliance: @inComptime is true in the always-comptime REPL" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const F = struct { fn f() bool { return @inComptime(); } }; break :blk F.f(); }"}, .want = blk: {
+            const F = struct {
+                fn f() bool {
+                    return @inComptime();
+                }
+            };
+            break :blk F.f();
+        } },
+    });
+}
