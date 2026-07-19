@@ -187,3 +187,24 @@ test "compliance: error-set and error-union equality" {
         } },
     });
 }
+
+test "compliance: member access on an error set type yields the error value" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const E = error{ A, B }; break :blk @intFromError(E.B) == @intFromError(error.B); }"}, .want = blk: {
+            const E = error{ A, B };
+            break :blk @intFromError(E.B) == @intFromError(error.B);
+        } },
+        .{ .src = &.{"blk: { const E = error{ A, B }; const e: E = E.A; break :blk e == error.A; }"}, .want = blk: {
+            const E = error{ A, B };
+            const e: E = E.A;
+            break :blk e == error.A;
+        } },
+        // `anyerror.name` mints (or reuses) a global error.
+        .{ .src = &.{"blk: { const e = anyerror.Whatever; break :blk e == error.Whatever; }"}, .want = blk: {
+            const e = anyerror.Whatever;
+            break :blk e == error.Whatever;
+        } },
+        // A name outside the set is rejected.
+        .{ .src = &.{"blk: { const E = error{A}; break :blk E.C; }"}, .reject = {} },
+    });
+}

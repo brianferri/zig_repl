@@ -8268,7 +8268,17 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
 
     switch (ip.indexToKey(object.index)) {
         .struct_type, .union_type, .enum_type, .opaque_type => return try sema.fieldValOnType(object.index, name),
-        .simple_type,
+        // `E.name` on an error set type yields `error.name`; `anyerror.name` mints a new global error.
+        .error_set_type => |err_set| {
+            if (err_set.nameIndex(ip, name) == null)
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "no error named '{s}' in '{f}'", .{ ip.stringSlice(name), Type.fromIndex(object.index).fmt(ip) });
+            return .{ .index = try ip.internErr(.{ .ty = object.index, .name = name }) };
+        },
+        .simple_type => |s| if (s == .anyerror) {
+            _ = try ip.getErrorValue(name);
+            const set = try ip.singletonErrorSetType(name);
+            return .{ .index = try ip.internErr(.{ .ty = set, .name = name }) };
+        },
         .simple_value,
         .enum_literal,
         .int_type,
@@ -8279,7 +8289,6 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
         .ptr_type,
         .ptr,
         .slice,
-        .error_set_type,
         .err,
         .error_union_type,
         .error_union,
