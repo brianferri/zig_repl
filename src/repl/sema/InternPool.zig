@@ -1388,6 +1388,19 @@ const FuncCoercedRepr = struct {
     inner_func: Index,
 };
 
+pub const PackedU64 = packed struct(u64) {
+    a: u32,
+    b: u32,
+
+    pub fn get(x: PackedU64) u64 {
+        return @bitCast(x);
+    }
+
+    pub fn init(x: u64) PackedU64 {
+        return @bitCast(x);
+    }
+};
+
 const Vector = struct {
     len: u32,
     child: Index,
@@ -1398,8 +1411,14 @@ const Array = struct {
     len1: u32,
     child: Index,
     sentinel: Index,
+
+    pub const Length = PackedU64;
+
     fn getLength(a: Array) u64 {
-        return @as(u64, a.len1) << 32 | a.len0;
+        return (PackedU64{
+            .a = a.len0,
+            .b = a.len1,
+        }).get();
     }
 };
 
@@ -1435,8 +1454,9 @@ fn appendContainerType(pool: *InternPool, id: Key.ContainerType) Allocator.Error
         .reified => |r| {
             try pool.extra.append(pool.gpa, r.source_zir_id);
             try pool.extra.append(pool.gpa, @intFromEnum(r.decl_inst));
-            try pool.extra.append(pool.gpa, @truncate(r.type_hash));
-            try pool.extra.append(pool.gpa, @truncate(r.type_hash >> 32));
+            const type_hash: PackedU64 = .init(r.type_hash);
+            try pool.extra.append(pool.gpa, type_hash.a);
+            try pool.extra.append(pool.gpa, type_hash.b);
         },
     }
 }
@@ -1449,7 +1469,7 @@ fn readContainerType(pool: *const InternPool, captures_len: u32, off: u32) Key.C
     if (captures_len == captures_len_reified) return .{ .reified = .{
         .source_zir_id = source_zir_id,
         .decl_inst = decl_inst,
-        .type_hash = @as(u64, pool.extra.items[off + 3]) << 32 | pool.extra.items[off + 2],
+        .type_hash = (PackedU64{ .a = pool.extra.items[off + 2], .b = pool.extra.items[off + 3] }).get(),
     } };
     return .{ .declared = .{
         .source_zir_id = source_zir_id,
@@ -3735,9 +3755,10 @@ fn emitArrayType(pool: *InternPool, at: Key.ArrayType) Allocator.Error!void {
         pool.items.appendAssumeCapacity(.{ .tag = .type_array_small, .data = extra_index });
         return;
     }
+    const length = Array.Length.init(at.len);
     const extra_index = try pool.addExtra(Array{
-        .len0 = @truncate(at.len),
-        .len1 = @truncate(at.len >> 32),
+        .len0 = length.a,
+        .len1 = length.b,
         .child = at.child,
         .sentinel = at.sentinel,
     });
