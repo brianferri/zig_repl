@@ -32,7 +32,6 @@ inst_map: std.AutoHashMapUnmanaged(Zir.Inst.Index, Value),
 comptime_allocs: std.ArrayListUnmanaged(ComptimeAlloc),
 comptime_address_cursor: u64 = 0x1000,
 synthetic_addresses: std.AutoHashMapUnmanaged(InternPool.Index, u64) = .empty,
-namespace: ?InternPool.NamespaceIndex,
 comptime_break_inst: Zir.Inst.Index = undefined,
 branch_quota: u32 = default_branch_quota,
 branch_count: u32 = 0,
@@ -42,8 +41,6 @@ operand_comptime: bool = true,
 session: ?*Session = null,
 current_zir_id: u32 = 0,
 block: *Block = undefined,
-type_name_ctx: InternPool.NullTerminatedString = .empty,
-this_type: InternPool.Index = .none,
 
 pub const default_branch_quota: u32 = 1000;
 
@@ -53,6 +50,8 @@ pub const ErrorMsg = @import("ErrorMsg.zig").ErrorMsg;
 pub const Block = struct {
     params: std.ArrayListUnmanaged(Param) = .empty,
     src_base_inst: Zir.Inst.Index = undefined,
+    namespace: ?InternPool.NamespaceIndex = null,
+    type_name_ctx: InternPool.NullTerminatedString = .empty,
 
     pub fn deinit(self: *Block, gpa: std.mem.Allocator) void {
         self.params.deinit(gpa);
@@ -92,7 +91,7 @@ pub fn analyze(session: *Session, file_index: Session.Index, writer: *std.Io.Wri
     const zir = session.files.items[file_index].zir.?;
     assert(zir.instructions.len > 0);
 
-    var top_block: Block = .{};
+    var top_block: Block = .{ .namespace = namespace };
     defer top_block.deinit(gpa);
 
     var arena_instance = std.heap.ArenaAllocator.init(gpa);
@@ -106,7 +105,6 @@ pub fn analyze(session: *Session, file_index: Session.Index, writer: *std.Io.Wri
         .writer = writer,
         .inst_map = .empty,
         .comptime_allocs = .empty,
-        .namespace = namespace,
         .block = &top_block,
         .session = session,
         .current_zir_id = file_index,
@@ -115,7 +113,7 @@ pub fn analyze(session: *Session, file_index: Session.Index, writer: *std.Io.Wri
     defer sema.comptime_allocs.deinit(gpa);
     defer sema.synthetic_addresses.deinit(gpa);
 
-    sema.type_name_ctx = try intern_pool.namespaceName(gpa, namespace);
+    sema.block.type_name_ctx = try intern_pool.namespaceName(gpa, namespace);
 
     if (findReplInputBody(zir)) |bound| {
         top_block.src_base_inst = bound.decl_inst;
@@ -3014,7 +3012,8 @@ fn resolveStructLayout(sema: *Sema, struct_ty: InternPool.Index) Error!void {
     if (ip.loadStructType(struct_ty).layout == .@"packed") {
         const backing = backing: {
             if (ip.indexToKey(struct_ty).struct_type == .declared) {
-                const cf = try sema.enterContainer(struct_ty, "packed struct backing integer");
+                var block: Block = undefined;
+                const cf = try sema.enterContainer(&block, struct_ty, "packed struct backing integer");
                 defer cf.restore(sema);
                 if (sema.zir.getStructDecl(cf.decl_inst).backing_int_type_body) |body| {
                     break :backing (try sema.resolveInlineBody(body, cf.decl_inst)).index;
@@ -5076,9 +5075,9 @@ fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.In
     for (names) |n| std.hash.autoHash(&hasher, n);
 
     const name = switch (name_strategy) {
-        .parent => sema.type_name_ctx,
+        .parent => sema.block.type_name_ctx,
         .anon, .func, .dbg_var => blk: {
-            const ctx = ip.stringSlice(sema.type_name_ctx);
+            const ctx = ip.stringSlice(sema.block.type_name_ctx);
             const text = try std.fmt.allocPrint(sema.gpa, "{s}__enum_{d}", .{ ctx, @intFromEnum(inst) });
             defer sema.gpa.free(text);
             break :blk try ip.getOrPutString(sema.gpa, text, .no_embedded_nulls);
@@ -5088,7 +5087,6 @@ fn evalReifyEnum(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.In
     const enum_ty = try ip.getReifiedEnumType(.{
         .name = name,
         .id = .{ .reified = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst, .type_hash = hasher.final() } },
-        .parent = sema.this_type,
         .int_tag_type = tag_ty,
         .nonexhaustive = nonexhaustive,
         .names = names,
@@ -5230,9 +5228,9 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
     }
 
     const name = switch (name_strategy) {
-        .parent => sema.type_name_ctx,
+        .parent => sema.block.type_name_ctx,
         .anon, .func, .dbg_var => blk: {
-            const ctx = ip.stringSlice(sema.type_name_ctx);
+            const ctx = ip.stringSlice(sema.block.type_name_ctx);
             const text = try std.fmt.allocPrint(sema.gpa, "{s}__struct_{d}", .{ ctx, @intFromEnum(inst) });
             defer sema.gpa.free(text);
             break :blk try ip.getOrPutString(sema.gpa, text, .no_embedded_nulls);
@@ -5242,7 +5240,6 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
     const struct_ty = try ip.getReifiedStructType(.{
         .name = name,
         .id = .{ .reified = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst, .type_hash = hasher.final() } },
-        .parent = sema.this_type,
         .layout = layout,
         .backing_int = backing_int,
         .names = names,
@@ -5347,9 +5344,9 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
     }
 
     const name = switch (name_strategy) {
-        .parent => sema.type_name_ctx,
+        .parent => sema.block.type_name_ctx,
         .anon, .func, .dbg_var => blk: {
-            const ctx = ip.stringSlice(sema.type_name_ctx);
+            const ctx = ip.stringSlice(sema.block.type_name_ctx);
             const text = try std.fmt.allocPrint(sema.gpa, "{s}__union_{d}", .{ ctx, @intFromEnum(inst) });
             defer sema.gpa.free(text);
             break :blk try ip.getOrPutString(sema.gpa, text, .no_embedded_nulls);
@@ -5366,7 +5363,6 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
     const union_ty = try ip.getReifiedUnionType(.{
         .name = name,
         .id = .{ .reified = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst, .type_hash = hasher.final() } },
-        .parent = sema.this_type,
         .layout = layout,
         .tag_usage = tag_usage,
         .enum_tag_type = tag_type,
@@ -5750,13 +5746,12 @@ fn evalStructInitAnon(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     hasher.update(std.mem.sliceAsBytes(values));
     hasher.update(std.mem.sliceAsBytes(names));
 
-    const ctx = ip.stringSlice(sema.type_name_ctx);
+    const ctx = ip.stringSlice(sema.block.type_name_ctx);
     const name_text = try std.fmt.allocPrint(sema.gpa, "{s}__struct_{d}", .{ ctx, @intFromEnum(inst) });
     defer sema.gpa.free(name_text);
     const struct_ty = try ip.getReifiedStructType(.{
         .name = try ip.getOrPutString(sema.gpa, name_text, .no_embedded_nulls),
         .id = .{ .reified = .{ .source_zir_id = sema.current_zir_id, .decl_inst = inst, .type_hash = hasher.final() } },
-        .parent = sema.this_type,
         .layout = .auto,
         .backing_int = .none,
         .names = names,
@@ -5813,15 +5808,17 @@ fn rootModuleType(sema: *Sema) Error!InternPool.Index {
     if (session.root_file) |file_index| return session.files.items[file_index].root_type;
     const file_index: Session.Index = @intCast(session.files.items.len);
     try session.files.append(sema.gpa, .{ .zir = null, .tree = null, .wrapped = null, .sub_file_path = null });
-    const ty = try sema.intern_pool.getDeclaredStructType(
+    const ty = switch (try sema.intern_pool.getDeclaredStructType(
         try sema.intern_pool.getOrPutString(sema.gpa, "root", .no_embedded_nulls),
         .{ .declared = .{ .source_zir_id = file_index, .decl_inst = .main_struct_inst } },
-        .none,
         0,
         .auto,
         false,
         false,
-    );
+    )) {
+        .existing => |e| e,
+        .wip => |wip| wip.index,
+    };
     sema.intern_pool.setNamespace(ty, session.root_namespace);
     session.files.items[file_index].root_type = ty;
     session.root_file = file_index;
@@ -5879,15 +5876,23 @@ fn lowerModule(sema: *Sema, canonical: []const u8, bytes: [:0]const u8) Error!In
         if (field.is_comptime) any_comptime_fields = true;
     }
 
-    const root_type = try sema.intern_pool.getDeclaredStructType(
+    const root_type = switch (try sema.intern_pool.getDeclaredStructType(
         try sema.moduleTypeName(canonical),
         .{ .declared = .{ .source_zir_id = file_index, .decl_inst = .main_struct_inst } },
-        .none,
         @intCast(root_decl.field_names.len),
         .auto,
         any_field_aligns,
         any_comptime_fields,
-    );
+    )) {
+        .existing => |e| e,
+        .wip => |wip| wip.index,
+    };
+    const root_ns = try sema.intern_pool.createNamespace(sema.gpa, .{
+        .parent = .none,
+        .owner_type = root_type,
+        .file_scope = sema.namespaceFileScope(file_index),
+    });
+    sema.intern_pool.setNamespace(root_type, root_ns);
     session.files.items[file_index].root_type = root_type;
     return root_type;
 }
@@ -6679,9 +6684,9 @@ fn evalStructDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const struct_decl = sema.zir.getStructDecl(inst);
     const name = switch (struct_decl.name_strategy) {
-        .parent => sema.type_name_ctx,
+        .parent => sema.block.type_name_ctx,
         .anon, .func, .dbg_var => blk: {
-            const ctx = sema.intern_pool.stringSlice(sema.type_name_ctx);
+            const ctx = sema.intern_pool.stringSlice(sema.block.type_name_ctx);
             const text = try std.fmt.allocPrint(sema.gpa, "{s}__struct_{d}", .{ ctx, @intFromEnum(inst) });
             defer sema.gpa.free(text);
             break :blk try sema.intern_pool.getOrPutString(sema.gpa, text, .no_embedded_nulls);
@@ -6699,12 +6704,23 @@ fn evalStructDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         if (field.is_comptime) any_comptime_fields = true;
     }
 
-    const ty = try sema.intern_pool.getDeclaredStructType(name, .{ .declared = .{
+    const result = try sema.intern_pool.getDeclaredStructType(name, .{ .declared = .{
         .source_zir_id = sema.current_zir_id,
         .decl_inst = inst,
         .captures = captures,
-    } }, sema.this_type, @intCast(struct_decl.field_names.len), struct_decl.layout, any_field_aligns, any_comptime_fields);
-    return .{ .index = ty };
+    } }, @intCast(struct_decl.field_names.len), struct_decl.layout, any_field_aligns, any_comptime_fields);
+    switch (result) {
+        .existing => |ty| return .{ .index = ty },
+        .wip => |wip| {
+            const new_namespace_index = try sema.intern_pool.createNamespace(sema.gpa, .{
+                .parent = .init(sema.block.namespace),
+                .owner_type = wip.index,
+                .file_scope = sema.namespaceFileScope(sema.current_zir_id),
+            });
+            sema.intern_pool.setNamespace(wip.index, new_namespace_index);
+            return .{ .index = wip.index };
+        },
+    }
 }
 
 fn evalEnumDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
@@ -6712,9 +6728,9 @@ fn evalEnumDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const enum_decl = sema.zir.getEnumDecl(inst);
     const name = switch (enum_decl.name_strategy) {
-        .parent => sema.type_name_ctx,
+        .parent => sema.block.type_name_ctx,
         .anon, .func, .dbg_var => blk: {
-            const ctx = sema.intern_pool.stringSlice(sema.type_name_ctx);
+            const ctx = sema.intern_pool.stringSlice(sema.block.type_name_ctx);
             const text = try std.fmt.allocPrint(sema.gpa, "{s}__enum_{d}", .{ ctx, @intFromEnum(inst) });
             defer sema.gpa.free(text);
             break :blk try sema.intern_pool.getOrPutString(sema.gpa, text, .no_embedded_nulls);
@@ -6731,7 +6747,6 @@ fn evalEnumDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             .decl_inst = inst,
             .captures = captures,
         } },
-        sema.this_type,
         @intCast(enum_decl.field_names.len),
         enum_decl.nonexhaustive or enum_decl.tag_type_body != null,
         if (enum_decl.tag_type_body != null) .explicit else .auto,
@@ -6741,6 +6756,12 @@ fn evalEnumDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             return .{ .index = enum_ty };
         },
         .wip => |wip| {
+            const new_namespace_index = try sema.intern_pool.createNamespace(sema.gpa, .{
+                .parent = .init(sema.block.namespace),
+                .owner_type = wip.index,
+                .file_scope = sema.namespaceFileScope(sema.current_zir_id),
+            });
+            sema.intern_pool.setNamespace(wip.index, new_namespace_index);
             _ = try sema.resolveEnumFields(wip.index);
             return .{ .index = wip.index };
         },
@@ -6752,9 +6773,9 @@ fn evalUnionDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const union_decl = sema.zir.getUnionDecl(inst);
     const name = switch (union_decl.name_strategy) {
-        .parent => sema.type_name_ctx,
+        .parent => sema.block.type_name_ctx,
         .anon, .func, .dbg_var => blk: {
-            const ctx = sema.intern_pool.stringSlice(sema.type_name_ctx);
+            const ctx = sema.intern_pool.stringSlice(sema.block.type_name_ctx);
             const text = try std.fmt.allocPrint(sema.gpa, "{s}__union_{d}", .{ ctx, @intFromEnum(inst) });
             defer sema.gpa.free(text);
             break :blk try sema.intern_pool.getOrPutString(sema.gpa, text, .no_embedded_nulls);
@@ -6783,7 +6804,6 @@ fn evalUnionDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             .decl_inst = inst,
             .captures = captures,
         } },
-        sema.this_type,
         @intCast(union_decl.field_names.len),
         layout,
         union_decl.field_align_body_lens != null,
@@ -6791,7 +6811,15 @@ fn evalUnionDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     );
     const union_ty = switch (result) {
         .existing => |ty| ty,
-        .wip => |wip| wip.index,
+        .wip => |wip| blk: {
+            const new_namespace_index = try sema.intern_pool.createNamespace(sema.gpa, .{
+                .parent = .init(sema.block.namespace),
+                .owner_type = wip.index,
+                .file_scope = sema.namespaceFileScope(sema.current_zir_id),
+            });
+            sema.intern_pool.setNamespace(wip.index, new_namespace_index);
+            break :blk wip.index;
+        },
     };
     return .{ .index = union_ty };
 }
@@ -6799,9 +6827,9 @@ fn evalUnionDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 fn evalOpaqueDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const opaque_decl = sema.zir.getOpaqueDecl(inst);
     const name = switch (opaque_decl.name_strategy) {
-        .parent => sema.type_name_ctx,
+        .parent => sema.block.type_name_ctx,
         .anon, .func, .dbg_var => blk: {
-            const ctx = sema.intern_pool.stringSlice(sema.type_name_ctx);
+            const ctx = sema.intern_pool.stringSlice(sema.block.type_name_ctx);
             const text = try std.fmt.allocPrint(sema.gpa, "{s}__opaque_{d}", .{ ctx, @intFromEnum(inst) });
             defer sema.gpa.free(text);
             break :blk try sema.intern_pool.getOrPutString(sema.gpa, text, .no_embedded_nulls);
@@ -6811,26 +6839,45 @@ fn evalOpaqueDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const captures = try sema.resolveCaptures(opaque_decl.captures);
     defer sema.gpa.free(captures);
 
-    return .{ .index = try sema.intern_pool.getDeclaredOpaqueType(
+    const result = try sema.intern_pool.getDeclaredOpaqueType(
         name,
         .{ .declared = .{
             .source_zir_id = sema.current_zir_id,
             .decl_inst = inst,
             .captures = captures,
         } },
-        sema.this_type,
-    ) };
+    );
+    switch (result) {
+        .existing => |ty| return .{ .index = ty },
+        .wip => |wip| {
+            const new_namespace_index = try sema.intern_pool.createNamespace(sema.gpa, .{
+                .parent = .init(sema.block.namespace),
+                .owner_type = wip.index,
+                .file_scope = sema.namespaceFileScope(sema.current_zir_id),
+            });
+            sema.intern_pool.setNamespace(wip.index, new_namespace_index);
+            return .{ .index = wip.index };
+        },
+    }
 }
 
 fn resolveCaptures(sema: *Sema, zir_captures: []const Zir.Inst.Capture) Error![]const InternPool.Index {
     if (zir_captures.len == 0) return &.{};
+    // The REPL session root is a typeless namespace (owner_type == .none), unlike the
+    // compiler's file root which is a struct; a type declared directly there has no
+    // enclosing captures to inherit.
+    const parent_ty = sema.intern_pool.namespacePtr(sema.block.namespace.?).owner_type;
+    const parent_captures: []const InternPool.Index = if (parent_ty != .none)
+        sema.intern_pool.indexToKey(parent_ty).struct_type.captures()
+    else
+        &.{};
     const caps = try sema.gpa.alloc(InternPool.Index, zir_captures.len);
     errdefer sema.gpa.free(caps);
     for (zir_captures, caps) |zc, *c| {
         c.* = switch (zc.unwrap()) {
             .instruction => |i| (try sema.resolveInst(i.toRef())).index,
             .instruction_load => |i| (try sema.loadValue(try sema.resolveInst(i.toRef()))).index,
-            .nested => |idx| sema.intern_pool.indexToKey(sema.this_type).struct_type.captures()[idx],
+            .nested => |idx| parent_captures[idx],
             .decl_val, .decl_ref => {
                 return sema.fail(sema.block, sema.block.nodeOffset(.zero), "closure capture: decl captures are not supported", .{});
             },
@@ -6866,30 +6913,36 @@ fn failZirUnavailable(sema: *Sema, ctx: []const u8) Error {
 
 const ContainerFrame = struct {
     zir: ZirFrame,
-    saved_this: InternPool.Index,
+    prev_block: *Block,
     decl_inst: Zir.Inst.Index,
     old_inst_map: std.AutoHashMapUnmanaged(Zir.Inst.Index, Value),
 
     fn restore(cf: ContainerFrame, sema: *Sema) void {
+        sema.block.deinit(sema.gpa);
         sema.inst_map.deinit(sema.gpa);
         sema.inst_map = cf.old_inst_map;
-        sema.this_type = cf.saved_this;
+        sema.block = cf.prev_block;
         cf.zir.restore(sema);
     }
 };
 
-fn enterContainer(sema: *Sema, container_ty: InternPool.Index, ctx: []const u8) Error!ContainerFrame {
+fn enterContainer(sema: *Sema, block: *Block, container_ty: InternPool.Index, ctx: []const u8) Error!ContainerFrame {
     const owner = switch (sema.intern_pool.indexToKey(container_ty)) {
         .enum_type => |et| if (et.generatedUnion() != .none) et.generatedUnion() else container_ty,
         else => container_ty,
     };
     const ns = sema.containerNamespace(owner).?;
     const zir = try sema.enterSourceZir(ns.source_zir_id, ctx);
-    const saved_this = sema.this_type;
-    sema.this_type = owner;
+    block.* = .{
+        .namespace = sema.getNamespaceIndex(owner),
+        .src_base_inst = ns.decl_inst,
+        .type_name_ctx = sema.block.type_name_ctx,
+    };
+    const prev_block = sema.block;
+    sema.block = block;
     const old_inst_map = sema.inst_map;
     sema.inst_map = .empty;
-    return .{ .zir = zir, .saved_this = saved_this, .decl_inst = ns.decl_inst, .old_inst_map = old_inst_map };
+    return .{ .zir = zir, .prev_block = prev_block, .decl_inst = ns.decl_inst, .old_inst_map = old_inst_map };
 }
 
 fn containerTypeSrc(sema: *Sema, container_ty: InternPool.Index) LazySrcLoc {
@@ -6989,7 +7042,8 @@ pub fn structFieldByName(
         .declared => {},
         .generated_union_tag => unreachable,
     }
-    const cf = try sema.enterContainer(struct_ty, "struct field");
+    var block: Block = undefined;
+    const cf = try sema.enterContainer(&block, struct_ty, "struct field");
     defer cf.restore(sema);
     if (sema.zir.instructions.items(.tag)[@intFromEnum(cf.decl_inst)] == .struct_init_anon)
         return try sema.anonStructFieldByName(cf.decl_inst, name);
@@ -7022,7 +7076,8 @@ pub fn structFieldDefault(
         .declared => {},
         .generated_union_tag => unreachable,
     }
-    const cf = try sema.enterContainer(struct_ty, "struct field default");
+    var block: Block = undefined;
+    const cf = try sema.enterContainer(&block, struct_ty, "struct field default");
     defer cf.restore(sema);
     if (sema.zir.instructions.items(.tag)[@intFromEnum(cf.decl_inst)] == .struct_init_anon) return .none;
     var it = sema.zir.getStructDecl(cf.decl_inst).iterateFields();
@@ -7078,7 +7133,8 @@ pub fn unionFieldByName(
         .declared => {},
         .generated_union_tag => unreachable,
     }
-    const cf = try sema.enterContainer(union_ty, "union field");
+    var block: Block = undefined;
+    const cf = try sema.enterContainer(&block, union_ty, "union field");
     defer cf.restore(sema);
     var it = sema.zir.getUnionDecl(cf.decl_inst).iterateFields();
     while (it.next()) |field| {
@@ -7142,7 +7198,8 @@ pub fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) E
         .declared => {},
         .generated_union_tag => unreachable,
     }
-    const cf = try sema.enterContainer(struct_ty, "struct field name");
+    var block: Block = undefined;
+    const cf = try sema.enterContainer(&block, struct_ty, "struct field name");
     defer cf.restore(sema);
     if (sema.zir.instructions.items(.tag)[@intFromEnum(cf.decl_inst)] == .struct_init_anon) {
         const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(cf.decl_inst)].pl_node;
@@ -7170,7 +7227,8 @@ pub fn unionFieldCount(sema: *Sema, union_ty: InternPool.Index) Error!u32 {
         .declared => {},
         .generated_union_tag => unreachable,
     }
-    const cf = try sema.enterContainer(union_ty, "union field count");
+    var block: Block = undefined;
+    const cf = try sema.enterContainer(&block, union_ty, "union field count");
     defer cf.restore(sema);
     return @intCast(sema.zir.getUnionDecl(cf.decl_inst).field_names.len);
 }
@@ -7185,7 +7243,8 @@ pub fn unionFieldNameAt(sema: *Sema, union_ty: InternPool.Index, index: u32) Err
         .declared => {},
         .generated_union_tag => unreachable,
     }
-    const cf = try sema.enterContainer(union_ty, "union field name");
+    var block: Block = undefined;
+    const cf = try sema.enterContainer(&block, union_ty, "union field name");
     defer cf.restore(sema);
     var it = sema.zir.getUnionDecl(cf.decl_inst).iterateFields();
     while (it.next()) |field| {
@@ -7252,7 +7311,8 @@ pub fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPoo
             if (f.enum_tag_type != .none) return f.enum_tag_type;
         },
         .declared => {
-            const cf = try sema.enterContainer(union_ty, "union tag type");
+            var block: Block = undefined;
+            const cf = try sema.enterContainer(&block, union_ty, "union tag type");
             defer cf.restore(sema);
             const decl = sema.zir.getUnionDecl(cf.decl_inst);
             if (decl.kind == .tagged_explicit) {
@@ -7266,7 +7326,7 @@ pub fn unionTagEnumType(sema: *Sema, union_ty: InternPool.Index) Error!InternPoo
         .generated_union_tag => unreachable,
     }
     const fields_len = try sema.unionFieldCount(union_ty);
-    const result = try ip.getDeclaredEnumType(ip.typeName(union_ty), .{ .generated_union_tag = union_ty }, .none, fields_len, false, .auto);
+    const result = try ip.getDeclaredEnumType(ip.typeName(union_ty), .{ .generated_union_tag = union_ty }, fields_len, false, .auto);
     switch (result) {
         .existing => |tag| return tag,
         .wip => |wip| {
@@ -7282,7 +7342,8 @@ fn enumFieldCount(sema: *Sema, enum_ty: InternPool.Index) Error!u32 {
         .reified => return @intCast(sema.intern_pool.loadEnumType(enum_ty).field_names.len),
         .declared => {},
     }
-    const cf = try sema.enterContainer(enum_ty, "enum field count");
+    var block: Block = undefined;
+    const cf = try sema.enterContainer(&block, enum_ty, "enum field count");
     defer cf.restore(sema);
     return @intCast(sema.zir.getEnumDecl(cf.decl_inst).field_names.len);
 }
@@ -7316,7 +7377,8 @@ fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Lo
     assert(ip.indexToKey(enum_ty).enum_type == .declared);
 
     const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
-    const cf = try sema.enterContainer(enum_ty, "enum field");
+    var block: Block = undefined;
+    const cf = try sema.enterContainer(&block, enum_ty, "enum field");
     defer cf.restore(sema);
     const decl = sema.zir.getEnumDecl(cf.decl_inst);
     const have_values = decl.nonexhaustive or decl.tag_type_body != null;
@@ -7383,7 +7445,8 @@ pub fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool
             if (sema.intern_pool.indexToKey(gu).union_type == .reified) {
                 return try sema.enumIntTagType(try sema.unionFieldCount(gu));
             }
-            const cf = try sema.enterContainer(enum_ty, "enum tag type");
+            var block: Block = undefined;
+            const cf = try sema.enterContainer(&block, enum_ty, "enum tag type");
             defer cf.restore(sema);
             const decl = sema.zir.getUnionDecl(cf.decl_inst);
             return if (decl.kind == .tagged_enum_explicit)
@@ -7392,7 +7455,8 @@ pub fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool
                 try sema.enumIntTagType(@intCast(decl.field_names.len));
         },
         .declared => {
-            const cf = try sema.enterContainer(enum_ty, "enum tag type");
+            var block: Block = undefined;
+            const cf = try sema.enterContainer(&block, enum_ty, "enum tag type");
             defer cf.restore(sema);
             const decl = sema.zir.getEnumDecl(cf.decl_inst);
             return if (decl.tag_type_body) |body|
@@ -7409,7 +7473,8 @@ fn enumNonexhaustive(sema: *Sema, enum_ty: InternPool.Index) Error!bool {
         .reified => return sema.intern_pool.loadEnumType(enum_ty).nonexhaustive,
         .declared => {},
     }
-    const cf = try sema.enterContainer(enum_ty, "enum mode");
+    var block: Block = undefined;
+    const cf = try sema.enterContainer(&block, enum_ty, "enum mode");
     defer cf.restore(sema);
     return sema.zir.getEnumDecl(cf.decl_inst).nonexhaustive;
 }
@@ -7754,22 +7819,8 @@ fn ensureNamespaceUpToDate(sema: *Sema, ns: InternPool.NamespaceIndex) Error!voi
     try sema.scanNamespace(ns, ns_ptr.owner_type);
 }
 
-fn getNamespaceIndex(sema: *Sema, ty: InternPool.Index) Error!?InternPool.NamespaceIndex {
-    const ip = sema.intern_pool;
-    if (ip.typeNamespace(ty).unwrap()) |ns| return ns;
-    const cn = sema.containerNamespace(ty) orelse return null;
-    const parent_ty = ip.typeParent(ty);
-    const parent_ns: InternPool.OptionalNamespaceIndex = if (parent_ty != .none)
-        .init(try sema.getNamespaceIndex(parent_ty))
-    else
-        .none;
-    const ns = try ip.createNamespace(sema.gpa, .{
-        .parent = parent_ns,
-        .owner_type = ty,
-        .file_scope = sema.namespaceFileScope(cn.source_zir_id),
-    });
-    ip.setNamespace(ty, ns);
-    return ns;
+fn getNamespaceIndex(sema: *Sema, ty: InternPool.Index) ?InternPool.NamespaceIndex {
+    return sema.intern_pool.typeNamespace(ty).unwrap();
 }
 
 fn namespaceFileScope(sema: *Sema, source_zir_id: u32) InternPool.OptionalFileIndex {
@@ -7811,20 +7862,16 @@ fn analyzeNavVal(sema: *Sema, nav_idx: InternPool.Nav.Index) Error!Value {
     const value_body = unwrapped.value_body orelse
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "decl '{s}': no value_body (extern decl)", .{ip.stringSlice(ip.getNav(nav_idx).name)});
 
-    const saved_namespace = sema.namespace;
-    sema.namespace = analysis.namespace;
-    defer sema.namespace = saved_namespace;
-    const saved_this = sema.this_type;
-    sema.this_type = container_ty;
-    defer sema.this_type = saved_this;
-    const saved_ctx = sema.type_name_ctx;
-    sema.type_name_ctx = ip.getNav(nav_idx).fqn;
-    defer sema.type_name_ctx = saved_ctx;
-    const saved_params = sema.block.params;
-    sema.block.params = .empty;
+    var block: Block = .{
+        .namespace = analysis.namespace,
+        .src_base_inst = decl_inst,
+        .type_name_ctx = ip.getNav(nav_idx).fqn,
+    };
+    const prev_block = sema.block;
+    sema.block = &block;
     defer {
-        sema.block.params.deinit(sema.gpa);
-        sema.block.params = saved_params;
+        block.deinit(sema.gpa);
+        sema.block = prev_block;
     }
     const old_inst_map = sema.inst_map;
     sema.inst_map = .empty;
@@ -7854,7 +7901,7 @@ fn analyzeNavVal(sema: *Sema, nav_idx: InternPool.Nav.Index) Error!Value {
 }
 
 fn containerDeclByName(sema: *Sema, container_ty: InternPool.Index, name: InternPool.NullTerminatedString) Error!?Value {
-    const ns = (try sema.getNamespaceIndex(container_ty)) orelse return null;
+    const ns = sema.getNamespaceIndex(container_ty) orelse return null;
     const nav = (try sema.namespaceLookup(ns, name)) orelse return null;
     return try sema.analyzeNavVal(nav);
 }
@@ -9196,14 +9243,16 @@ fn wellKnownRefToValue(ref: Zir.Inst.Ref) ?Value {
 
 fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
-    if (sema.this_type != .none) {
+    // Container decls resolve as lazy Navs via the namespace-parent walk; the typeless
+    // session root's decls are eager-bound and served by `lookupDecl` below.
+    if (sema.block.namespace) |start_ns| if (ip.namespacePtr(start_ns).owner_type != .none) {
         const name = try ip.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir), .no_embedded_nulls);
-        var ns_opt = try sema.getNamespaceIndex(sema.this_type);
+        var ns_opt: ?InternPool.NamespaceIndex = start_ns;
         while (ns_opt) |ns| {
             if (try sema.lookupInNamespace(ns, name)) |lookup| return try sema.analyzeNavVal(lookup.nav);
             ns_opt = ip.namespacePtr(ns).parent.unwrap();
         }
-    }
+    };
     if (try sema.lookupDecl(inst, "decl_val")) |found| {
         return .{ .index = found.resolved.value };
     }
@@ -9213,14 +9262,14 @@ fn evalDeclVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
-    if (sema.this_type != .none) {
+    if (sema.block.namespace) |start_ns| if (ip.namespacePtr(start_ns).owner_type != .none) {
         const name = try ip.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir), .no_embedded_nulls);
-        var ns_opt = try sema.getNamespaceIndex(sema.this_type);
+        var ns_opt: ?InternPool.NamespaceIndex = start_ns;
         while (ns_opt) |ns| {
             if (try sema.lookupInNamespace(ns, name)) |lookup| return try sema.materializeConstPtr(try sema.analyzeNavVal(lookup.nav));
             ns_opt = ip.namespacePtr(ns).parent.unwrap();
         }
-    }
+    };
     const found = (try sema.lookupDecl(inst, "decl_ref")) orelse {
         const name = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir);
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "decl_ref '{s}': not found in scope", .{name});
@@ -9249,7 +9298,7 @@ fn lookupDecl(sema: *Sema, inst: Zir.Inst.Index, op_name: []const u8) Error!?Dec
     const name_bytes = data.get(sema.zir);
     const name = try sema.intern_pool.getOrPutString(sema.gpa, name_bytes, .no_embedded_nulls);
 
-    const ns_idx = sema.namespace orelse {
+    const ns_idx = sema.block.namespace orelse {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "{s} '{s}': no namespace in scope", .{ op_name, name_bytes });
     };
 
@@ -9294,7 +9343,7 @@ fn lookupInNamespace(
     try sema.ensureNamespaceUpToDate(namespace_index);
     const namespace = ip.namespacePtr(namespace_index);
     const adapter: InternPool.Namespace.NameAdapter = .{ .pool = ip };
-    const src_file = if (sema.namespace) |cur| ip.namespacePtr(cur).file_scope else .none;
+    const src_file = if (sema.block.namespace) |cur| ip.namespacePtr(cur).file_scope else .none;
     if (namespace.pub_decls.getKeyAdapted(ident_name, adapter)) |nav_index| {
         return .{ .nav = nav_index, .accessible = true };
     } else if (namespace.priv_decls.getKeyAdapted(ident_name, adapter)) |nav_index| {
@@ -9321,9 +9370,9 @@ fn namespaceLookup(
 const max_namespace_chain: u32 = 1024;
 
 fn bindDecls(sema: *Sema) Error!void {
-    assert(sema.namespace != null);
+    assert(sema.block.namespace != null);
 
-    const ns_idx = sema.namespace.?;
+    const ns_idx = sema.block.namespace.?;
     for (sema.zir.typeDecls(.main_struct_inst)) |decl_inst| {
         try sema.bindOneDecl(ns_idx, decl_inst);
     }
@@ -9373,9 +9422,9 @@ fn bindValueDecl(
         break :blk t;
     } else null;
     const fqn = try sema.intern_pool.fullyQualifiedName(sema.gpa, ns_idx, name);
-    const prev_ctx = sema.type_name_ctx;
-    sema.type_name_ctx = fqn;
-    defer sema.type_name_ctx = prev_ctx;
+    const prev_ctx = sema.block.type_name_ctx;
+    sema.block.type_name_ctx = fqn;
+    defer sema.block.type_name_ctx = prev_ctx;
     const raw_value = try sema.resolveInlineBody(value_body, decl_inst);
     const final_value = if (declared_type) |dest_ty|
         try sema.coerceValueToType(raw_value, dest_ty, "decl")
@@ -10273,7 +10322,7 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .ty = fn_ty,
         .uncoerced_ty = fn_ty,
         .zir_body_inst = inst,
-        .parent = sema.this_type,
+        .parent = if (sema.block.namespace) |ns| sema.intern_pool.namespacePtr(ns).owner_type else .none,
     });
     return Value{ .index = func_idx };
 }
@@ -10344,9 +10393,18 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     const raw_args = try sema.evalCallArgs(inst, self_val, explicit_len, args_body, func_ty.param_types);
     defer sema.gpa.free(raw_args);
 
-    const saved_this = sema.this_type;
-    sema.this_type = if (func.parent != .none) func.parent else enclosing_ty;
-    defer sema.this_type = saved_this;
+    const target_ty = if (func.parent != .none) func.parent else enclosing_ty;
+    var call_block: Block = .{
+        .namespace = if (target_ty != .none) sema.getNamespaceIndex(target_ty) else sema.block.namespace,
+        .src_base_inst = sema.block.src_base_inst,
+        .type_name_ctx = sema.block.type_name_ctx,
+    };
+    const prev_block = sema.block;
+    sema.block = &call_block;
+    defer {
+        call_block.deinit(sema.gpa);
+        sema.block = prev_block;
+    }
 
     const frame = try sema.enterSourceZir(func.source_zir_id, "call");
     defer frame.restore(sema);
@@ -10450,17 +10508,15 @@ fn evalTypeof(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 }
 
 fn evalThis(sema: *Sema) Error!?Value {
-    if (sema.this_type == .none) {
+    const ns = sema.block.namespace orelse
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@This(): no enclosing container", .{});
-    }
-    return Value{ .index = sema.this_type };
+    return Value{ .index = sema.intern_pool.namespacePtr(ns).owner_type };
 }
 
 fn evalClosureGet(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
-    if (sema.this_type == .none) {
+    const ns = sema.block.namespace orelse
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "closure_get: no enclosing container", .{});
-    }
-    const captures = switch (sema.intern_pool.indexToKey(sema.this_type)) {
+    const captures = switch (sema.intern_pool.indexToKey(sema.intern_pool.namespacePtr(ns).owner_type)) {
         .struct_type => |st| st.captures(),
         .union_type => |ut| ut.captures(),
         .enum_type => |et| et.captures(),
@@ -10797,7 +10853,6 @@ fn opvTestSema(gpa: std.mem.Allocator, pool: *InternPool, arena: *std.heap.Arena
         .writer = w,
         .inst_map = .empty,
         .comptime_allocs = .empty,
-        .namespace = null,
     };
 }
 
@@ -10814,7 +10869,6 @@ fn opvEnum(sema: *Sema, hash: u64, names: []const []const u8) !Type {
     const enum_ty = try pool.getReifiedEnumType(.{
         .name = try pool.getOrPutString(sema.gpa, "E", .no_embedded_nulls),
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
-        .parent = .none,
         .int_tag_type = tag_ty,
         .nonexhaustive = false,
         .names = handles,
@@ -10832,7 +10886,6 @@ fn opvStruct(sema: *Sema, hash: u64, names: []const []const u8, types: []const I
     const struct_ty = try pool.getReifiedStructType(.{
         .name = try pool.getOrPutString(sema.gpa, "S", .no_embedded_nulls),
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
-        .parent = .none,
         .layout = .auto,
         .backing_int = .none,
         .names = handles,
@@ -10854,7 +10907,6 @@ fn opvUnion(sema: *Sema, hash: u64, tag_hash: u64, names: []const []const u8, ty
     const union_ty = try pool.getReifiedUnionType(.{
         .name = try pool.getOrPutString(sema.gpa, "U", .no_embedded_nulls),
         .id = .{ .reified = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(0), .type_hash = hash } },
-        .parent = .none,
         .layout = .auto,
         .tag_usage = .tagged,
         .enum_tag_type = tag_enum.index,

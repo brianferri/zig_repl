@@ -1630,7 +1630,6 @@ const Env = struct {
             .writer = &e.w,
             .inst_map = .empty,
             .comptime_allocs = .empty,
-            .namespace = null,
         };
         e.sema.block = &e.block;
     }

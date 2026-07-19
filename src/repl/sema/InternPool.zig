@@ -1493,7 +1493,6 @@ pub const TypeClass = enum(u3) {
 
 const TypeStruct = struct {
     name: NullTerminatedString,
-    parent: Index,
     namespace: OptionalNamespaceIndex,
     fields_len: u32,
     field_name_map: OptionalMapIndex,
@@ -1523,7 +1522,6 @@ fn containerIdTrailingLen(captures_len: u32) u32 {
 
 const TypeEnum = struct {
     name: NullTerminatedString,
-    parent: Index,
     namespace: OptionalNamespaceIndex,
     int_tag_type: Index,
     fields_len: u32,
@@ -1544,7 +1542,6 @@ const TypeEnum = struct {
 
 const TypeUnion = struct {
     name: NullTerminatedString,
-    parent: Index,
     namespace: OptionalNamespaceIndex,
     enum_tag_type: Index,
     backing_int: Index,
@@ -1569,7 +1566,6 @@ const TypeUnion = struct {
 
 const TypeOpaque = struct {
     name: NullTerminatedString,
-    parent: Index,
     namespace: OptionalNamespaceIndex,
     captures_len: u32,
 };
@@ -3533,17 +3529,6 @@ pub fn typeName(pool: *const InternPool, ty: Index) NullTerminatedString {
     };
 }
 
-pub fn typeParent(pool: *const InternPool, ty: Index) Index {
-    const item = pool.items.get(@intFromEnum(ty));
-    return switch (item.tag) {
-        .type_struct => pool.extraData(TypeStruct, item.data).parent,
-        .type_enum => pool.extraData(TypeEnum, item.data).parent,
-        .type_union => pool.extraData(TypeUnion, item.data).parent,
-        .type_opaque => pool.extraData(TypeOpaque, item.data).parent,
-        else => .none,
-    };
-}
-
 pub fn typeNamespace(pool: *const InternPool, ty: Index) OptionalNamespaceIndex {
     const item = pool.items.get(@intFromEnum(ty));
     return switch (item.tag) {
@@ -3858,20 +3843,18 @@ pub fn getDeclaredStructType(
     pool: *InternPool,
     name: NullTerminatedString,
     id: Key.ContainerType,
-    parent: Index,
     fields_len: u32,
     layout: std.lang.Type.ContainerLayout,
     any_field_aligns: bool,
     any_comptime_fields: bool,
-) Allocator.Error!Index {
+) Allocator.Error!WipContainerType.Result {
     const gop = try pool.getOrPutContainer(.{ .struct_type = id });
-    if (gop.existing) |e| return e;
+    if (gop.existing) |e| return .{ .existing = e };
     const runtime_order_len: u32 = if (layout == .auto) fields_len else 0;
     const comptime_len: u32 = if (any_comptime_fields) (fields_len + 31) / 32 else 0;
     const field_name_map = try pool.addMap(pool.gpa, fields_len);
     const extra_index = try pool.addExtra(TypeStruct{
         .name = name,
-        .parent = parent,
         .namespace = .none,
         .fields_len = fields_len,
         .field_name_map = field_name_map.toOptional(),
@@ -3901,13 +3884,12 @@ pub fn getDeclaredStructType(
     pool.extra.appendNTimesAssumeCapacity(@intFromEnum(RuntimeOrder.unresolved), runtime_order_len);
     pool.extra.appendNTimesAssumeCapacity(0, fields_len);
     pool.items.appendAssumeCapacity(.{ .tag = .type_struct, .data = extra_index });
-    return @enumFromInt(gop.index);
+    return .{ .wip = .{ .index = @enumFromInt(gop.index) } };
 }
 
 pub fn getReifiedStructType(pool: *InternPool, ini: struct {
     name: NullTerminatedString,
     id: Key.ContainerType,
-    parent: Index,
     layout: std.lang.Type.ContainerLayout,
     backing_int: Index,
     names: []const NullTerminatedString,
@@ -3927,7 +3909,6 @@ pub fn getReifiedStructType(pool: *InternPool, ini: struct {
     const field_name_map = try pool.addMap(pool.gpa, fields_len);
     const extra_index = try pool.addExtra(TypeStruct{
         .name = ini.name,
-        .parent = ini.parent,
         .namespace = .none,
         .fields_len = fields_len,
         .field_name_map = field_name_map.toOptional(),
@@ -3968,7 +3949,6 @@ pub fn getDeclaredEnumType(
     pool: *InternPool,
     name: NullTerminatedString,
     id: Key.ContainerType,
-    parent: Index,
     fields_len: u32,
     has_values: bool,
     int_tag_mode: BackingTypeMode,
@@ -3977,7 +3957,6 @@ pub fn getDeclaredEnumType(
     if (gop.existing) |e| return .{ .existing = e };
     const extra_index = try pool.addExtra(TypeEnum{
         .name = name,
-        .parent = parent,
         .namespace = .none,
         .int_tag_type = .none,
         .fields_len = fields_len,
@@ -3997,7 +3976,6 @@ pub fn getDeclaredEnumType(
 pub fn getReifiedEnumType(pool: *InternPool, ini: struct {
     name: NullTerminatedString,
     id: Key.ContainerType,
-    parent: Index,
     int_tag_type: Index,
     nonexhaustive: bool,
     names: []const NullTerminatedString,
@@ -4012,7 +3990,6 @@ pub fn getReifiedEnumType(pool: *InternPool, ini: struct {
     const field_value_map: OptionalMapIndex = if (has_values) (try pool.addMap(pool.gpa, fields_len)).toOptional() else .none;
     const extra_index = try pool.addExtra(TypeEnum{
         .name = ini.name,
-        .parent = ini.parent,
         .namespace = .none,
         .int_tag_type = ini.int_tag_type,
         .fields_len = fields_len,
@@ -4037,7 +4014,6 @@ pub fn getDeclaredUnionType(
     pool: *InternPool,
     name: NullTerminatedString,
     id: Key.ContainerType,
-    parent: Index,
     fields_len: u32,
     layout: std.lang.Type.ContainerLayout,
     any_field_aligns: bool,
@@ -4048,7 +4024,6 @@ pub fn getDeclaredUnionType(
     const field_name_map = try pool.addMap(pool.gpa, fields_len);
     const extra_index = try pool.addExtra(TypeUnion{
         .name = name,
-        .parent = parent,
         .namespace = .none,
         .enum_tag_type = .none,
         .backing_int = .none,
@@ -4079,24 +4054,22 @@ pub fn getDeclaredUnionType(
     return .{ .wip = .{ .index = @enumFromInt(gop.index) } };
 }
 
-pub fn getDeclaredOpaqueType(pool: *InternPool, name: NullTerminatedString, id: Key.ContainerType, parent: Index) Allocator.Error!Index {
+pub fn getDeclaredOpaqueType(pool: *InternPool, name: NullTerminatedString, id: Key.ContainerType) Allocator.Error!WipContainerType.Result {
     const gop = try pool.getOrPutContainer(.{ .opaque_type = id });
-    if (gop.existing) |e| return e;
+    if (gop.existing) |e| return .{ .existing = e };
     const extra_index = try pool.addExtra(TypeOpaque{
         .name = name,
-        .parent = parent,
         .namespace = .none,
         .captures_len = containerCapturesLen(id),
     });
     try pool.appendContainerType(id);
     pool.items.appendAssumeCapacity(.{ .tag = .type_opaque, .data = extra_index });
-    return @enumFromInt(gop.index);
+    return .{ .wip = .{ .index = @enumFromInt(gop.index) } };
 }
 
 pub fn getReifiedUnionType(pool: *InternPool, ini: struct {
     name: NullTerminatedString,
     id: Key.ContainerType,
-    parent: Index,
     layout: std.lang.Type.ContainerLayout,
     tag_usage: UnionFields.TagUsage,
     enum_tag_type: Index,
@@ -4114,7 +4087,6 @@ pub fn getReifiedUnionType(pool: *InternPool, ini: struct {
     const field_name_map = try pool.addMap(pool.gpa, fields_len);
     const extra_index = try pool.addExtra(TypeUnion{
         .name = ini.name,
-        .parent = ini.parent,
         .namespace = .none,
         .enum_tag_type = ini.enum_tag_type,
         .backing_int = ini.backing_int,
@@ -5175,15 +5147,14 @@ test "fullyQualifiedName: a member of a named container nests under it" {
     var pool = try InternPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const outer = try pool.getDeclaredStructType(
+    const outer = (try pool.getDeclaredStructType(
         try pool.getOrPutString(pool.gpa, "repl.Outer", .no_embedded_nulls),
         .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(1) } },
-        .none,
         0,
         .auto,
         false,
         false,
-    );
+    )).wip.index;
     const ns = try pool.createNamespace(pool.gpa, .{});
     pool.namespacePtr(ns).owner_type = outer;
 

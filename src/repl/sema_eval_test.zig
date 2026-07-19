@@ -1090,17 +1090,16 @@ test "struct_type: nominal identity keys on (source_zir_id, decl_inst)" {
     defer pool.deinit();
 
     const name_a = try pool.getOrPutString(gpa, "repl.A", .no_embedded_nulls);
-    const a1 = try pool.getDeclaredStructType(name_a, .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(2) } }, .none, 0, .auto, false, false);
-    const a2 = try pool.getDeclaredStructType(name_a, .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(2) } }, .none, 0, .auto, false, false);
-    const b = try pool.getDeclaredStructType(
+    const a1 = (try pool.getDeclaredStructType(name_a, .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(2) } }, 0, .auto, false, false)).wip.index;
+    const a2 = (try pool.getDeclaredStructType(name_a, .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(2) } }, 0, .auto, false, false)).existing;
+    const b = (try pool.getDeclaredStructType(
         try pool.getOrPutString(gpa, "repl.B", .no_embedded_nulls),
         .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(3) } },
-        .none,
         0,
         .auto,
         false,
         false,
-    );
+    )).wip.index;
 
     // Same declaration site dedups to one type; a different site is a
     // distinct type even with an identical shape (nominal, not structural).
