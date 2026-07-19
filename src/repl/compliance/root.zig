@@ -164,6 +164,7 @@ test {
     _ = @import("error_test.zig");
     _ = @import("import_test.zig");
     _ = @import("fn_test.zig");
+    _ = @import("memory_test.zig");
     _ = @import("module_test.zig");
     _ = @import("optional_test.zig");
     _ = @import("pointer_test.zig");
