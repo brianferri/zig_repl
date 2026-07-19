@@ -1826,7 +1826,6 @@ fn intTypeInfo(pool: *const InternPool, ty: InternPool.Index) ?std.lang.Type.Int
     };
 }
 
-
 fn coerceToTargetFloat(
     key: InternPool.Key,
     target_ty: InternPool.Index,
@@ -1982,7 +1981,12 @@ fn evalTypeofLog2IntType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(un_node.operand != .none);
 
     const ip = sema.intern_pool;
+    // A type query yields a comptime-known result whatever the operand's runtime-ness;
+    // the compiler returns `Air.internedToRef` unconditionally, so keep the operand's
+    // value from tainting this result's comptime flag.
+    const saved_operand_comptime = sema.operand_comptime;
     const operand = try sema.resolveInst(un_node.operand);
+    sema.operand_comptime = saved_operand_comptime;
     const operand_type = Value.typeOf(operand, ip).index;
 
     if (ip.indexToKey(operand_type) == .vector_type) {
@@ -8271,7 +8275,6 @@ fn containerDeclByName(sema: *Sema, container_ty: InternPool.Index, name: Intern
     return try sema.analyzeNavVal(nav);
 }
 
-
 fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const ip = sema.intern_pool;
@@ -10894,7 +10897,12 @@ fn evalTypeof(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    // The type is comptime-known even when the operand is a runtime value; the compiler
+    // returns `Air.internedToRef(operand_ty)` unconditionally, so the operand must not
+    // taint this result's comptime flag.
+    const saved_operand_comptime = sema.operand_comptime;
     const operand = try sema.resolveInst(un_node.operand);
+    sema.operand_comptime = saved_operand_comptime;
     return Value{ .index = Value.typeOf(operand, sema.intern_pool).index };
 }
 
@@ -11018,6 +11026,10 @@ fn evalOverflowArithmetic(sema: *Sema, extended: Zir.Inst.Extended.InstData, opc
 fn evalTypeofPeer(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.Inst.Index) Error!?Value {
     const extra = sema.zir.extraData(Zir.Inst.TypeOfPeer, extended.operand);
     const body = sema.zir.bodySlice(extra.data.body_index, extra.data.body_len);
+    // The compiler evaluates the operand body in an `is_typeof` block whose runtime side
+    // is discarded and returns `Air.internedToRef(result_type)`; the peer type is
+    // comptime-known, so keep the operands' runtime-ness from tainting it.
+    const saved_operand_comptime = sema.operand_comptime;
     _ = try sema.resolveInlineBody(body, inst);
 
     const args = sema.zir.refSlice(extra.end, extended.small);
@@ -11025,6 +11037,7 @@ fn evalTypeofPeer(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
 
     const insts = try sema.arena.alloc(Value, args.len);
     for (insts, args) |*v, arg_ref| v.* = try sema.resolveInst(arg_ref);
+    sema.operand_comptime = saved_operand_comptime;
     const ty = try sema.resolvePeerTypes(insts);
     return Value{ .index = ty.index };
 }
@@ -11035,7 +11048,12 @@ fn evalTypeofBuiltin(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.Block, pl_node.payload_index);
     const body = sema.zir.bodySlice(extra.end, extra.data.body_len);
+    // The compiler evaluates the operand body in an `is_typeof` block whose runtime side
+    // is discarded and returns `Air.internedToRef(operand_ty)`; the type is comptime-known,
+    // so keep the operand's runtime-ness from tainting this result's comptime flag.
+    const saved_operand_comptime = sema.operand_comptime;
     const operand = try sema.resolveInlineBody(body, inst);
+    sema.operand_comptime = saved_operand_comptime;
     return Value{ .index = Value.typeOf(operand, sema.intern_pool).index };
 }
 

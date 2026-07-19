@@ -430,7 +430,7 @@ test "render: a packed struct value unpacks its fields; a packed union shows the
 }
 
 test "compliance: a failure raised inside a loaded module still surfaces its message" {
-    // The error is raised in std's ZIR, which keeps no AST/source for a caret; the
-    // message must still render rather than vanish into an empty result.
-    try compliance.expectDiagnostic(testing.allocator, &.{ "const std = @import(\"std\");", "std.math.pow(f64, 2.0, 10.0)" }, "incompatible types");
+    // A @compileError reached inside std's own source must surface its message rather
+    // than vanish into an empty result; the caret re-reads the module's source on demand.
+    try compliance.expectDiagnostic(testing.allocator, &.{ "const std = @import(\"std\");", "std.math.sqrt(@as(i32, 4))" }, "sqrt not implemented");
 }

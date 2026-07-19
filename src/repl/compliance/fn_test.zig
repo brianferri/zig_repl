@@ -157,5 +157,18 @@ test "compliance: a later arg's result type resolves from an earlier comptime pa
         .{ .src = &.{ "const std = @import(\"std\");", "std.math.gcd(@as(u32, 48), 36)" }, .want = std.math.gcd(@as(u32, 48), 36) },
         // A comptime-only arg to an anytype param stays comptime-known, so u16 + (comptime int) peers.
         .{ .src = &.{ "const std = @import(\"std\");", "std.math.IntFittingRange(0, 48)" }, .want = std.math.IntFittingRange(0, 48) },
+        // Reflecting a runtime param's type (@sizeOf of @TypeOf) yields a comptime-known
+        // comptime_int, so it peers with a concrete int instead of reading as runtime.
+        .{ .src = &.{"blk: { const F = struct { fn f(x: f64) i32 { const b: comptime_int = @sizeOf(@TypeOf(x)); return @as(i32, 5) - b; } }; break :blk F.f(2.0); }"}, .want = blk: {
+            const F = struct {
+                fn f(x: f64) i32 {
+                    const b: comptime_int = @sizeOf(@TypeOf(x));
+                    return @as(i32, 5) - b;
+                }
+            };
+            break :blk F.f(2.0);
+        } },
+        .{ .src = &.{ "const std = @import(\"std\");", "std.math.frexp(@as(f64, 2.0)).exponent" }, .want = std.math.frexp(@as(f64, 2.0)).exponent },
+        .{ .src = &.{ "const std = @import(\"std\");", "std.math.pow(f64, 2.0, 10.0)" }, .want = std.math.pow(f64, 2.0, 10.0) },
     });
 }
