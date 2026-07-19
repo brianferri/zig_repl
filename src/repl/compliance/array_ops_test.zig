@@ -46,6 +46,23 @@ test "compliance: @memcpy copies a slice range" {
     try compliance.expectDiagnostic(a, &.{"blk: { var dst = [_]u8{ 0, 0 }; const src = [_]u16{ 1, 2 }; @memcpy(dst[0..2], src[0..2]); break :blk dst[0]; }"}, "cannot represent all possible");
 }
 
+test "compliance: @memset writes a value to every element" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { var buf: [4]u8 = undefined; @memset(&buf, 7); break :blk buf[0] + buf[3]; }"}, .want = blk: {
+            var buf: [4]u8 = undefined;
+            @memset(&buf, 7);
+            break :blk buf[0] + buf[3];
+        } },
+        .{ .src = &.{"blk: { var buf = [_]u8{ 1, 2, 3 }; @memset(buf[0..2], 0); break :blk buf[0] + buf[2]; }"}, .want = blk: {
+            var buf = [_]u8{ 1, 2, 3 };
+            @memset(buf[0..2], 0);
+            break :blk buf[0] + buf[2];
+        } },
+        // A const destination cannot be written.
+        .{ .src = &.{"blk: { const buf = [_]u8{ 1, 2, 3 }; @memset(&buf, 0); break :blk buf[0]; }"}, .reject = {} },
+    });
+}
+
 test "compliance: @memcpy ported behavior cases" {
     try compliance.check(a, .{
         .{ .src = &.{"blk: { var foo = [_]u8{ 65, 66, 67 }; var bar: [3]u8 = undefined; @memcpy(&bar, &foo); break :blk bar[2]; }"}, .want = blk: {

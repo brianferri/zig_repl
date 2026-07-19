@@ -414,6 +414,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .ptr_from_int => sema.evalPtrFromInt(inst),
         .array_init_elem_type => sema.evalArrayInitElemType(inst),
         .elem_type => sema.evalElemType(inst),
+        .indexable_ptr_elem_type => sema.evalIndexablePtrElemType(inst),
         .splat_op_result_ty => sema.evalSplatOpResultType(inst),
         .splat => sema.evalSplat(inst),
         .shuffle => sema.evalShuffle(inst),
@@ -425,6 +426,7 @@ fn evalInst(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!?Value {
         .elem_ptr, .elem_ptr_node => sema.evalElemPtrNode(inst),
         .elem_val => sema.evalElemVal(inst),
         .memcpy => sema.evalMemcpy(inst),
+        .memset => sema.evalMemset(inst),
         .compile_error => sema.evalCompileError(inst),
         .set_eval_branch_quota => sema.evalSetEvalBranchQuota(inst),
         .set_runtime_safety => sema.evalSetRuntimeSafety(inst),
@@ -6456,6 +6458,19 @@ fn evalElemType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = sema.intern_pool.indexToKey(ptr_ty).ptr_type.child };
 }
 
+fn evalIndexablePtrElemType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    assert(@intFromEnum(inst) < sema.zir.instructions.len);
+    const ip = sema.intern_pool;
+    const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
+    const ptr_ty = Type.fromIndex(try sema.resolveDestType(un_node.operand, "indexable element type"));
+    const ptr_child = Type.fromIndex(ip.indexToKey(ptr_ty.index).ptr_type.child);
+    const elem_ty = switch (ip.indexToKey(ptr_ty.index).ptr_type.flags.size) {
+        .slice, .many, .c => ptr_child,
+        .one => ptr_child.childType(ip),
+    };
+    return .{ .index = elem_ty.index };
+}
+
 fn evalSplatOpResultType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
@@ -9034,6 +9049,40 @@ fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const dest_arr_ptr: InternPool.Key.Ptr = .{
         .ty = try ip.internPtrType(.{
             .child = try ip.internArrayType(.{ .len = len, .child = dest_elem.index }),
+            .flags = .{ .size = .one, .is_const = false },
+        }),
+        .base_addr = .{ .arr_elem = .{ .base = dest_back.ptr, .index = dest_back.start } },
+        .byte_offset = 0,
+    };
+    try sema.storePointee(dest_arr_ptr, array_val);
+    return null;
+}
+
+fn evalMemset(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
+    const ip = sema.intern_pool;
+    const bin = sema.binData(inst);
+    const dest = try sema.resolveInst(bin.lhs);
+    const uncoerced_elem = try sema.resolveInst(bin.rhs);
+
+    const dest_ty = sema.memOperandType(dest) orelse return sema.failMemOperand(dest.typeOf(ip));
+    if (dest_ty.isConstPtr(ip)) {
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "cannot memset constant pointer", .{});
+    }
+
+    const dest_elem = dest_ty.indexableElem(ip);
+    const elem = try sema.coerceValueToType(uncoerced_elem, dest_elem.index, "@memset");
+
+    const len = (try sema.indexableMemLen(dest)) orelse {
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "unknown @memset length", .{});
+    };
+    if (len == 0) return null;
+
+    const dest_back = sema.memBacking(dest);
+    const array_ty = try ip.internArrayType(.{ .len = len, .child = dest_elem.index });
+    const array_val = try sema.aggregateSplatValue(.fromIndex(array_ty), elem);
+    const dest_arr_ptr: InternPool.Key.Ptr = .{
+        .ty = try ip.internPtrType(.{
+            .child = array_ty,
             .flags = .{ .size = .one, .is_const = false },
         }),
         .base_addr = .{ .arr_elem = .{ .base = dest_back.ptr, .index = dest_back.start } },
