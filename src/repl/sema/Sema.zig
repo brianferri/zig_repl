@@ -2471,6 +2471,25 @@ fn evalComparison(
         return try sema.evalVectorComparison(op, lhs_value, rhs_value, op_name);
 
     {
+        const lhs_ty = Value.typeOf(lhs_value, ip);
+        const rhs_ty = Value.typeOf(rhs_value, ip);
+        if (lhs_ty.zigTypeTag(ip) == .pointer and rhs_ty.zigTypeTag(ip) == .pointer) {
+            // Mirrors Type.isSelfComparable: a non-slice pointer compares for eq/neq; ordered
+            // comparison is allowed only for C pointers. Comptime pointers with the same base and
+            // offset intern to the same value, so equality is interned identity.
+            const is_eq = op == .eq or op == .neq;
+            const both_c = lhs_ty.ptrInfo(ip).flags.size == .c and rhs_ty.ptrInfo(ip).flags.size == .c;
+            if (lhs_ty.isSlice(ip) or rhs_ty.isSlice(ip) or (!is_eq and !both_c)) {
+                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "{s}: operator not allowed for pointer operands", .{op_name});
+            }
+            if (is_eq) return boolValue((lhs_value.index == rhs_value.index) == (op == .eq));
+            const la = lhs_value.getUnsignedInt(ip) orelse return sema.failNumericOperands(op_name, lhs_key, rhs_key);
+            const ra = rhs_value.getUnsignedInt(ip) orelse return sema.failNumericOperands(op_name, lhs_key, rhs_key);
+            return boolValue(std.math.order(la, ra).compare(op));
+        }
+    }
+
+    {
         const lhs_ty = Value.typeOf(lhs_value, ip).index;
         const rhs_ty = Value.typeOf(rhs_value, ip).index;
         const kind: ?[]const u8 = if (lhs_ty == .type_type and rhs_ty == .type_type)

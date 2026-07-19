@@ -295,3 +295,23 @@ test "compliance: pointer-cast family" {
         .{ .src = &.{"blk: { const p: *volatile u32 = @ptrFromInt(0x1000); const q: *u32 = @ptrCast(p); break :blk @intFromPtr(q); }"}, .reject = {} },
     });
 }
+
+test "compliance: pointer equality compares base and offset" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const a2 = [_]u8{ 1, 2, 3 }; const p: [*]const u8 = &a2; break :blk p == p; }"}, .want = blk: {
+            const a2 = [_]u8{ 1, 2, 3 };
+            const p: [*]const u8 = &a2;
+            break :blk p == p;
+        } },
+        .{ .src = &.{"blk: { const a2 = [_]u8{ 1, 2 }; const b = [_]u8{ 3, 4 }; const pa: [*]const u8 = &a2; const pb: [*]const u8 = &b; break :blk pa == pb; }"}, .want = blk: {
+            const a2 = [_]u8{ 1, 2 };
+            const b = [_]u8{ 3, 4 };
+            const pa: [*]const u8 = &a2;
+            const pb: [*]const u8 = &b;
+            break :blk pa == pb;
+        } },
+        // std.mem.eql (and the family built on it) hinges on `a.ptr == b.ptr`.
+        .{ .src = &.{ "const std = @import(\"std\");", "std.mem.eql(u8, \"foo\", \"foo\")" }, .want = std.mem.eql(u8, "foo", "foo") },
+        .{ .src = &.{ "const std = @import(\"std\");", "std.mem.indexOf(u8, \"hello world\", \"world\").?" }, .want = std.mem.indexOf(u8, "hello world", "world").? },
+    });
+}
