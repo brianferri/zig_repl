@@ -7874,10 +7874,10 @@ fn matchEnumField(
 }
 
 fn enumTagIntValue(sema: *Sema, tag_ty: InternPool.Index, value: i128) Error!InternPool.Index {
-    const i64v = std.math.cast(i64, value) orelse {
-        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "enum: tag value out of supported range", .{});
-    };
-    const raw = try sema.intern_pool.internInt(.{ .ty = .comptime_int_type, .storage = .{ .i64 = i64v } });
+    var limbs_buf: [std.math.big.int.calcLimbLen(@as(i128, std.math.minInt(i128)))]Limb = undefined;
+    var mutable: BigIntMutable = .{ .limbs = &limbs_buf, .len = undefined, .positive = undefined };
+    mutable.set(value);
+    const raw = try sema.intern_pool.internComptimeInt(mutable.toConst());
     return (try sema.coerceValueToType(.{ .index = raw }, tag_ty, "enum tag")).index;
 }
 

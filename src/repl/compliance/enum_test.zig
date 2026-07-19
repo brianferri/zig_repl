@@ -179,6 +179,15 @@ test "compliance: explicit enum tag types and values" {
             .src = &.{"blk: { const E = enum(u8) { a = 300 }; break :blk @intFromEnum(E.a); }"},
             .reject = {},
         },
+        // A tag value at the top of a wide unsigned tag type exceeds i64 but fits u64;
+        // it must intern through its natural storage (the std.Io.Limit shape).
+        .{
+            .src = &.{"blk: { const E = enum(usize) { nothing = 0, unlimited = @import(\"std\").math.maxInt(usize), _ }; break :blk @intFromEnum(E.unlimited); }"},
+            .want = blk: {
+                const E = enum(usize) { nothing = 0, unlimited = std.math.maxInt(usize), _ };
+                break :blk @intFromEnum(E.unlimited);
+            },
+        },
     });
 }
 
