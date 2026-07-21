@@ -5186,18 +5186,30 @@ fn evalReifyTuple(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Valu
 
 fn derefSliceAsArray(sema: *Sema, val: Value) Error!Value {
     const ip = sema.intern_pool;
-    switch (ip.indexToKey(val.index)) {
-        .slice => |s| {
-            const slice_ty = ip.indexToKey(s.ty).ptr_type;
-            const len = try sema.resolveUsizeInt(.{ .index = s.len }, "slice len");
-            try sema.ensureLayoutResolved(slice_ty.child);
-            const array_ty = try ip.internArrayType(.{ .len = len, .child = slice_ty.child });
-            const array_ptr_ty = try ip.internPtrType(.{ .child = array_ty, .flags = .{ .size = .one, .is_const = true } });
-            return try sema.loadValue(.{ .index = try ip.getCoerced(s.ptr, array_ptr_ty) });
-        },
-        .ptr => return try sema.loadValue(val),
-        else => return sema.fail(sema.block, sema.block.nodeOffset(.zero), "reify: expected a comptime array-backed slice", .{}),
+    const slice_ty = val.typeOf(ip);
+    assert(slice_ty.zigTypeTag(ip) == .pointer);
+    switch (slice_ty.ptrInfo(ip).flags.size) {
+        .slice => {},
+        .one => return sema.loadValue(val),
+        .many, .c => unreachable,
     }
+    const slice = switch (ip.indexToKey(val.index)) {
+        .undef => return sema.failWithUseOfUndef(),
+        .slice => |slice| slice,
+        else => unreachable,
+    };
+    const elem_ty = Type.fromIndex(slice.ty).childType(ip);
+    const len = try sema.resolveUsizeInt(.{ .index = slice.len }, "slice len");
+    const array_ty = try ip.internArrayType(.{ .child = elem_ty.index, .len = len });
+    const ptr_ty = try ip.internPtrType(p: {
+        var p = Type.fromIndex(slice.ty).ptrInfo(ip);
+        p.flags.size = .one;
+        p.child = array_ty;
+        p.sentinel = .none;
+        break :p p;
+    });
+    const casted_ptr = try ip.getCoerced(slice.ptr, ptr_ty);
+    return sema.loadValue(.{ .index = casted_ptr });
 }
 
 fn validateTupleFieldType(sema: *Sema, field_ty: InternPool.Index) Error!void {
