@@ -1353,6 +1353,37 @@ pub fn isPtrAtRuntime(ty: Type, pool: *const InternPool) bool {
     };
 }
 
+pub fn isSliceAtRuntime(ty: Type, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(ty.index)) {
+        .ptr_type => |ptr_type| ptr_type.flags.size == .slice,
+        .opt_type => |child| switch (pool.indexToKey(child)) {
+            .ptr_type => |ptr_type| !ptr_type.flags.is_allowzero and ptr_type.flags.size == .slice,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+pub fn isGenericPoison(ty: Type) bool {
+    return ty.index == .generic_poison_type;
+}
+
+pub fn isValidParamType(ty: Type, pool: *const InternPool) bool {
+    if (ty.index == .generic_poison_type) return true;
+    return switch (ty.zigTypeTag(pool)) {
+        .@"opaque", .noreturn => false,
+        else => true,
+    };
+}
+
+pub fn isValidReturnType(ty: Type, pool: *const InternPool) bool {
+    if (ty.index == .generic_poison_type) return true;
+    return switch (ty.zigTypeTag(pool)) {
+        .@"opaque" => false,
+        else => true,
+    };
+}
+
 pub fn isSlice(ty: Type, pool: *const InternPool) bool {
     return switch (pool.indexToKey(ty.index)) {
         .ptr_type => |ptr_type| ptr_type.flags.size == .slice,

@@ -5325,6 +5325,108 @@ fn evalReifySliceArgTy(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!
     return .{ .index = try ip.internPtrType(.{ .child = arr_ty, .flags = .{ .size = .one, .is_const = true } }) };
 }
 
+const calling_conventions_supporting_var_args = [_]std.lang.CallingConvention.Tag{
+    .x86_16_cdecl,
+    .x86_64_sysv,
+    .x86_64_x32,
+    .x86_64_win,
+    .x86_sysv,
+    .x86_win,
+    .aarch64_aapcs,
+    .aarch64_aapcs_darwin,
+    .aarch64_aapcs_win,
+    .aarch64_vfabi,
+    .aarch64_vfabi_sve,
+    .alpha_osf,
+    .arm_aapcs,
+    .arm_aapcs_vfp,
+    .microblaze_std,
+    .mips64_n64,
+    .mips64_n32,
+    .mips_o32,
+    .riscv64_lp64,
+    .riscv64_lp64_v,
+    .riscv32_ilp32,
+    .riscv32_ilp32_v,
+    .sparc64_sysv,
+    .sparc_sysv,
+    .powerpc64_elf,
+    .powerpc64_elf_altivec,
+    .powerpc64_elf_v2,
+    .powerpc_sysv,
+    .powerpc_sysv_altivec,
+    .powerpc_aix,
+    .powerpc_aix_altivec,
+    .wasm_mvp,
+    .arc_sysv,
+    .avr_gnu,
+    .bpf_std,
+    .csky_sysv,
+    .hexagon_sysv,
+    .hexagon_sysv_hvx,
+    .hppa_elf,
+    .hppa64_elf,
+    .kvx_lp64,
+    .kvx_ilp32,
+    .lanai_sysv,
+    .loongarch64_lp64,
+    .loongarch32_ilp32,
+    .m68k_sysv,
+    .m68k_gnu,
+    .m68k_rtd,
+    .m88k_sysv,
+    .msp430_eabi,
+    .or1k_sysv,
+    .s390x_sysv,
+    .s390x_sysv_vx,
+    .sh_gnu,
+    .sh_renesas,
+    .ve_sysv,
+    .xcore_xs1,
+    .xcore_xs2,
+    .xtensa_call0,
+    .xtensa_windowed,
+};
+
+fn callConvSupportsVarArgs(cc: std.lang.CallingConvention.Tag) bool {
+    return for (calling_conventions_supporting_var_args) |supported_cc| {
+        if (cc == supported_cc) return true;
+    } else false;
+}
+
+fn checkCallConvSupportsVarArgs(sema: *Sema, cc: std.lang.CallingConvention.Tag) Error!void {
+    if (!callConvSupportsVarArgs(cc)) {
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "variadic function does not support '{s}' calling convention", .{@tagName(cc)});
+    }
+}
+
+// Ported from Sema.checkParamType; the interrupt/SPIR-V calling-convention, comptime/generic-parameter, and
+// vulkan/opengl address-space branches do not apply to `@Fn` reification, which has concrete parameter types,
+// payload-free calling conventions, and the native target.
+fn checkParamType(sema: *Sema, param_ty: Type, param_is_noalias: bool) Error!void {
+    const ip = sema.intern_pool;
+    if (!param_ty.isValidParamType(ip)) {
+        const opaque_str: []const u8 = if (param_ty.zigTypeTag(ip) == .@"opaque") "opaque " else "";
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "parameter of {s}type '{f}' not allowed", .{ opaque_str, param_ty.fmt(ip) });
+    }
+    if (param_is_noalias and !param_ty.isGenericPoison() and !param_ty.isPtrAtRuntime(ip) and !param_ty.isSliceAtRuntime(ip)) {
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "non-pointer parameter declared noalias", .{});
+    }
+}
+
+// Ported from Sema.checkReturnTypeAndCallConv; inferred error sets, incoming-stack-alignment, and the
+// interrupt calling conventions do not apply here (no inferred error sets; payload-free calling conventions).
+fn checkReturnTypeAndCallConv(sema: *Sema, bare_ret_ty: Type, opt_varargs: bool, cc: std.lang.CallingConvention.Tag) Error!void {
+    const ip = sema.intern_pool;
+    if (opt_varargs) {
+        try sema.checkCallConvSupportsVarArgs(cc);
+    }
+    if (!bare_ret_ty.isValidReturnType(ip)) {
+        const opaque_str: []const u8 = if (bare_ret_ty.zigTypeTag(ip) == .@"opaque") "opaque " else "";
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}return type '{f}' not allowed", .{ opaque_str, bare_ret_ty.fmt(ip) });
+    }
+}
+
 fn interpretCallConv(sema: *Sema, val: Value) Error!std.lang.CallingConvention {
     const ip = sema.intern_pool;
     const un = ip.indexToKey(val.index).un;
@@ -5367,13 +5469,17 @@ fn evalReifyFn(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
     for (param_types, 0..) |*param_ty, param_idx| {
         param_ty.* = try ip.aggregateElementAt(param_types_arr, param_idx);
         const param_attr = ip.indexToKey(try ip.aggregateElementAt(param_attrs_arr, param_idx)).aggregate;
-        if (try ip.aggregateElementAt(param_attr, 0) == .bool_true) {
+        const param_is_noalias = try ip.aggregateElementAt(param_attr, 0) == .bool_true;
+        try sema.checkParamType(.fromIndex(param_ty.*), param_is_noalias);
+        if (param_is_noalias) {
             if (param_idx > 31) {
                 return sema.fail(sema.block, sema.block.nodeOffset(.zero), "this compiler implementation only supports 'noalias' on the first 32 parameters", .{});
             }
             noalias_bits |= @as(u32, 1) << @intCast(param_idx);
         }
     }
+
+    try sema.checkReturnTypeAndCallConv(.fromIndex(ret_ty), varargs, std.meta.activeTag(cc));
 
     return .{ .index = try ip.internFuncType(.{
         .param_types = param_types,
