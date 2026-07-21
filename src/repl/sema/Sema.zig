@@ -3261,7 +3261,7 @@ pub fn ensureLayoutResolved(sema: *Sema, ty: InternPool.Index) Error!void {
         .enum_type => {},
         .struct_type => try sema.resolveStructLayout(ty),
         .union_type => try sema.resolveUnionLayout(ty),
-        .simple_value, .enum_literal, .int, .float, .undef, .ptr, .slice, .err, .error_union, .func, .opt, .aggregate, .enum_tag, .un, .bitpack => unreachable,
+        .simple_value, .enum_literal, .int, .float, .undef, .ptr, .slice, .err, .error_union, .func, .@"extern", .opt, .aggregate, .enum_tag, .un, .bitpack => unreachable,
     }
 }
 
@@ -8332,6 +8332,7 @@ fn containerNamespace(sema: *Sema, container_ty: InternPool.Index) ?ContainerNam
         .error_union,
         .func_type,
         .func,
+        .@"extern",
         .array_type,
         .vector_type,
         .opt_type,
@@ -8398,8 +8399,6 @@ fn analyzeNavVal(sema: *Sema, nav_idx: InternPool.Nav.Index) Error!Value {
     defer frame.restore(sema);
     const decl_inst = analysis.zir_index;
     const unwrapped = sema.zir.getDeclaration(decl_inst);
-    const value_body = unwrapped.value_body orelse
-        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "decl '{s}': no value_body (extern decl)", .{ip.stringSlice(ip.getNav(nav_idx).name)});
 
     var block: Block = .{
         .namespace = analysis.namespace,
@@ -8423,6 +8422,28 @@ fn analyzeNavVal(sema: *Sema, nav_idx: InternPool.Nav.Index) Error!Value {
         try sema.inst_map.put(sema.gpa, decl_inst, .{ .index = t });
         break :blk t;
     } else null;
+
+    if (unwrapped.linkage == .@"extern") {
+        // An extern decl has no value body; the linker supplies its value at runtime. Mirror the
+        // compiler's nav resolution and mint an extern symbol from the declared type, which the
+        // comptime layer only ever holds. It can only be executed on the (deferred) runtime path.
+        const nav_ty = declared_type.?;
+        const ext = try ip.getExtern(.{ .ty = nav_ty, .owner_nav = nav_idx });
+        ip.navPtr(nav_idx).resolved = .{
+            .type = nav_ty,
+            .@"align" = .none,
+            .@"linksection" = .none,
+            .@"addrspace" = .generic,
+            .@"const" = unwrapped.kind == .@"const",
+            .@"threadlocal" = unwrapped.is_threadlocal,
+            .is_extern_decl = true,
+            .value = ext,
+        };
+        return .{ .index = ext };
+    }
+
+    const value_body = unwrapped.value_body orelse
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "decl '{s}': no value_body", .{ip.stringSlice(ip.getNav(nav_idx).name)});
     const raw_value = try sema.resolveInlineBody(value_body, decl_inst);
     const value = if (declared_type) |dest_ty| try sema.coerceValueToType(raw_value, dest_ty, "decl") else raw_value;
 
@@ -8486,6 +8507,7 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
         .error_union,
         .func_type,
         .func,
+        .@"extern",
         .array_type,
         .vector_type,
         .opt_type,
@@ -8570,6 +8592,7 @@ fn fieldPtrLoad(sema: *Sema, object: Value, name: InternPool.NullTerminatedStrin
         .error_union,
         .func_type,
         .func,
+        .@"extern",
         .vector_type,
         .opt_type,
         .opt,
@@ -9961,10 +9984,6 @@ fn bindValueDecl(
     decl_inst: Zir.Inst.Index,
     unwrapped: std.zig.Zir.Inst.Declaration.Unwrapped,
 ) Error!void {
-    const value_body = unwrapped.value_body orelse {
-        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "bindDecls '{s}': no value_body (extern decl)", .{sema.intern_pool.stringSlice(name)});
-    };
-
     const declared_type: ?InternPool.Index = if (unwrapped.type_body) |tb| blk: {
         const t = (try sema.coerceValueToType(try sema.resolveInlineBody(tb, decl_inst), .type_type, "variable type")).index;
         try sema.inst_map.put(sema.gpa, decl_inst, .{ .index = t });
@@ -9974,22 +9993,31 @@ fn bindValueDecl(
     const prev_ctx = sema.block.type_name_ctx;
     sema.block.type_name_ctx = fqn;
     defer sema.block.type_name_ctx = prev_ctx;
-    const raw_value = try sema.resolveInlineBody(value_body, decl_inst);
-    const final_value = if (declared_type) |dest_ty|
-        try sema.coerceValueToType(raw_value, dest_ty, "decl")
-    else
-        raw_value;
-    const final_type = if (declared_type) |dest_ty|
-        dest_ty
-    else
-        Value.typeOf(final_value, sema.intern_pool).index;
+
+    const nav_idx = try sema.intern_pool.createNav(sema.gpa, name, fqn);
+
+    // An extern decl has no value body; the linker supplies its value at runtime. Mint an extern
+    // symbol from the declared type (see analyzeNavVal); otherwise evaluate the value body.
+    const final_type: InternPool.Index, const final_value: Value = if (unwrapped.linkage == .@"extern") ext: {
+        const nav_ty = declared_type.?;
+        break :ext .{ nav_ty, .{ .index = try sema.intern_pool.getExtern(.{ .ty = nav_ty, .owner_nav = nav_idx }) } };
+    } else val: {
+        const value_body = unwrapped.value_body orelse
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "bindDecls '{s}': no value_body", .{sema.intern_pool.stringSlice(name)});
+        const raw_value = try sema.resolveInlineBody(value_body, decl_inst);
+        const fv = if (declared_type) |dest_ty|
+            try sema.coerceValueToType(raw_value, dest_ty, "decl")
+        else
+            raw_value;
+        const ft = if (declared_type) |dest_ty| dest_ty else Value.typeOf(fv, sema.intern_pool).index;
+        break :val .{ ft, fv };
+    };
 
     const declared_align: InternPool.Alignment = if (unwrapped.align_body) |ab|
         try sema.alignmentFromValue(try sema.resolveInlineBody(ab, decl_inst), "decl align")
     else
         .none;
 
-    const nav_idx = try sema.intern_pool.createNav(sema.gpa, name, fqn);
     sema.intern_pool.navPtr(nav_idx).resolved = .{
         .type = final_type,
         .@"align" = declared_align,

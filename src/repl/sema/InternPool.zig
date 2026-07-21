@@ -559,6 +559,7 @@ pub const Key = union(enum) {
     error_union: ErrorUnion,
     func_type: FuncType,
     func: Func,
+    @"extern": Extern,
     array_type: ArrayType,
     vector_type: VectorType,
     opt_type: Index,
@@ -840,6 +841,15 @@ pub const Key = union(enum) {
         comptime_args: []const Index = &.{},
     };
 
+    /// An external symbol whose value is supplied by the linker at runtime. The comptime
+    /// layer only ever holds it; name/is_const/alignment come from `owner_nav`, matching
+    /// the compiler's `Tag.Extern`. The linker-only fields (linkage, visibility, relocation,
+    /// decoration, source) have no comptime meaning here and are not modelled.
+    pub const Extern = struct {
+        ty: Index,
+        owner_nav: Nav.Index,
+    };
+
     pub fn hash64(key: Key, pool: *const InternPool) u64 {
         var hasher = std.hash.Wyhash.init(0);
         const Tag = @typeInfo(Key).@"union".tag_type.?;
@@ -1027,6 +1037,10 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, f.parent);
                 std.hash.autoHash(&hasher, f.generic_owner);
                 for (f.comptime_args) |arg| std.hash.autoHash(&hasher, arg);
+            },
+            .@"extern" => |e| {
+                std.hash.autoHash(&hasher, e.ty);
+                std.hash.autoHash(&hasher, e.owner_nav);
             },
         }
         return hasher.final();
@@ -1216,6 +1230,7 @@ pub const Key = union(enum) {
                 if (x.generic_owner != y.generic_owner) break :blk false;
                 break :blk std.mem.eql(Index, x.comptime_args, y.comptime_args);
             },
+            .@"extern" => |x| x.ty == b.@"extern".ty and x.owner_nav == b.@"extern".owner_nav,
         };
     }
 
@@ -1248,6 +1263,7 @@ pub const Key = union(enum) {
             .error_union,
             .opt,
             .func,
+            .@"extern",
             .aggregate,
             .enum_tag,
             .un,
@@ -1345,6 +1361,7 @@ const Item = struct {
         func_decl,
         func_instance,
         func_coerced,
+        extern_decl,
         type_vector,
         type_optional,
         type_array_small,
@@ -2325,6 +2342,7 @@ pub fn get(pool: *InternPool, key: Key) Allocator.Error!Index {
         .error_union => |eu| try emitErrorUnion(pool, eu),
         .func_type => |ft| try emitFuncType(pool, ft),
         .func => |f| try emitFunc(pool, f),
+        .@"extern" => |e| try emitExtern(pool, e),
         .array_type => |at| try emitArrayType(pool, at),
         .vector_type => |vt| try emitVectorType(pool, vt),
         .opt_type => |child| appendOptionalType(pool, child),
@@ -2506,6 +2524,7 @@ pub fn zigTypeTag(pool: *const InternPool, index: Index) std.lang.TypeId {
             .err,
             .error_union,
             .func,
+            .@"extern",
             .opt,
             .aggregate,
             .enum_tag,
@@ -2615,6 +2634,7 @@ pub fn indexToKey(pool: *const InternPool, index: Index) Key {
         .func_decl => funcDeclFromExtra(pool, item.data),
         .func_instance => funcInstanceFromExtra(pool, item.data),
         .func_coerced => funcCoercedFromExtra(pool, item.data),
+        .extern_decl => externFromExtra(pool, item.data),
         .type_vector => vectorTypeFromExtra(pool, item.data),
         .type_optional => .{ .opt_type = @enumFromInt(item.data) },
         .opt_payload => optPayloadFromExtra(pool, item.data),
@@ -4200,6 +4220,20 @@ pub fn internFunc(pool: *InternPool, f: Key.Func) Allocator.Error!Index {
     return pool.get(.{ .func = f });
 }
 
+pub fn getExtern(pool: *InternPool, e: Key.Extern) Allocator.Error!Index {
+    return pool.get(.{ .@"extern" = e });
+}
+
+fn emitExtern(pool: *InternPool, e: Key.Extern) Allocator.Error!void {
+    assert(e.ty != .none);
+    const extra_index = try pool.addExtra(e);
+    pool.items.appendAssumeCapacity(.{ .tag = .extern_decl, .data = extra_index });
+}
+
+fn externFromExtra(pool: *const InternPool, extra_index: u32) Key {
+    return .{ .@"extern" = pool.extraData(Key.Extern, extra_index) };
+}
+
 fn emitFuncType(pool: *InternPool, ft: Key.FuncType) Allocator.Error!void {
     assert(ft.return_type != .none);
     assert(ft.param_types.len <= std.math.maxInt(u32));
@@ -4405,6 +4439,7 @@ pub fn typeOf(pool: *const InternPool, val: Index) Index {
         .err => |e| e.ty,
         .error_union => |eu| eu.ty,
         .func => |f| f.ty,
+        .@"extern" => |e| e.ty,
         .opt => |o| o.ty,
         .aggregate => |agg| agg.ty,
         .enum_tag => |et| et.ty,

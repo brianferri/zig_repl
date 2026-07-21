@@ -92,6 +92,7 @@ pub fn render(
         .err => |e| writer.print("error.{s}", .{pool.stringSlice(e.name)}),
         .error_union => |eu| renderErrorUnion(eu, pool, session, writer),
         .func => |f| writer.print("fn@{d}", .{@intFromEnum(f.zir_body_inst)}),
+        .@"extern" => |e| writer.print("(extern '{s}')", .{pool.stringSlice(pool.getNav(e.owner_nav).name)}),
         .aggregate => |agg| renderAggregate(agg, pool, session, writer),
         .enum_tag => |et| renderEnumTag(et, pool, session, writer),
         .un => |uv| renderUnion(uv, pool, session, writer),
