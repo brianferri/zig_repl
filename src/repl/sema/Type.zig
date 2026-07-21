@@ -1342,6 +1342,18 @@ pub fn unionTagTypeHypothetical(ty: Type, pool: *const InternPool) Type {
     return .fromIndex(pool.unionFields(ty.index).enum_tag_type);
 }
 
+/// The payload type of the union field selected by `enum_tag`, or null if the tag names no field.
+/// Mirrors the compiler's `Type.unionFieldType`; the tag enum type is read from the tag value (the
+/// REPL's union stores `.none` for it until resolved), not from `loaded_union.enum_tag_type`.
+pub fn unionFieldType(ty: Type, enum_tag: Value, pool: *const InternPool) ?Type {
+    pool.assertLayoutResolved(ty.index);
+    if (enum_tag.index == .none) return null;
+    const enum_tag_key = pool.indexToKey(enum_tag.index).enum_tag;
+    const loaded_enum = pool.loadEnumType(enum_tag_key.ty);
+    const index = loaded_enum.tagValueIndex(pool, enum_tag_key.int) orelse return null;
+    return .fromIndex(pool.unionFields(ty.index).field_types[index]);
+}
+
 pub fn isPtrAtRuntime(ty: Type, pool: *const InternPool) bool {
     return switch (pool.indexToKey(ty.index)) {
         .ptr_type => |ptr_type| switch (ptr_type.flags.size) {

@@ -5464,6 +5464,10 @@ fn interpretStdLangType(sema: *Sema, comptime T: type, val: Value) Error!T {
     };
 }
 
+fn uninterpretStdLangType(sema: *Sema, val: anytype, ty: Type) Error!Value {
+    return Value.uninterpret(val, ty, sema);
+}
+
 fn evalReifyFn(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
     const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.ReifyFn, extended.operand).data;
@@ -6540,7 +6544,7 @@ fn evalStdLangValue(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Va
                 return sema.fail(sema.block, sema.block.nodeOffset(.zero), "std.lang is corrupt: CallingConvention.c", .{});
             };
         },
-        .calling_convention_inline => return .{ .index = try sema.callConvValue(.@"inline") },
+        .calling_convention_inline => return try sema.uninterpretStdLangType(@as(std.lang.CallingConvention, .@"inline"), .fromIndex(try sema.getStdLangType(.CallingConvention))),
     };
     return .{ .index = try sema.getStdLangType(std_lang_type) };
 }
@@ -6791,7 +6795,7 @@ fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             const return_type_val = try sema.optTypeValue(if (ft.return_type == .generic_poison_type) .none else ft.return_type);
 
             var attr_elems = [_]InternPool.Index{
-                try sema.callConvValue(ft.cc),
+                (try sema.uninterpretStdLangType(ft.cc, .fromIndex(try sema.getStdLangType(.CallingConvention)))).index,
                 if (ft.is_var_args) .bool_true else .bool_false,
             };
             const attrs_val = try ip.internAggregate(.{ .ty = fn_attr_ty, .storage = .{ .elems = &attr_elems } });
@@ -7705,22 +7709,6 @@ fn alignOptValue(sema: *Sema, align_bytes: ?u64) Error!InternPool.Index {
 fn optTypeValue(sema: *Sema, val: InternPool.Index) Error!InternPool.Index {
     const ip = sema.intern_pool;
     return try ip.internOpt(.{ .ty = try ip.internOptionalType(.type_type), .val = val });
-}
-
-fn callConvValue(sema: *Sema, cc: std.lang.CallingConvention) Error!InternPool.Index {
-    const ip = sema.intern_pool;
-    const cc_ty = try sema.getStdLangType(.CallingConvention);
-    const tag_enum = try sema.unionTagEnumType(cc_ty);
-    switch (cc) {
-        inline else => |payload, tag| {
-            if (@TypeOf(payload) != void) {
-                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "@typeInfo: calling convention '{s}' is not modelled", .{@tagName(tag)});
-            }
-            const idx = (try sema.enumFieldIndex(tag_enum, try ip.getOrPutString(sema.gpa, @tagName(tag), .no_embedded_nulls))).?;
-            const tag_val = (try sema.enumValueFieldIndex(tag_enum, idx)).?;
-            return try ip.internUnion(.{ .ty = cc_ty, .tag = tag_val.index, .val = .void_value });
-        },
-    }
 }
 
 pub fn structFieldNameAt(sema: *Sema, struct_ty: InternPool.Index, index: u32) Error!?InternPool.NullTerminatedString {

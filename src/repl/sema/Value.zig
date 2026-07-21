@@ -4,6 +4,7 @@ const assert = std.debug.assert;
 
 const InternPool = @import("InternPool.zig");
 const Type = @import("Type.zig");
+const Sema = @import("Sema.zig");
 
 const Value = @This();
 
@@ -752,6 +753,103 @@ pub fn interpret(val: Value, comptime T: type, pool: *InternPool) error{ OutOfMe
                 @field(result, field_name) = try field_val.interpret(field_type, pool);
             }
             return result;
+        },
+    };
+}
+
+/// The inverse of `interpret`: construct a comptime `Value` of type `ty` from the native `std.lang`
+/// value `val` (direct mode, so fields are matched by index and enum tags by integer value). A shape
+/// that does not match `ty` means a corrupt `std.lang`. Unlike `interpret`, this takes `sema`: minting
+/// a union or struct value drives the lazy union-tag-enum and field resolution, which live on `Sema`.
+pub fn uninterpret(val: anytype, ty: Type, sema: *Sema) Sema.Error!Value {
+    const T = @TypeOf(val);
+    const ip = sema.intern_pool;
+    if (ty.zigTypeTag(ip) != @typeInfo(T)) @panic("std.lang is corrupt");
+
+    return switch (@typeInfo(T)) {
+        .type,
+        .noreturn,
+        .comptime_float,
+        .comptime_int,
+        .undefined,
+        .null,
+        .@"fn",
+        .@"opaque",
+        .spirv,
+        .enum_literal,
+        => comptime unreachable, // comptime-only or otherwise impossible
+
+        .pointer,
+        .array,
+        .error_union,
+        .error_set,
+        .frame,
+        .@"anyframe",
+        .vector,
+        => comptime unreachable, // unsupported
+
+        .void => .fromIndex(.void_value),
+
+        .bool => .fromIndex(if (val) .bool_true else .bool_false),
+
+        .int => .fromIndex(try ip.internInt(.{
+            .ty = ty.index,
+            .storage = switch (@typeInfo(T).int.signedness) {
+                .unsigned => .{ .u64 = @intCast(val) },
+                .signed => .{ .i64 = @intCast(val) },
+            },
+        })),
+
+        .float => .fromIndex(try ip.internFloat(.{
+            .ty = ty.index,
+            .storage = switch (T) {
+                f16 => .{ .f16 = val },
+                f32 => .{ .f32 = val },
+                f64 => .{ .f64 = val },
+                f80 => .{ .f80 = val },
+                f128 => .{ .f128 = val },
+                else => comptime unreachable,
+            },
+        })),
+
+        .optional => if (val) |some|
+            .fromIndex(try ip.internOpt(.{
+                .ty = ty.index,
+                .val = (try uninterpret(some, ty.optionalChild(ip), sema)).index,
+            }))
+        else
+            .fromIndex(try ip.internOpt(.{ .ty = ty.index, .val = .none })),
+
+        .@"enum" => .fromIndex(try ip.internEnumTag(.{
+            .ty = ty.index,
+            .int = (try uninterpret(@intFromEnum(val), .fromIndex(ip.loadEnumType(ty.index).int_tag_type), sema)).index,
+        })),
+
+        .@"union" => |@"union"| {
+            const tag: @"union".tag_type.? = val;
+            // The REPL's union tag enum is resolved lazily (the compiler's `unionTagType` reads a
+            // stored one); resolving the layout also makes the field types available.
+            try sema.ensureLayoutResolved(ty.index);
+            const tag_val = try uninterpret(tag, .fromIndex(try sema.unionTagEnumType(ty.index)), sema);
+            const field_ty = ty.unionFieldType(tag_val, ip) orelse @panic("std.lang is corrupt");
+            return switch (val) {
+                inline else => |payload| .fromIndex(try ip.internUnion(.{
+                    .ty = ty.index,
+                    .tag = tag_val.index,
+                    .val = (try uninterpret(payload, field_ty, sema)).index,
+                })),
+            };
+        },
+
+        .@"struct" => |@"struct"| {
+            if (try sema.structFieldCount(ty.index) != @"struct".field_names.len) @panic("std.lang is corrupt");
+            // `Type.fieldType` asserts a resolved layout; the REPL resolves it lazily.
+            try sema.ensureLayoutResolved(ty.index);
+            var field_vals: [@"struct".field_names.len]InternPool.Index = undefined;
+            inline for (&field_vals, @"struct".field_names, 0..) |*field_val, field_name, field_idx| {
+                field_val.* = (try uninterpret(@field(val, field_name), ty.fieldType(field_idx, ip), sema)).index;
+            }
+            return try sema.aggregateValue(ty, &field_vals);
         },
     };
 }
