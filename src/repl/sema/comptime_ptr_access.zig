@@ -246,7 +246,14 @@ fn loadComptimePtrInner(
     };
 
     const base_val: MutableValue = switch (ptr.base_addr) {
-        .nav => |nav| .{ .interned = ip.getNav(nav).resolved.?.value },
+        .nav => |nav_id| val: {
+            const nav = ip.getNav(nav_id);
+            if (!nav.resolved.?.@"const") return .runtime_load;
+            if (nav.resolved.?.is_extern_decl and Type.fromIndex(nav.resolved.?.type).zigTypeTag(ip) != .@"fn") {
+                return .runtime_load;
+            }
+            break :val .{ .interned = nav.resolved.?.value };
+        },
         .uav => |uav| .{ .interned = uav.val },
         .comptime_alloc => |alloc_index| sema.getComptimeAlloc(alloc_index).val,
         .comptime_field => |val| .{ .interned = val },
