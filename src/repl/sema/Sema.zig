@@ -43,6 +43,9 @@ fn_ret_ty: InternPool.Index = .none,
 operand_comptime: bool = true,
 session: ?*Session = null,
 current_zir_id: u32 = 0,
+/// The declaration currently being analyzed, the compiler's `sema.owner`. A function created
+/// while resolving a declaration records it as its owner nav.
+owner_nav: InternPool.Nav.Index.Optional = .none,
 block: *Block = undefined,
 
 pub const default_branch_quota: u32 = 1000;
@@ -8251,9 +8254,9 @@ fn fieldPtr(sema: *Sema, object_ptr: Value, name: InternPool.NullTerminatedStrin
 
     if (container_ty == .type_type) {
         const container = try sema.loadValue(base_ptr);
-        if (try sema.containerDeclByName(container.index, name)) |decl_val|
-            return try sema.materializeConstPtr(decl_val);
-        return sema.failBadMemberAccess(container.index, name);
+        const ns = sema.getNamespaceIndex(container.index) orelse return sema.failBadMemberAccess(container.index, name);
+        const nav = (try sema.namespaceLookup(ns, name)) orelse return sema.failBadMemberAccess(container.index, name);
+        return try sema.analyzeNavRef(nav);
     }
 
     switch (ip.indexToKey(container_ty)) {
@@ -8404,6 +8407,9 @@ fn analyzeNavVal(sema: *Sema, nav_idx: InternPool.Nav.Index) Error!Value {
         block.deinit(sema.gpa);
         sema.block = prev_block;
     }
+    const prev_owner_nav = sema.owner_nav;
+    sema.owner_nav = nav_idx.toOptional();
+    defer sema.owner_nav = prev_owner_nav;
     const old_inst_map = sema.inst_map;
     sema.inst_map = .empty;
     defer {
@@ -8457,6 +8463,60 @@ fn containerDeclByName(sema: *Sema, container_ty: InternPool.Index, name: Intern
     const ns = sema.getNamespaceIndex(container_ty) orelse return null;
     const nav = (try sema.namespaceLookup(ns, name)) orelse return null;
     return try sema.analyzeNavVal(nav);
+}
+
+/// A pointer to a declaration's storage. Its constness follows the declaration (a `var` yields a
+/// mutable pointer), unlike materializing an anonymous const value.
+fn analyzeNavRef(sema: *Sema, nav_index: InternPool.Nav.Index) Error!Value {
+    return sema.analyzeNavRefInner(nav_index, true);
+}
+
+/// Reference the `Nav` at the given index, ensuring it is resolved. `is_ref` is `true` when the
+/// pointer is used directly and `false` when it will be immediately loaded (a `decl_val`).
+///
+/// The following pieces have no analog in this comptime-only layer:
+///   - `ensureNavResolved(.type/.fully)`: there is no type-only nav resolution, so both kinds map to
+///     `analyzeNavVal` (full) and `is_ref` cannot reduce the work.
+///   - the `is_runtime` path (threadlocal / dll-import / pcrel extern) emits a runtime pointer (AIR).
+///   - `maybeQueueFuncBodyAnalysis`: there is no separate function-body analysis queue.
+fn analyzeNavRefInner(sema: *Sema, orig_nav_index: InternPool.Nav.Index, is_ref: bool) Error!Value {
+    const ip = sema.intern_pool;
+    _ = try sema.analyzeNavVal(orig_nav_index);
+
+    const nav_index = nav: {
+        const orig_nav = ip.getNav(orig_nav_index);
+        if (orig_nav.resolved.?.is_extern_decl or ip.zigTypeTag(orig_nav.resolved.?.type) == .@"fn") {
+            const orig_nav_value = switch (is_ref) {
+                false => orig_nav.resolved.?.value,
+                true => orig_val: {
+                    _ = try sema.analyzeNavVal(orig_nav_index);
+                    break :orig_val ip.getNav(orig_nav_index).resolved.?.value;
+                },
+            };
+            switch (ip.indexToKey(orig_nav_value)) {
+                .func => |f| if (f.owner_nav.unwrap()) |owner| break :nav owner,
+                .@"extern" => |e| break :nav e.owner_nav,
+                else => {},
+            }
+        }
+        break :nav orig_nav_index;
+    };
+
+    const nav_resolved = ip.getNav(nav_index).resolved.?;
+    const ptr_ty = try ip.internPtrType(.{
+        .child = nav_resolved.type,
+        .flags = .{
+            .size = .one,
+            .alignment = nav_resolved.@"align",
+            .is_const = nav_resolved.@"const",
+            .address_space = nav_resolved.@"addrspace",
+        },
+    });
+    return .{ .index = try ip.internPtr(.{
+        .ty = ptr_ty,
+        .base_addr = .{ .nav = nav_index },
+        .byte_offset = 0,
+    }) };
 }
 
 fn evalFieldPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
@@ -9831,7 +9891,7 @@ fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         const name = try ip.getOrPutString(sema.gpa, sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir), .no_embedded_nulls);
         var ns_opt: ?InternPool.NamespaceIndex = start_ns;
         while (ns_opt) |ns| {
-            if (try sema.lookupInNamespace(ns, name)) |lookup| return try sema.materializeConstPtr(try sema.analyzeNavVal(lookup.nav));
+            if (try sema.lookupInNamespace(ns, name)) |lookup| return try sema.analyzeNavRef(lookup.nav);
             ns_opt = ip.namespacePtr(ns).parent.unwrap();
         }
     };
@@ -9839,16 +9899,7 @@ fn evalDeclRef(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         const name = sema.zir.instructions.items(.data)[@intFromEnum(inst)].str_tok.get(sema.zir);
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "decl_ref '{s}': not found in scope", .{name});
     };
-    const ptr_ty = try ip.internPtrType(.{
-        .child = found.resolved.type,
-        .flags = .{ .size = .one, .is_const = found.resolved.@"const", .alignment = found.resolved.@"align" },
-    });
-    const ptr_idx = try ip.internPtr(.{
-        .ty = ptr_ty,
-        .base_addr = .{ .nav = found.nav },
-        .byte_offset = 0,
-    });
-    return .{ .index = ptr_idx };
+    return try sema.analyzeNavRef(found.nav);
 }
 
 const DeclLookup = struct {
@@ -9988,6 +10039,9 @@ fn bindValueDecl(
     defer sema.block.type_name_ctx = prev_ctx;
 
     const nav_idx = try sema.intern_pool.createNav(sema.gpa, name, fqn);
+    const prev_owner_nav = sema.owner_nav;
+    sema.owner_nav = nav_idx.toOptional();
+    defer sema.owner_nav = prev_owner_nav;
 
     // An extern decl has no value body; the linker supplies its value at runtime. Mint an extern
     // symbol from the declared type (see analyzeNavVal); otherwise evaluate the value body.
@@ -10972,6 +11026,7 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .uncoerced_ty = fn_ty,
         .zir_body_inst = inst,
         .parent = if (sema.block.namespace) |ns| sema.intern_pool.namespacePtr(ns).owner_type else .none,
+        .owner_nav = sema.owner_nav,
     });
     return Value{ .index = func_idx };
 }

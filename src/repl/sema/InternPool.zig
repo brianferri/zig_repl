@@ -302,7 +302,25 @@ pub const Nav = struct {
         value: InternPool.Index,
     };
 
-    pub const Index = enum(u32) { _ };
+    pub const Index = enum(u32) {
+        _,
+
+        pub fn toOptional(i: Nav.Index) Optional {
+            return @enumFromInt(@intFromEnum(i));
+        }
+
+        pub const Optional = enum(u32) {
+            none = std.math.maxInt(u32),
+            _,
+
+            pub fn unwrap(opt: Optional) ?Nav.Index {
+                return switch (opt) {
+                    .none => null,
+                    _ => @enumFromInt(@intFromEnum(opt)),
+                };
+            }
+        };
+    };
 };
 
 pub const NamespaceIndex = enum(u32) { _ };
@@ -839,6 +857,10 @@ pub const Key = union(enum) {
         parent: Index = .none,
         generic_owner: Index = .none,
         comptime_args: []const Index = &.{},
+        /// The `Nav` that owns this function. Ignored by hashing and equality (a function alias
+        /// shares the aliased function's value, hence its owner). `.none` for a function with no
+        /// owning declaration, e.g. a bare function literal evaluated at the session prompt.
+        owner_nav: Nav.Index.Optional = .none,
     };
 
     /// An external symbol whose value is supplied by the linker at runtime. The comptime
@@ -1542,6 +1564,7 @@ const FuncDeclRepr = struct {
     ty: Index,
     zir_body_inst: std.zig.Zir.Inst.Index,
     parent: Index,
+    owner_nav: Nav.Index.Optional,
 };
 
 const FuncInstanceRepr = struct {
@@ -1549,6 +1572,7 @@ const FuncInstanceRepr = struct {
     ty: Index,
     generic_owner: Index,
     comptime_args_len: u32,
+    owner_nav: Nav.Index.Optional,
 };
 
 const FuncCoercedRepr = struct {
@@ -3017,6 +3041,7 @@ fn addExtra(pool: *InternPool, item: anytype) Allocator.Error!u32 {
         pool.extra.appendAssumeCapacity(switch (field_type) {
             Index,
             Nav.Index,
+            Nav.Index.Optional,
             NamespaceIndex,
             OptionalNamespaceIndex,
             MapIndex,
@@ -3053,6 +3078,7 @@ fn extraDataTrail(pool: *const InternPool, comptime T: type, index: u32) struct 
         @field(result, field_name) = switch (field_type) {
             Index,
             Nav.Index,
+            Nav.Index.Optional,
             NamespaceIndex,
             OptionalNamespaceIndex,
             MapIndex,
@@ -4421,6 +4447,7 @@ fn emitFunc(pool: *InternPool, f: Key.Func) Allocator.Error!void {
             .ty = f.ty,
             .generic_owner = f.generic_owner,
             .comptime_args_len = @intCast(f.comptime_args.len),
+            .owner_nav = f.owner_nav,
         });
         try pool.extra.ensureUnusedCapacity(pool.gpa, @intCast(f.comptime_args.len));
         for (f.comptime_args) |arg| pool.extra.appendAssumeCapacity(@intFromEnum(arg));
@@ -4434,6 +4461,7 @@ fn emitFunc(pool: *InternPool, f: Key.Func) Allocator.Error!void {
             .uncoerced_ty = f.uncoerced_ty,
             .zir_body_inst = f.zir_body_inst,
             .parent = f.parent,
+            .owner_nav = f.owner_nav,
         });
         const coerced_extra = try pool.addExtra(FuncCoercedRepr{ .ty = f.ty, .inner_func = inner });
         pool.items.appendAssumeCapacity(.{ .tag = .func_coerced, .data = coerced_extra });
@@ -4444,6 +4472,7 @@ fn emitFunc(pool: *InternPool, f: Key.Func) Allocator.Error!void {
         .ty = f.ty,
         .zir_body_inst = f.zir_body_inst,
         .parent = f.parent,
+        .owner_nav = f.owner_nav,
     });
     pool.items.appendAssumeCapacity(.{ .tag = .func_decl, .data = extra_index });
 }
@@ -4493,6 +4522,7 @@ fn funcDeclFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .uncoerced_ty = r.ty,
         .zir_body_inst = r.zir_body_inst,
         .parent = r.parent,
+        .owner_nav = r.owner_nav,
     } };
 }
 
@@ -4511,6 +4541,7 @@ fn funcInstanceFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .zir_body_inst = owner_key.zir_body_inst,
         .generic_owner = r.generic_owner,
         .comptime_args = comptime_args,
+        .owner_nav = r.owner_nav,
     } };
 }
 
@@ -4529,6 +4560,7 @@ fn funcCoercedFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .parent = inner_key.parent,
         .generic_owner = inner_key.generic_owner,
         .comptime_args = inner_key.comptime_args,
+        .owner_nav = inner_key.owner_nav,
     } };
 }
 
