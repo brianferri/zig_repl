@@ -614,6 +614,11 @@ pub const Key = union(enum) {
         flags: Flags = .{},
         packed_offset: PackedOffset = .{ .host_size = 0, .bit_offset = 0 },
 
+        pub const VectorIndex = enum(u16) {
+            none = std.math.maxInt(u16),
+            _,
+        };
+
         pub const Flags = packed struct(u32) {
             size: Size = .one,
             alignment: Alignment = .none,
@@ -621,7 +626,7 @@ pub const Key = union(enum) {
             is_volatile: bool = false,
             is_allowzero: bool = false,
             address_space: AddressSpace = .generic,
-            _reserved: u16 = 0,
+            vector_index: VectorIndex = .none,
         };
 
         pub const PackedOffset = packed struct(u32) {

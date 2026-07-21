@@ -22,19 +22,35 @@ pub fn loadComptimePtr(sema: *Sema, ptr: Value) !ComptimeLoadResult {
     }
 
     assert(elem_ty.hasBitRepresentation(ip));
-    if (ptr_info.packed_offset.bit_offset + elem_ty.bitSize(ip) > host_size * 8) {
+    if (ptr_info.flags.vector_index == .none) {
+        if (ptr_info.packed_offset.bit_offset + elem_ty.bitSize(ip) > host_size * 8) {
+            return .exceeds_host_size;
+        }
+        const load_ty: Type = .fromIndex(try ip.internIntType(.unsigned, @intCast(host_size * 8)));
+        const backing_int_mv = switch (try loadComptimePtrInner(sema, ptr, load_ty, 0)) {
+            else => |result| return result,
+            .success => |mv| mv,
+        };
+        const backing_int_val = try backing_int_mv.intern(ip, sema.arena);
+        const buf = try sema.arena.alloc(u8, host_size);
+        @memset(buf, 0);
+        backing_int_val.writeToPackedMemory(ip, buf, 0);
+        const result_val: Value = try .readFromPackedMemory(elem_ty, ip, buf, ptr_info.packed_offset.bit_offset);
+        return .{ .success = .{ .interned = result_val.index } };
+    }
+    if (@intFromEnum(ptr_info.flags.vector_index) >= host_size) {
         return .exceeds_host_size;
     }
-    const load_ty: Type = .fromIndex(try ip.internIntType(.unsigned, @intCast(host_size * 8)));
-    const backing_int_mv = switch (try loadComptimePtrInner(sema, ptr, load_ty, 0)) {
+    const load_ty: Type = .fromIndex(try ip.internVectorType(.{
+        .len = host_size,
+        .child = elem_ty.index,
+    }));
+    const vector_mv = switch (try loadComptimePtrInner(sema, ptr, load_ty, 0)) {
         else => |result| return result,
         .success => |mv| mv,
     };
-    const backing_int_val = try backing_int_mv.intern(ip, sema.arena);
-    const buf = try sema.arena.alloc(u8, host_size);
-    @memset(buf, 0);
-    backing_int_val.writeToPackedMemory(ip, buf, 0);
-    const result_val: Value = try .readFromPackedMemory(elem_ty, ip, buf, ptr_info.packed_offset.bit_offset);
+    const vector_val = try vector_mv.intern(ip, sema.arena);
+    const result_val = try vector_val.elemValue(ip, @intFromEnum(ptr_info.flags.vector_index));
     return .{ .success = .{ .interned = result_val.index } };
 }
 
@@ -70,22 +86,46 @@ pub fn storeComptimePtr(
     }
 
     assert(elem_ty.hasBitRepresentation(ip));
-    if (ptr_info.packed_offset.bit_offset + elem_ty.bitSize(ip) > host_size * 8) {
+    if (ptr_info.flags.vector_index == .none) {
+        if (ptr_info.packed_offset.bit_offset + elem_ty.bitSize(ip) > host_size * 8) {
+            return .exceeds_host_size;
+        }
+        const backing_ty: Type = .fromIndex(try ip.internIntType(.unsigned, @intCast(host_size * 8)));
+        const backing_int_mv = switch (try loadComptimePtrInner(sema, ptr, backing_ty, 0)) {
+            .success => |mv| mv,
+            .runtime_load => return .runtime_store,
+            inline else => |payload, tag| return @unionInit(ComptimeStoreResult, @tagName(tag), payload),
+        };
+        const old_backing_int_val = try backing_int_mv.intern(ip, sema.arena);
+        const buf = try sema.arena.alloc(u8, host_size);
+        @memset(buf, 0);
+        old_backing_int_val.writeToPackedMemory(ip, buf, 0);
+        store_val.writeToPackedMemory(ip, buf, ptr_info.packed_offset.bit_offset);
+        const new_backing_int_val: Value = try .readFromPackedMemory(backing_ty, ip, buf, 0);
+        return storeComptimePtrInner(sema, ptr, new_backing_int_val);
+    }
+
+    if (@intFromEnum(ptr_info.flags.vector_index) >= host_size) {
         return .exceeds_host_size;
     }
-    const backing_ty: Type = .fromIndex(try ip.internIntType(.unsigned, @intCast(host_size * 8)));
-    const backing_int_mv = switch (try loadComptimePtrInner(sema, ptr, backing_ty, 0)) {
+    const vec_ty: Type = .fromIndex(try ip.internVectorType(.{
+        .len = host_size,
+        .child = elem_ty.index,
+    }));
+    const vector_mv = switch (try loadComptimePtrInner(sema, ptr, vec_ty, 0)) {
         .success => |mv| mv,
         .runtime_load => return .runtime_store,
         inline else => |payload, tag| return @unionInit(ComptimeStoreResult, @tagName(tag), payload),
     };
-    const old_backing_int_val = try backing_int_mv.intern(ip, sema.arena);
-    const buf = try sema.arena.alloc(u8, host_size);
-    @memset(buf, 0);
-    old_backing_int_val.writeToPackedMemory(ip, buf, 0);
-    store_val.writeToPackedMemory(ip, buf, ptr_info.packed_offset.bit_offset);
-    const new_backing_int_val: Value = try .readFromPackedMemory(backing_ty, ip, buf, 0);
-    return storeComptimePtrInner(sema, ptr, new_backing_int_val);
+    const old_vector_val = try vector_mv.intern(ip, sema.arena);
+    const elems_buf = try sema.arena.alloc(InternPool.Index, host_size);
+    for (elems_buf, 0..) |*elem, elem_index| {
+        const elem_val = try old_vector_val.elemValue(ip, elem_index);
+        elem.* = elem_val.index;
+    }
+    elems_buf[@intFromEnum(ptr_info.flags.vector_index)] = store_val.index;
+    const new_vector_val = try sema.aggregateValue(vec_ty, elems_buf);
+    return storeComptimePtrInner(sema, ptr, new_vector_val);
 }
 
 /// Like `storeComptimePtr`, except ignores the type of `ptr`, instead treating it as a single-item
@@ -548,17 +588,27 @@ fn prepareComptimePtrStore(
         .arr_elem => |base_index| base_val: {
             const base_ptr: Value = .fromIndex(base_index.base);
             const base_ty = base_ptr.typeOf(ip).childType(ip);
-            const arr_val, const alloc = switch (try prepareComptimePtrStore(sema, base_ptr, base_ty, 0)) {
-                .direct => |direct| .{ direct.val, direct.alloc },
-                .index => |index| .{
-                    try index.val.elem(ip, sema.arena, @intCast(index.elem_index)),
-                    index.alloc,
-                },
-                .flat_index => unreachable,
-                .reinterpret => unreachable,
+
+            // We have a comptime-only array. This case is a little nasty.
+            // To avoid messing with too much data, we want to figure out how many elements we need to store.
+            // If `store_ty` and the array share a base type, we'll store the correct number of elements.
+            // Otherwise, we'll be reinterpreting (which we can't do, since it's comptime-only); just
+            // load a single element and let the logic below emit its error.
+
+            const store_one_ty, const store_count = store_ty.arrayBase(ip);
+            const count = if (store_one_ty.index == base_ty.index) store_count else 1;
+
+            const want_ty = try ip.internArrayType(.{
+                .len = count,
+                .child = base_ty.index,
+            });
+
+            const result = try prepareComptimePtrStore(sema, base_ptr, .fromIndex(want_ty), base_index.index);
+            switch (result) {
+                .direct, .index, .flat_index => break :base_val result,
+                .reinterpret => unreachable, // comptime-only array so ill-defined layout
                 else => |err| return err,
-            };
-            break :base_val .{ .index = .{ .alloc = alloc, .val = arr_val, .elem_index = base_index.index } };
+            }
         },
         .field => |base_index| strat: {
             const base_ptr: Value = .fromIndex(base_index.base);
