@@ -5610,7 +5610,7 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
             if (layout == .@"packed") {
                 return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "packed struct fields cannot be aligned", .{});
             }
-            aligns[i] = .fromByteUnits(Value.fromIndex(align_opt).toUnsignedInt(ip));
+            aligns[i] = try sema.alignmentFromValue(.{ .index = align_opt }, "struct field alignment");
             any_aligns = true;
         }
 
@@ -5647,7 +5647,7 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
         if (ip.addFieldName(names, fields.field_name_map, field_name)) |prev_field_index| {
             return sema.failWithOwnedErrorMsg(sema.block, msg: {
                 const src = sema.block.builtinCallArgSrc(sema.srcNodeOffset(inst), 2);
-                const msg = try sema.errMsg(src, "duplicate struct field '{f}' at index '{d}", .{ field_name.fmt(ip), field_index });
+                const msg = try sema.errMsg(src, "duplicate struct field '{f}' at index '{d}'", .{ field_name.fmt(ip), field_index });
                 errdefer msg.destroy(sema.gpa);
                 try sema.errNote(src, msg, "previous field at index '{d}'", .{prev_field_index});
                 break :msg msg;
@@ -5730,7 +5730,7 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
             if (layout == .@"packed") {
                 return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "packed union fields cannot be aligned", .{});
             }
-            aligns[i] = .fromByteUnits(Value.fromIndex(align_opt).toUnsignedInt(ip));
+            aligns[i] = try sema.alignmentFromValue(.{ .index = align_opt }, "union field alignment");
             any_aligns = true;
         }
         std.hash.autoHash(&hasher, name_out.*);
@@ -5770,7 +5770,7 @@ fn evalReifyUnion(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.I
         if (ip.addFieldName(names, fields.field_name_map, field_name)) |prev_field_index| {
             return sema.failWithOwnedErrorMsg(sema.block, msg: {
                 const src = sema.block.builtinCallArgSrc(sema.srcNodeOffset(inst), 2);
-                const msg = try sema.errMsg(src, "duplicate union field '{f}' at index '{d}", .{ field_name.fmt(ip), field_index });
+                const msg = try sema.errMsg(src, "duplicate union field '{f}' at index '{d}'", .{ field_name.fmt(ip), field_index });
                 errdefer msg.destroy(sema.gpa);
                 try sema.errNote(src, msg, "previous field at index '{d}'", .{prev_field_index});
                 break :msg msg;
