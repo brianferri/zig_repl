@@ -339,6 +339,91 @@ pub fn classify(start_ty: Type, pool: *const InternPool) InternPool.TypeClass {
     };
 }
 
+pub fn hasWellDefinedLayout(ty: Type, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(ty.index)) {
+        .int_type => true,
+
+        .vector_type,
+        .error_union_type,
+        .error_set_type,
+        .tuple_type,
+        .opaque_type,
+        .anyframe_type,
+        // These are function bodies, not function pointers.
+        .func_type,
+        => false,
+
+        .array_type => |array_type| Type.fromIndex(array_type.child).hasWellDefinedLayout(pool),
+        .opt_type => ty.isPtrLikeOptional(pool),
+        .ptr_type => |ptr_type| ptr_type.flags.size != .slice,
+
+        .simple_type => |t| switch (t) {
+            .f16,
+            .f32,
+            .f64,
+            .f80,
+            .f128,
+            .usize,
+            .isize,
+            .c_char,
+            .c_short,
+            .c_ushort,
+            .c_int,
+            .c_uint,
+            .c_long,
+            .c_ulong,
+            .c_longlong,
+            .c_ulonglong,
+            .c_longdouble,
+            .bool,
+            .void,
+            => true,
+
+            .anyerror,
+            .adhoc_inferred_error_set,
+            .anyopaque,
+            .type,
+            .comptime_int,
+            .comptime_float,
+            .noreturn,
+            .null,
+            .undefined,
+            .enum_literal,
+            .generic_poison,
+            => false,
+        },
+        .struct_type => switch (pool.loadStructType(ty.index).layout) {
+            .auto => false,
+            .@"extern", .@"packed" => true,
+        },
+        .union_type => switch (pool.unionFields(ty.index).layout) {
+            .auto => false,
+            .@"extern", .@"packed" => true,
+        },
+        .enum_type => switch (pool.loadEnumType(ty.index).int_tag_mode) {
+            .explicit => true,
+            .auto => false,
+        },
+
+        .simple_value,
+        .enum_literal,
+        .int,
+        .float,
+        .undef,
+        .ptr,
+        .slice,
+        .err,
+        .error_union,
+        .func,
+        .opt,
+        .aggregate,
+        .enum_tag,
+        .un,
+        .bitpack,
+        => unreachable,
+    };
+}
+
 fn classifyTuple(types: []const InternPool.Index, values: []const InternPool.Index, pool: *const InternPool) InternPool.TypeClass {
     var has_runtime_state = false;
     var has_comptime_state = false;
@@ -555,6 +640,64 @@ pub fn explicitFieldAlignment(ty: Type, index: usize, pool: *const InternPool) I
     };
 }
 
+pub fn elemPtrType(ptr_ty: Type, index: ?u64, pool: *InternPool) std.mem.Allocator.Error!Type {
+    const ptr_info = pool.indexToKey(ptr_ty.index).ptr_type;
+    const elem_ty: Type = switch (ptr_info.flags.size) {
+        .slice, .many, .c => .fromIndex(ptr_info.child),
+        .one => switch (pool.indexToKey(ptr_info.child)) {
+            .array_type => |array_type| .fromIndex(array_type.child),
+            else => unreachable,
+        },
+    };
+    const elem_align: InternPool.Alignment = switch (elem_ty.classify(pool)) {
+        .no_possible_value,
+        .one_possible_value,
+        => ptr_info.flags.alignment,
+
+        .partially_comptime,
+        .fully_comptime,
+        => switch (ptr_info.flags.alignment) {
+            .none => .none,
+            else => |array_align| array_align.minStrict(elem_ty.abiAlignment(pool)),
+        },
+
+        .runtime => switch (ptr_info.flags.alignment) {
+            .none => .none,
+            else => |array_align| elem_align: {
+                // If the index is runtime-known, use 1 as it gives the minimum possible alignment.
+                const effective_index = index orelse 1;
+                if (effective_index == 0) break :elem_align array_align;
+                const byte_offset = effective_index * elem_ty.abiSize(pool);
+                break :elem_align array_align.minStrict(.fromLog2Units(@ctz(byte_offset)));
+            },
+        },
+    };
+    return .fromIndex(try pool.internPtrType(.{
+        .child = elem_ty.index,
+        .flags = .{
+            .size = .one,
+            .is_const = ptr_info.flags.is_const,
+            .is_volatile = ptr_info.flags.is_volatile,
+            .is_allowzero = ptr_info.flags.is_allowzero and (index == null or index == 0),
+            .address_space = ptr_info.flags.address_space,
+            .alignment = elem_align,
+        },
+    }));
+}
+
+pub fn structPackedFieldBitOffset(struct_type: InternPool.LoadedStructType, field_index: u32, pool: *const InternPool) u16 {
+    assert(struct_type.layout == .@"packed");
+    var bit_sum: u64 = 0;
+    for (0..struct_type.field_types.len) |i| {
+        if (i == field_index) {
+            return @intCast(bit_sum);
+        }
+        const field_ty: Type = .fromIndex(struct_type.field_types[i]);
+        bit_sum += field_ty.bitSize(pool);
+    }
+    unreachable; // index out of bounds
+}
+
 pub fn fieldPtrType(ptr_ty: Type, field_index: u32, pool: *InternPool) std.mem.Allocator.Error!Type {
     const ptr_info = pool.indexToKey(ptr_ty.index).ptr_type;
     assert(ptr_info.flags.size == .one or ptr_info.flags.size == .c);
@@ -597,10 +740,19 @@ pub fn fieldPtrType(ptr_ty: Type, field_index: u32, pool: *InternPool) std.mem.A
                 field_ptr_info.flags.alignment = field_ptr_align;
                 return .fromIndex(try pool.internPtrType(field_ptr_info));
             },
-            // A packed field pointer needs the bit-offset info (`packed_offset`) the REPL's pointer flags omit;
-            // the REPL instead reads packed fields through the backing integer, so this is a plain pointer.
             .@"packed" => {
                 var field_ptr_info = ptr_info;
+                if (field_ptr_info.flags.alignment == .none) {
+                    field_ptr_info.flags.alignment = aggregate_ty.abiAlignment(pool);
+                }
+                const bit_offset = structPackedFieldBitOffset(pool.loadStructType(aggregate_ty.index), field_index, pool);
+                field_ptr_info.packed_offset = if (ptr_info.packed_offset.host_size != 0) .{
+                    .host_size = ptr_info.packed_offset.host_size,
+                    .bit_offset = ptr_info.packed_offset.bit_offset + bit_offset,
+                } else .{
+                    .host_size = @intCast((aggregate_ty.bitSize(pool) + 7) / 8),
+                    .bit_offset = ptr_info.packed_offset.bit_offset + bit_offset,
+                };
                 field_ptr_info.child = aggregate_ty.fieldType(field_index, pool).index;
                 return .fromIndex(try pool.internPtrType(field_ptr_info));
             },
@@ -1245,6 +1397,14 @@ pub fn isPtrLikeOptional(ty: Type, pool: *const InternPool) bool {
 
 pub fn ptrAllowsZero(ty: Type, pool: *const InternPool) bool {
     return ty.isPtrLikeOptional(pool) or ty.ptrInfo(pool).flags.is_allowzero;
+}
+
+pub fn isAllowzeroPtr(ty: Type, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(ty.index)) {
+        .ptr_type => |ptr_type| ptr_type.flags.is_allowzero,
+        .opt_type => true,
+        else => false,
+    };
 }
 
 pub fn optionalChild(ty: Type, pool: *const InternPool) Type {

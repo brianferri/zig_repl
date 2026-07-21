@@ -3390,6 +3390,14 @@ pub const LoadedStructType = struct {
     };
 };
 
+pub fn typeToStruct(pool: *const InternPool, ty: Index) ?LoadedStructType {
+    if (ty == .none) return null;
+    return switch (pool.indexToKey(ty)) {
+        .struct_type => pool.loadStructType(ty),
+        else => null,
+    };
+}
+
 pub fn loadStructType(pool: *const InternPool, struct_ty: Index) LoadedStructType {
     const item = pool.items.get(@intFromEnum(struct_ty));
     assert(item.tag == .type_struct);
@@ -4431,6 +4439,27 @@ pub fn slicePtrType(pool: *InternPool, index: Index) Allocator.Error!Index {
 
 pub fn getCoercedInts(pool: *InternPool, int: Key.Int, new_ty: Index) Allocator.Error!Index {
     return pool.get(.{ .int = .{ .ty = new_ty, .storage = int.storage } });
+}
+
+/// The base-address tag reached by following a pointer value through its bases, or null if `val`
+/// is not a pointer. Ported from the compiler's `getBackingAddrTag`.
+pub fn getBackingAddrTag(pool: *const InternPool, val: Index) ?@typeInfo(Key.Ptr.BaseAddr).@"union".tag_type.? {
+    var base = val;
+    while (true) {
+        switch (pool.indexToKey(base)) {
+            .ptr => |ptr| switch (ptr.base_addr) {
+                .nav => return .nav,
+                .comptime_alloc => return .comptime_alloc,
+                .uav => return .uav,
+                .comptime_field => return .comptime_field,
+                .int => return .int,
+                .eu_payload, .opt_payload => |b| base = b,
+                .field, .arr_elem => |f| base = f.base,
+            },
+            .slice => |s| base = s.ptr,
+            else => return null,
+        }
+    }
 }
 
 pub fn getCoerced(pool: *InternPool, val: Index, new_ty: Index) Allocator.Error!Index {

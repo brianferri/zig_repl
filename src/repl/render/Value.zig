@@ -233,20 +233,28 @@ fn renderBytes(pool: *InternPool, writer: *std.Io.Writer, agg: InternPool.Key.Ag
 /// renderer can follow: a `.uav` or `.nav` (the whole value) or an `.arr_elem` into one (the
 /// `arr[0..]`/`arr[a..b]` shape). Null for `comptime_alloc`/`field` bases, whose storage lives in
 /// Sema out of the renderer's reach.
-fn ptrBacking(pool: *const InternPool, ptr_index: InternPool.Index) ?struct { array: InternPool.Index, start: u64 } {
+const PtrBacking = struct { array: InternPool.Index, start: u64 };
+fn ptrBacking(pool: *const InternPool, ptr_index: InternPool.Index) ?PtrBacking {
     if (pool.indexToKey(ptr_index) != .ptr) return null;
-    switch (pool.indexToKey(ptr_index).ptr.base_addr) {
-        .uav => |u| return .{ .array = u.val, .start = 0 },
-        .nav => |nav| {
+    const p = pool.indexToKey(ptr_index).ptr;
+    const inner: PtrBacking = switch (p.base_addr) {
+        .uav => |u| .{ .array = u.val, .start = 0 },
+        .nav => |nav| blk: {
             const r = pool.getNav(nav).resolved orelse return null;
-            return .{ .array = r.value, .start = 0 };
+            break :blk .{ .array = r.value, .start = 0 };
         },
-        .arr_elem => |ae| {
+        .arr_elem => |ae| blk: {
             const base = ptrBacking(pool, ae.base) orelse return null;
-            return .{ .array = base.array, .start = base.start + ae.index };
+            break :blk .{ .array = base.array, .start = base.start + ae.index };
         },
         else => return null,
-    }
+    };
+    if (p.byte_offset == 0) return inner;
+    if (pool.indexToKey(inner.array) != .aggregate) return null;
+    const elem_ty = pool.childType(pool.indexToKey(inner.array).aggregate.ty);
+    const elem_size = Type.fromIndex(elem_ty).abiSize(pool);
+    if (elem_size == 0) return null;
+    return .{ .array = inner.array, .start = inner.start + p.byte_offset / elem_size };
 }
 
 /// Render the `len` elements a pointer indexes -- for both a slice's `ptr` and a single-item

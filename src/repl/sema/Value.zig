@@ -19,6 +19,9 @@ pub fn toIndex(val: Value) InternPool.Index {
     return val.index;
 }
 
+pub const slice_ptr_index = 0;
+pub const slice_len_index = 1;
+
 pub fn getOffsetPtr(ptr_val: Value, byte_off: u64, new_ty: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
     if (ptr_val.isUndef(pool)) return ptr_val;
     var ptr = pool.indexToKey(ptr_val.index).ptr;
@@ -27,7 +30,128 @@ pub fn getOffsetPtr(ptr_val: Value, byte_off: u64, new_ty: Type, pool: *InternPo
     return .fromIndex(try pool.internPtr(ptr));
 }
 
-fn canonicalizeBasePtr(base_ptr: Value, want_size: InternPool.Key.PtrType.Size, want_child: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+pub fn doPointersOverlap(ptr_val_a: Value, ptr_val_b: Value, elem_count: u64, pool: *const InternPool) bool {
+    const ip = pool;
+
+    const a_elem_ty = ptr_val_a.typeOf(pool).indexableElem(pool);
+    const b_elem_ty = ptr_val_b.typeOf(pool).indexableElem(pool);
+
+    const a_ptr = ip.indexToKey(ptr_val_a.index).ptr;
+    const b_ptr = ip.indexToKey(ptr_val_b.index).ptr;
+
+    // If `a_elem_ty` is not comptime-only, then overlapping pointers have identical
+    // `base_addr`, and we just need to look at the byte offset. If it *is* comptime-only,
+    // then `base_addr` may be an `arr_elem`, and we'll have to consider the element index.
+    if (a_elem_ty.comptimeOnly(pool)) {
+        assert(a_elem_ty.index == b_elem_ty.index); // IMC comptime-only types are equivalent
+
+        const a_base_addr: InternPool.Key.Ptr.BaseAddr, const a_idx: u64 = switch (a_ptr.base_addr) {
+            else => .{ a_ptr.base_addr, 0 },
+            .arr_elem => |arr_elem| a: {
+                const base_ptr: Value = .fromIndex(arr_elem.base);
+                const base_child_ty = base_ptr.typeOf(pool).childType(pool);
+                if (base_child_ty.index == a_elem_ty.index) {
+                    // This `arr_elem` is indexing into the element type we want.
+                    const base_ptr_info = ip.indexToKey(base_ptr.index).ptr;
+                    if (base_ptr_info.byte_offset != 0) {
+                        return false; // this pointer is invalid, just let the access fail
+                    }
+                    break :a .{ base_ptr_info.base_addr, arr_elem.index };
+                }
+                break :a .{ a_ptr.base_addr, 0 };
+            },
+        };
+        const b_base_addr: InternPool.Key.Ptr.BaseAddr, const b_idx: u64 = switch (a_ptr.base_addr) {
+            else => .{ b_ptr.base_addr, 0 },
+            .arr_elem => |arr_elem| b: {
+                const base_ptr: Value = .fromIndex(arr_elem.base);
+                const base_child_ty = base_ptr.typeOf(pool).childType(pool);
+                if (base_child_ty.index == b_elem_ty.index) {
+                    // This `arr_elem` is indexing into the element type we want.
+                    const base_ptr_info = ip.indexToKey(base_ptr.index).ptr;
+                    if (base_ptr_info.byte_offset != 0) {
+                        return false; // this pointer is invalid, just let the access fail
+                    }
+                    break :b .{ base_ptr_info.base_addr, arr_elem.index };
+                }
+                break :b .{ b_ptr.base_addr, 0 };
+            },
+        };
+        if (!std.meta.eql(a_base_addr, b_base_addr)) return false;
+        const diff = if (a_idx >= b_idx) a_idx - b_idx else b_idx - a_idx;
+        return diff < elem_count;
+    } else {
+        assert(a_elem_ty.abiSize(pool) == b_elem_ty.abiSize(pool));
+
+        if (!std.meta.eql(a_ptr.base_addr, b_ptr.base_addr)) return false;
+
+        const bytes_diff = if (a_ptr.byte_offset >= b_ptr.byte_offset)
+            a_ptr.byte_offset - b_ptr.byte_offset
+        else
+            b_ptr.byte_offset - a_ptr.byte_offset;
+
+        const need_bytes_diff = elem_count * a_elem_ty.abiSize(pool);
+        return bytes_diff < need_bytes_diff;
+    }
+}
+
+pub fn slicePtr(val: Value, pool: *const InternPool) Value {
+    return .fromIndex(pool.indexToKey(val.index).slice.ptr);
+}
+
+pub fn ptrElem(orig_parent_ptr: Value, field_idx: u64, pool: *InternPool) std.mem.Allocator.Error!Value {
+    const parent_ptr = switch (orig_parent_ptr.typeOf(pool).ptrInfo(pool).flags.size) {
+        .one, .many, .c => orig_parent_ptr,
+        .slice => orig_parent_ptr.slicePtr(pool),
+    };
+
+    const parent_ptr_ty = parent_ptr.typeOf(pool);
+    const result_ty = try parent_ptr_ty.elemPtrType(field_idx, pool);
+    const elem_ty = result_ty.childType(pool);
+
+    if (parent_ptr.isUndef(pool)) return .fromIndex(try pool.get(.{ .undef = result_ty.index }));
+
+    if (!elem_ty.comptimeOnly(pool)) {
+        const byte_offset = field_idx * elem_ty.abiSize(pool);
+        return parent_ptr.getOffsetPtr(byte_offset, result_ty, pool);
+    }
+
+    // Comptime-only element type.
+
+    if (field_idx == 0) {
+        return .fromIndex(try pool.getCoerced(parent_ptr.index, result_ty.index));
+    }
+
+    const arr_base_ty, const arr_base_len = elem_ty.arrayBase(pool);
+    const base_idx = arr_base_len * field_idx;
+    const parent_info = pool.indexToKey(parent_ptr.index).ptr;
+    switch (parent_info.base_addr) {
+        .arr_elem => |arr_elem| {
+            if (Value.fromIndex(arr_elem.base).typeOf(pool).childType(pool).index == arr_base_ty.index) {
+                // We already have a pointer to an element of an array of this type.
+                // Just modify the index.
+                return .fromIndex(try pool.internPtr(ptr: {
+                    var new = parent_info;
+                    new.base_addr.arr_elem.index += base_idx;
+                    new.ty = result_ty.index;
+                    break :ptr new;
+                }));
+            }
+        },
+        else => {},
+    }
+    const base_ptr = try parent_ptr.canonicalizeBasePtr(.many, arr_base_ty, pool);
+    return .fromIndex(try pool.internPtr(.{
+        .ty = result_ty.index,
+        .base_addr = .{ .arr_elem = .{
+            .base = base_ptr.index,
+            .index = base_idx,
+        } },
+        .byte_offset = 0,
+    }));
+}
+
+pub fn canonicalizeBasePtr(base_ptr: Value, want_size: InternPool.Key.PtrType.Size, want_child: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
     const ptr_info = base_ptr.typeOf(pool).ptrInfo(pool);
     if (ptr_info.flags.size == want_size and
         ptr_info.child == want_child.index and
@@ -66,14 +190,16 @@ pub fn ptrField(parent_ptr: Value, field_idx: u32, pool: *InternPool) std.mem.Al
 
     switch (aggregate_ty.zigTypeTag(pool)) {
         .pointer => assert(aggregate_ty.isSlice(pool)),
-        // A packed field has no `packed_offset` in the REPL's pointer flags; it is read through a `.field`
-        // pointer over the backing integer (the bitpack load/store path), so it uses the `.auto` form below.
+        // A packed field pointer is a bit pointer: the same address re-typed to the field's
+        // host-size/bit-offset pointer type (mirrors the compiler's `Value.ptrField`).
         .@"struct" => switch (aggregate_ty.containerLayout(pool)) {
-            .auto, .@"packed" => {},
+            .auto => {},
+            .@"packed" => return .fromIndex(try pool.getCoerced(parent_ptr.index, field_ptr_ty.index)),
             .@"extern" => return parent_ptr.getOffsetPtr(aggregate_ty.structFieldOffset(pool, field_idx), field_ptr_ty, pool),
         },
         .@"union" => switch (aggregate_ty.containerLayout(pool)) {
-            .auto, .@"packed" => {},
+            .auto => {},
+            .@"packed" => return .fromIndex(try pool.getCoerced(parent_ptr.index, field_ptr_ty.index)),
             .@"extern" => return parent_ptr.getOffsetPtr(0, field_ptr_ty, pool),
         },
         else => unreachable,
@@ -88,6 +214,182 @@ pub fn ptrField(parent_ptr: Value, field_idx: u32, pool: *InternPool) std.mem.Al
         .base_addr = .{ .field = .{ .base = base_ptr.index, .index = field_idx } },
         .byte_offset = 0,
     }));
+}
+
+pub fn unionPayload(val: Value, pool: *const InternPool) Value {
+    return switch (pool.indexToKey(val.index)) {
+        .un => |un| .fromIndex(un.val),
+        else => unreachable,
+    };
+}
+
+pub fn optionalValue(val: Value, pool: *const InternPool) ?Value {
+    return switch (pool.indexToKey(val.index)) {
+        .opt => |opt| switch (opt.val) {
+            .none => null,
+            else => |payload| .fromIndex(payload),
+        },
+        .ptr => val,
+        else => unreachable,
+    };
+}
+
+/// Byte-oriented (ABI-layout) serialization of a value to memory. Ported from the compiler's
+/// `Value.writeToMemory`; the REPL evaluates for the native target, so endianness comes from `builtin`.
+pub fn writeToMemory(val: Value, pool: *const InternPool, buffer: []u8) error{
+    ReinterpretDeclRef,
+    IllDefinedMemoryLayout,
+    OutOfMemory,
+}!void {
+    const endian = builtin.target.cpu.arch.endian();
+    const ty = val.typeOf(pool);
+    if (val.isUndef(pool)) {
+        const size: usize = @intCast(ty.abiSize(pool));
+        @memset(buffer[0..size], 0xAA);
+        return;
+    }
+    tag: switch (ty.zigTypeTag(pool)) {
+        .type,
+        .comptime_float,
+        .comptime_int,
+        .undefined,
+        .null,
+        .error_union,
+        .enum_literal,
+        .@"fn",
+        .spirv,
+        => return error.IllDefinedMemoryLayout,
+        .@"opaque", .frame, .@"anyframe", .noreturn => unreachable,
+        .void => {},
+        .bool => {
+            buffer[0] = @intFromBool(val.toBool());
+        },
+        .pointer => {
+            if (ty.isSlice(pool)) return error.IllDefinedMemoryLayout;
+            if (pool.getBackingAddrTag(val.index).? != .int) return error.ReinterpretDeclRef;
+            continue :tag .int;
+        },
+        .int, .@"enum", .error_set => {
+            var bigint_buffer: InternPool.Key.Int.Storage.BigIntSpace = undefined;
+            const bigint = val.toBigInt(&bigint_buffer, pool);
+            bigint.writeTwosComplement(buffer[0..@intCast(ty.abiSize(pool))], endian);
+        },
+        .float => {
+            const float_bits = ty.floatBits();
+            switch (float_bits) {
+                16 => std.mem.writeInt(u16, buffer[0..2], @bitCast(val.toFloat(f16, pool)), endian),
+                32 => std.mem.writeInt(u32, buffer[0..4], @bitCast(val.toFloat(f32, pool)), endian),
+                64 => std.mem.writeInt(u64, buffer[0..8], @bitCast(val.toFloat(f64, pool)), endian),
+                80 => std.mem.writeInt(u80, buffer[0..10], @bitCast(val.toFloat(f80, pool)), endian),
+                128 => std.mem.writeInt(u128, buffer[0..16], @bitCast(val.toFloat(f128, pool)), endian),
+                else => unreachable,
+            }
+            const float_bytes = @divExact(float_bits, 8);
+            const total_bytes: usize = @intCast(ty.abiSize(pool));
+            @memset(buffer[float_bytes..total_bytes], 0); // padding
+        },
+        .array => {
+            const aggregate = pool.indexToKey(val.index).aggregate;
+            const len = ty.arrayLen(pool);
+            const elem_ty = ty.childType(pool);
+            const elem_size: usize = @intCast(elem_ty.abiSize(pool));
+            var elem_i: usize = 0;
+            var buf_off: usize = 0;
+            while (elem_i < len) : (elem_i += 1) {
+                switch (aggregate.storage) {
+                    .bytes => |bytes| buffer[buf_off] = bytes.at(elem_i, pool),
+                    .elems => |elems| try Value.fromIndex(elems[elem_i]).writeToMemory(pool, buffer[buf_off..]),
+                    .repeated_elem => |elem| try Value.fromIndex(elem).writeToMemory(pool, buffer[buf_off..]),
+                }
+                buf_off += elem_size;
+            }
+            if (ty.sentinel(pool)) |sentinel_val| {
+                try sentinel_val.writeToMemory(pool, buffer[buf_off..]);
+            }
+        },
+        .vector => return error.IllDefinedMemoryLayout,
+        .@"struct" => {
+            const struct_type = pool.typeToStruct(ty.index) orelse return error.IllDefinedMemoryLayout;
+            switch (struct_type.layout) {
+                .auto => return error.IllDefinedMemoryLayout,
+                .@"extern" => {
+                    var last_off: usize = 0;
+                    for (struct_type.field_types, 0..) |field_ty_ip, field_index| {
+                        const off: usize = @intCast(ty.structFieldOffset(pool, field_index));
+                        @memset(buffer[last_off..off], 0xAA);
+                        const field_val: Value = .fromIndex(switch (pool.indexToKey(val.index).aggregate.storage) {
+                            .bytes => |bytes| {
+                                buffer[off] = bytes.at(field_index, pool);
+                                continue;
+                            },
+                            .elems => |elems| elems[field_index],
+                            .repeated_elem => |elem| elem,
+                        });
+                        try writeToMemory(field_val, pool, buffer[off..]);
+                        last_off = @intCast(off + Type.fromIndex(field_ty_ip).abiSize(pool));
+                    }
+                    const struct_size: usize = @intCast(ty.abiSize(pool));
+                    @memset(buffer[last_off..struct_size], 0xAA);
+                },
+                .@"packed" => {
+                    const int_index = pool.indexToKey(val.index).bitpack.backing_int_val;
+                    return Value.fromIndex(int_index).writeToMemory(pool, buffer);
+                },
+            }
+        },
+        .@"union" => switch (ty.containerLayout(pool)) {
+            .auto => return error.IllDefinedMemoryLayout, // Sema is supposed to have emitted a compile error already
+            .@"extern" => {
+                const payload_val = val.unionPayload(pool);
+                const payload_size: usize = @intCast(payload_val.typeOf(pool).abiSize(pool));
+                const union_size: usize = @intCast(ty.abiSize(pool));
+                @memset(buffer[payload_size..union_size], 0xAA);
+                return writeToMemory(payload_val, pool, buffer);
+            },
+            .@"packed" => {
+                const int_val: Value = .fromIndex(pool.indexToKey(val.index).bitpack.backing_int_val);
+                return writeToMemory(int_val, pool, buffer);
+            },
+        },
+        .optional => {
+            if (!ty.isPtrLikeOptional(pool)) return error.IllDefinedMemoryLayout;
+            const opt_val = val.optionalValue(pool);
+            if (opt_val) |some| {
+                return some.writeToMemory(pool, buffer);
+            } else {
+                const byte_count = Type.fromIndex(.usize_type).abiSize(pool);
+                @memset(buffer[0..@intCast(byte_count)], 0); // null pointer
+            }
+        },
+    }
+}
+
+/// Read an integer of type `ty` from a byte buffer. Ported from the compiler's `Value.readIntFromMemory`.
+pub fn readIntFromMemory(ty: Type, pool: *InternPool, buffer: []const u8, arena: std.mem.Allocator) std.mem.Allocator.Error!Value {
+    const endian = builtin.target.cpu.arch.endian();
+    const int = ty.intInfo(pool);
+    const abi_size: usize = @intCast(ty.abiSize(pool));
+    const exact_buf = buffer[0..abi_size];
+
+    if (abi_size <= 8) {
+        const shift: u6 = @intCast(64 - int.bits);
+        switch (int.signedness) {
+            .unsigned => {
+                const x = std.mem.readVarInt(u64, exact_buf, endian);
+                return .fromIndex(try pool.internInt(.{ .ty = ty.index, .storage = .{ .u64 = (x << shift) >> shift } }));
+            },
+            .signed => {
+                const x = std.mem.readVarInt(i64, exact_buf, endian);
+                return .fromIndex(try pool.internInt(.{ .ty = ty.index, .storage = .{ .i64 = (x << shift) >> shift } }));
+            },
+        }
+    } else {
+        const limb_count = std.math.big.int.calcTwosCompLimbCount(int.bits);
+        const limbs_buffer = try arena.alloc(std.math.big.Limb, limb_count);
+        var bigint: std.math.big.int.Mutable = .init(limbs_buffer, 0);
+        bigint.readTwosComplement(exact_buf, int.bits, endian, int.signedness);
+        return .fromIndex(try pool.internIntValue(ty.index, bigint.toConst()));
+    }
 }
 
 pub fn writeToPackedMemory(val: Value, pool: *const InternPool, buffer: []u8, bit_offset: usize) void {

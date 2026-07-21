@@ -1406,9 +1406,9 @@ test "alloc/store/load: wrap arith through a stored var" {
 }
 
 test "store through a pointer to a declaration is a comptime-only rejection" {
-    // The compiler performs this store at runtime; a comptime-only evaluator
-    // has no runtime stage, so `&x` (a `.nav` pointer) rejects the store rather
-    // than silently mutating a copy of the decl.
+    // The compiler lowers a store through a pointer to a declaration to a runtime
+    // instruction; a comptime-only evaluator has no runtime stage, so it rejects
+    // the store rather than silently mutating a copy of the decl.
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
@@ -1420,7 +1420,7 @@ test "store through a pointer to a declaration is a comptime-only rejection" {
         "blk: { const p = &x; p.* = 5; break :blk x; }",
     }, &diag_buf);
     try testing.expectError(error.AnalysisFail, result);
-    try testing.expect(std.mem.indexOf(u8, &diag_buf, "store through a pointer to a declaration") != null);
+    try testing.expect(std.mem.indexOf(u8, &diag_buf, "store requires runtime memory") != null);
 }
 
 /// Run a sequence of session inputs through the shared `eval.run` driver,

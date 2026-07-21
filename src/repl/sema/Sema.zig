@@ -7,6 +7,9 @@ const Limb = std.math.big.Limb;
 
 const InternPool = @import("InternPool.zig");
 const Value = @import("Value.zig");
+const MutableValue = @import("MutableValue.zig").MutableValue;
+const comptime_ptr_access = @import("comptime_ptr_access.zig");
+const reinterpret = @import("reinterpret.zig");
 const Type = @import("Type.zig");
 const render_value = @import("../render/Value.zig");
 const arith = @import("arith.zig");
@@ -79,10 +82,16 @@ pub const Block = struct {
 };
 
 pub const ComptimeAlloc = struct {
-    val: Value,
+    val: MutableValue,
     is_const: bool,
+    /// The alignment of this allocation. `.none` means naturally aligned.
+    alignment: InternPool.Alignment = .none,
     address: ?u64 = null,
 };
+
+pub fn getComptimeAlloc(sema: *Sema, idx: InternPool.Key.ComptimeAllocIndex) *ComptimeAlloc {
+    return &sema.comptime_allocs.items[@intFromEnum(idx)];
+}
 
 pub fn analyze(session: *Session, file_index: Session.Index, writer: *std.Io.Writer) Error!?Value {
     const gpa = session.gpa;
@@ -536,6 +545,28 @@ pub fn intValue_u64(sema: *Sema, ty: Type, x: u64) Error!Value {
     return .fromIndex(try sema.intern_pool.internInt(.{ .ty = ty.index, .storage = .{ .u64 = x } }));
 }
 
+pub fn floatValue(sema: *Sema, ty: Type, x: anytype) Error!Value {
+    const storage: InternPool.Key.Float.Storage = switch (ty.floatBits()) {
+        16 => .{ .f16 = @as(f16, @floatCast(x)) },
+        32 => .{ .f32 = @as(f32, @floatCast(x)) },
+        64 => .{ .f64 = @as(f64, @floatCast(x)) },
+        80 => .{ .f80 = @as(f80, @floatCast(x)) },
+        128 => .{ .f128 = @as(f128, @floatCast(x)) },
+        else => unreachable,
+    };
+    return .fromIndex(try sema.intern_pool.get(.{ .float = .{ .ty = ty.index, .storage = storage } }));
+}
+
+pub fn ptrIntValue(sema: *Sema, ty: Type, x: u64) Error!Value {
+    assert(ty.zigTypeTag(sema.intern_pool) == .pointer and !ty.isSlice(sema.intern_pool));
+    assert(x != 0 or ty.isAllowzeroPtr(sema.intern_pool));
+    return .fromIndex(try sema.intern_pool.internPtr(.{
+        .ty = ty.index,
+        .base_addr = .int,
+        .byte_offset = x,
+    }));
+}
+
 pub fn intValue_i64(sema: *Sema, ty: Type, x: i64) Error!Value {
     return .fromIndex(try sema.intern_pool.internInt(.{ .ty = ty.index, .storage = .{ .i64 = x } }));
 }
@@ -564,6 +595,11 @@ fn overflowArithmeticTupleType(sema: *Sema, ty: Type) Error!Type {
 }
 
 pub fn aggregateValue(sema: *Sema, ty: Type, elems: []const InternPool.Index) Error!Value {
+    for (elems) |elem| {
+        if (!Value.fromIndex(elem).isUndef(sema.intern_pool)) break;
+    } else if (elems.len > 0) {
+        return sema.undefValue(ty);
+    }
     return .fromIndex(try sema.intern_pool.internAggregate(.{ .ty = ty.index, .storage = .{ .elems = elems } }));
 }
 
@@ -3935,8 +3971,9 @@ fn evalMakePtrConst(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     // zirMakePtrConst. A value that can still mutate comptime-var state keeps its comptime_alloc base.
     if (p.base_addr == .comptime_alloc and p.byte_offset == 0) {
         const alloc = try sema.lookupComptimeAlloc(p);
-        if (!alloc.val.canMutateComptimeVarState(ip))
-            return .{ .index = try sema.uavPtr(const_ty, alloc.val.index) };
+        const alloc_val = try alloc.val.intern(ip, sema.arena);
+        if (!alloc_val.canMutateComptimeVarState(ip))
+            return .{ .index = try sema.uavPtr(const_ty, alloc_val.index) };
     }
 
     if (old.flags.is_const) return ptr;
@@ -3964,7 +4001,8 @@ fn fillComptimeAllocFields(sema: *Sema, alloc_ptr: InternPool.Key.Ptr, agg_ty: I
         if (!ty.structFieldIsComptime(i, ip)) continue;
         const default = ty.structFieldDefaultValue(i, ip).?;
         const alloc = try sema.lookupComptimeAlloc(alloc_ptr);
-        alloc.val = try sema.setAggregateElement(alloc.val, agg_ty, i, default);
+        const cur = try alloc.val.intern(ip, sema.arena);
+        alloc.val = .{ .interned = (try sema.setAggregateElement(cur, agg_ty, i, default)).index };
     }
 }
 
@@ -3981,8 +4019,9 @@ fn pushComptimeAlloc(
     const ip = sema.intern_pool;
     const alloc_index: u32 = @intCast(sema.comptime_allocs.items.len);
     try sema.comptime_allocs.append(sema.gpa, .{
-        .val = val,
+        .val = .{ .interned = val.index },
         .is_const = is_const,
+        .alignment = alignment,
     });
 
     const ptr_ty = try ip.internPtrType(.{
@@ -4011,7 +4050,7 @@ fn evalStoreToInferredPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const p = ip.indexToKey(ptr.index).ptr;
     const slot = try sema.lookupComptimeAlloc(p);
-    slot.val = operand;
+    slot.val = .{ .interned = operand.index };
 
     const ptr_ty = try ip.internPtrType(.{
         .child = operand.typeOf(ip).toIndex(),
@@ -4097,11 +4136,10 @@ fn evalStoreNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     }
 
     const rhs_value = try sema.resolveInst(bin.rhs);
-    const coerced = if (ptr_key.ptr.base_addr == .comptime_alloc)
-        try sema.coerceValueToType(rhs_value, (try sema.lookupComptimeAlloc(ptr_key.ptr)).val.typeOf(ip).toIndex(), "store")
-    else
-        try sema.coerceValueToType(rhs_value, ptr_ty_key.ptr_type.child, "store");
-    try sema.storePointee(ptr_key.ptr, coerced);
+    // Coerce to the pointer's element type and store through the comptime pointer engine, which
+    // navigates the pointer (including byte offsets into extern aggregates) to its sub-location.
+    const coerced = try sema.coerceValueToType(rhs_value, ptr_ty_key.ptr_type.child, "store");
+    try sema.storePtrVal(ptr_value, coerced);
     return .{ .index = .void_value };
 }
 
@@ -4117,62 +4155,21 @@ fn evalLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
 fn loadValue(sema: *Sema, ptr: Value) Error!Value {
     const ip = sema.intern_pool;
-    const ptr_key = ip.indexToKey(ptr.index);
-    if (ptr_key != .ptr) {
+    if (ip.indexToKey(ptr.index) != .ptr) {
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "internal error: load through non-pointer value", .{});
     }
-    switch (ptr_key.ptr.base_addr) {
-        .nav => |nav| return .{ .index = ip.getNav(nav).resolved.?.value },
-        .uav => |uav| return .{ .index = uav.val },
-        .comptime_field => |val| return .{ .index = val },
-        .field, .arr_elem => |f| {
-            const parent = try sema.loadValue(.{ .index = f.base });
-            const parent_key = ip.indexToKey(parent.index);
-            if (parent_key == .undef) return .{ .index = .undef };
-            if (ptr_key.ptr.base_addr == .arr_elem) sub_array: {
-                const child_ty = ip.indexToKey(ptr_key.ptr.ty).ptr_type.child;
-                const sub = indexableInfo(ip, child_ty) orelse break :sub_array;
-                const agg = switch (parent_key) {
-                    .aggregate => |agg| agg,
-                    else => break :sub_array,
-                };
-                const parent_info = indexableInfo(ip, agg.ty) orelse break :sub_array;
-                if (parent_info.child != sub.child) break :sub_array;
-                const count = ip.aggregateElementCount(child_ty);
-                const elems = try sema.arena.alloc(InternPool.Index, @intCast(count));
-                for (elems, 0..) |*e, i| e.* = try ip.aggregateElementAt(agg, f.index + @as(u64, @intCast(i)));
-                return try sema.aggregateValue(Type.fromIndex(child_ty), elems);
-            }
-            return switch (parent_key) {
-                .un => try sema.loadUnionField(parent.index, @intCast(f.index)),
-                .aggregate => |agg| .{ .index = try ip.aggregateElementAt(agg, @intCast(f.index)) },
-                else => unreachable,
-            };
-        },
-        .opt_payload => |base| {
-            const opt = try sema.loadValue(.{ .index = base });
-            return switch (ip.indexToKey(opt.index)) {
-                .undef => .{ .index = .undef },
-                else => .{ .index = ip.indexToKey(opt.index).opt.val },
-            };
-        },
-        .eu_payload => |base| {
-            const eu = try sema.loadValue(.{ .index = base });
-            return switch (ip.indexToKey(eu.index)) {
-                .undef => .{ .index = .undef },
-                .error_union => |e| switch (e.val) {
-                    .payload => |p| .{ .index = p },
-                    .err_name => {
-                        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "err_union_payload: operand carries an error, not a payload", .{});
-                    },
-                },
-                else => unreachable,
-            };
-        },
-        else => {
-            const alloc = try sema.lookupComptimeAlloc(ptr_key.ptr);
-            return alloc.val;
-        },
+    const src = sema.block.nodeOffset(.zero);
+    const ptr_ty = ptr.typeOf(ip);
+    switch (try comptime_ptr_access.loadComptimePtr(sema, ptr)) {
+        .success => |mv| return try mv.intern(ip, sema.arena),
+        .runtime_load => return sema.fail(sema.block, src, "unable to evaluate comptime expression: load requires runtime memory", .{}),
+        .undef => return sema.failWithUseOfUndef(),
+        .err_payload => |err_name| return sema.fail(sema.block, src, "attempt to unwrap error: {f}", .{err_name.fmt(ip)}),
+        .null_payload => return sema.fail(sema.block, src, "attempt to use null value", .{}),
+        .inactive_union_field => return sema.fail(sema.block, src, "access of inactive union field", .{}),
+        .needed_well_defined => |ty| return sema.fail(sema.block, src, "comptime dereference requires '{f}' to have a well-defined layout", .{ty.fmt(ip)}),
+        .out_of_bounds => |ty| return sema.fail(sema.block, src, "dereference of '{f}' exceeds bounds of containing decl of type '{f}'", .{ ptr_ty.fmt(ip), ty.fmt(ip) }),
+        .exceeds_host_size => return sema.fail(sema.block, src, "bit-pointer target exceeds host size", .{}),
     }
 }
 
@@ -4198,7 +4195,10 @@ fn lookupComptimeAlloc(sema: *Sema, ptr: InternPool.Key.Ptr) Error!*ComptimeAllo
     return &sema.comptime_allocs.items[idx];
 }
 
-const InMemoryCoercionResult = union(enum) {
+pub const castMemory = reinterpret.castMemory;
+pub const spliceMemory = reinterpret.spliceMemory;
+
+pub const InMemoryCoercionResult = union(enum) {
     ok: Strategy,
     no_match: Pair,
     int_not_coercible: Int,
@@ -4464,7 +4464,7 @@ fn pointerSizeString(size: std.lang.Type.Pointer.Size) []const u8 {
     };
 }
 
-fn coerceInMemoryAllowed(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_mut: bool, src_val: ?Value) Error!InMemoryCoercionResult {
+pub fn coerceInMemoryAllowed(sema: *Sema, dest_ty: Type, src_ty: Type, dest_is_mut: bool, src_val: ?Value) Error!InMemoryCoercionResult {
     const ip = sema.intern_pool;
     if (dest_ty.index == src_ty.index) return .{ .ok = .same_type };
 
@@ -4991,15 +4991,7 @@ fn coerceToSlice(sema: *Sema, value: Value, dest_ty: InternPool.Index) Error!?Va
     if (ip.indexToKey(child) != .array_type) return null;
     const array = ip.indexToKey(child).array_type;
 
-    const many_ptr_ty = try ip.internPtrType(.{
-        .child = array.child,
-        .flags = .{ .size = .many, .is_const = ip.indexToKey(dest_ty).ptr_type.flags.is_const },
-    });
-    const many_ptr = try ip.internPtr(.{
-        .ty = many_ptr_ty,
-        .base_addr = .{ .arr_elem = .{ .base = value.index, .index = 0 } },
-        .byte_offset = 0,
-    });
+    const many_ptr = try ip.getCoerced(value.index, try ip.slicePtrType(dest_ty));
     const len_val = try ip.internInt(.{ .ty = .usize_type, .storage = .{ .u64 = array.len } });
     return .{ .index = try ip.get(.{ .slice = .{ .ty = dest_ty, .ptr = many_ptr, .len = len_val } }) };
 }
@@ -5194,19 +5186,18 @@ fn evalReifyTuple(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Valu
 
 fn derefSliceAsArray(sema: *Sema, val: Value) Error!Value {
     const ip = sema.intern_pool;
-    const array_ptr: InternPool.Index = switch (ip.indexToKey(val.index)) {
-        .slice => |s| s.ptr,
-        .ptr => val.index,
-        else => {
-            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "reify: expected a comptime array-backed slice", .{});
+    switch (ip.indexToKey(val.index)) {
+        .slice => |s| {
+            const slice_ty = ip.indexToKey(s.ty).ptr_type;
+            const len = try sema.resolveUsizeInt(.{ .index = s.len }, "slice len");
+            try sema.ensureLayoutResolved(slice_ty.child);
+            const array_ty = try ip.internArrayType(.{ .len = len, .child = slice_ty.child });
+            const array_ptr_ty = try ip.internPtrType(.{ .child = array_ty, .flags = .{ .size = .one, .is_const = true } });
+            return try sema.loadValue(.{ .index = try ip.getCoerced(s.ptr, array_ptr_ty) });
         },
-    };
-    switch (ip.indexToKey(array_ptr).ptr.base_addr) {
-        .uav, .nav => return try sema.loadValue(.{ .index = array_ptr }),
-        .arr_elem => |ae| if (ae.index == 0) return try sema.loadValue(.{ .index = ae.base }),
-        else => {},
+        .ptr => return try sema.loadValue(val),
+        else => return sema.fail(sema.block, sema.block.nodeOffset(.zero), "reify: expected a comptime array-backed slice", .{}),
     }
-    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "reify: expected a comptime array-backed slice", .{});
 }
 
 fn validateTupleFieldType(sema: *Sema, field_ty: InternPool.Index) Error!void {
@@ -5566,7 +5557,12 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
         const align_opt = ip.indexToKey(align_elem).opt.val;
         const default_ptr = ip.indexToKey(try ip.aggregateElementAt(attr, 2)).opt.val;
 
-        const field_default: InternPool.Index = if (default_ptr == .none) .none else (try sema.loadValue(.{ .index = default_ptr })).index;
+        // `default_value_ptr` is typed `*const anyopaque`; re-type it to a pointer to the field type
+        // before loading, so the deref reinterprets from the pointee rather than the opaque type.
+        const field_default: InternPool.Index = if (default_ptr == .none) .none else d: {
+            const field_ptr_ty = try ip.internPtrType(.{ .child = type_out.*, .flags = .{ .size = .one, .is_const = true } });
+            break :d (try sema.loadValue(.{ .index = try ip.getCoerced(default_ptr, field_ptr_ty) })).index;
+        };
         if (field_default != .none) {
             defaults[i] = field_default;
             any_defaults = true;
@@ -5910,6 +5906,13 @@ fn optPayloadPtr(sema: *Sema, optional_ptr: Value, comptime initializing: bool) 
         if (ip.indexToKey(opt_val.index).opt.val == .none) {
             return sema.fail(sema.block, sema.block.nodeOffset(.zero), "unable to unwrap null", .{});
         }
+    } else {
+        // Set the optional to non-null at comptime before returning the payload pointer, so stores
+        // into the payload have somewhere to land. Use the payload's OPV if it has one, else undef.
+        const child_type: Type = .fromIndex(opt_key.opt_type);
+        const payload_val = (try child_type.onePossibleValue(sema)) orelse try sema.undefValue(child_type);
+        const opt_val: Value = .fromIndex(try ip.internOpt(.{ .ty = ptr_type.child, .val = payload_val.index }));
+        try sema.storePtrVal(optional_ptr, opt_val);
     }
     const child_ptr_ty = try ip.internPtrType(.{ .child = opt_key.opt_type, .sentinel = ptr_type.sentinel, .flags = ptr_type.flags });
     return .{ .index = try ip.internPtr(.{
@@ -7885,7 +7888,7 @@ fn enumFieldIndex(sema: *Sema, enum_ty: InternPool.Index, name: InternPool.NullT
     return if (try sema.enumFieldScan(enum_ty, .{ .name = name })) |m| m.index else null;
 }
 
-fn enumTagFieldIndex(sema: *Sema, enum_ty: InternPool.Index, tag: Value) Error!?u32 {
+pub fn enumTagFieldIndex(sema: *Sema, enum_ty: InternPool.Index, tag: Value) Error!?u32 {
     const int = switch (sema.intern_pool.indexToKey(tag.index)) {
         .enum_tag => |et| et.int,
         .int => tag.index,
@@ -8451,30 +8454,19 @@ fn evalFieldPtrNamed(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 fn resolveConstStringIntern(sema: *Sema, ref: Zir.Inst.Ref) Error!InternPool.NullTerminatedString {
     const ip = sema.intern_pool;
     var agg = try sema.resolveInst(ref);
-    var start: u64 = 0;
-    var slice_len: ?u64 = null;
-    if (ip.indexToKey(agg.index) == .slice) {
-        const s = ip.indexToKey(agg.index).slice;
-        slice_len = try sema.resolveUsizeInt(.{ .index = s.len }, "string len");
-        const ptr = ip.indexToKey(s.ptr).ptr;
-        if (ptr.base_addr == .arr_elem) {
-            start = ptr.base_addr.arr_elem.index;
-            agg = .{ .index = ptr.base_addr.arr_elem.base };
-        } else {
-            agg = .{ .index = s.ptr };
-        }
+    if (ip.indexToKey(agg.index) == .slice or ip.indexToKey(agg.index) == .ptr) {
+        agg = try sema.derefSliceAsArray(agg);
     }
-    while (ip.indexToKey(agg.index) == .ptr) agg = try sema.loadValue(agg);
     const key = ip.indexToKey(agg.index);
     const arr = if (key == .aggregate) ip.indexToKey(key.aggregate.ty) else key;
     if (key != .aggregate or arr != .array_type or arr.array_type.child != .u8_type) {
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected a comptime string", .{});
     }
-    const len: usize = @intCast(slice_len orelse arr.array_type.len);
+    const len: usize = @intCast(arr.array_type.len);
     const bytes = try sema.gpa.alloc(u8, len);
     defer sema.gpa.free(bytes);
     for (bytes, 0..) |*b, i| {
-        const elem = try ip.aggregateElementAt(key.aggregate, start + i);
+        const elem = try ip.aggregateElementAt(key.aggregate, i);
         b.* = @intCast(ip.indexToKey(elem).int.storage.u64);
     }
     return try ip.getOrPutString(sema.gpa, bytes, .no_embedded_nulls);
@@ -8706,7 +8698,7 @@ fn storeElement(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
 fn storePointee(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
     const ip = sema.intern_pool;
     switch (ptr.base_addr) {
-        .comptime_alloc => (try sema.lookupComptimeAlloc(ptr)).val = value,
+        .comptime_alloc => (try sema.lookupComptimeAlloc(ptr)).val = .{ .interned = value.index },
         .comptime_field => |field_val| {
             if (value.index != field_val) {
                 return sema.fail(sema.block, sema.block.nodeOffset(.zero), "value stored in comptime field does not match the comptime field value", .{});
@@ -8729,6 +8721,26 @@ fn storePointee(sema: *Sema, ptr: InternPool.Key.Ptr, value: Value) Error!void {
         .int => {
             return sema.fail(sema.block, sema.block.nodeOffset(.zero), "unable to evaluate comptime expression: store through an integer-address pointer", .{});
         },
+    }
+}
+
+fn storePtrVal(sema: *Sema, ptr: Value, value: Value) Error!void {
+    const ip = sema.intern_pool;
+    const src = sema.block.nodeOffset(.zero);
+    const ptr_ty = ptr.typeOf(ip);
+    switch (try comptime_ptr_access.storeComptimePtr(sema, ptr, value)) {
+        .success => {},
+        // The compiler treats a runtime store as unreachable here (its use sites emit runtime AIR); a
+        // comptime-only evaluator has no runtime stage, so it fails instead.
+        .runtime_store => return sema.fail(sema.block, src, "unable to evaluate comptime expression: store requires runtime memory", .{}),
+        .comptime_field_mismatch => return sema.fail(sema.block, src, "value stored in comptime field does not match the default value of the field", .{}),
+        .undef => return sema.failWithUseOfUndef(),
+        .err_payload => |err_name| return sema.fail(sema.block, src, "attempt to unwrap error: {f}", .{err_name.fmt(ip)}),
+        .null_payload => return sema.fail(sema.block, src, "attempt to use null value", .{}),
+        .inactive_union_field => return sema.fail(sema.block, src, "access of inactive union field", .{}),
+        .needed_well_defined => |ty| return sema.fail(sema.block, src, "comptime dereference requires '{f}' to have a well-defined layout", .{ty.fmt(ip)}),
+        .out_of_bounds => |ty| return sema.fail(sema.block, src, "dereference of '{f}' exceeds bounds of containing decl of type '{f}'", .{ ptr_ty.fmt(ip), ty.fmt(ip) }),
+        .exceeds_host_size => return sema.fail(sema.block, src, "bit-pointer target exceeds host size", .{}),
     }
 }
 
@@ -9029,8 +9041,9 @@ fn evalElemPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
-    const array_value = try sema.loadValue(try sema.resolveInst(bin.lhs));
-    return try sema.aggregateElement(array_value, bin.rhs);
+    // The operand is a pointer to the indexable; dereference it, then index the loaded value.
+    const indexable = try sema.loadValue(try sema.resolveInst(bin.lhs));
+    return try sema.elemVal(indexable, bin.rhs);
 }
 
 fn evalElemPtrNode(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
@@ -9058,9 +9071,14 @@ fn unionFieldPtr(sema: *Sema, union_ptr: Value, field_name: InternPool.NullTermi
     }
 
     switch (union_ty.containerLayout(ip)) {
-        // Reading a union field asserts it is the active one; an initializing store sets the tag when the
-        // field pointer is written (storeElement), so no tag store is needed here.
-        .auto => if (!initializing) {
+        .auto => if (initializing) {
+            const field_ty: Type = .fromIndex(field.ty);
+            const payload_val = (try field_ty.onePossibleValue(sema)) orelse try sema.undefValue(field_ty);
+            const tag_enum = try sema.unionTagEnumType(union_ty.index);
+            const field_tag = (try sema.enumValueFieldIndex(tag_enum, field.index)).?;
+            const new_union_val: Value = .fromIndex(try ip.internUnion(.{ .ty = union_ty.index, .tag = field_tag.index, .val = payload_val.index }));
+            try sema.storePtrVal(union_ptr, new_union_val);
+        } else {
             const union_val = try sema.loadValue(union_ptr);
             if (union_val.isUndef(ip)) return sema.failWithUseOfUndef();
             _ = try sema.loadUnionField(union_val.index, field.index);
@@ -9123,6 +9141,15 @@ fn elemPtr(sema: *Sema, array_ptr: Value, index: u64) Error!Value {
         .child = elems.child,
         .flags = .{ .size = .one, .is_const = ip.indexToKey(parent_ty).ptr_type.flags.is_const },
     });
+    // An array with a well-defined element type gives a byte-offset pointer (mirrors the compiler's
+    // `Value.ptrElem`). A vector is not byte-addressable and a comptime-only element has no layout, so
+    // those keep the structural `.arr_elem` representation.
+    const elem_child_ty: Type = .fromIndex(elems.child);
+    if (ip.indexToKey(child_ty) == .array_type and !elem_child_ty.comptimeOnly(ip)) {
+        try sema.ensureLayoutResolved(elems.child);
+        const byte_offset = index * elem_child_ty.abiSize(ip);
+        return try array_ptr.getOffsetPtr(byte_offset, .fromIndex(elem_ptr_ty), ip);
+    }
     return .{ .index = try ip.internPtr(.{
         .ty = elem_ptr_ty,
         .base_addr = .{ .arr_elem = .{ .base = array_ptr.index, .index = @intCast(index) } },
@@ -9133,25 +9160,19 @@ fn elemPtr(sema: *Sema, array_ptr: Value, index: u64) Error!Value {
 fn elemPtrSlice(sema: *Sema, slice_ptr: Value, index: u64, slice_ty: InternPool.Index) Error!Value {
     const ip = sema.intern_pool;
     const slice_val = try sema.loadValue(slice_ptr);
+    const slice_sent = ip.indexToKey(slice_ty).ptr_type.sentinel != .none;
+    try sema.ensureLayoutResolved(ip.indexToKey(slice_ty).ptr_type.child);
     const s = ip.indexToKey(slice_val.index).slice;
     const len = try sema.resolveUsizeInt(.{ .index = s.len }, "slice index");
-    if (index >= len) {
-        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index {d} outside slice of length {d}", .{ index, len });
+    const len_s = len + @intFromBool(slice_sent);
+    if (len_s == 0) {
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "cannot index into empty slice", .{});
     }
-    const many = ip.indexToKey(s.ptr).ptr;
-    const base: InternPool.Index, const start: u64 = if (many.base_addr == .arr_elem)
-        .{ many.base_addr.arr_elem.base, many.base_addr.arr_elem.index }
-    else
-        .{ s.ptr, 0 };
-    const elem_ptr_ty = try ip.internPtrType(.{
-        .child = ip.indexToKey(slice_ty).ptr_type.child,
-        .flags = .{ .size = .one, .is_const = ip.indexToKey(slice_ty).ptr_type.flags.is_const },
-    });
-    return .{ .index = try ip.internPtr(.{
-        .ty = elem_ptr_ty,
-        .base_addr = .{ .arr_elem = .{ .base = base, .index = start + index } },
-        .byte_offset = 0,
-    }) };
+    if (index >= len_s) {
+        const sentinel_label: []const u8 = if (slice_sent) " +1 (sentinel)" else "";
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index {d} outside slice of length {d}{s}", .{ index, len, sentinel_label });
+    }
+    return try slice_val.ptrElem(index, ip);
 }
 
 const IndexableInfo = struct { len: u64, child: InternPool.Index };
@@ -9202,6 +9223,7 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
         .ptr_type => |inner| switch (inner.flags.size) {
             .one => {
                 const arr = ip.indexToKey(inner.child).array_type;
+                // `ptr_ptr` is a pointer to the array pointer; load it to get the pointer to the array.
                 backing = (try sema.loadValue(ptr_ptr)).index;
                 base_offset = 0;
                 len = arr.len;
@@ -9258,11 +9280,18 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
 
     const result_array_ty = try ip.internArrayType(.{ .len = end - start, .child = elem_ty, .sentinel = sentinel });
     const result_ptr_ty = try ip.internPtrType(.{ .child = result_array_ty, .flags = .{ .size = .one, .is_const = is_const } });
-    return .{ .index = try ip.internPtr(.{
-        .ty = result_ptr_ty,
-        .base_addr = .{ .arr_elem = .{ .base = backing, .index = base_offset + start } },
-        .byte_offset = 0,
-    }) };
+    // `backing` is a pointer to the sliced array/slice; the sub-array pointer is that address offset
+    // by the start element -- a byte-offset pointer for a well-defined element, else structural.
+    const elem_type: Type = .fromIndex(elem_ty);
+    if (elem_type.comptimeOnly(ip)) {
+        return .{ .index = try ip.internPtr(.{
+            .ty = result_ptr_ty,
+            .base_addr = .{ .arr_elem = .{ .base = backing, .index = base_offset + start } },
+            .byte_offset = 0,
+        }) };
+    }
+    try sema.ensureLayoutResolved(elem_ty);
+    return try Value.fromIndex(backing).getOffsetPtr((base_offset + start) * elem_type.abiSize(ip), .fromIndex(result_ptr_ty), ip);
 }
 
 fn failSliceNotArrayPtr(sema: *Sema) Error {
@@ -9340,12 +9369,39 @@ fn evalElemVal(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
-    const lhs = try sema.resolveInst(bin.lhs);
-    const array_value = if (sema.intern_pool.indexToKey(lhs.index) == .ptr)
-        try sema.loadValue(lhs)
-    else
-        lhs;
-    return try sema.aggregateElement(array_value, bin.rhs);
+    return try sema.elemVal(try sema.resolveInst(bin.lhs), bin.rhs);
+}
+
+fn elemVal(sema: *Sema, indexable: Value, index_ref: Zir.Inst.Ref) Error!Value {
+    const ip = sema.intern_pool;
+    const indexable_ty = indexable.typeOf(ip);
+    if (indexable_ty.zigTypeTag(ip) == .pointer) {
+        const ptr_info = indexable_ty.ptrInfo(ip);
+        switch (ptr_info.flags.size) {
+            // A slice, many-, or C-pointer indexes by computing the element pointer and loading it; a
+            // single-item pointer is dereferenced to its backing aggregate by `aggregateElement`.
+            .slice, .many, .c => {
+                const index = try sema.resolveArrayLen(index_ref, "elem access");
+                try sema.ensureLayoutResolved(ptr_info.child);
+                if (ptr_info.flags.size == .slice) {
+                    const slice_sent = ptr_info.sentinel != .none;
+                    const slice_len = try sema.resolveUsizeInt(.{ .index = ip.indexToKey(indexable.index).slice.len }, "slice len");
+                    const slice_len_s = slice_len + @intFromBool(slice_sent);
+                    if (slice_len_s == 0) {
+                        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "indexing into empty slice is not allowed", .{});
+                    }
+                    if (index >= slice_len_s) {
+                        const sentinel_label: []const u8 = if (slice_sent) " +1 (sentinel)" else "";
+                        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "index {d} outside slice of length {d}{s}", .{ index, slice_len, sentinel_label });
+                    }
+                }
+                const elem_ptr = try indexable.ptrElem(index, ip);
+                return try sema.loadValue(elem_ptr);
+            },
+            .one => {},
+        }
+    }
+    return try sema.aggregateElement(indexable, index_ref);
 }
 
 fn aggregateElement(sema: *Sema, array_value: Value, index_ref: Zir.Inst.Ref) Error!Value {
@@ -9426,32 +9482,6 @@ fn indexableMemLen(sema: *Sema, value: Value) Error!?u64 {
     }
 }
 
-fn memBacking(sema: *Sema, value: Value) struct { ptr: InternPool.Index, start: u64 } {
-    const ip = sema.intern_pool;
-    switch (ip.indexToKey(value.index)) {
-        .slice => |s| {
-            const many = ip.indexToKey(s.ptr).ptr;
-            return switch (many.base_addr) {
-                .arr_elem => |ae| .{ .ptr = ae.base, .start = ae.index },
-                else => .{ .ptr = s.ptr, .start = 0 },
-            };
-        },
-        .ptr => |p| return switch (p.base_addr) {
-            .arr_elem => |ae| .{ .ptr = ae.base, .start = ae.index },
-            else => .{ .ptr = value.index, .start = 0 },
-        },
-        else => unreachable,
-    }
-}
-
-fn doPointersOverlap(sema: *Sema, a: Value, b: Value, elem_count: u64) bool {
-    const a_back = sema.memBacking(a);
-    const b_back = sema.memBacking(b);
-    if (a_back.ptr != b_back.ptr) return false;
-    const diff = if (a_back.start >= b_back.start) a_back.start - b_back.start else b_back.start - a_back.start;
-    return diff < elem_count;
-}
-
 fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const bin = sema.binData(inst);
@@ -9495,30 +9525,33 @@ fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         if (src_elem.abiSize(ip) == 0) return null;
     }
 
-    if (sema.doPointersOverlap(dest, src, len)) {
+    const raw_dest_ptr: Value = if (dest_ty.isSlice(ip)) .{ .index = ip.indexToKey(dest.index).slice.ptr } else dest;
+    const raw_src_ptr: Value = if (src_ty.isSlice(ip)) .{ .index = ip.indexToKey(src.index).slice.ptr } else src;
+
+    if (Value.doPointersOverlap(raw_src_ptr, raw_dest_ptr, len, ip)) {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@memcpy: arguments alias", .{});
     }
 
-    const src_back = sema.memBacking(src);
-    const dest_back = sema.memBacking(dest);
-    const src_arr_ptr = try ip.internPtr(.{
-        .ty = try ip.internPtrType(.{
-            .child = try ip.internArrayType(.{ .len = len, .child = src_elem.index }),
-            .flags = .{ .size = .one, .is_const = true },
-        }),
-        .base_addr = .{ .arr_elem = .{ .base = src_back.ptr, .index = src_back.start } },
-        .byte_offset = 0,
+    // Implement @memcpy as a single array load and store rather than N element accesses.
+    const array_ty = try ip.internArrayType(.{ .len = len, .child = dest_elem.index });
+    const dest_array_ptr_ty = try ip.internPtrType(info: {
+        var info = dest_ty.ptrInfo(ip);
+        info.flags.size = .one;
+        info.child = array_ty;
+        info.sentinel = .none;
+        break :info info;
     });
-    const array_val = try sema.loadValue(.{ .index = src_arr_ptr });
-    const dest_arr_ptr: InternPool.Key.Ptr = .{
-        .ty = try ip.internPtrType(.{
-            .child = try ip.internArrayType(.{ .len = len, .child = dest_elem.index }),
-            .flags = .{ .size = .one, .is_const = false },
-        }),
-        .base_addr = .{ .arr_elem = .{ .base = dest_back.ptr, .index = dest_back.start } },
-        .byte_offset = 0,
-    };
-    try sema.storePointee(dest_arr_ptr, array_val);
+    const src_array_ptr_ty = try ip.internPtrType(info: {
+        var info = src_ty.ptrInfo(ip);
+        info.flags.size = .one;
+        info.child = array_ty;
+        info.sentinel = .none;
+        break :info info;
+    });
+    const coerced_dest_ptr: Value = .{ .index = try ip.getCoerced(raw_dest_ptr.index, dest_array_ptr_ty) };
+    const coerced_src_ptr: Value = .{ .index = try ip.getCoerced(raw_src_ptr.index, src_array_ptr_ty) };
+    const array_val = try sema.loadValue(coerced_src_ptr);
+    try sema.storePtrVal(coerced_dest_ptr, array_val);
     return null;
 }
 
@@ -9541,18 +9574,18 @@ fn evalMemset(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     };
     if (len == 0) return null;
 
-    const dest_back = sema.memBacking(dest);
+    try sema.ensureLayoutResolved(dest_elem.index);
     const array_ty = try ip.internArrayType(.{ .len = len, .child = dest_elem.index });
     const array_val = try sema.aggregateSplatValue(.fromIndex(array_ty), elem);
-    const dest_arr_ptr: InternPool.Key.Ptr = .{
-        .ty = try ip.internPtrType(.{
-            .child = array_ty,
-            .flags = .{ .size = .one, .is_const = false },
-        }),
-        .base_addr = .{ .arr_elem = .{ .base = dest_back.ptr, .index = dest_back.start } },
-        .byte_offset = 0,
-    };
-    try sema.storePointee(dest_arr_ptr, array_val);
+    const array_ptr_ty = try ip.internPtrType(info: {
+        var info = dest_ty.ptrInfo(ip);
+        info.flags.size = .one;
+        info.child = array_ty;
+        break :info info;
+    });
+    const raw_ptr: Value = if (dest_ty.isSlice(ip)) .{ .index = ip.indexToKey(dest.index).slice.ptr } else dest;
+    const array_ptr_val: Value = .{ .index = try ip.getCoerced(raw_ptr.index, array_ptr_ty) };
+    try sema.storePtrVal(array_ptr_val, array_val);
     return null;
 }
 
@@ -9998,6 +10031,13 @@ fn errUnionPayloadPtr(sema: *Sema, eu_ptr: Value, comptime initializing: bool) E
         if (ip.indexToKey(eu_val.index).error_union.val == .err_name) {
             return sema.fail(sema.block, sema.block.nodeOffset(.zero), "err_union_payload: operand carries an error, not a payload", .{});
         }
+    } else {
+        // Set the error union to non-error at comptime before returning the payload pointer, so stores
+        // into the payload have somewhere to land. Use the payload's OPV if it has one, else undef.
+        const payload_type: Type = .fromIndex(eu_key.error_union_type.payload_type);
+        const payload_val = (try payload_type.onePossibleValue(sema)) orelse try sema.undefValue(payload_type);
+        const eu_val: Value = .fromIndex(try ip.internErrorUnion(.{ .ty = ptr_type.child, .val = .{ .payload = payload_val.index } }));
+        try sema.storePtrVal(eu_ptr, eu_val);
     }
     const child_ptr_ty = try ip.internPtrType(.{ .child = eu_key.error_union_type.payload_type, .sentinel = ptr_type.sentinel, .flags = ptr_type.flags });
     return .{ .index = try ip.internPtr(.{
