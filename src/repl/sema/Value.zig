@@ -1110,6 +1110,17 @@ pub fn isUndef(val: Value, pool: *const InternPool) bool {
     return pool.indexToKey(val.index) == .undef;
 }
 
+pub fn getErrorName(val: Value, pool: *const InternPool) InternPool.OptionalNullTerminatedString {
+    return switch (pool.indexToKey(val.index)) {
+        .err => |err| err.name.toOptional(),
+        .error_union => |error_union| switch (error_union.val) {
+            .err_name => |err_name| err_name.toOptional(),
+            .payload => .none,
+        },
+        else => unreachable,
+    };
+}
+
 pub fn isNull(val: Value, pool: *const InternPool) bool {
     return switch (val.index) {
         .undef => unreachable,

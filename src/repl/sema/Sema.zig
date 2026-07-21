@@ -5419,17 +5419,21 @@ fn checkParamType(sema: *Sema, param_ty: Type, param_is_noalias: bool, cc: std.l
     }
 }
 
-// Ported from Sema.checkReturnTypeAndCallConv. Inferred error sets and incoming-stack-alignment do not apply
-// here (no inferred error sets; option-carrying calling conventions are rejected by `interpretCallConv`), so
-// of the interrupt calling conventions only the option-free avr_interrupt and avr_signal reach the switch.
-fn checkReturnTypeAndCallConv(sema: *Sema, bare_ret_ty: Type, opt_varargs: bool, cc: std.lang.CallingConvention.Tag) Error!void {
+// Ported from Sema.checkReturnTypeAndCallConv. incoming-stack-alignment does not apply here (option-carrying
+// calling conventions are rejected by `interpretCallConv`), so of the interrupt calling conventions only the
+// option-free avr_interrupt and avr_signal reach the switch.
+fn checkReturnTypeAndCallConv(sema: *Sema, bare_ret_ty: Type, opt_varargs: bool, inferred_error_set: bool, cc: std.lang.CallingConvention.Tag) Error!void {
     const ip = sema.intern_pool;
     if (opt_varargs) {
         try sema.checkCallConvSupportsVarArgs(cc);
     }
+    if (inferred_error_set and !bare_ret_ty.isGenericPoison()) {
+        try sema.validateErrorUnionPayloadType(bare_ret_ty);
+    }
+    const ies_ret_ty_prefix: []const u8 = if (inferred_error_set) "!" else "";
     if (!bare_ret_ty.isValidReturnType(ip)) {
         const opaque_str: []const u8 = if (bare_ret_ty.zigTypeTag(ip) == .@"opaque") "opaque " else "";
-        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}return type '{f}' not allowed", .{ opaque_str, bare_ret_ty.fmt(ip) });
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}return type '{s}{f}' not allowed", .{ opaque_str, ies_ret_ty_prefix, bare_ret_ty.fmt(ip) });
     }
     switch (cc) {
         .avr_interrupt, .avr_signal => {
@@ -5497,7 +5501,7 @@ fn evalReifyFn(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
         }
     }
 
-    try sema.checkReturnTypeAndCallConv(.fromIndex(ret_ty), varargs, std.meta.activeTag(cc));
+    try sema.checkReturnTypeAndCallConv(.fromIndex(ret_ty), varargs, false, std.meta.activeTag(cc));
 
     return .{ .index = try ip.internFuncType(.{
         .param_types = param_types,
@@ -6146,9 +6150,20 @@ fn getArrayCatInfo(sema: *Sema, operand: Value) Error!?ArrayCatInfo {
         },
         .pointer => {
             const ptr_info = ip.indexToKey(operand_ty.index).ptr_type;
-            if (ptr_info.flags.size == .one and Type.fromIndex(ptr_info.child).zigTypeTag(ip) == .array) {
-                const ai = Type.fromIndex(ptr_info.child).arrayInfo(ip);
-                return .{ .elem_type = ai.elem_type, .sentinel = ai.sentinel orelse .none, .len = ai.len, .array = try sema.loadValue(operand) };
+            switch (ptr_info.flags.size) {
+                .slice => {
+                    // A comptime-known slice supplies its length from the value; index its backing array.
+                    const arr = try sema.derefSliceAsArray(operand);
+                    const len = try sema.resolveUsizeInt(.{ .index = ip.indexToKey(operand.index).slice.len }, "slice concatenation operand");
+                    return .{ .elem_type = .fromIndex(ptr_info.child), .sentinel = ptr_info.sentinel, .len = len, .array = arr };
+                },
+                .one => {
+                    if (Type.fromIndex(ptr_info.child).zigTypeTag(ip) == .array) {
+                        const ai = Type.fromIndex(ptr_info.child).arrayInfo(ip);
+                        return .{ .elem_type = ai.elem_type, .sentinel = ai.sentinel orelse .none, .len = ai.len, .array = try sema.loadValue(operand) };
+                    }
+                },
+                .c, .many => {},
             }
         },
         else => {},
@@ -10210,50 +10225,69 @@ fn evalErrUnionPayloadUnsafe(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     assert(un_node.operand != .none);
 
-    const operand_value = try sema.resolveInst(un_node.operand);
-    const operand_key = sema.intern_pool.indexToKey(operand_value.index);
-    if (operand_key != .error_union) {
-        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "err_union_payload: operand is not an error union", .{});
+    const ip = sema.intern_pool;
+    const operand = try sema.resolveInst(un_node.operand);
+    const err_union_ty = operand.typeOf(ip);
+    if (err_union_ty.zigTypeTag(ip) != .error_union) {
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected error union type, found '{f}'", .{err_union_ty.fmt(ip)});
     }
-
-    switch (operand_key.error_union.val) {
-        .payload => |payload_idx| return .{ .index = payload_idx },
-        .err_name => {
-            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "err_union_payload: operand carries an error, not a payload", .{});
-        },
+    // The compiler unwinds a comptime error return trace here; the REPL has no such trace.
+    if (operand.getErrorName(ip).unwrap()) |name| {
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "caught unexpected error '{s}'", .{ip.stringSlice(name)});
     }
+    return .{ .index = ip.indexToKey(operand.index).error_union.val.payload };
 }
 
 fn evalIsNonErr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     assert(un_node.operand != .none);
-    return try sema.isNonErrVal(try sema.resolveInst(un_node.operand));
+    return try sema.resolveIsNonErrVal(try sema.resolveInst(un_node.operand));
 }
 
 fn evalRetIsNonErr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     assert(un_node.operand != .none);
-    return try sema.isNonErrVal(try sema.resolveInst(un_node.operand));
+    return try sema.resolveIsNonErrVal(try sema.resolveInst(un_node.operand));
 }
 
 fn evalIsNonErrPtr(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
     const un_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].un_node;
     assert(un_node.operand != .none);
-    return try sema.isNonErrVal(try sema.loadValue(try sema.resolveInst(un_node.operand)));
+    return try sema.resolveIsNonErrVal(try sema.loadValue(try sema.resolveInst(un_node.operand)));
 }
 
-fn isNonErrVal(sema: *Sema, operand_value: Value) Error!Value {
-    const operand_key = sema.intern_pool.indexToKey(operand_value.index);
-    if (operand_key != .error_union) {
-        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "is_non_err: operand is not an error union", .{});
+fn resolveIsNonErrFromType(sema: *Sema, operand_ty: Type) Error!?Value {
+    const ip = sema.intern_pool;
+    const ot = operand_ty.zigTypeTag(ip);
+    if (ot != .error_set and ot != .error_union) return Value.bool_true;
+    if (ot == .error_set) return Value.bool_false;
+    assert(ot == .error_union);
+
+    const payload_ty = operand_ty.errorUnionPayload(ip);
+    // The compiler asserts the payload layout is already resolved before `classify` reads its class; the
+    // REPL resolves lazily, so ensure it here.
+    try sema.ensureLayoutResolved(payload_ty.index);
+    if (payload_ty.classify(ip) == .no_possible_value) {
+        return Value.bool_false;
     }
-    return switch (operand_key.error_union.val) {
-        .payload => Value.bool_true,
-        .err_name => Value.bool_false,
-    };
+    // The REPL never mints an inferred error set, so `resolveErrSetIsEmpty` reduces to `errorSetIsEmpty`.
+    if (operand_ty.errorUnionSet(ip).errorSetIsEmpty(ip)) {
+        return Value.bool_true;
+    }
+    return null;
+}
+
+fn resolveIsNonErrVal(sema: *Sema, operand: Value) Error!Value {
+    const ip = sema.intern_pool;
+    if (try sema.resolveIsNonErrFromType(operand.typeOf(ip))) |res| {
+        return res;
+    }
+    assert(operand.typeOf(ip).zigTypeTag(ip) == .error_union);
+    if (operand.isUndef(ip)) return .{ .index = .undef_bool };
+    return Value.makeBool(operand.getErrorName(ip) == .none);
 }
 
 fn evalLoop(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
@@ -10334,8 +10368,8 @@ fn evalSwitchBlock(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "switch_block_err_union: operand is not an error_union", .{});
         }
         switch (eu_key.error_union.val) {
-            .payload => {
-                if (non_err.capture != .none) return sema.failSwitch("non-err payload capture");
+            .payload => |payload_idx| {
+                if (non_err.capture != .none) try sema.bindSwitchCapture(inst, sw, non_err.capture, .{ .index = payload_idx });
                 return try sema.resolveInlineBody(non_err.body, inst);
             },
             .err_name => {},
@@ -10814,6 +10848,15 @@ fn evalRetType(sema: *Sema) Error!?Value {
     return .{ .index = sema.fn_ret_ty };
 }
 
+fn validateErrorUnionPayloadType(sema: *Sema, payload_ty: Type) Error!void {
+    const ip = sema.intern_pool;
+    if (payload_ty.zigTypeTag(ip) == .@"opaque") {
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "error union with payload of opaque type '{f}' not allowed", .{payload_ty.fmt(ip)});
+    } else if (payload_ty.zigTypeTag(ip) == .error_set) {
+        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "error union with payload of error set type '{f}' not allowed", .{payload_ty.fmt(ip)});
+    }
+}
+
 fn resolveDeclaredRetType(sema: *Sema, info: Zir.FnInfo, break_target: Zir.Inst.Index) Error!InternPool.Index {
     if (info.ret_ty_ref != .none) return (try sema.coerceValueToType(try sema.resolveInst(info.ret_ty_ref), .type_type, "return type")).index;
     if (info.ret_ty_body.len > 0) return (try sema.coerceValueToType(try sema.resolveInlineBody(info.ret_ty_body, break_target), .type_type, "return type")).index;
@@ -10847,7 +10890,7 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const info = sema.zir.getFnInfo(inst);
 
-    const ret_ty: InternPool.Index = if (info.ret_ty_is_generic)
+    const bare_ret_ty: InternPool.Index = if (info.ret_ty_is_generic)
         .generic_poison_type
     else
         try sema.resolveDeclaredRetType(info, inst);
@@ -10863,6 +10906,23 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
 
     const tag = sema.zir.instructions.items(.tag)[@intFromEnum(inst)];
     const fancy = sema.funcFancyExtras(inst, tag);
+
+    // The REPL does not model a per-declaration calling convention (a regular function type carries no cc),
+    // so the parameter and return-type checks run against the default `.auto`.
+    const cc: std.lang.CallingConvention.Tag = .auto;
+    for (params, 0..) |param_ty, i| {
+        try sema.checkParamType(.fromIndex(param_ty), (fancy.noalias_bits >> @intCast(i)) & 1 != 0, cc);
+    }
+    if (!info.ret_ty_is_generic) {
+        try sema.checkReturnTypeAndCallConv(.fromIndex(bare_ret_ty), fancy.is_var_args, info.inferred_error_set, cc);
+    }
+
+    // A `!T` return carries the adhoc inferred error set; the REPL never mints an inferred error set type.
+    const ret_ty: InternPool.Index = if (info.inferred_error_set and !info.ret_ty_is_generic)
+        try sema.intern_pool.internErrorUnionType(.{ .error_set_type = .adhoc_inferred_error_set_type, .payload_type = bare_ret_ty })
+    else
+        bare_ret_ty;
+
     const fn_ty = try sema.intern_pool.internFuncType(.{
         .param_types = params,
         .return_type = ret_ty,
