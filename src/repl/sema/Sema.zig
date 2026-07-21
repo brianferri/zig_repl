@@ -9234,18 +9234,12 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
 
     const result_array_ty = try ip.internArrayType(.{ .len = end - start, .child = elem_ty, .sentinel = sentinel });
     const result_ptr_ty = try ip.internPtrType(.{ .child = result_array_ty, .flags = .{ .size = .one, .is_const = is_const } });
-    // `backing` is a pointer to the sliced array/slice; the sub-array pointer is that address offset
-    // by the start element -- a byte-offset pointer for a well-defined element, else structural.
-    const elem_type: Type = .fromIndex(elem_ty);
-    if (elem_type.comptimeOnly(ip)) {
-        return .{ .index = try ip.internPtr(.{
-            .ty = result_ptr_ty,
-            .base_addr = .{ .arr_elem = .{ .base = backing, .index = base_offset + start } },
-            .byte_offset = 0,
-        }) };
-    }
-    try sema.ensureLayoutResolved(elem_ty);
-    return try Value.fromIndex(backing).getOffsetPtr((base_offset + start) * elem_type.abiSize(ip), .fromIndex(result_ptr_ty), ip);
+    // The sub-array pointer is a pointer to element `start` of the backing, re-typed to the sub-array
+    // type (mirrors the compiler's analyzePtrArithmetic + getCoerced). `ptrElem` gives a byte-offset
+    // pointer for a well-defined element and the canonical `arr_elem` for a comptime-only element.
+    if (!Type.fromIndex(elem_ty).comptimeOnly(ip)) try sema.ensureLayoutResolved(elem_ty);
+    const elem_ptr = try Value.fromIndex(backing).ptrElem(base_offset + start, ip);
+    return .{ .index = try ip.getCoerced(elem_ptr.index, result_ptr_ty) };
 }
 
 fn failSliceNotArrayPtr(sema: *Sema) Error {

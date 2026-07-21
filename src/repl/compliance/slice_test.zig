@@ -207,6 +207,22 @@ test "compliance: slicing an array pointer yields a pointer-to-array" {
     });
 }
 
+// Slicing a comptime-only array ([N]type) at a non-zero start must carry the element index through
+// the canonical arr_elem pointer; `zig run` can't be an oracle, so the reference is comptime-folded.
+test "compliance: slicing a comptime-only array at a non-zero start" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const arr: [3]type = .{ u8, u16, bool }; const s = arr[1..3]; break :blk s[0] == u16 and s[1] == bool; }"}, .want = blk: {
+            const arr: [3]type = .{ u8, u16, bool };
+            const s = arr[1..3];
+            break :blk s[0] == u16 and s[1] == bool;
+        } },
+        .{ .src = &.{"blk: { const arr: [3]type = .{ u8, u16, bool }; break :blk arr[2..3][0] == bool; }"}, .want = blk: {
+            const arr: [3]type = .{ u8, u16, bool };
+            break :blk arr[2..3][0] == bool;
+        } },
+    });
+}
+
 test "compliance: storing through a pointer-to-array writes the sub-array range" {
     try compliance.check(a, .{
         .{ .src = &.{"blk: { var d = [_]u8{ 1, 2, 3, 4 }; d[1..3].* = .{ 8, 9 }; break :blk d[0] + d[1] + d[2] + d[3]; }"}, .want = blk: {
