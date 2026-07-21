@@ -10863,17 +10863,30 @@ fn resolveDeclaredRetType(sema: *Sema, info: Zir.FnInfo, break_target: Zir.Inst.
     return .void_type;
 }
 
-fn funcFancyExtras(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) struct { noalias_bits: u32, is_var_args: bool } {
-    if (tag != .func_fancy) return .{ .noalias_bits = 0, .is_var_args = false };
+fn funcFancyExtras(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) Error!struct { noalias_bits: u32, is_var_args: bool, cc: std.lang.CallingConvention } {
+    if (tag != .func_fancy) return .{ .noalias_bits = 0, .is_var_args = false, .cc = .auto };
     const pl_node = sema.zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = sema.zir.extraData(Zir.Inst.FuncFancy, pl_node.payload_index);
     const bits = extra.data.bits;
     var extra_index = extra.end;
-    if (bits.has_cc_body) {
-        extra_index += 1 + sema.zir.extra[extra_index];
-    } else if (bits.has_cc_ref) {
+
+    const cc: std.lang.CallingConvention = if (bits.has_cc_body) blk: {
+        const body_len = sema.zir.extra[extra_index];
         extra_index += 1;
-    }
+        const body = sema.zir.bodySlice(extra_index, body_len);
+        extra_index += body.len;
+        const cc_ty = try sema.getStdLangType(.CallingConvention);
+        break :blk try sema.interpretCallConv(try sema.coerceValueToType(try sema.resolveInlineBody(body, inst), cc_ty, "calling convention"));
+    } else if (bits.has_cc_ref) blk: {
+        const cc_ref: Zir.Inst.Ref = @enumFromInt(sema.zir.extra[extra_index]);
+        extra_index += 1;
+        const cc_ty = try sema.getStdLangType(.CallingConvention);
+        break :blk try sema.interpretCallConv(try sema.coerceValueToType(try sema.resolveInst(cc_ref), cc_ty, "calling convention"));
+    } else
+        // The compiler defaults an exported decl to target.cCallingConvention(); that needs
+        // export-linkage resolution and a concrete target ABI, neither present in the comptime REPL.
+        .auto;
+
     if (bits.has_ret_ty_body) {
         extra_index += 1 + sema.zir.extra[extra_index];
     } else if (bits.has_ret_ty_ref) {
@@ -10882,6 +10895,7 @@ fn funcFancyExtras(sema: *Sema, inst: Zir.Inst.Index, tag: Zir.Inst.Tag) struct 
     return .{
         .noalias_bits = if (bits.has_any_noalias) sema.zir.extra[extra_index] else 0,
         .is_var_args = bits.is_var_args,
+        .cc = cc,
     };
 }
 
@@ -10889,6 +10903,10 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@intFromEnum(inst) < sema.zir.instructions.len);
 
     const info = sema.zir.getFnInfo(inst);
+
+    const tag = sema.zir.instructions.items(.tag)[@intFromEnum(inst)];
+    const fancy = try sema.funcFancyExtras(inst, tag);
+    const cc_tag = std.meta.activeTag(fancy.cc);
 
     const bare_ret_ty: InternPool.Index = if (info.ret_ty_is_generic)
         .generic_poison_type
@@ -10904,17 +10922,11 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     }
     sema.block.params.clearRetainingCapacity();
 
-    const tag = sema.zir.instructions.items(.tag)[@intFromEnum(inst)];
-    const fancy = sema.funcFancyExtras(inst, tag);
-
-    // The REPL does not model a per-declaration calling convention (a regular function type carries no cc),
-    // so the parameter and return-type checks run against the default `.auto`.
-    const cc: std.lang.CallingConvention.Tag = .auto;
     for (params, 0..) |param_ty, i| {
-        try sema.checkParamType(.fromIndex(param_ty), (fancy.noalias_bits >> @intCast(i)) & 1 != 0, cc);
+        try sema.checkParamType(.fromIndex(param_ty), (fancy.noalias_bits >> @intCast(i)) & 1 != 0, cc_tag);
     }
     if (!info.ret_ty_is_generic) {
-        try sema.checkReturnTypeAndCallConv(.fromIndex(bare_ret_ty), fancy.is_var_args, info.inferred_error_set, cc);
+        try sema.checkReturnTypeAndCallConv(.fromIndex(bare_ret_ty), fancy.is_var_args, info.inferred_error_set, cc_tag);
     }
 
     // A `!T` return carries the adhoc inferred error set; the REPL never mints an inferred error set type.
@@ -10929,6 +10941,7 @@ fn evalFunc(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .comptime_bits = comptime_bits,
         .noalias_bits = fancy.noalias_bits,
         .is_var_args = fancy.is_var_args,
+        .cc = fancy.cc,
     });
     if (info.body.len == 0) return Value{ .index = fn_ty };
 
