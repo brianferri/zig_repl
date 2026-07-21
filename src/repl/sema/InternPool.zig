@@ -4348,10 +4348,7 @@ fn funcCoercedFromExtra(pool: *const InternPool, extra_index: u32) Key {
 
 fn ccFromTag(tag: std.lang.CallingConvention.Tag) std.lang.CallingConvention {
     return switch (tag) {
-        .auto => .auto,
-        .async => .async,
-        .naked => .naked,
-        .@"inline" => .@"inline",
+        // Options-carrying calling conventions round-trip with their options defaulted.
         .x86_64_sysv => .{ .x86_64_sysv = .{} },
         .x86_64_win => .{ .x86_64_win = .{} },
         .x86_sysv => .{ .x86_sysv = .{} },
@@ -4369,7 +4366,12 @@ fn ccFromTag(tag: std.lang.CallingConvention.Tag) std.lang.CallingConvention {
         .arm_aapcs_vfp => .{ .arm_aapcs_vfp = .{} },
         .riscv64_lp64 => .{ .riscv64_lp64 = .{} },
         .riscv32_ilp32 => .{ .riscv32_ilp32 = .{} },
-        else => @panic("InternPool: round-trip for this CallingConvention.Tag variant not yet implemented"),
+        // An options-free calling convention round-trips directly; this is exactly the set `interpretCallConv`
+        // admits, so the two stay in agreement about which conventions are representable.
+        inline else => |t| if (@FieldType(std.lang.CallingConvention, @tagName(t)) == void)
+            @unionInit(std.lang.CallingConvention, @tagName(t), {})
+        else
+            @panic("InternPool: round-trip for this CallingConvention.Tag variant not yet implemented"),
     };
 }
 

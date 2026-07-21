@@ -5400,22 +5400,28 @@ fn checkCallConvSupportsVarArgs(sema: *Sema, cc: std.lang.CallingConvention.Tag)
     }
 }
 
-// Ported from Sema.checkParamType; the interrupt/SPIR-V calling-convention, comptime/generic-parameter, and
-// vulkan/opengl address-space branches do not apply to `@Fn` reification, which has concrete parameter types,
-// payload-free calling conventions, and the native target.
-fn checkParamType(sema: *Sema, param_ty: Type, param_is_noalias: bool) Error!void {
+// Ported from Sema.checkParamType. The option-carrying interrupt calling conventions (x86_64_interrupt,
+// arm_interrupt, ...) are rejected earlier by `interpretCallConv`, so only the option-free avr_interrupt and
+// avr_signal reach this switch; the comptime/generic-parameter and vulkan/opengl address-space branches do
+// not apply to `@Fn` reification (concrete parameter types, native target).
+fn checkParamType(sema: *Sema, param_ty: Type, param_is_noalias: bool, cc: std.lang.CallingConvention.Tag) Error!void {
     const ip = sema.intern_pool;
     if (!param_ty.isValidParamType(ip)) {
         const opaque_str: []const u8 = if (param_ty.zigTypeTag(ip) == .@"opaque") "opaque " else "";
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "parameter of {s}type '{f}' not allowed", .{ opaque_str, param_ty.fmt(ip) });
+    }
+    switch (cc) {
+        .avr_interrupt, .avr_signal => return sema.fail(sema.block, sema.block.nodeOffset(.zero), "parameters are not allowed with '{s}' calling convention", .{@tagName(cc)}),
+        else => {},
     }
     if (param_is_noalias and !param_ty.isGenericPoison() and !param_ty.isPtrAtRuntime(ip) and !param_ty.isSliceAtRuntime(ip)) {
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "non-pointer parameter declared noalias", .{});
     }
 }
 
-// Ported from Sema.checkReturnTypeAndCallConv; inferred error sets, incoming-stack-alignment, and the
-// interrupt calling conventions do not apply here (no inferred error sets; payload-free calling conventions).
+// Ported from Sema.checkReturnTypeAndCallConv. Inferred error sets and incoming-stack-alignment do not apply
+// here (no inferred error sets; option-carrying calling conventions are rejected by `interpretCallConv`), so
+// of the interrupt calling conventions only the option-free avr_interrupt and avr_signal reach the switch.
 fn checkReturnTypeAndCallConv(sema: *Sema, bare_ret_ty: Type, opt_varargs: bool, cc: std.lang.CallingConvention.Tag) Error!void {
     const ip = sema.intern_pool;
     if (opt_varargs) {
@@ -5424,6 +5430,18 @@ fn checkReturnTypeAndCallConv(sema: *Sema, bare_ret_ty: Type, opt_varargs: bool,
     if (!bare_ret_ty.isValidReturnType(ip)) {
         const opaque_str: []const u8 = if (bare_ret_ty.zigTypeTag(ip) == .@"opaque") "opaque " else "";
         return sema.fail(sema.block, sema.block.nodeOffset(.zero), "{s}return type '{f}' not allowed", .{ opaque_str, bare_ret_ty.fmt(ip) });
+    }
+    switch (cc) {
+        .avr_interrupt, .avr_signal => {
+            const ret_ok = switch (bare_ret_ty.index) {
+                .void_type, .noreturn_type => true,
+                else => false,
+            };
+            if (!ret_ok) {
+                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "function with calling convention '{s}' must return 'void' or 'noreturn'", .{@tagName(cc)});
+            }
+        },
+        else => {},
     }
 }
 
@@ -5470,7 +5488,7 @@ fn evalReifyFn(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
         param_ty.* = try ip.aggregateElementAt(param_types_arr, param_idx);
         const param_attr = ip.indexToKey(try ip.aggregateElementAt(param_attrs_arr, param_idx)).aggregate;
         const param_is_noalias = try ip.aggregateElementAt(param_attr, 0) == .bool_true;
-        try sema.checkParamType(.fromIndex(param_ty.*), param_is_noalias);
+        try sema.checkParamType(.fromIndex(param_ty.*), param_is_noalias, std.meta.activeTag(cc));
         if (param_is_noalias) {
             if (param_idx > 31) {
                 return sema.fail(sema.block, sema.block.nodeOffset(.zero), "this compiler implementation only supports 'noalias' on the first 32 parameters", .{});
