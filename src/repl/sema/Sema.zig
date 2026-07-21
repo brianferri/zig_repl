@@ -5249,28 +5249,33 @@ fn evalReifyPointer(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Va
         .none;
 
     const elem_ty = try sema.resolveDestType(extra.elem_ty, "pointer child");
-    if (elem_ty == .noreturn_type) {
-        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "pointer to noreturn not allowed", .{});
-    }
-    if (elem_ty == .null_type) {
-        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "cannot reify pointer to '@TypeOf(null)'", .{});
-    }
-    if (elem_ty == .anyopaque_type and size != .one) {
-        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "indexable pointer to opaque type not allowed", .{});
-    }
-    if (ip.indexToKey(elem_ty) == .func_type and size != .one) {
-        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "function pointers must be single pointers", .{});
+    switch (Type.fromIndex(elem_ty).zigTypeTag(ip)) {
+        .noreturn => return sema.fail(sema.block, sema.block.nodeOffset(.zero), "pointer to noreturn not allowed", .{}),
+        // This needs to be disallowed, because the sentinel parameter would otherwise have type
+        // `?@TypeOf(null)`, which is not a valid type because you cannot differentiate between
+        // constructing the "inner" null value and the "outer" null value.
+        .null => return sema.fail(sema.block, sema.block.nodeOffset(.zero), "cannot reify pointer to '@TypeOf(null)'", .{}),
+        .@"fn" => switch (size) {
+            .one => {},
+            .many, .c, .slice => return sema.fail(sema.block, sema.block.nodeOffset(.zero), "function pointers must be single pointers", .{}),
+        },
+        .@"opaque" => switch (size) {
+            .one => {},
+            .many, .c, .slice => return sema.fail(sema.block, sema.block.nodeOffset(.zero), "indexable pointer to opaque type '{f}' not allowed", .{Type.fromIndex(elem_ty).fmt(ip)}),
+        },
+        else => {},
     }
 
     const sentinel_ty = try ip.internOptionalType(elem_ty);
     const sentinel_val = try sema.coerceValueToType(try sema.resolveInst(extra.sentinel), sentinel_ty, "pointer sentinel");
     const opt_sentinel = ip.indexToKey(sentinel_val.index).opt.val;
-    if (opt_sentinel != .none) switch (size) {
-        .many, .slice => {},
-        .one, .c => {
-            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "sentinels are only allowed on slices and unknown-length pointers", .{});
-        },
-    };
+    if (opt_sentinel != .none) {
+        switch (size) {
+            .many, .slice => {},
+            .one, .c => return sema.fail(sema.block, sema.block.nodeOffset(.zero), "sentinels are only allowed on slices and unknown-length pointers", .{}),
+        }
+        try sema.checkSentinelType(elem_ty);
+    }
 
     return .{ .index = try ip.internPtrType(.{
         .child = elem_ty,
@@ -5290,8 +5295,14 @@ fn evalReifyPointerSentinelTy(sema: *Sema, extended: Zir.Inst.Extended.InstData)
     const ip = sema.intern_pool;
     const extra = sema.zir.extraData(Zir.Inst.UnNode, extended.operand).data;
     const elem_ty = try sema.resolveDestType(extra.operand, "pointer child");
-    const child = if (elem_ty == .anyopaque_type or elem_ty == .null_type) .noreturn_type else elem_ty;
-    return .{ .index = try ip.internOptionalType(child) };
+    return .{
+        .index = switch (Type.fromIndex(elem_ty).zigTypeTag(ip)) {
+            else => try ip.internOptionalType(elem_ty),
+            // These types cannot be the child of an optional. To allow reifying pointers to them still,
+            // we treat the "sentinel" argument to `@Pointer` as `?noreturn` instead of `?T`.
+            .@"opaque", .null => .optional_noreturn_type,
+        },
+    };
 }
 
 fn evalReifySliceArgTy(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
@@ -5307,7 +5318,9 @@ fn evalReifySliceArgTy(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!
     };
     const operand_ty = try ip.internPtrType(.{ .child = in_scalar_ty, .flags = .{ .size = .slice, .is_const = true } });
     const operand_val = try sema.coerceValueToType(try sema.resolveInst(extra.operand), operand_ty, "reify slice argument");
-    const len = try sema.resolveUsizeInt(.{ .index = ip.indexToKey(operand_val.index).slice.len }, "reify slice argument length");
+    const len_val: Value = .fromIndex(ip.indexToKey(operand_val.index).slice.len);
+    if (len_val.isUndef(ip)) return sema.failWithUseOfUndef();
+    const len = try sema.resolveUsizeInt(len_val, "reify slice argument length");
     const arr_ty = try ip.internArrayType(.{ .len = len, .child = out_scalar_ty });
     return .{ .index = try ip.internPtrType(.{ .child = arr_ty, .flags = .{ .size = .one, .is_const = true } }) };
 }
@@ -5397,7 +5410,9 @@ fn evalReifyEnumValueSliceTy(sema: *Sema, extended: Zir.Inst.Extended.InstData) 
     const extra = sema.zir.extraData(Zir.Inst.BinNode, extended.operand).data;
     const int_tag_ty = try sema.resolveDestType(extra.lhs, "enum tag type");
     const names_slice = try sema.coerceValueToType(try sema.resolveInst(extra.rhs), try sema.sliceOfStringTy(), "enum field names");
-    const len = try sema.resolveUsizeInt(.{ .index = ip.indexToKey(names_slice.index).slice.len }, "enum field names length");
+    const len_val: Value = .fromIndex(ip.indexToKey(names_slice.index).slice.len);
+    if (len_val.isUndef(ip)) return sema.failWithUseOfUndef();
+    const len = try sema.resolveUsizeInt(len_val, "enum field names length");
     const arr_ty = try ip.internArrayType(.{ .len = len, .child = int_tag_ty });
     return .{ .index = try ip.internPtrType(.{ .child = arr_ty, .flags = .{ .size = .one, .is_const = true } }) };
 }
