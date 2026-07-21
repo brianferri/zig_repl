@@ -1025,7 +1025,7 @@ pub const Key = union(enum) {
                 std.hash.autoHash(&hasher, ft.return_type);
                 std.hash.autoHash(&hasher, ft.comptime_bits);
                 std.hash.autoHash(&hasher, ft.noalias_bits);
-                std.hash.autoHash(&hasher, @as(std.lang.CallingConvention.Tag, ft.cc));
+                std.hash.autoHash(&hasher, ft.cc);
                 std.hash.autoHash(&hasher, ft.is_var_args);
                 std.hash.autoHash(&hasher, ft.is_noinline);
             },
@@ -1216,8 +1216,7 @@ pub const Key = union(enum) {
                 if (x.noalias_bits != y.noalias_bits) break :blk false;
                 if (x.is_var_args != y.is_var_args) break :blk false;
                 if (x.is_noinline != y.is_noinline) break :blk false;
-                if (@as(std.lang.CallingConvention.Tag, x.cc) !=
-                    @as(std.lang.CallingConvention.Tag, y.cc)) break :blk false;
+                if (!x.cc.eql(y.cc)) break :blk false;
                 break :blk std.mem.eql(Index, x.param_types, y.param_types);
             },
             .func => |x| blk: {
@@ -1387,13 +1386,155 @@ const FuncTypeRepr = struct {
     flags: Flags,
 
     const Flags = packed struct(u32) {
-        cc_tag: std.lang.CallingConvention.Tag,
+        cc: PackedCallingConvention,
         is_var_args: bool,
         is_noinline: bool,
         has_comptime_bits: bool,
         has_noalias_bits: bool,
-        _reserved: u20 = 0,
+        _reserved: u10 = 0,
     };
+};
+
+const PackedCallingConvention = packed struct(u18) {
+    tag: std.lang.CallingConvention.Tag,
+    /// May be ignored depending on `tag`.
+    incoming_stack_alignment: Alignment,
+    /// Interpretation depends on `tag`.
+    extra: u4,
+
+    fn pack(cc: std.lang.CallingConvention) PackedCallingConvention {
+        return switch (cc) {
+            inline else => |pl, tag| switch (@TypeOf(pl)) {
+                void => .{
+                    .tag = tag,
+                    .incoming_stack_alignment = .none, // unused
+                    .extra = 0, // unused
+                },
+                std.lang.CallingConvention.CommonOptions => .{
+                    .tag = tag,
+                    .incoming_stack_alignment = .fromByteUnits(pl.incoming_stack_alignment orelse 0),
+                    .extra = 0, // unused
+                },
+                std.lang.CallingConvention.X86RegparmOptions => .{
+                    .tag = tag,
+                    .incoming_stack_alignment = .fromByteUnits(pl.incoming_stack_alignment orelse 0),
+                    .extra = pl.register_params,
+                },
+                std.lang.CallingConvention.ArcInterruptOptions => .{
+                    .tag = tag,
+                    .incoming_stack_alignment = .fromByteUnits(pl.incoming_stack_alignment orelse 0),
+                    .extra = @intFromEnum(pl.type),
+                },
+                std.lang.CallingConvention.ArmInterruptOptions => .{
+                    .tag = tag,
+                    .incoming_stack_alignment = .fromByteUnits(pl.incoming_stack_alignment orelse 0),
+                    .extra = @intFromEnum(pl.type),
+                },
+                std.lang.CallingConvention.MicroblazeInterruptOptions => .{
+                    .tag = tag,
+                    .incoming_stack_alignment = .fromByteUnits(pl.incoming_stack_alignment orelse 0),
+                    .extra = @intFromEnum(pl.type),
+                },
+                std.lang.CallingConvention.MipsInterruptOptions => .{
+                    .tag = tag,
+                    .incoming_stack_alignment = .fromByteUnits(pl.incoming_stack_alignment orelse 0),
+                    .extra = @intFromEnum(pl.mode),
+                },
+                std.lang.CallingConvention.RiscvInterruptOptions => .{
+                    .tag = tag,
+                    .incoming_stack_alignment = .fromByteUnits(pl.incoming_stack_alignment orelse 0),
+                    .extra = @intFromEnum(pl.mode),
+                },
+                std.lang.CallingConvention.ShInterruptOptions => .{
+                    .tag = tag,
+                    .incoming_stack_alignment = .fromByteUnits(pl.incoming_stack_alignment orelse 0),
+                    .extra = @intFromEnum(pl.save),
+                },
+                std.lang.CallingConvention.SpirvKernelOptions => .{
+                    .tag = tag,
+                    .incoming_stack_alignment = .none,
+                    .extra = 0,
+                },
+                std.lang.CallingConvention.SpirvFragmentOptions => .{
+                    .tag = tag,
+                    .incoming_stack_alignment = .none,
+                    .extra = @as(u4, @intFromEnum(pl.depth_assumption)) << 1 | @intFromBool(pl.pixel_centered_integer),
+                },
+                std.lang.CallingConvention.SpirvMeshOptions => .{
+                    .tag = tag,
+                    .incoming_stack_alignment = .none,
+                    .extra = @intFromEnum(pl.stage_output),
+                },
+                else => comptime unreachable,
+            },
+        };
+    }
+
+    fn extraLen(cc: PackedCallingConvention) u2 {
+        return switch (cc.tag) {
+            .spirv_kernel, .spirv_task => 3,
+            .spirv_mesh => 2,
+            else => 0,
+        };
+    }
+
+    fn unpack(cc: PackedCallingConvention, trailing: []const u32) std.lang.CallingConvention {
+        return switch (cc.tag) {
+            inline else => |tag| @unionInit(
+                std.lang.CallingConvention,
+                @tagName(tag),
+                switch (@FieldType(std.lang.CallingConvention, @tagName(tag))) {
+                    void => {},
+                    std.lang.CallingConvention.CommonOptions => .{
+                        .incoming_stack_alignment = cc.incoming_stack_alignment.toByteUnits(),
+                    },
+                    std.lang.CallingConvention.X86RegparmOptions => .{
+                        .incoming_stack_alignment = cc.incoming_stack_alignment.toByteUnits(),
+                        .register_params = @intCast(cc.extra),
+                    },
+                    std.lang.CallingConvention.ArcInterruptOptions => .{
+                        .incoming_stack_alignment = cc.incoming_stack_alignment.toByteUnits(),
+                        .type = @enumFromInt(cc.extra),
+                    },
+                    std.lang.CallingConvention.ArmInterruptOptions => .{
+                        .incoming_stack_alignment = cc.incoming_stack_alignment.toByteUnits(),
+                        .type = @enumFromInt(cc.extra),
+                    },
+                    std.lang.CallingConvention.MicroblazeInterruptOptions => .{
+                        .incoming_stack_alignment = cc.incoming_stack_alignment.toByteUnits(),
+                        .type = @enumFromInt(cc.extra),
+                    },
+                    std.lang.CallingConvention.MipsInterruptOptions => .{
+                        .incoming_stack_alignment = cc.incoming_stack_alignment.toByteUnits(),
+                        .mode = @enumFromInt(cc.extra),
+                    },
+                    std.lang.CallingConvention.RiscvInterruptOptions => .{
+                        .incoming_stack_alignment = cc.incoming_stack_alignment.toByteUnits(),
+                        .mode = @enumFromInt(cc.extra),
+                    },
+                    std.lang.CallingConvention.ShInterruptOptions => .{
+                        .incoming_stack_alignment = cc.incoming_stack_alignment.toByteUnits(),
+                        .save = @enumFromInt(cc.extra),
+                    },
+                    std.lang.CallingConvention.SpirvKernelOptions => .{
+                        .x = trailing[0],
+                        .y = trailing[1],
+                        .z = trailing[2],
+                    },
+                    std.lang.CallingConvention.SpirvFragmentOptions => .{
+                        .pixel_centered_integer = @bitCast(@as(u1, @truncate(cc.extra))),
+                        .depth_assumption = @enumFromInt(@as(u2, @truncate(cc.extra >> 1))),
+                    },
+                    std.lang.CallingConvention.SpirvMeshOptions => .{
+                        .stage_output = @enumFromInt(cc.extra),
+                        .max_primitives = trailing[0],
+                        .max_vertices = trailing[1],
+                    },
+                    else => comptime unreachable,
+                },
+            ),
+        };
+    }
 };
 
 const FuncDeclRepr = struct {
@@ -4240,8 +4381,10 @@ fn emitFuncType(pool: *InternPool, ft: Key.FuncType) Allocator.Error!void {
 
     const has_comptime_bits = ft.comptime_bits != 0;
     const has_noalias_bits = ft.noalias_bits != 0;
+    const packed_cc: PackedCallingConvention = .pack(ft.cc);
+    const cc_extra_len = packed_cc.extraLen();
     const flags: FuncTypeRepr.Flags = .{
-        .cc_tag = ft.cc,
+        .cc = packed_cc,
         .is_var_args = ft.is_var_args,
         .is_noinline = ft.is_noinline,
         .has_comptime_bits = has_comptime_bits,
@@ -4255,9 +4398,14 @@ fn emitFuncType(pool: *InternPool, ft: Key.FuncType) Allocator.Error!void {
     });
     const opt_slots: u32 = @as(u32, @intFromBool(has_comptime_bits)) +
         @as(u32, @intFromBool(has_noalias_bits));
-    try pool.extra.ensureUnusedCapacity(pool.gpa, opt_slots + @as(u32, @intCast(ft.param_types.len)));
+    try pool.extra.ensureUnusedCapacity(pool.gpa, opt_slots + cc_extra_len + @as(u32, @intCast(ft.param_types.len)));
     if (has_comptime_bits) pool.extra.appendAssumeCapacity(ft.comptime_bits);
     if (has_noalias_bits) pool.extra.appendAssumeCapacity(ft.noalias_bits);
+    switch (ft.cc) {
+        .spirv_kernel, .spirv_task => |kernel| pool.extra.appendSliceAssumeCapacity(&.{ kernel.x, kernel.y, kernel.z }),
+        .spirv_mesh => |mesh| pool.extra.appendSliceAssumeCapacity(&.{ mesh.max_primitives, mesh.max_vertices }),
+        else => {},
+    }
     for (ft.param_types) |p| pool.extra.appendAssumeCapacity(@intFromEnum(p));
 
     pool.items.appendAssumeCapacity(.{ .tag = .type_function, .data = extra_index });
@@ -4315,12 +4463,16 @@ fn funcTypeFromExtra(pool: *const InternPool, extra_index: u32) Key {
         t += 1;
         break :blk v;
     } else 0;
+
+    const cc_extra_len = r.flags.cc.extraLen();
+    const cc_trailing = pool.extra.items[t..][0..cc_extra_len];
+    t += cc_extra_len;
+    const cc: std.lang.CallingConvention = r.flags.cc.unpack(cc_trailing);
+
     assert(t + r.params_len <= pool.extra.items.len);
 
     const param_slots = pool.extra.items[t..][0..r.params_len];
     const param_types: []const Index = @ptrCast(param_slots);
-
-    const cc: std.lang.CallingConvention = ccFromTag(r.flags.cc_tag);
 
     return .{ .func_type = .{
         .param_types = param_types,
@@ -4378,35 +4530,6 @@ fn funcCoercedFromExtra(pool: *const InternPool, extra_index: u32) Key {
         .generic_owner = inner_key.generic_owner,
         .comptime_args = inner_key.comptime_args,
     } };
-}
-
-fn ccFromTag(tag: std.lang.CallingConvention.Tag) std.lang.CallingConvention {
-    return switch (tag) {
-        // Options-carrying calling conventions round-trip with their options defaulted.
-        .x86_64_sysv => .{ .x86_64_sysv = .{} },
-        .x86_64_win => .{ .x86_64_win = .{} },
-        .x86_sysv => .{ .x86_sysv = .{} },
-        .x86_win => .{ .x86_win = .{} },
-        .x86_stdcall => .{ .x86_stdcall = .{} },
-        .x86_fastcall => .{ .x86_fastcall = .{} },
-        .x86_thiscall => .{ .x86_thiscall = .{} },
-        .x86_vectorcall => .{ .x86_vectorcall = .{} },
-        .aarch64_aapcs => .{ .aarch64_aapcs = .{} },
-        .aarch64_aapcs_darwin => .{ .aarch64_aapcs_darwin = .{} },
-        .aarch64_aapcs_win => .{ .aarch64_aapcs_win = .{} },
-        .aarch64_vfabi => .{ .aarch64_vfabi = .{} },
-        .aarch64_vfabi_sve => .{ .aarch64_vfabi_sve = .{} },
-        .arm_aapcs => .{ .arm_aapcs = .{} },
-        .arm_aapcs_vfp => .{ .arm_aapcs_vfp = .{} },
-        .riscv64_lp64 => .{ .riscv64_lp64 = .{} },
-        .riscv32_ilp32 => .{ .riscv32_ilp32 = .{} },
-        // An options-free calling convention round-trips directly; this is exactly the set `interpretCallConv`
-        // admits, so the two stay in agreement about which conventions are representable.
-        inline else => |t| if (@FieldType(std.lang.CallingConvention, @tagName(t)) == void)
-            @unionInit(std.lang.CallingConvention, @tagName(t), {})
-        else
-            @panic("InternPool: round-trip for this CallingConvention.Tag variant not yet implemented"),
-    };
 }
 
 fn isFloatType(ty: Index) bool {

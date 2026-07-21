@@ -216,6 +216,14 @@ pub fn ptrField(parent_ptr: Value, field_idx: u32, pool: *InternPool) std.mem.Al
     }));
 }
 
+pub fn unionTag(val: Value, pool: *const InternPool) ?Value {
+    return switch (pool.indexToKey(val.index)) {
+        .undef, .enum_tag => val,
+        .un => |un| if (un.tag != .none) .fromIndex(un.tag) else null,
+        else => unreachable,
+    };
+}
+
 pub fn unionPayload(val: Value, pool: *const InternPool) Value {
     return switch (pool.indexToKey(val.index)) {
         .un => |un| .fromIndex(un.val),
@@ -665,6 +673,86 @@ pub fn fieldValue(val: Value, index: usize, pool: *InternPool) std.mem.Allocator
             break :blk try readFromPackedMemory(field_ty, pool, buf, field_bit_offset);
         },
         else => unreachable,
+    };
+}
+
+/// Read this comptime value into the native `std.lang` type `T`, the inverse of the compiler's
+/// `uninterpret`, used to bring reflection structures back into the host. `.direct` mode: `std.lang`
+/// is assumed to match what the REPL was built against, so fields are matched by index and enum tags
+/// by integer value. `TypeMismatch` therefore signals a corrupt `std.lang`.
+pub fn interpret(val: Value, comptime T: type, pool: *InternPool) error{ OutOfMemory, UndefinedValue, TypeMismatch }!T {
+    const ty = val.typeOf(pool);
+    if (ty.zigTypeTag(pool) != @typeInfo(T)) return error.TypeMismatch;
+    if (val.isUndef(pool)) return error.UndefinedValue;
+
+    return switch (@typeInfo(T)) {
+        .type,
+        .noreturn,
+        .comptime_float,
+        .comptime_int,
+        .undefined,
+        .null,
+        .@"fn",
+        .@"opaque",
+        .spirv,
+        .enum_literal,
+        => comptime unreachable, // comptime-only or otherwise impossible
+
+        .pointer,
+        .array,
+        .error_union,
+        .error_set,
+        .frame,
+        .@"anyframe",
+        .vector,
+        => comptime unreachable, // unsupported
+
+        .void => {},
+
+        .bool => switch (val.index) {
+            .bool_false => false,
+            .bool_true => true,
+            else => unreachable,
+        },
+
+        .int => switch (pool.indexToKey(val.index).int.storage) {
+            inline .u64, .i64 => |x| std.math.cast(T, x) orelse return error.TypeMismatch,
+            .big_int => |big| big.toInt(T) catch return error.TypeMismatch,
+        },
+
+        .float => val.toFloat(T, pool),
+
+        .optional => |opt| if (val.optionalValue(pool)) |unwrapped|
+            try unwrapped.interpret(opt.child, pool)
+        else
+            null,
+
+        .@"enum" => {
+            const int = val.getUnsignedInt(pool) orelse return error.TypeMismatch;
+            return std.enums.fromInt(T, int) orelse error.TypeMismatch;
+        },
+
+        .@"union" => |@"union"| {
+            const tag_val = val.unionTag(pool) orelse return error.TypeMismatch;
+            const tag = try tag_val.interpret(@"union".tag_type.?, pool);
+            return switch (tag) {
+                inline else => |tag_comptime| @unionInit(
+                    T,
+                    @tagName(tag_comptime),
+                    try val.unionPayload(pool).interpret(@FieldType(T, @tagName(tag_comptime)), pool),
+                ),
+            };
+        },
+
+        .@"struct" => |@"struct"| {
+            if (pool.loadStructType(ty.index).field_types.len != @"struct".field_names.len) return error.TypeMismatch;
+            var result: T = undefined;
+            inline for (@"struct".field_names, @"struct".field_types, 0..) |field_name, field_type, field_idx| {
+                const field_val = try val.fieldValue(field_idx, pool);
+                @field(result, field_name) = try field_val.interpret(field_type, pool);
+            }
+            return result;
+        },
     };
 }
 
@@ -1242,6 +1330,9 @@ pub fn getUnsignedInt(val: Value, pool: *const InternPool) ?u64 {
                 .none => 0,
                 else => |payload| Value.fromIndex(payload).getUnsignedInt(pool),
             },
+            .enum_tag => |enum_tag| Value.fromIndex(enum_tag.int).getUnsignedInt(pool),
+            .bitpack => |bitpack| Value.fromIndex(bitpack.backing_int_val).getUnsignedInt(pool),
+            .err => |err| pool.getErrorValueIfExists(err.name).?,
             else => null,
         },
     };

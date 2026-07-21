@@ -5450,22 +5450,15 @@ fn checkReturnTypeAndCallConv(sema: *Sema, bare_ret_ty: Type, opt_varargs: bool,
 }
 
 fn interpretCallConv(sema: *Sema, val: Value) Error!std.lang.CallingConvention {
-    const ip = sema.intern_pool;
-    const un = ip.indexToKey(val.index).un;
-    const tag_enum = ip.indexToKey(un.tag).enum_tag.ty;
-    const idx = (try sema.enumTagFieldIndex(tag_enum, .{ .index = un.tag })).?;
-    const name = ip.stringSlice((try sema.enumFieldName(tag_enum, idx)).?);
-    const tag = std.meta.stringToEnum(std.meta.Tag(std.lang.CallingConvention), name) orelse {
-        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "calling convention: unknown variant '{s}'", .{name});
+    return sema.interpretStdLangType(std.lang.CallingConvention, val);
+}
+
+fn interpretStdLangType(sema: *Sema, comptime T: type, val: Value) Error!T {
+    return val.interpret(T, sema.intern_pool) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.UndefinedValue => return sema.failWithUseOfUndef(),
+        error.TypeMismatch => @panic("std.lang is corrupt"),
     };
-    switch (tag) {
-        inline else => |t| {
-            if (@FieldType(std.lang.CallingConvention, @tagName(t)) != void) {
-                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "calling convention '{s}' is not modelled", .{@tagName(t)});
-            }
-            return @unionInit(std.lang.CallingConvention, @tagName(t), {});
-        },
-    }
 }
 
 fn evalReifyFn(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Value {
