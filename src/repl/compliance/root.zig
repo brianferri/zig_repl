@@ -104,8 +104,26 @@ test "fuzz: the evaluator survives arbitrary zig source" {
     try std.testing.fuzz({}, fuzzEval, .{});
 }
 
+// A comptime shift by billions of bits requests gigabytes in a single limb
+// allocation -- the same evaluation the compiler performs (both OOM on it). Under
+// the per-allocation cap that request fails as `error.OutOfMemory` instead of
+// OS-killing the process, and the eval path surfaces it gracefully.
+test "fuzz-harness: a pathological comptime allocation fails gracefully" {
+    var capped: CappedAllocator = .{ .child = std.testing.allocator, .max_alloc_bytes = 512 * 1024 * 1024 };
+    const gpa = capped.allocator();
+    const out = replRun(gpa, &.{"-306690 <<| 95721572180"}) catch return;
+    gpa.free(out);
+}
+
 fn fuzzEval(_: void, smith: *std.testing.Smith) anyerror!void {
-    const gpa = std.testing.allocator;
+    // A pathological comptime computation -- e.g. a shift by billions of bits --
+    // requests gigabytes in a single allocation. Uncapped, that request succeeds
+    // under memory overcommit and the fuzz process is OS-killed on first write,
+    // before the allocator can report failure. Capping the per-allocation size
+    // turns it into `error.OutOfMemory`, which the eval path already surfaces and
+    // the `catch return` below tolerates, so the fuzzer survives the input.
+    var capped: CappedAllocator = .{ .child = std.testing.allocator, .max_alloc_bytes = 512 * 1024 * 1024 };
+    const gpa = capped.allocator();
     const token_smith = try gpa.create(std.zig.TokenSmith);
     defer gpa.destroy(token_smith);
     token_smith.* = .gen(smith);
@@ -114,6 +132,40 @@ fn fuzzEval(_: void, smith: *std.testing.Smith) anyerror!void {
     const out = replRun(gpa, &.{src}) catch return;
     gpa.free(out);
 }
+
+/// Wraps a child allocator, failing any single allocation or in-place grow that
+/// exceeds `max_alloc_bytes` instead of forwarding it. Frees and shrinks pass
+/// straight through, so the child's leak tracking stays intact.
+const CappedAllocator = struct {
+    child: std.mem.Allocator,
+    max_alloc_bytes: usize,
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (len > self.max_alloc_bytes) return null;
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > self.max_alloc_bytes) return false;
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > self.max_alloc_bytes) return null;
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn allocator(self: *CappedAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
 
 /// Run `inputs` through a fresh session and return the rendered last value. The
 /// session is wired to the real std library, so cases using `@import("std")` (e.g.
