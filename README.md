@@ -1,135 +1,102 @@
+---
+accent:    "#f7a41d"
+bg:        "#0e1116"
+dark:       true
+font:       Inter
+titleFont:  Inter
+mono:      "JetBrains Mono"
+particles:  false
+---
+
 # zig-repl
 
-An expression-first REPL for Zig 0.16.
+An expression-first REPL for Zig.
 
-The REPL parses input with Zig's own parser (`std.zig.Ast`) and evaluates a
-bounded language subset with persistent session state.
+It evaluates input with a faithful port of the compiler's own semantic
+analysis, so results match what `zig` folds at comptime.
+
+---
+
+## How it works
+
+Input is parsed by Zig's own parser and lowered to ZIR by
+`std.zig.AstGen`; the same front end the compiler uses.
+
+Evaluation is a port of the compiler's `Sema`, `InternPool`, `Type`, and `Value`, run comptime-eager:
+every expression folds to a concrete value, with session state persisting across
+lines.
+
+There is no runtime or codegen backend; the REPL models the compiler's
+compile-time semantics, not machine execution.
+
+---
+
+## Run it
+
+```sh
+zig build run     # the terminal REPL
+zig build wasm    # the wasm REPL + web explorer -> zig-out/web
+zig build test    # compliance + unit tests
+zig build fuzz    # randomized stress (-Dfuzz-iterations, -Dfuzz-seed)
+```
+
+A hosted build runs in the browser at **brianferri.github.io/zig_repl**.
+
+---
 
 ## Commands
 
-- `:help` show available commands
-- `:vars` list current variables
-- `:fns` list defined functions
-- `:reset` clear all session state
+- `:help` list every command with its summary
+- `:dump <expr>` show the AST and tree-walked ZIR for an expression
+- `:theme [name]` show or switch the prompt theme (`zig`, `catppuccin`, `adwaita-dark`)
+- `:terminal` show the active terminal's detected capabilities
+- `:clear` wipe the output log (web)
 - `:quit` exit the REPL
 
-## Runtime Contract
+---
 
-### Output Channels
+## What it evaluates
 
-- Value output is written to stdout.
-- Captured external output (for emulated external calls) is written to stdout.
-- Diagnostics and debug logs are written through `std.log` (typically stderr).
+### Values & aggregates
 
-### Debug vs Release
+Integers, floats, bools, strings; structs, tuples, enums, unions; arrays,
+slices, and vectors.
 
-- Debug builds emit scoped debug logs (`debug(repl): ...`, `debug(ast): ...`, `debug(eval): ...`).
-- Release builds do not emit debug logs by default.
-- Error logs are scoped (`error(ast): ...`, `error(eval): ...`).
+### Pointers & wrappers
 
-### Inline Statements
+Pointers, optionals, and error unions, with the pointer-cast family
+(`@ptrCast`, `@alignCast`, `@constCast`, `@volatileCast`).
 
-The REPL supports semicolon-separated inline statements in one input line:
+### Control flow
 
-```zig
-const std = @import("std"); std.debug.print("Hello", .{});
-```
+`if` / `switch` / `while` / `for`, plus `catch`, `try`, and error-union capture.
 
-Execution is sequential and non-transactional. If an early segment succeeds and a
-later segment fails, prior state mutations remain committed.
+### Types & reflection
 
-### Multiline Input
+`@TypeOf`, `@typeInfo`, `@Type`, `@sizeOf` / `@alignOf` / `@offsetOf`, and
+`@import` of `std`, `root`, and local modules.
 
-If input has unclosed delimiters/strings, the REPL waits for continuation and
-prompts with `...`.
+---
 
-## Display Representation Policy
+## Web explorer
 
-### Top-level integers
+The wasm frontend is two views over the same core:
 
-Top-level integer results are rendered as a base table:
+- a **REPL** with persistent session state, and
+- an **explorer** that renders the **AST** and the tree-walked **ZIR** for any
+  input side by side, so you can watch the front end lower your code.
 
-```text
-Base    Value
-BIN     0b1
-OCT     0o1
-DEC     1
-HEX     0x1
-```
+---
 
-### Nested integers
+## Faithfulness
 
-Nested integers (for example inside arrays/structs) are currently rendered as
-plain decimal in aggregate formatting.
+The evaluator is a 1:1 (attempted) port of the compiler's comptime pipeline; the same
+`InternPool` interning, `Type` / `Value` model, and `Sema` instruction handling.
+Where behavior would need a runtime (I/O side effects, codegen), you will encounter some
+limits, soon to be broken (hopefully)
 
-### Strings
+---
 
-Strings are displayed as byte-slice literals:
+This README is a valid [dropdeck](https://brianferri.github.io/dropdeck)!
 
-- `"A"` renders as `&.{65}`
-- `"Hello"` renders as `&.{72, 101, 108, 108, 111}`
-
-Operationally, string values are still used as text payloads for output capture.
-
-### Address-of
-
-`&expr` is modeled as an address wrapper value and printed with `&` prefix (for
-example `&.{69}`). This is not a full pointer memory model.
-
-## Builtin Support
-
-Builtins are recognized via `std.zig.BuiltinFn.list`.
-
-Implemented runtime builtins:
-
-- `@import("...")` recursive module loading with cache/cycle checks
-- `@addWithOverflow` (used by `std.math.add` paths)
-
-All other recognized builtins currently return `UnsupportedBuiltin`.
-
-## Supported Input (Current Subset)
-
-### Declarations
-
-- `const` / `var` declarations
-- `fn` declarations
-
-### Expressions
-
-- literals: int, float, bool, string, char
-- unary: `-`, `!`, `&`
-- binary arithmetic/comparison/boolean/bitwise
-- error-set merge `||`
-- function calls and builtin calls
-- field access and index access
-- `if` expression forms
-- `catch` expression
-- array and struct literal forms
-
-### Known reduced semantics
-
-- some constructs are intentionally reduced and not Zig-complete (for example
-  selected lowering shortcuts for currently unsupported full semantics).
-- see `docs/repl_subset_spec.md` for detailed support and rationale.
-
-## Import Resolution
-
-`@import("std")` resolution order:
-
-1. `ZIG_LIB_DIR`
-2. probing from `PATH` entries near `zig`
-
-Relative imports resolve from current module path when available, otherwise from
-cwd.
-
-## Example
-
-```text
-> const std = @import("std"); std.debug.print("Hello", .{});
-Hello
-void
-> &.{69}
-&.{69}
-> "A"
-&.{65}
-```
+Drop it into the presenter to read these notes as slides.
