@@ -37,12 +37,16 @@ pub fn main(init: std.process.Init) !void {
     try tar_writer.finishPedantically();
 
     // Gzip-compress the tar to the output file.
+    if (std.fs.path.dirname(out_path)) |parent| {
+        try std.Io.Dir.cwd().createDirPath(io, parent);
+    }
     var out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
     defer out_file.close(io);
     var out_buf: [64 * 1024]u8 = undefined;
     var out_writer = out_file.writer(io, &out_buf);
 
     const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
+    defer gpa.free(window);
     var compress = try std.compress.flate.Compress.init(&out_writer.interface, window, .gzip, .default);
     var tar_in: std.Io.Reader = .fixed(tar_buf.written());
     _ = try tar_in.streamRemaining(&compress.writer);

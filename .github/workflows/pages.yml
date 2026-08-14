@@ -1,0 +1,57 @@
+name: Deploy wasm REPL to Pages
+
+# `zig build wasm` produces `zig-out/web` (the wasm binary plus the `web/public`
+# frontend); this workflow publishes that directory to GitHub Pages. The repo's
+# Pages source must be set to "GitHub Actions" (Settings -> Pages).
+#
+# `ZIG_VERSION` pins the toolchain the project builds against. Keep it in step
+# with that toolchain: the setup-zig mirror purges old nightlies, so a stale pin
+# eventually fails to download.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; queued runs coalesce, but a live deploy is never
+# interrupted.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  ZIG_VERSION: 0.17.0-dev.1745+ac8a8d0c5
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          # Don't restore the Zig build cache: it bakes in an absolute path to
+          # this action's per-run temp Zig install, which is a fresh directory
+          # every run, so a restored cache points the std-packing step at a std
+          # dir that no longer exists. The tarball download stays cached.
+          use-cache: false
+      - run: zig build wasm
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: zig-out/web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
