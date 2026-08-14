@@ -9,14 +9,14 @@ test "compliance: enum declarations, tag access, and @intFromEnum" {
             .src = &.{"blk: { const E = enum { a, b, c }; break :blk @intFromEnum(E.a); }"},
             .want = blk: {
                 const E = enum { a, b, c };
-                break :blk @intFromEnum(E.a);
+                break :blk @backingInt(E.a);
             },
         },
         .{
             .src = &.{"blk: { const E = enum { a, b, c }; break :blk @intFromEnum(E.c); }"},
             .want = blk: {
                 const E = enum { a, b, c };
-                break :blk @intFromEnum(E.c);
+                break :blk @backingInt(E.c);
             },
         },
         .{
@@ -24,14 +24,14 @@ test "compliance: enum declarations, tag access, and @intFromEnum" {
             .want = blk: {
                 const E = enum { a, b, c };
                 const x = E.b;
-                break :blk @intFromEnum(x);
+                break :blk @backingInt(x);
             },
         },
         .{
             .src = &.{"blk: { const Dir = enum { north, east, south, west }; break :blk @intFromEnum(Dir.west); }"},
             .want = blk: {
                 const Dir = enum { north, east, south, west };
-                break :blk @intFromEnum(Dir.west);
+                break :blk @backingInt(Dir.west);
             },
         },
         .{
@@ -76,8 +76,8 @@ test "compliance: @enumFromInt and result-typed enum literals" {
             .src = &.{"blk: { const E = enum { a, b, c }; const e: E = @enumFromInt(1); break :blk @intFromEnum(e); }"},
             .want = blk: {
                 const E = enum { a, b, c };
-                const e: E = @enumFromInt(1);
-                break :blk @intFromEnum(e);
+                const e: E = @fromBackingInt(@intCast(1));
+                break :blk @backingInt(e);
             },
         },
         .{
@@ -85,7 +85,7 @@ test "compliance: @enumFromInt and result-typed enum literals" {
             .want = blk: {
                 const E = enum { a, b, c };
                 const e: E = .c;
-                break :blk @intFromEnum(e);
+                break :blk @backingInt(e);
             },
         },
         .{
@@ -93,7 +93,7 @@ test "compliance: @enumFromInt and result-typed enum literals" {
             .want = blk: {
                 const E = enum { a, b, c };
                 const e: E = .a;
-                break :blk @intFromEnum(e);
+                break :blk @backingInt(e);
             },
         },
         .{
@@ -104,6 +104,13 @@ test "compliance: @enumFromInt and result-typed enum literals" {
             .src = &.{"blk: { const E = enum { a, b, c }; const e: E = .z; break :blk @intFromEnum(e); }"},
             .reject = {},
         },
+    });
+}
+
+test "compliance: a bare enum literal renders as .name" {
+    try compliance.check(a, .{
+        .{ .src = &.{".foo"}, .rendered = ".foo" },
+        .{ .src = &.{"blk: { const e = .bar; break :blk e; }"}, .rendered = ".bar" },
     });
 }
 
@@ -139,36 +146,36 @@ test "compliance: explicit enum tag types and values" {
             .src = &.{"blk: { const E = enum(u8) { a, b, c }; break :blk @intFromEnum(E.c); }"},
             .want = blk: {
                 const E = enum(u8) { a, b, c };
-                break :blk @intFromEnum(E.c);
+                break :blk @backingInt(E.c);
             },
         },
         .{
             .src = &.{"blk: { const E = enum(u8) { a = 5, b, c = 10 }; break :blk @intFromEnum(E.b); }"},
             .want = blk: {
                 const E = enum(u8) { a = 5, b, c = 10 };
-                break :blk @intFromEnum(E.b);
+                break :blk @backingInt(E.b);
             },
         },
         .{
             .src = &.{"blk: { const E = enum(u8) { a = 5, b, c = 10 }; break :blk @intFromEnum(E.c); }"},
             .want = blk: {
                 const E = enum(u8) { a = 5, b, c = 10 };
-                break :blk @intFromEnum(E.c);
+                break :blk @backingInt(E.c);
             },
         },
         .{
             .src = &.{"blk: { const E = enum(u16) { a = 300, b = 301 }; break :blk @intFromEnum(E.a); }"},
             .want = blk: {
                 const E = enum(u16) { a = 300, b = 301 };
-                break :blk @intFromEnum(E.a);
+                break :blk @backingInt(E.a);
             },
         },
         .{
             .src = &.{"blk: { const E = enum(u8) { a = 5, b = 10 }; const e: E = @enumFromInt(10); break :blk @intFromEnum(e); }"},
             .want = blk: {
                 const E = enum(u8) { a = 5, b = 10 };
-                const e: E = @enumFromInt(10);
-                break :blk @intFromEnum(e);
+                const e: E = @fromBackingInt(@intCast(10));
+                break :blk @backingInt(e);
             },
         },
         .{
@@ -185,7 +192,7 @@ test "compliance: explicit enum tag types and values" {
             .src = &.{"blk: { const E = enum(usize) { nothing = 0, unlimited = @import(\"std\").math.maxInt(usize), _ }; break :blk @intFromEnum(E.unlimited); }"},
             .want = blk: {
                 const E = enum(usize) { nothing = 0, unlimited = std.math.maxInt(usize), _ };
-                break :blk @intFromEnum(E.unlimited);
+                break :blk @backingInt(E.unlimited);
             },
         },
     });

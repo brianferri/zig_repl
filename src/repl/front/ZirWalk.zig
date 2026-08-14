@@ -32,7 +32,7 @@ pub fn Walker(comptime Sink: type) type {
 
         fn declaration(self: *Self, decl_inst: Zir.Inst.Index) anyerror!void {
             const decl = self.zir.getDeclaration(decl_inst);
-            const base = self.zir.instructions.items(.data)[@intFromEnum(decl_inst)].declaration.src_node;
+            const base = self.zir.instructions.items(.data)[@backingInt(decl_inst)].declaration.src_node;
             try self.sink.openDeclaration(decl_inst, base);
             if (decl.type_body) |b| try self.section("type_body", b, base);
             if (decl.align_body) |b| try self.section("align_body", b, base);
@@ -50,7 +50,7 @@ pub fn Walker(comptime Sink: type) type {
         }
 
         fn instruction(self: *Self, inst: Zir.Inst.Index, base: Ast.Node.Index) anyerror!void {
-            const idx = @intFromEnum(inst);
+            const idx = @backingInt(inst);
             const tag = self.zir.instructions.items(.tag)[idx];
             const data = self.zir.instructions.items(.data)[idx];
             try self.sink.openInstruction(inst, tag, data, base);

@@ -251,7 +251,7 @@ test "compliance: @splat broadcasts a scalar to a vector or array" {
         .{ .src = &.{"blk: { const E = enum { red, green }; const arr: [3]E = @splat(.green); break :blk @intFromEnum(arr[1]); }"}, .want = blk: {
             const E = enum { red, green };
             const arr: [3]E = @splat(.green);
-            break :blk @intFromEnum(arr[1]);
+            break :blk @backingInt(arr[1]);
         } },
         .{ .src = &.{"blk: { const v: @Vector(4, bool) = @splat(true); break :blk v[2]; }"}, .want = blk: {
             const v: @Vector(4, bool) = @splat(true);

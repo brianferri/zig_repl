@@ -467,6 +467,16 @@ pub fn bitpackBackingInt(ty: Type, pool: *const InternPool) Type {
     };
 }
 
+/// The integer type backing an enum tag or a packed aggregate, for `@backingInt`.
+pub fn backingIntType(ty: Type, pool: *const InternPool) Type {
+    return switch (pool.indexToKey(ty.index)) {
+        .enum_type => .fromIndex(pool.loadEnumType(ty.index).int_tag_type),
+        .struct_type => .fromIndex(pool.loadStructType(ty.index).packed_backing_int_type),
+        .union_type => .fromIndex(pool.unionFields(ty.index).packed_backing_int_type),
+        else => unreachable,
+    };
+}
+
 pub fn hasRuntimeBits(ty: Type, pool: *const InternPool) bool {
     return switch (ty.classify(pool)) {
         .no_possible_value, .one_possible_value, .fully_comptime => false,
@@ -1138,20 +1148,20 @@ pub fn abiSize(ty: Type, pool: *const InternPool) u64 {
             .bool => 1,
             .anyerror, .adhoc_inferred_error_set => errorAbiSize(pool),
             .usize, .isize => ptrByteSize(),
-            .c_char => target.cTypeByteSize(.char),
-            .c_short => target.cTypeByteSize(.short),
-            .c_ushort => target.cTypeByteSize(.ushort),
-            .c_int => target.cTypeByteSize(.int),
-            .c_uint => target.cTypeByteSize(.uint),
-            .c_long => target.cTypeByteSize(.long),
-            .c_ulong => target.cTypeByteSize(.ulong),
-            .c_longlong => target.cTypeByteSize(.longlong),
-            .c_ulonglong => target.cTypeByteSize(.ulonglong),
-            .c_longdouble => target.cTypeByteSize(.longdouble),
+            .c_char => target.cTypeByteSize(.char).?,
+            .c_short => target.cTypeByteSize(.short).?,
+            .c_ushort => target.cTypeByteSize(.ushort).?,
+            .c_int => target.cTypeByteSize(.int).?,
+            .c_uint => target.cTypeByteSize(.uint).?,
+            .c_long => target.cTypeByteSize(.long).?,
+            .c_ulong => target.cTypeByteSize(.ulong).?,
+            .c_longlong => target.cTypeByteSize(.longlong).?,
+            .c_ulonglong => target.cTypeByteSize(.ulonglong).?,
+            .c_longdouble => target.cTypeByteSize(.longdouble).?,
             .f16 => 2,
             .f32 => 4,
             .f64 => 8,
-            .f80 => if (target.cTypeBitSize(.longdouble) == 80) target.cTypeByteSize(.longdouble) else abiSize(fromIndex(.u80_type), pool),
+            .f80 => if (target.cTypeBitSize(.longdouble) == 80) target.cTypeByteSize(.longdouble).? else abiSize(fromIndex(.u80_type), pool),
             .f128 => 16,
             .anyopaque => unreachable,
             .generic_poison => unreachable,
@@ -1217,15 +1227,15 @@ pub fn intInfo(starting_ty: Type, pool: *const InternPool) std.lang.Type.Int {
         .anyerror_type, .adhoc_inferred_error_set_type => return .{ .signedness = .unsigned, .bits = pool.errorSetBits() },
         .usize_type => return .{ .signedness = .unsigned, .bits = target.ptrBitWidth() },
         .isize_type => return .{ .signedness = .signed, .bits = target.ptrBitWidth() },
-        .c_char_type => return .{ .signedness = target.cCharSignedness(), .bits = target.cTypeBitSize(.char) },
-        .c_short_type => return .{ .signedness = .signed, .bits = target.cTypeBitSize(.short) },
-        .c_ushort_type => return .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ushort) },
-        .c_int_type => return .{ .signedness = .signed, .bits = target.cTypeBitSize(.int) },
-        .c_uint_type => return .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.uint) },
-        .c_long_type => return .{ .signedness = .signed, .bits = target.cTypeBitSize(.long) },
-        .c_ulong_type => return .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ulong) },
-        .c_longlong_type => return .{ .signedness = .signed, .bits = target.cTypeBitSize(.longlong) },
-        .c_ulonglong_type => return .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ulonglong) },
+        .c_char_type => return .{ .signedness = target.cCharSignedness().?, .bits = target.cTypeBitSize(.char).? },
+        .c_short_type => return .{ .signedness = .signed, .bits = target.cTypeBitSize(.short).? },
+        .c_ushort_type => return .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ushort).? },
+        .c_int_type => return .{ .signedness = .signed, .bits = target.cTypeBitSize(.int).? },
+        .c_uint_type => return .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.uint).? },
+        .c_long_type => return .{ .signedness = .signed, .bits = target.cTypeBitSize(.long).? },
+        .c_ulong_type => return .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ulong).? },
+        .c_longlong_type => return .{ .signedness = .signed, .bits = target.cTypeBitSize(.longlong).? },
+        .c_ulonglong_type => return .{ .signedness = .unsigned, .bits = target.cTypeBitSize(.ulonglong).? },
         else => switch (pool.indexToKey(ty.index)) {
             .int_type => |int_type| return int_type,
             .struct_type => {
@@ -1314,7 +1324,7 @@ pub fn floatBits(ty: Type) u16 {
         .f64_type => 64,
         .f80_type => 80,
         .f128_type, .comptime_float_type => 128,
-        .c_longdouble_type => target.cTypeBitSize(.longdouble),
+        .c_longdouble_type => target.cTypeBitSize(.longdouble).?,
         else => unreachable,
     };
 }
@@ -1660,7 +1670,7 @@ pub fn hasBitRepresentation(ty: Type, pool: *const InternPool) bool {
 }
 
 fn cTypeAlign(c: std.Target.CType) InternPool.Alignment {
-    return .fromByteUnits(target.cTypeAlignment(c));
+    return .fromByteUnits(target.cTypeAlignment(c).?);
 }
 
 fn ptrAbiAlignment() InternPool.Alignment {

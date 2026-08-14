@@ -158,16 +158,25 @@ test "compliance: switch else and scalar-prong captures bind the operand" {
     try compliance.check(a, .{
         .{ .src = &.{"blk: { const x: u32 = 48; break :blk switch (x) { 0 => @as(u32, 0), else => |m| 1 + m }; }"}, .want = blk: {
             const x: u32 = 48;
-            break :blk switch (x) { 0 => @as(u32, 0), else => |m| 1 + m };
+            break :blk switch (x) {
+                0 => @as(u32, 0),
+                else => |m| 1 + m,
+            };
         } },
         .{ .src = &.{"blk: { const x: u8 = 5; break :blk switch (x) { 1, 2 => |v| @as(u8, v) * 10, else => |v| v }; }"}, .want = blk: {
             const x: u8 = 5;
-            break :blk switch (x) { 1, 2 => |v| @as(u8, v) * 10, else => |v| v };
+            break :blk switch (x) {
+                1, 2 => |v| @as(u8, v) * 10,
+                else => |v| v,
+            };
         } },
         .{ .src = &.{"blk: { const E = enum { a, b, c }; const v: E = .c; break :blk switch (v) { .a => @as(u8, 1), else => |e| @intFromEnum(e) }; }"}, .want = blk: {
             const E = enum { a, b, c };
             const v: E = .c;
-            break :blk switch (v) { .a => @as(u8, 1), else => |e| @intFromEnum(e) };
+            break :blk switch (v) {
+                .a => @as(u8, 1),
+                else => |e| @backingInt(e),
+            };
         } },
     });
 }

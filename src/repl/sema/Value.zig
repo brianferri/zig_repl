@@ -217,6 +217,15 @@ pub fn ptrField(parent_ptr: Value, field_idx: u32, pool: *InternPool) std.mem.Al
     }));
 }
 
+/// The backing integer of an enum tag or a packed aggregate value, for `@backingInt`.
+pub fn backingInt(val: Value, pool: *const InternPool) Value {
+    return switch (pool.indexToKey(val.index)) {
+        .enum_tag => |enum_tag| .fromIndex(enum_tag.int),
+        .bitpack => |bitpack| .fromIndex(bitpack.backing_int_val),
+        else => unreachable,
+    };
+}
+
 pub fn unionTag(val: Value, pool: *const InternPool) ?Value {
     return switch (pool.indexToKey(val.index)) {
         .undef, .enum_tag => val,
@@ -822,7 +831,7 @@ pub fn uninterpret(val: anytype, ty: Type, sema: *Sema) Sema.Error!Value {
 
         .@"enum" => .fromIndex(try ip.internEnumTag(.{
             .ty = ty.index,
-            .int = (try uninterpret(@intFromEnum(val), .fromIndex(ip.loadEnumType(ty.index).int_tag_type), sema)).index,
+            .int = (try uninterpret(@backingInt(val), .fromIndex(ip.loadEnumType(ty.index).int_tag_type), sema)).index,
         })),
 
         .@"union" => |@"union"| {

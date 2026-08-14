@@ -26,8 +26,8 @@ pub const LazySrcLoc = struct {
 
     pub fn resolveBaseNode(base_node_inst: Zir.Inst.Index, zir: Zir) Ast.Node.Index {
         if (base_node_inst == .main_struct_inst) return .root;
-        if (@intFromEnum(base_node_inst) >= zir.instructions.len) return .root;
-        const inst = zir.instructions.get(@intFromEnum(base_node_inst));
+        if (@backingInt(base_node_inst) >= zir.instructions.len) return .root;
+        const inst = zir.instructions.get(@backingInt(base_node_inst));
         return switch (inst.tag) {
             .declaration => inst.data.declaration.src_node,
             .struct_init, .struct_init_ref => zir.extraData(Zir.Inst.StructInit, inst.data.pl_node.payload_index).data.abs_node,

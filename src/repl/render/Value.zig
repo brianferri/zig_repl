@@ -77,7 +77,7 @@ pub fn render(
                     else => {},
                 }
             }
-            return writer.print("ptr@{d}+{d}", .{ @intFromEnum(p.ty), p.byte_offset });
+            return writer.print("ptr@{d}+{d}", .{ @backingInt(p.ty), p.byte_offset });
         },
         .slice => |s| {
             const child = pool.indexToKey(s.ty).ptr_type.child;
@@ -91,9 +91,10 @@ pub fn render(
         },
         .err => |e| writer.print("error.{s}", .{pool.stringSlice(e.name)}),
         .error_union => |eu| renderErrorUnion(eu, pool, session, writer),
-        .func => |f| writer.print("fn@{d}", .{@intFromEnum(f.zir_body_inst)}),
+        .func => |f| writer.print("fn@{d}", .{@backingInt(f.zir_body_inst)}),
         .@"extern" => |e| writer.print("(extern '{s}')", .{pool.stringSlice(pool.getNav(e.owner_nav).name)}),
         .aggregate => |agg| renderAggregate(agg, pool, session, writer),
+        .enum_literal => |enum_literal| writer.print(".{f}", .{enum_literal.fmt(pool)}),
         .enum_tag => |et| renderEnumTag(et, pool, session, writer),
         .un => |uv| renderUnion(uv, pool, session, writer),
         // A bare type Key viewed as a value identifies the type itself
@@ -397,11 +398,14 @@ fn renderTypeRef(
     try Type.print(Type.fromIndex(type_index), pool, writer);
 }
 
-/// Print each float-storage variant in its native precision. f80 has no
-/// dedicated `std.fmt` formatter, so we widen to f128 for display only;
-/// the stored value keeps its precision.
+/// Print each float-storage variant in its native precision through
+/// `std.fmt.float.render` -- the building block `{d}` routes through, but
+/// invoked directly so wide types keep full precision rather than degrading
+/// to the f64-sized buffer `std.fmt`'s float printer allocates. Full-precision
+/// decimal output can be thousands of digits, so the buffer is sized for the
+/// widest storage variant (see `std.fmt.float.bufferSize`).
 ///
-/// `std.fmt`'s `{d}` strips the trailing decimal for integral values
+/// Full-precision decimal strips the trailing decimal for integral values
 /// (`4.0` -> "4"), which is ambiguous next to integers in REPL output.
 /// We restore the `.0` when the printed form has no decimal exponent or
 /// dot -- but leave NaN / inf / -inf untouched.
@@ -409,10 +413,11 @@ fn renderFloat(
     float: InternPool.Key.Float,
     writer: *std.Io.Writer,
 ) Error!void {
-    var buf: [128]u8 = undefined;
+    var buf: [std.fmt.float.bufferSize(.decimal, f128)]u8 = undefined;
     const text = switch (float.storage) {
-        .f80 => |v| std.fmt.bufPrint(&buf, "{d}", .{@as(f128, @floatCast(v))}) catch unreachable,
-        inline else => |v| std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable,
+        inline else => |v| std.fmt.float.render(&buf, v, .{ .mode = .decimal }) catch |err| switch (err) {
+            error.BufferTooSmall => unreachable, // buf is sized for the widest storage variant
+        },
     };
     try writer.writeAll(text);
     if (needsTrailingDecimal(text)) try writer.writeAll(".0");

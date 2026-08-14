@@ -174,7 +174,7 @@ fn buildInjectionPrefix(
 ) ![]u8 {
     const p = pool orelse return gpa.alloc(u8, 0);
     const ns_idx = namespace.unwrap() orelse return gpa.alloc(u8, 0);
-    const ns = p.namespaces.items[@intFromEnum(ns_idx)];
+    const ns = p.namespaces.items[@backingInt(ns_idx)];
     if (ns.pub_decls.count() == 0 and ns.priv_decls.count() == 0) {
         return gpa.alloc(u8, 0);
     }

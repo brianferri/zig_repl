@@ -164,7 +164,7 @@ const TextSink = struct {
             self.zir.nullTerminatedString(u.name);
         try self.stdout.print(
             "decl %{d} {s}  kind={s}  linkage={s}  pub={}\n",
-            .{ @intFromEnum(decl_inst), name, @tagName(u.kind), @tagName(u.linkage), u.is_pub },
+            .{ @backingInt(decl_inst), name, @tagName(u.kind), @tagName(u.linkage), u.is_pub },
         );
         self.indent += indent_step;
     }
@@ -191,7 +191,7 @@ const TextSink = struct {
         base: Ast.Node.Index,
     ) !void {
         _ = base;
-        const idx: u32 = @intFromEnum(inst);
+        const idx: u32 = @backingInt(inst);
         var idx_buf: [16]u8 = undefined;
         const idx_str = std.fmt.bufPrint(&idx_buf, "%{d}", .{idx}) catch unreachable;
         try self.stdout.writeAll(idx_str);

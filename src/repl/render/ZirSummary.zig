@@ -44,6 +44,7 @@ pub fn write(
         .error_union_type,
         .float_cast,
         .float_from_int,
+        .from_backing_int,
         .has_decl,
         .has_field,
         .int_cast,
@@ -95,7 +96,7 @@ pub fn write(
         .typeof_builtin,
         .validate_ptr_array_init,
         .validate_ptr_struct_init,
-        => try stdout.print(" src_node={d}", .{@intFromEnum(data.pl_node.src_node)}),
+        => try stdout.print(" src_node={d}", .{@backingInt(data.pl_node.src_node)}),
 
         .block_comptime => try writeBlockComptime(zir, data, stdout),
 
@@ -141,7 +142,7 @@ pub fn write(
         .validate_array_init_result_ty,
         .validate_array_init_ty,
         .validate_destructure,
-        => try stdout.print(" payload={d} src_node={d}", .{ data.pl_node.payload_index, @intFromEnum(data.pl_node.src_node) }),
+        => try stdout.print(" payload={d} src_node={d}", .{ data.pl_node.payload_index, @backingInt(data.pl_node.src_node) }),
 
         .abs,
         .align_of,
@@ -149,6 +150,7 @@ pub fn write(
         .alloc_comptime_mut,
         .alloc_mut,
         .anyframe_type,
+        .backing_int,
         .bit_not,
         .bit_reverse,
         .bit_size_of,
@@ -174,6 +176,7 @@ pub fn write(
         .exp2,
         .floor,
         .frame_type,
+        .from_backing_int_arg_ty,
         .indexable_ptr_elem_type,
         .indexable_ptr_len,
         .int_from_bool,
@@ -231,7 +234,7 @@ pub fn write(
         => {
             try stdout.writeAll(" operand=");
             try writeRef(stdout, data.un_node.operand);
-            try stdout.print(" src_node={d}", .{@intFromEnum(data.un_node.src_node)});
+            try stdout.print(" src_node={d}", .{@backingInt(data.un_node.src_node)});
         },
 
         .ref,
@@ -240,13 +243,13 @@ pub fn write(
         => {
             try stdout.writeAll(" operand=");
             try writeRef(stdout, data.un_tok.operand);
-            try stdout.print(" src_tok={d}", .{@intFromEnum(data.un_tok.src_tok)});
+            try stdout.print(" src_tok={d}", .{@backingInt(data.un_tok.src_tok)});
         },
 
         .import,
         .param,
         .param_comptime,
-        => try stdout.print(" payload={d} src_tok={d}", .{ data.pl_tok.payload_index, @intFromEnum(data.pl_tok.src_tok) }),
+        => try stdout.print(" payload={d} src_tok={d}", .{ data.pl_tok.payload_index, @backingInt(data.pl_tok.src_tok) }),
 
         .alloc_inferred,
         .alloc_inferred_comptime,
@@ -257,7 +260,7 @@ pub fn write(
         .ret_ptr,
         .ret_type,
         .trap,
-        => try stdout.print(" src_node={d}", .{@intFromEnum(data.node)}),
+        => try stdout.print(" src_node={d}", .{@backingInt(data.node)}),
 
         .decl_ref,
         .decl_val,
@@ -266,7 +269,7 @@ pub fn write(
         .param_anytype,
         .param_anytype_comptime,
         .ret_err_value,
-        => try stdout.print(" \"{s}\" src_tok={d}", .{ data.str_tok.get(zir), @intFromEnum(data.str_tok.src_tok) }),
+        => try stdout.print(" \"{s}\" src_tok={d}", .{ data.str_tok.get(zir), @backingInt(data.str_tok.src_tok) }),
 
         .dbg_var_ptr,
         .dbg_var_val,
@@ -286,10 +289,10 @@ pub fn write(
             const e = zir.extraData(Zir.Inst.Break, data.@"break".payload_index);
             try stdout.writeAll(" operand=");
             try writeRef(stdout, data.@"break".operand);
-            try stdout.print(" target=%{d}", .{@intFromEnum(e.data.block_inst)});
+            try stdout.print(" target=%{d}", .{@backingInt(e.data.block_inst)});
         },
 
-        .@"unreachable" => try stdout.print(" src_node={d}", .{@intFromEnum(data.@"unreachable".src_node)}),
+        .@"unreachable" => try stdout.print(" src_node={d}", .{@backingInt(data.@"unreachable".src_node)}),
 
         .@"defer" => try stdout.print(" index={d} len={d}", .{ data.@"defer".index, data.@"defer".len }),
 
@@ -307,7 +310,7 @@ pub fn write(
             try writeRef(stdout, data.elem_val_imm.operand);
             try stdout.print(" idx={d}", .{data.elem_val_imm.idx});
         },
-        .declaration => try stdout.print(" payload={d} src_node={d}", .{ data.declaration.payload_index, @intFromEnum(data.declaration.src_node) }),
+        .declaration => try stdout.print(" payload={d} src_node={d}", .{ data.declaration.payload_index, @backingInt(data.declaration.src_node) }),
         .dbg_stmt => try stdout.print(" line={d} col={d}", .{ data.dbg_stmt.line, data.dbg_stmt.column }),
         .array_init_elem_type => {
             try stdout.writeAll(" lhs=");
@@ -366,14 +369,14 @@ fn writeCall(
     switch (kind) {
         .direct => {
             const e = zir.extraData(Zir.Inst.Call, data.pl_node.payload_index).data;
-            const modifier: std.lang.CallModifier = @enumFromInt(e.flags.packed_modifier);
+            const modifier: std.lang.CallModifier = @fromBackingInt(@intCast(e.flags.packed_modifier));
             try stdout.print(" modifier=.{s} callee=", .{@tagName(modifier)});
             try writeRef(stdout, e.callee);
             try stdout.print(" args_len={d}", .{@as(u32, e.flags.args_len)});
         },
         .field => {
             const e = zir.extraData(Zir.Inst.FieldCall, data.pl_node.payload_index).data;
-            const modifier: std.lang.CallModifier = @enumFromInt(e.flags.packed_modifier);
+            const modifier: std.lang.CallModifier = @fromBackingInt(@intCast(e.flags.packed_modifier));
             const name = zir.nullTerminatedString(e.field_name_start);
             try stdout.print(" modifier=.{s} obj_ptr=", .{@tagName(modifier)});
             try writeRef(stdout, e.obj_ptr);
@@ -391,7 +394,7 @@ fn writeRef(stdout: *std.Io.Writer, ref: Zir.Inst.Ref) !void {
     if (ref == .none) {
         try stdout.writeAll(".none");
     } else if (ref.toIndex()) |idx| {
-        try stdout.print("%{d}", .{@intFromEnum(idx)});
+        try stdout.print("%{d}", .{@backingInt(idx)});
     } else {
         try stdout.writeAll(@tagName(ref));
     }

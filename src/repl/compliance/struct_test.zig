@@ -475,6 +475,12 @@ test "compliance: explicit-type struct init (T{ ... })" {
             .src = &.{"blk: { const Q = struct { a: u8 }; const q = Q{ .a = 300 }; break :blk q.a; }"},
             .reject = {},
         },
+        // The type position of `T{}` must be a type; a value there is rejected,
+        // not passed on to a layout query.
+        .{
+            .src = &.{"blk: { const x = 5; break :blk x{}; }"},
+            .reject = {},
+        },
     });
 }
 

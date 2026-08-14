@@ -39,7 +39,11 @@ const Pipeline = @import("Pipeline.zig");
 /// anchored on a var-decl name identifier (covers both "local variable
 /// is never mutated" and "unused local variable" -- both are style
 /// guidance the REPL has no use for).
-fn isSuppressed(tree: Ast, item: Zir.Inst.CompileErrors.Item) bool {
+fn isSuppressed(zir: Zir, tree: Ast, item: Zir.Inst.CompileErrors.Item) bool {
+    // Suppression exists to let analysis proceed past a benign error. A ZIR with
+    // no instructions has no root to analyse, so whatever error AstGen recorded is
+    // fatal -- surface it rather than swallow it into an empty, unanalysable ZIR.
+    if (zir.instructions.len == 0) return false;
     const opt_token = item.token.unwrap() orelse return false;
     if (opt_token == 0) return false;
     if (tree.tokenTag(opt_token) != .identifier) return false;
@@ -50,7 +54,7 @@ fn isSuppressed(tree: Ast, item: Zir.Inst.CompileErrors.Item) bool {
 /// Zero means the REPL can proceed to Sema even though
 /// `zir.hasCompileErrors()` reports `true`.
 pub fn countActionable(zir: Zir, tree: Ast) u32 {
-    const payload_index = zir.extra[@intFromEnum(Zir.ExtraIndex.compile_errors)];
+    const payload_index = zir.extra[@backingInt(Zir.ExtraIndex.compile_errors)];
     if (payload_index == 0) return 0;
 
     const header = zir.extraData(Zir.Inst.CompileErrors, payload_index);
@@ -59,7 +63,7 @@ pub fn countActionable(zir: Zir, tree: Ast) u32 {
     for (0..header.data.items_len) |_| {
         const item = zir.extraData(Zir.Inst.CompileErrors.Item, extra_index);
         extra_index = item.end;
-        if (!isSuppressed(tree, item.data)) actionable += 1;
+        if (!isSuppressed(zir, tree, item.data)) actionable += 1;
     }
     return actionable;
 }
@@ -85,14 +89,14 @@ pub fn renderActionable(
     try wip.init(gpa);
     defer wip.deinit();
 
-    const payload_index = zir.extra[@intFromEnum(Zir.ExtraIndex.compile_errors)];
+    const payload_index = zir.extra[@backingInt(Zir.ExtraIndex.compile_errors)];
     if (payload_index != 0) {
         const header = zir.extraData(Zir.Inst.CompileErrors, payload_index);
         var extra_index = header.end;
         for (0..header.data.items_len) |_| {
             const item = zir.extraData(Zir.Inst.CompileErrors.Item, extra_index);
             extra_index = item.end;
-            if (isSuppressed(tree, item.data)) continue;
+            if (isSuppressed(zir, tree, item.data)) continue;
             try appendItem(&wip, zir, tree, view, src_path, item.data);
         }
     }
@@ -181,7 +185,7 @@ fn appendNotes(
         const raw_span = spanOf(tree, note_item.data.node, note_item.data.token, note_item.data.byte_offset);
         const span = view.translate(raw_span) orelse continue;
         const loc = view.findLoc(span.main);
-        const note_index = @intFromEnum(try wip.addErrorMessage(.{
+        const note_index = @backingInt(try wip.addErrorMessage(.{
             .msg = try wip.addString(zir.nullTerminatedString(note_item.data.msg)),
             .src_loc = try wip.addSourceLocation(.{
                 .src_path = try wip.addString(src_path),

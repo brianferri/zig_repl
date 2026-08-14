@@ -120,7 +120,8 @@ pub fn generate(gpa: Allocator) Allocator.Error![:0]u8 {
 
     try buffer.print(
         \\pub const object_format: std.Target.ObjectFormat = .{f};
-        \\pub const mode: std.lang.OptimizeMode = .{f};
+        \\pub const mode = optimize;
+        \\pub const optimize: std.lang.Optimize = .{f};
         \\pub const link_libc = {};
         \\pub const link_libcpp = {};
         \\pub const have_error_return_tracing = {};

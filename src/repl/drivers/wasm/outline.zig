@@ -121,7 +121,7 @@ fn emitOutline(gpa: std.mem.Allocator, w: *std.Io.Writer, source: []const u8, se
         // Skip injected-prelude decls, whose own node maps into bytes the
         // `UserView` hides.
         for (zir.typeDecls(.main_struct_inst)) |decl_inst| {
-            const decl_node = datas[@intFromEnum(decl_inst)].declaration.src_node;
+            const decl_node = datas[@backingInt(decl_inst)].declaration.src_node;
             if (view.translate(seg.result.tree.nodeToSpan(decl_node)) == null) continue;
             try ZirWalk.walkDecl(ZirSink, zir, decl_inst, &sink);
         }
@@ -157,7 +157,7 @@ fn emitAstNode(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index, off
     const span = view.translate(tree.nodeToSpan(node)) orelse return;
     try json.beginObject();
     try json.objectField("id");
-    try json.write(@intFromEnum(node) + off.id);
+    try json.write(@backingInt(node) + off.id);
     try json.objectField("label");
     try json.write(@tagName(tree.nodeTag(node)));
     try json.objectField("lo");
@@ -314,7 +314,7 @@ const ZirSink = struct {
         const node = instNode(base, tag, data);
         try self.open(
             @tagName(tag),
-            if (node) |n| @intFromEnum(n) + self.id_offset else null,
+            if (node) |n| @backingInt(n) + self.id_offset else null,
             if (detail.len > 0) detail else null,
         );
     }

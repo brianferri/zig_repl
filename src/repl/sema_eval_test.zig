@@ -1090,11 +1090,11 @@ test "struct_type: nominal identity keys on (source_zir_id, decl_inst)" {
     defer pool.deinit();
 
     const name_a = try pool.getOrPutString(gpa, "repl.A", .no_embedded_nulls);
-    const a1 = (try pool.getDeclaredStructType(name_a, .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(2) } }, 0, .auto, false, false)).wip.index;
-    const a2 = (try pool.getDeclaredStructType(name_a, .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(2) } }, 0, .auto, false, false)).existing;
+    const a1 = (try pool.getDeclaredStructType(name_a, .{ .declared = .{ .source_zir_id = 0, .decl_inst = @fromBackingInt(@intCast(2)) } }, 0, .auto, false, false)).wip.index;
+    const a2 = (try pool.getDeclaredStructType(name_a, .{ .declared = .{ .source_zir_id = 0, .decl_inst = @fromBackingInt(@intCast(2)) } }, 0, .auto, false, false)).existing;
     const b = (try pool.getDeclaredStructType(
         try pool.getOrPutString(gpa, "repl.B", .no_embedded_nulls),
-        .{ .declared = .{ .source_zir_id = 0, .decl_inst = @enumFromInt(3) } },
+        .{ .declared = .{ .source_zir_id = 0, .decl_inst = @fromBackingInt(@intCast(3)) } },
         0,
         .auto,
         false,
@@ -1706,7 +1706,7 @@ test "error_set: error{Foo, Bar} interns as a sorted set type" {
     // by lexicographic order or source order.
     const a = key.error_set_type.names[0];
     const b = key.error_set_type.names[1];
-    try testing.expect(@intFromEnum(a) < @intFromEnum(b));
+    try testing.expect(@backingInt(a) < @backingInt(b));
 }
 
 test "error_set: same membership dedups regardless of source ordering" {

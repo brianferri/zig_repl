@@ -197,5 +197,5 @@ fn onTerminationSignal(sig: posix.SIG) callconv(.c) void {
     if (saved_termios) |orig| {
         posix.tcsetattr(saved_termios_fd, .NOW, orig) catch {};
     }
-    std.process.exit(@as(u8, @intCast(128 + @intFromEnum(sig))));
+    std.process.exit(@as(u8, @intCast(128 + @backingInt(sig))));
 }
