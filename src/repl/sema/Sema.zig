@@ -10764,10 +10764,9 @@ fn validateSwitchBlock(sema: *Sema, inst: Zir.Inst.Index, item_ty: InternPool.In
                 },
                 .enum_literal => |n| blk: {
                     const name = try ip.getOrPutString(gpa, sema.zir.nullTerminatedString(n), .no_embedded_nulls);
-                    if (ip.indexToKey(item_ty) != .enum_type) return sema.failBadMemberAccess(item_ty, name);
-                    const field_index = (try sema.enumFieldIndex(item_ty, name)) orelse
-                        return sema.failBadMemberAccess(item_ty, name);
-                    break :blk markSwitchEnumField(seen_enum_fields, field_index);
+                    const uncoerced = try sema.analyzeDeclLiteral(item_ty, name, false);
+                    const val = try sema.coerceValueToType(uncoerced, item_ty, "switch case");
+                    break :blk try validateSwitchItemValue(sema, type_tag, val, seen_enum_fields, &seen_errors, &seen_sparse, &range_set, &true_seen, &false_seen, &void_seen);
                 },
                 .error_value => |n| blk: {
                     const name = try ip.getOrPutString(gpa, sema.zir.nullTerminatedString(n), .no_embedded_nulls);
@@ -10903,12 +10902,8 @@ fn matchSwitchItems(
             },
             .enum_literal => |name_idx| {
                 if (hit) continue;
-                if (sema.intern_pool.indexToKey(op.ty) != .enum_type) {
-                    return sema.failSwitch("enum-literal case on a non-enum operand");
-                }
                 const name = try sema.intern_pool.getOrPutString(sema.gpa, sema.zir.nullTerminatedString(name_idx), .no_embedded_nulls);
-                const tag = (try sema.enumTagByName(op.ty, name)) orelse
-                    return sema.failBadMemberAccess(op.ty, name);
+                const tag = try sema.analyzeDeclLiteral(op.ty, name, true);
                 if (tag.index == op.value.index) hit = true;
             },
         }

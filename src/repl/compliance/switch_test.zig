@@ -102,6 +102,20 @@ test "compliance: switch operand and exhaustiveness are validated" {
                 else => 9,
             };
         } },
+        .{
+            .src = &.{"blk: { const E = enum { a, b, pub const B: @This() = .b; }; break :blk switch (E.b) { .B => 1, .a => 2 }; }"},
+            .want = blk: {
+                const E = enum {
+                    a,
+                    b,
+                    pub const B: @This() = .b;
+                };
+                break :blk switch (E.b) {
+                    .B => 1,
+                    .a => 2,
+                };
+            },
+        },
         .{ .src = &.{"blk: { break :blk switch (@as(u1, 0)) { 0 => 10, 1 => 20 }; }"}, .want = blk: {
             break :blk switch (@as(u1, 0)) {
                 0 => 10,
