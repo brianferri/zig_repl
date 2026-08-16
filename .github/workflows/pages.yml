@@ -1,12 +1,7 @@
 name: Deploy wasm REPL to Pages
 
-# `zig build wasm` produces `zig-out/web` (the wasm binary plus the `web/public`
-# frontend); this workflow publishes that directory to GitHub Pages. The repo's
-# Pages source must be set to "GitHub Actions" (Settings -> Pages).
-#
-# `ZIG_VERSION` pins the toolchain the project builds against. Keep it in step
-# with that toolchain: the setup-zig mirror purges old nightlies, so a stale pin
-# eventually fails to download.
+# Keep `ZIG_VERSION` in step.
+# the setup-zig mirror purges old nightlies, so a stale pin eventually fails to download.
 
 on:
   push:
@@ -18,8 +13,7 @@ permissions:
   pages: write
   id-token: write
 
-# One deployment at a time; queued runs coalesce, but a live deploy is never
-# interrupted.
+# One deployment at a time; queued runs coalesce, but a live deploy is never interrupted.
 concurrency:
   group: pages
   cancel-in-progress: false
