@@ -92,6 +92,33 @@ pub fn build(b: *std.Build) void {
         .single_threaded = true,
         .link_libc = false,
     });
+    // The device vocabulary, terminal parser, and line editor, rebuilt for the
+    // wasm target so the wasm frontend reuses the same input + editing stack the
+    // tty does (the `Terminal` platform backends are never referenced, so they
+    // do not compile here).
+    const device_wasm = b.createModule(.{
+        .root_source_file = b.path("src/device/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .single_threaded = true,
+        .link_libc = false,
+    });
+    const terminal_wasm = b.createModule(.{
+        .root_source_file = b.path("src/terminal/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .single_threaded = true,
+        .link_libc = false,
+    });
+    terminal_wasm.addImport("device", device_wasm);
+    const editor_wasm = b.createModule(.{
+        .root_source_file = b.path("src/editor/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .single_threaded = true,
+        .link_libc = false,
+    });
+    editor_wasm.addImport("device", device_wasm);
     const drivers_wasm = b.createModule(.{
         .root_source_file = b.path("src/repl/drivers/wasm/root.zig"),
         .target = wasm_target,
@@ -100,6 +127,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = false,
     });
     drivers_wasm.addImport("repl", repl_wasm);
+    drivers_wasm.addImport("terminal", terminal_wasm);
+    drivers_wasm.addImport("editor", editor_wasm);
+    drivers_wasm.addImport("device", device_wasm);
 
     const wasm = b.addExecutable(.{
         .name = "zig_repl",

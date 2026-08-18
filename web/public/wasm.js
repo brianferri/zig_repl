@@ -16,6 +16,12 @@
  * @property {(ptr: number, len: number) => void} replOutline
  * @property {() => number} replResultPtr
  * @property {() => number} replResultLen
+ * @property {(ptr: number, len: number) => void} replInputFeed
+ * @property {() => number} replInputBufferPtr
+ * @property {() => number} replInputBufferLen
+ * @property {() => number} replInputCursor
+ * @property {() => number} replInputTakeSubmitted
+ * @property {() => number} replInputSubmittedPtr
  */
 
 /**
@@ -51,10 +57,22 @@
 /**
  * The interpreter, line in / text out. `evalLine` runs against the persistent
  * session; `preview` and `outline` use throwaway sessions.
+ * @typedef {object} InputState
+ * @property {string} buffer the current input line (may span multiple lines).
+ * @property {number} cursor byte offset of the cursor within `buffer`.
+ */
+
+/**
+ * The interpreter, line in / text out. `evalLine` runs against the persistent
+ * session; `preview` and `outline` use throwaway sessions. `feed`/`inputState`/
+ * `takeSubmitted` drive the shared line editor from raw key bytes.
  * @typedef {object} Binding
  * @property {(line: string) => string} evalLine
  * @property {(line: string) => string} preview
  * @property {(line: string) => Outline} outline
+ * @property {(bytes: Uint8Array) => void} feed
+ * @property {() => InputState} inputState
+ * @property {() => (string | null)} takeSubmitted
  */
 
 /**
@@ -102,10 +120,41 @@ export async function loadRepl(env = {}) {
         }
     }
 
+    /** @param {number} ptr @param {number} len @returns {string} */
+    function readString(ptr, len) {
+        return decoder.decode(new Uint8Array(wasm.memory.buffer, ptr, len));
+    }
+
+    /** @param {Uint8Array} bytes */
+    function feed(bytes) {
+        const ptr = wasm.replAlloc(bytes.length);
+        if (ptr === 0) return;
+        new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
+        wasm.replInputFeed(ptr, bytes.length);
+    }
+
+    /** @returns {InputState} */
+    function inputState() {
+        return {
+            buffer: readString(wasm.replInputBufferPtr(), wasm.replInputBufferLen()),
+            cursor: wasm.replInputCursor(),
+        };
+    }
+
+    /** @returns {string | null} */
+    function takeSubmitted() {
+        const len = wasm.replInputTakeSubmitted();
+        if (len < 0) return null;
+        return readString(wasm.replInputSubmittedPtr(), len);
+    }
+
     return {
         wasm,
         evalLine: (line) => call(wasm.replEval, line),
         preview: (line) => call(wasm.replPreview, line),
         outline,
+        feed,
+        inputState,
+        takeSubmitted,
     };
 }

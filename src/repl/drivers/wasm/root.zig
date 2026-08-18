@@ -9,6 +9,7 @@ const dump = repl.commands.dump;
 const Session = repl.Session;
 
 pub const outline = @import("outline.zig");
+pub const LineInput = @import("LineInput.zig");
 
 pub const commands = Registry(&[_]type{
     help,

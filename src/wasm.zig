@@ -20,6 +20,7 @@ const render_value = repl.render.Value;
 const Type = repl.sema.Type;
 const outline = drivers_wasm.outline;
 const Commands = drivers_wasm.commands;
+const LineInput = drivers_wasm.LineInput;
 
 // `wasm_allocator` requires the module be single-threaded (build.zig sets
 // it); it grows linear memory as needed, which detaches the host's view of
@@ -34,6 +35,7 @@ var pool: InternPool = undefined;
 var session: Session = undefined;
 var module_source: repl.module.Buffer = undefined;
 var output: std.Io.Writer.Allocating = undefined;
+var line_input: LineInput = undefined;
 var ready = false;
 
 /// Set up the interpreter. Safe to call more than once; later calls are
@@ -46,6 +48,7 @@ export fn replInit() bool {
     module_source = repl.module.Buffer.init(gpa, embedded_std) catch return false;
     session.module_source = &module_source.interface;
     output = .init(gpa);
+    line_input.setup(gpa);
     ready = true;
     return true;
 }
@@ -75,6 +78,38 @@ export fn replResultPtr() [*]const u8 {
 
 export fn replResultLen() usize {
     return output.written().len;
+}
+
+/// Feed `len` bytes of xterm key sequences (the `ptr` buffer, freed here) to the
+/// shared line editor. Read `replInputBuffer*`/`replInputCursor` afterward to
+/// render, and `replInputTakeSubmitted` for a completed line to `replEval`.
+export fn replInputFeed(ptr: [*]u8, len: usize) void {
+    if (!ready and !replInit()) return;
+    defer gpa.free(ptr[0..len]);
+    line_input.feed(ptr[0..len]) catch {};
+}
+
+export fn replInputBufferPtr() [*]const u8 {
+    return line_input.buffer().ptr;
+}
+
+export fn replInputBufferLen() usize {
+    return line_input.buffer().len;
+}
+
+export fn replInputCursor() usize {
+    return line_input.cursor();
+}
+
+/// The length of a line submitted since the last call (Enter was pressed), or
+/// -1 if none; read the bytes at `replInputSubmittedPtr`. Consumed once.
+export fn replInputTakeSubmitted() isize {
+    if (line_input.takeSubmitted()) |line| return @intCast(line.len);
+    return -1;
+}
+
+export fn replInputSubmittedPtr() [*]const u8 {
+    return line_input.submitted.items.ptr;
 }
 
 fn dispatch(input: []const u8) !void {

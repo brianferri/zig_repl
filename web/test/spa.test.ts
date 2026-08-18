@@ -34,7 +34,10 @@ declare global {
         repl: {
             evalLine: (line: string) => string,
             preview: (line: string) => string,
-            outline: (line: string) => Outline
+            outline: (line: string) => Outline,
+            feed: (bytes: Uint8Array) => void,
+            inputState: () => { buffer: string, cursor: number },
+            takeSubmitted: () => string | null
         };
     }
 }
@@ -79,6 +82,34 @@ await describe("wasm repl", async () => {
         assert.match(first, /\b42\b/);
         const second = await page.evaluate(() => window.repl.evalLine("x * 2"));
         assert.match(second, /\b80\b/);
+    });
+
+    await test("the shared line editor drives typing, editing, submit, and history from key bytes", async () => {
+        const r = await page.evaluate(() => {
+            const te = new TextEncoder();
+            const R = window.repl;
+            R.feed(te.encode("1 + 2"));
+            const typed = R.inputState();
+            R.feed(te.encode("\x7f")); // Backspace -> "1 + "
+            R.feed(te.encode("3")); // -> "1 + 3"
+            const { buffer: edited } = R.inputState();
+            R.feed(te.encode("\x1b[D\x1b[D")); // Left twice -> cursor 3
+            const { cursor } = R.inputState();
+            R.feed(te.encode("\x1b[F")); // End -> cursor 5
+            const { cursor: atEnd } = R.inputState();
+            R.feed(te.encode("\r")); // submit "1 + 3"
+            const submitted = R.takeSubmitted();
+            R.feed(te.encode("\x1b[A")); // Up recalls the submitted line
+            const { buffer: recalled } = R.inputState();
+            return { typed, edited, cursor, atEnd, submitted, recalled };
+        });
+        assert.equal(r.typed.buffer, "1 + 2");
+        assert.equal(r.typed.cursor, 5);
+        assert.equal(r.edited, "1 + 3");
+        assert.equal(r.cursor, 3);
+        assert.equal(r.atEnd, 5);
+        assert.equal(r.submitted, "1 + 3");
+        assert.equal(r.recalled, "1 + 3");
     });
 
     await test("recognises :clear and reports unknown commands", async () => {

@@ -5,7 +5,6 @@ import { loadRepl } from "./wasm.js";
 
 const replOutput = /** @type {HTMLElement} */ (document.getElementById("repl-output"));
 const replInput = /** @type {HTMLTextAreaElement} */ (document.getElementById("repl-input"));
-const replForm = /** @type {HTMLFormElement} */ (document.getElementById("repl-form"));
 
 const editor = /** @type {HTMLTextAreaElement} */ (document.getElementById("editor"));
 const outResult = /** @type {HTMLElement} */ (document.getElementById("out-result"));
@@ -15,14 +14,28 @@ const outZir = /** @type {HTMLElement} */ (document.getElementById("out-zir"));
 // One wasm instance backs both tabs: the REPL persists its session
 // (replEval); the explorer uses throwaway sessions (replPreview / replOutline)
 // so exploring never disturbs REPL state.
-const { evalLine, preview, outline } = await loadRepl({
+const {
+    evalLine,
+    preview,
+    outline,
+    feed,
+    inputState,
+    takeSubmitted
+} = await loadRepl({
     replClearOutput() {
         replOutput.textContent = "";
     },
 });
 
 // Expose the interpreter binding for the console and the test harness.
-window.repl = { evalLine, preview, outline };
+window.repl = {
+    evalLine,
+    preview,
+    outline,
+    feed,
+    inputState,
+    takeSubmitted
+};
 
 const tabs = /** @type {NodeListOf<HTMLElement>} */ (document.querySelectorAll("nav button"));
 tabs.forEach((btn) => {
@@ -105,31 +118,69 @@ function appendOutput(text) {
 
 appendOutput("zig_repl (wasm). try `1 + 2`, `const x = 40; x + 2`, `:help`, `:clear`.\n");
 
-// Grow the input to fit its content (CSS caps it, then it scrolls).
 function fitInput() {
     replInput.style.height = "auto";
     replInput.style.height = `${replInput.scrollHeight}px`;
 }
-replInput.addEventListener("input", fitInput);
 
-// Enter runs the input; Shift+Enter inserts a newline, so a multi-line program
-// (a function, a paste) is entered as one submission.
-replInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey) {
-        event.preventDefault();
-        replForm.requestSubmit();
+// The textarea is display-only: the shared Zig line editor owns the buffer,
+// cursor, and history. Keystrokes are translated to the terminal byte sequences
+// it parses and fed in; its state is mirrored back into the textarea.
+const encoder = new TextEncoder();
+const keySequences = {
+    Enter: "\r",
+    Backspace: "\x7f",
+    Delete: "\x1b[3~",
+    ArrowUp: "\x1b[A",
+    ArrowDown: "\x1b[B",
+    ArrowRight: "\x1b[C",
+    ArrowLeft: "\x1b[D",
+    Home: "\x1b[H",
+    End: "\x1b[F",
+    Tab: "\t",
+};
+
+/** @param {KeyboardEvent} event @returns {Uint8Array | null} */
+function keyToBytes(event) {
+    const seq = /** @type {Record<string, string>} */ (keySequences)[event.key];
+    if (seq !== undefined) return encoder.encode(seq);
+    if (event.ctrlKey && event.key.length === 1) {
+        const c = event.key.toLowerCase().charCodeAt(0);
+        if (c >= 97 && c <= 122) return Uint8Array.of(c - 96); // Ctrl+A..Z -> 0x01..0x1a
     }
+    if (event.key.length === 1 && !event.ctrlKey && !event.metaKey) return encoder.encode(event.key);
+    return null;
+}
+
+function renderInput() {
+    const state = inputState();
+    replInput.value = state.buffer;
+    replInput.selectionStart = replInput.selectionEnd = state.cursor;
+    fitInput();
+}
+
+replInput.addEventListener("keydown", (event) => {
+    const bytes = keyToBytes(event);
+    if (bytes === null) return;
+    event.preventDefault();
+    feed(bytes);
+    const line = takeSubmitted();
+    if (line !== null && line.trim().length !== 0) {
+        appendEcho(">>> " + line + "\n");
+        appendOutput(evalLine(line));
+    }
+    renderInput();
 });
 
-replForm.addEventListener("submit", (event) => {
+replInput.addEventListener("paste", (event) => {
     event.preventDefault();
-    const source = replInput.value;
-    replInput.value = "";
-    fitInput();
-    if (source.trim().length === 0) return;
-    appendEcho(">>> " + source + "\n");
-    appendOutput(evalLine(source));
+    const text = event.clipboardData?.getData("text") ?? "";
+    if (text.length === 0) return;
+    feed(encoder.encode(text));
+    renderInput();
 });
+
+renderInput();
 
 // Hover binds the three views by AST node identity: an ast node carries its
 // node id, a zir instruction carries the id it lowered from, and both map to
