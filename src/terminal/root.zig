@@ -6,6 +6,13 @@
 
 pub const Terminal = @import("Terminal.zig");
 
+// The parser and the legacy Xterm keyboard protocol, without the platform
+// backends `Terminal` carries -- a frontend that supplies its own byte stream
+// (the wasm REPL) parses it into `device.Event`s with these directly.
+pub const Parser = @import("Parser.zig");
+pub const Protocol = @import("Protocol.zig");
+pub const Xterm = @import("protocol/Xterm.zig");
+
 test {
     _ = Terminal;
     _ = @import("Parser.zig");
