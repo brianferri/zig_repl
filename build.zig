@@ -27,6 +27,13 @@ pub fn build(b: *std.Build) void {
     });
     terminal.addImport("device", device);
 
+    const editor = b.createModule(.{
+        .root_source_file = b.path("src/editor/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    editor.addImport("device", device);
+
     const tty = b.createModule(.{
         .root_source_file = b.path("src/repl/drivers/tty/root.zig"),
         .target = target,
@@ -34,6 +41,7 @@ pub fn build(b: *std.Build) void {
     });
     tty.addImport("repl", repl);
     tty.addImport("terminal", terminal);
+    tty.addImport("editor", editor);
     tty.addImport("device", device);
 
     const exe_module = b.createModule(.{
@@ -158,12 +166,14 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe_module, .use_llvm = true });
     const device_tests = b.addTest(.{ .root_module = device, .use_llvm = true });
     const terminal_tests = b.addTest(.{ .root_module = terminal, .use_llvm = true });
+    const editor_tests = b.addTest(.{ .root_module = editor, .use_llvm = true });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(repl_tests).step);
     test_step.dependOn(&b.addRunArtifact(tty_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     test_step.dependOn(&b.addRunArtifact(device_tests).step);
     test_step.dependOn(&b.addRunArtifact(terminal_tests).step);
+    test_step.dependOn(&b.addRunArtifact(editor_tests).step);
 
     // The fuzz suite is a standalone module that imports `repl` by name, so it is fully decoupled
     // from the interpreter's internals. It holds a `std.testing.fuzz` target (coverage-guided when

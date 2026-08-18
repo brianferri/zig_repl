@@ -22,8 +22,4 @@ test {
     _ = @import("quit.zig");
     _ = @import("theme.zig");
     _ = @import("terminal.zig");
-    _ = @import("LineEditor.zig");
-    _ = @import("Theme.zig");
-    _ = @import("theme/root.zig");
-    _ = @import("mock/Device.zig");
 }

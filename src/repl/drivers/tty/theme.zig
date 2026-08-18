@@ -4,7 +4,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const Repl = @import("Repl.zig");
-const themes = @import("theme/root.zig");
+const themes = @import("editor").themes;
 const ColorLevel = @import("device").Color.ColorLevel;
 const Command = @import("repl").commands.Command;
 

@@ -5,7 +5,7 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 const Repl = @import("Repl.zig");
-const themes = @import("theme/root.zig");
+const themes = @import("editor").themes;
 const Command = @import("repl").commands.Command;
 
 pub fn command(comptime Ctx: type) Command(Ctx) {
