@@ -413,24 +413,9 @@ fn renderFloat(
     float: InternPool.Key.Float,
     writer: *std.Io.Writer,
 ) Error!void {
-    var buf: [std.fmt.float.bufferSize(.decimal, f128)]u8 = undefined;
-    const text = switch (float.storage) {
-        inline else => |v| std.fmt.float.render(&buf, v, .{ .mode = .decimal }) catch |err| switch (err) {
-            error.BufferTooSmall => unreachable, // buf is sized for the widest storage variant
-        },
-    };
-    try writer.writeAll(text);
-    if (needsTrailingDecimal(text)) try writer.writeAll(".0");
-}
-
-/// True IFF `text` is a finite-magnitude float printed without a decimal
-/// point or exponent (e.g. "4", "-7") -- in which case appending ".0"
-/// keeps the value visually distinct from an integer. NaN / inf / -inf
-/// start with a non-digit and are left alone.
-fn needsTrailingDecimal(text: []const u8) bool {
-    if (text.len == 0) return false;
-    if (std.mem.indexOfAny(u8, text, ".eE") != null) return false;
-    const start: usize = if (text[0] == '-' or text[0] == '+') 1 else 0;
-    if (start >= text.len) return false;
-    return std.ascii.isDigit(text[start]);
+    // Mirrors the compiler's value printer (src/print_value.zig): floats render at f64 precision with
+    // no synthetic trailing `.0`.
+    switch (float.storage) {
+        inline else => |v| try writer.print("{d}", .{@as(f64, @floatCast(v))}),
+    }
 }

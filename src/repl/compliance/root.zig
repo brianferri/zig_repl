@@ -50,12 +50,8 @@ pub fn check(gpa: std.mem.Allocator, comptime cases: anytype) !void {
     }
 }
 
-/// Strip surrounding whitespace and a trailing `.0` (which `{any}` omits on integral
-/// floats), so `4.0` and `4` compare equal.
 fn normalize(text: []const u8) []const u8 {
-    var t = std.mem.trim(u8, text, " \r\n\t");
-    if (std.mem.endsWith(u8, t, ".0")) t = t[0 .. t.len - 2];
-    return t;
+    return std.mem.trim(u8, text, " \r\n\t");
 }
 
 /// Assert the REPL rejects `inputs` and its rendered diagnostic contains `needle` --
