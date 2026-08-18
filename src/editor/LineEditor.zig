@@ -71,6 +71,17 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer) LineEditor {
     };
 }
 
+/// Clear the buffer and per-line state for a fresh input line. `readLine` calls
+/// this then redraws; an event-driven frontend (wasm) calls it after a submit.
+pub fn beginLine(editor: *LineEditor) void {
+    editor.buffer.clearRetainingCapacity();
+    editor.cursor = 0;
+    editor.lines_drawn = 0;
+    editor.cursor_row_drawn = 0;
+    editor.history_offset = null;
+    editor.draft.clearRetainingCapacity();
+}
+
 pub fn deinit(editor: *LineEditor) void {
     for (editor.history.items) |entry| editor.gpa.free(entry);
     editor.history.deinit(editor.gpa);
@@ -88,12 +99,7 @@ pub fn readLine(editor: *LineEditor, device: *Device, theme: *const themes.Theme
     assert(@intFromPtr(device) != 0);
     const level = device.color_level;
 
-    editor.buffer.clearRetainingCapacity();
-    editor.cursor = 0;
-    editor.lines_drawn = 0;
-    editor.cursor_row_drawn = 0;
-    editor.history_offset = null;
-    editor.draft.clearRetainingCapacity();
+    editor.beginLine();
     try editor.redraw(theme, level);
 
     while (true) {
@@ -131,7 +137,7 @@ fn moveCursorBelowInput(editor: *LineEditor) !void {
     try editor.writer.flush();
 }
 
-fn pushHistory(editor: *LineEditor, input: []const u8) !void {
+pub fn pushHistory(editor: *LineEditor, input: []const u8) !void {
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
     if (trimmed.len == 0) return;
     if (editor.history.items.len > 0) {
@@ -147,9 +153,9 @@ fn pushHistory(editor: *LineEditor, input: []const u8) !void {
     try editor.history.append(editor.gpa, copy);
 }
 
-const Outcome = enum { keep_reading, submit, eof_empty };
+pub const Outcome = enum { keep_reading, submit, eof_empty };
 
-fn applyEvent(editor: *LineEditor, event: Event.Event) !Outcome {
+pub fn applyEvent(editor: *LineEditor, event: Event.Event) !Outcome {
     assert(@intFromPtr(editor) != 0);
     assert(editor.cursor <= editor.buffer.items.len);
     return switch (event) {
