@@ -150,6 +150,28 @@ await describe("wasm repl", async () => {
         assert.equal(zir.find((node) => node.label === "sub")?.node, root.id);
     });
 
+    await test("outlines a bare declaration and its zir directly (no expression wrapper)", async () => {
+        const out = await page.evaluate(() => window.repl.outline("const x = 40;"));
+        assert.equal(out.ast[0].label, "simple_var_decl");
+        assert.ok(flattenZir(out.zir).some((node) => node.label === "int"));
+    });
+
+    await test("outlines a function definition and walks its body zir", async () => {
+        const out = await page.evaluate(() => window.repl.outline("fn f(a: u32) u32 { return a + 1; }"));
+        assert.equal(out.ast[0].label, "fn_decl");
+        const zir = flattenZir(out.zir);
+        assert.ok(zir.some((node) => node.label === "func"));
+        assert.ok(zir.some((node) => node.label === "add"));
+    });
+
+    await test("outlines declarations then a trailing expression as one merged view", async () => {
+        const out = await page.evaluate(() => window.repl.outline("const y = 7;\ny * 2"));
+        assert.deepEqual(out.ast.map((node) => node.label), ["simple_var_decl", "mul"]);
+        const zir = flattenZir(out.zir);
+        assert.ok(zir.some((node) => node.label === "int")); // the 7 binding
+        assert.ok(zir.some((node) => node.label === "mul")); // y * 2
+    });
+
     await test("loads without page errors", () => {
         assert.deepEqual(errors, []);
     });

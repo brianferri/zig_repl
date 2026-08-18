@@ -119,10 +119,13 @@ fn emitOutline(gpa: std.mem.Allocator, w: *std.Io.Writer, source: []const u8, se
         var sink: ZirSink = .{ .json = &json, .zir = zir, .scratch = &scratch, .id_offset = seg.off.id };
         const datas = zir.instructions.items(.data);
         // Skip injected-prelude decls, whose own node maps into bytes the
-        // `UserView` hides.
+        // `UserView` hides -- but always walk the expression wrapper: its own
+        // node is injected (`fn __repl_input() ...`), yet its body holds the
+        // user expression whose instructions map back into user bytes.
         for (zir.typeDecls(.main_struct_inst)) |decl_inst| {
             const decl_node = datas[@backingInt(decl_inst)].declaration.src_node;
-            if (view.translate(seg.result.tree.nodeToSpan(decl_node)) == null) continue;
+            if (!isWrapperDecl(seg.result.tree, decl_node) and
+                view.translate(seg.result.tree.nodeToSpan(decl_node)) == null) continue;
             try ZirWalk.walkDecl(ZirSink, zir, decl_inst, &sink);
         }
     }
