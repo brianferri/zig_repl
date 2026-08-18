@@ -3,6 +3,46 @@ const compliance = @import("root.zig");
 
 const a = std.testing.allocator;
 
+// `@fieldParentPtr` recovers a pointer to the containing struct/union from a pointer to one of its
+// fields; the `.auto`-layout case reads the field pointer's base, the alignment mismatch case requires
+// an `@alignCast`.
+test "compliance: @fieldParentPtr recovers the parent pointer" {
+    try compliance.check(a, .{
+        .{
+            .src = &.{"blk: { const S = struct { a: u32, b: u32 }; var s: S = .{ .a = 1, .b = 7 }; break :blk @as(*S, @fieldParentPtr(\"b\", &s.b)).a; }"},
+            .want = blk: {
+                const S = struct { a: u32, b: u32 };
+                var s: S = .{ .a = 1, .b = 7 };
+                break :blk @as(*S, @fieldParentPtr("b", &s.b)).a;
+            },
+        },
+        .{
+            .src = &.{"blk: { const S = struct { a: u32, b: u32, c: u32 }; var s: S = .{ .a = 10, .b = 20, .c = 30 }; break :blk @as(*S, @fieldParentPtr(\"c\", &s.c)).a + @as(*S, @fieldParentPtr(\"b\", &s.b)).c; }"},
+            .want = blk: {
+                const S = struct { a: u32, b: u32, c: u32 };
+                var s: S = .{ .a = 10, .b = 20, .c = 30 };
+                break :blk @as(*S, @fieldParentPtr("c", &s.c)).a + @as(*S, @fieldParentPtr("b", &s.b)).c;
+            },
+        },
+        .{
+            .src = &.{"blk: { const U = union { a: u32, b: u32 }; var u: U = .{ .b = 42 }; break :blk @as(*U, @fieldParentPtr(\"b\", &u.b)).b; }"},
+            .want = blk: {
+                const U = union { a: u32, b: u32 };
+                var u: U = .{ .b = 42 };
+                break :blk @as(*U, @fieldParentPtr("b", &u.b)).b;
+            },
+        },
+        .{
+            .src = &.{"blk: { const S = struct { x: u8, y: u16 }; var s: S = .{ .x = 3, .y = 500 }; break :blk @as(*S, @alignCast(@fieldParentPtr(\"x\", &s.x))).y; }"},
+            .want = blk: {
+                const S = struct { x: u8, y: u16 };
+                var s: S = .{ .x = 3, .y = 500 };
+                break :blk @as(*S, @alignCast(@fieldParentPtr("x", &s.x))).y;
+            },
+        },
+    });
+}
+
 test "compliance: pointer types render as zig prints" {
     try compliance.check(a, .{
         .{ .src = &.{"*const u8"}, .want = *const u8 },
@@ -313,5 +353,49 @@ test "compliance: pointer equality compares base and offset" {
         // std.mem.eql (and the family built on it) hinges on `a.ptr == b.ptr`.
         .{ .src = &.{ "const std = @import(\"std\");", "std.mem.eql(u8, \"foo\", \"foo\")" }, .want = std.mem.eql(u8, "foo", "foo") },
         .{ .src = &.{ "const std = @import(\"std\");", "std.mem.indexOf(u8, \"hello world\", \"world\").?" }, .want = std.mem.indexOf(u8, "hello world", "world").? },
+    });
+}
+
+// The C-pointer coercion family: `*[N]T`/`[*]T`/`null`/integer sources coerce into a `[*c]T`, and a
+// `[*c]T` source retypes back into any non-slice pointer whose element type matches -- but a coercion that
+// would drop `const` is rejected (compiler: coerceExtra's src_array_ptr/src_c_ptr/`.c` arms guarded by
+// checkPtrAttributes). Null-ness of a C pointer is its address, so `c == null` follows the address.
+test "compliance: the C-pointer coercion family" {
+    try compliance.check(a, .{
+        // *[N]T -> [*c]T (decay by retype), then index and slice.
+        .{ .src = &.{"blk: { const a2 = [_]u8{ 10, 20, 30, 40 }; const c: [*c]const u8 = &a2; break :blk c[1]; }"}, .want = blk: {
+            const a2 = [_]u8{ 10, 20, 30, 40 };
+            const c: [*c]const u8 = &a2;
+            break :blk c[1];
+        } },
+        .{ .src = &.{"blk: { const a2 = [_]u8{ 10, 20, 30, 40 }; const c: [*c]const u8 = &a2; const s = c[1..3]; break :blk s[0]; }"}, .want = blk: {
+            const a2 = [_]u8{ 10, 20, 30, 40 };
+            const c: [*c]const u8 = &a2;
+            const s = c[1..3];
+            break :blk s[0];
+        } },
+        // [*c]T source -> [*]T, retyped through checkPtrAttributes.
+        .{ .src = &.{"blk: { const a2 = [_]u8{ 7, 8, 9 }; const c: [*c]const u8 = &a2; const m: [*]const u8 = c; break :blk m[2]; }"}, .want = blk: {
+            const a2 = [_]u8{ 7, 8, 9 };
+            const c: [*c]const u8 = &a2;
+            const m: [*]const u8 = c;
+            break :blk m[2];
+        } },
+        // null and integer sources: a C pointer's null-ness is its address.
+        .{ .src = &.{"blk: { const c: [*c]const u8 = null; break :blk c == null; }"}, .want = blk: {
+            const c: [*c]const u8 = null;
+            break :blk c == null;
+        } },
+        .{ .src = &.{"blk: { const c: [*c]const u8 = 0; break :blk c == null; }"}, .want = blk: {
+            const c: [*c]const u8 = 0;
+            break :blk c == null;
+        } },
+        .{ .src = &.{"blk: { const a2 = [_]u8{ 5, 6 }; const c: [*c]const u8 = &a2; break :blk c != null; }"}, .want = blk: {
+            const a2 = [_]u8{ 5, 6 };
+            const c: [*c]const u8 = &a2;
+            break :blk c != null;
+        } },
+        // Dropping `const` through the C pointer is rejected.
+        .{ .src = &.{"blk: { const a2 = [_]u8{ 1, 2 }; const c: [*c]const u8 = &a2; const m: [*]u8 = c; break :blk m[0]; }"}, .reject = {} },
     });
 }

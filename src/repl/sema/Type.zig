@@ -790,10 +790,25 @@ pub fn fieldPtrType(ptr_ty: Type, field_index: u32, pool: *InternPool) std.mem.A
                 return .fromIndex(try pool.internPtrType(field_ptr_info));
             },
             .@"packed" => {
+                const field_ty = aggregate_ty.fieldType(field_index, pool);
                 var field_ptr_info = ptr_info;
+                if (field_ptr_info.flags.alignment == .none) {
+                    const resolved_align = aggregate_ty.abiAlignment(pool);
+                    if (field_ty.abiAlignment(pool) != resolved_align) {
+                        field_ptr_info.flags.alignment = resolved_align;
+                    }
+                }
                 field_ptr_info.child = aggregate_ty.fieldType(field_index, pool).index;
                 return .fromIndex(try pool.internPtrType(field_ptr_info));
             },
+        },
+        .pointer => field: {
+            assert(aggregate_ty.isSlice(pool));
+            break :field switch (field_index) {
+                Value.slice_ptr_index => .{ try aggregate_ty.slicePtrFieldType(pool), .none },
+                Value.slice_len_index => .{ .fromIndex(.usize_type), .none },
+                else => unreachable,
+            };
         },
         else => unreachable,
     };
@@ -803,8 +818,8 @@ pub fn fieldPtrType(ptr_ty: Type, field_index: u32, pool: *InternPool) std.mem.A
         }
         const actual_field_align = switch (field_align) {
             .none => switch (pool.indexToKey(aggregate_ty.index)) {
-                .tuple_type, .union_type => field_ty.abiAlignment(pool),
-                .struct_type => field_ty.defaultStructFieldAlignment(.auto, pool),
+                .struct_type, .tuple_type, .union_type => field_ty.abiAlignment(pool),
+                .ptr_type => Type.fromIndex(.usize_type).abiAlignment(pool),
                 else => unreachable,
             },
             else => |a| a,
@@ -865,7 +880,10 @@ pub fn structFieldValueComptime(ty: Type, sema: *Sema, index: usize) Sema.Error!
     switch (pool.indexToKey(ty.index)) {
         .struct_type => {
             if (ty.structFieldIsComptime(index, pool)) {
-                return .fromIndex(pool.loadStructType(ty.index).field_defaults[index]);
+                // A declared struct evaluates its field defaults lazily, so the default is fetched
+                // through `structFieldDefault` rather than the reified `field_defaults` slice.
+                const name = (try sema.structFieldNameAt(ty.index, @intCast(index))).?;
+                return .fromIndex(try sema.structFieldDefault(ty.index, name));
             } else {
                 return try Type.fromIndex(pool.loadStructType(ty.index).field_types[index]).onePossibleValue(sema);
             }
@@ -888,23 +906,6 @@ pub fn isAbiInt(ty: Type, pool: *const InternPool) bool {
         .@"struct", .@"union" => ty.containerLayout(pool) == .@"packed",
         else => false,
     };
-}
-
-pub fn defaultStructFieldAlignment(field_ty: Type, layout: std.lang.Type.ContainerLayout, pool: *const InternPool) InternPool.Alignment {
-    const overalign_big_int = switch (layout) {
-        .@"packed" => unreachable,
-        .auto => target.ofmt == .c,
-        .@"extern" => true,
-    };
-    const abi_align = field_ty.abiAlignment(pool);
-    assert(abi_align != .none);
-    if (overalign_big_int and
-        ((field_ty.isAbiInt(pool) and field_ty.intInfo(pool).bits > 64) or
-            (field_ty.index == .f80_type and target.cTypeBitSize(.longdouble) != 80)))
-    {
-        return abi_align.maxStrict(if (target.cpu.arch == .s390x) .@"8" else .@"16");
-    }
-    return abi_align;
 }
 
 pub const void_type: Type = .{ .index = .void_type };
@@ -1284,6 +1285,36 @@ pub fn intInfo(starting_ty: Type, pool: *const InternPool) std.lang.Type.Int {
     };
 }
 
+pub fn isAnyFloat(ty: Type) bool {
+    return switch (ty.index) {
+        .f16_type, .f32_type, .f64_type, .f80_type, .f128_type, .c_longdouble_type, .comptime_float_type => true,
+        else => false,
+    };
+}
+
+pub fn isSignedInt(ty: Type, pool: *const InternPool) bool {
+    return switch (ty.index) {
+        .c_char_type => target.cCharSignedness().? == .signed,
+        .isize_type, .c_short_type, .c_int_type, .c_long_type, .c_longlong_type => true,
+        else => switch (pool.indexToKey(ty.index)) {
+            .int_type => |int_type| int_type.signedness == .signed,
+            else => false,
+        },
+    };
+}
+
+/// Returns true if and only if the type is a fixed-width, unsigned integer.
+pub fn isUnsignedInt(ty: Type, pool: *const InternPool) bool {
+    return switch (ty.index) {
+        .c_char_type => target.cCharSignedness().? == .unsigned,
+        .usize_type, .c_ushort_type, .c_uint_type, .c_ulong_type, .c_ulonglong_type => true,
+        else => switch (pool.indexToKey(ty.index)) {
+            .int_type => |int_type| int_type.signedness == .unsigned,
+            else => false,
+        },
+    };
+}
+
 pub fn toUnsigned(ty: Type, pool: *InternPool) std.mem.Allocator.Error!Type {
     return switch (ty.index) {
         .usize_type, .isize_type => .fromIndex(.usize_type),
@@ -1417,6 +1448,10 @@ pub fn isSlice(ty: Type, pool: *const InternPool) bool {
         .ptr_type => |ptr_type| ptr_type.flags.size == .slice,
         else => false,
     };
+}
+
+pub fn slicePtrFieldType(ty: Type, pool: *InternPool) std.mem.Allocator.Error!Type {
+    return .fromIndex(try pool.slicePtrType(ty.index));
 }
 
 pub fn isSinglePointer(ty: Type, pool: *const InternPool) bool {
@@ -1586,6 +1621,22 @@ pub fn isTuple(ty: Type, pool: *const InternPool) bool {
     return pool.indexToKey(ty.index) == .tuple_type;
 }
 
+pub fn isIndexable(ty: Type, pool: *const InternPool) bool {
+    return switch (ty.zigTypeTag(pool)) {
+        .array, .vector => true,
+        .pointer => switch (ty.ptrInfo(pool).flags.size) {
+            .slice, .many, .c => true,
+            .one => switch (ty.childType(pool).zigTypeTag(pool)) {
+                .array, .vector => true,
+                .@"struct" => ty.childType(pool).isTuple(pool),
+                else => false,
+            },
+        },
+        .@"struct" => ty.isTuple(pool),
+        else => false,
+    };
+}
+
 pub fn indexableElem(ty: Type, pool: *const InternPool) Type {
     return switch (pool.indexToKey(ty.index)) {
         inline .array_type, .vector_type => |arr| .fromIndex(arr.child),
@@ -1661,7 +1712,11 @@ pub fn hasBitRepresentation(ty: Type, pool: *const InternPool) bool {
         .float,
         => true,
 
-        .@"enum" => pool.loadEnumType(ty.index).int_tag_mode == .explicit,
+        .@"enum" => {
+            const enum_obj = pool.loadEnumType(ty.index);
+            return enum_obj.int_tag_mode == .explicit and
+                enum_obj.int_tag_type != .noreturn_type;
+        },
         .pointer, .optional => ty.isPtrAtRuntime(pool),
         .@"struct", .@"union" => ty.containerLayout(pool) == .@"packed",
 
@@ -1740,40 +1795,56 @@ pub fn print(ty: Type, pool: *const InternPool, writer: *std.Io.Writer) PrintErr
     }
 }
 
-pub fn isSelfComparable(ty: Type, pool: *const InternPool, is_equality_cmp: bool) bool {
-    return switch (pool.indexToKey(ty.index)) {
-        .int_type => true,
-        .simple_type => |s| switch (s) {
-            .usize,
-            .isize,
-            .c_char,
-            .c_short,
-            .c_ushort,
-            .c_int,
-            .c_uint,
-            .c_long,
-            .c_ulong,
-            .c_longlong,
-            .c_ulonglong,
-            .comptime_int,
-            .f16,
-            .f32,
-            .f64,
-            .f80,
-            .f128,
-            .c_longdouble,
-            .comptime_float,
-            => true,
-            .bool, .type, .void, .anyerror, .adhoc_inferred_error_set, .enum_literal, .anyopaque => is_equality_cmp,
-            .noreturn, .undefined, .null, .generic_poison => false,
-        },
-        .vector_type => |vt| fromIndex(vt.child).isSelfComparable(pool, is_equality_cmp),
-        .enum_type, .error_set_type, .func_type, .anyframe_type, .opaque_type => is_equality_cmp,
-        .error_union_type, .array_type => false,
-        .struct_type, .union_type, .tuple_type => is_equality_cmp and ty.containerLayout(pool) == .@"packed",
-        .ptr_type => |pt| pt.flags.size != .slice and (is_equality_cmp or pt.flags.size == .c),
-        .opt_type => |child| is_equality_cmp and fromIndex(child).isSelfComparable(pool, is_equality_cmp),
+pub fn isNumeric(ty: Type, pool: *const InternPool) bool {
+    return switch (ty.zigTypeTag(pool)) {
+        .int, .comptime_int, .float, .comptime_float => true,
         else => false,
+    };
+}
+
+pub fn isCPtr(ty: Type, pool: *const InternPool) bool {
+    return switch (pool.indexToKey(ty.index)) {
+        .ptr_type => |ptr_type| ptr_type.flags.size == .c,
+        else => false,
+    };
+}
+
+pub fn isSelfComparable(ty: Type, pool: *const InternPool, is_equality_cmp: bool) bool {
+    return switch (ty.zigTypeTag(pool)) {
+        .int,
+        .float,
+        .comptime_float,
+        .comptime_int,
+        => true,
+
+        .vector => ty.childType(pool).isSelfComparable(pool, is_equality_cmp),
+
+        .bool,
+        .type,
+        .void,
+        .error_set,
+        .@"fn",
+        .@"opaque",
+        .spirv,
+        .@"anyframe",
+        .@"enum",
+        .enum_literal,
+        => is_equality_cmp,
+
+        .noreturn,
+        .array,
+        .undefined,
+        .null,
+        .error_union,
+        .frame,
+        => false,
+
+        .@"struct", .@"union" => is_equality_cmp and ty.containerLayout(pool) == .@"packed",
+        .pointer => !ty.isSlice(pool) and (is_equality_cmp or ty.isCPtr(pool)),
+        .optional => {
+            if (!is_equality_cmp) return false;
+            return ty.optionalChild(pool).isSelfComparable(pool, is_equality_cmp);
+        },
     };
 }
 

@@ -12,10 +12,10 @@
 //!     its syntax by node identity rather than overlapping spans.
 //!
 //! Both views are rooted at the user's input. The front end wraps an
-//! expression as `const __repl_input = ( EXPR )`, so its AST roots at EXPR
-//! (unwrapping the synthetic decl + parens). Mixed "declarations then a
-//! trailing expression" input is outlined as two runs merged into one view
-//! (see `writeJson`).
+//! expression in a function body whose single local binds it, so its AST roots
+//! at EXPR (diving into the wrapper to the bound initializer and unwrapping its
+//! parens). Mixed "declarations then a trailing expression" input is outlined
+//! as two runs merged into one view (see `writeJson`).
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -131,18 +131,22 @@ fn emitOutline(gpa: std.mem.Allocator, w: *std.Io.Writer, source: []const u8, se
     try json.endObject();
 }
 
-/// The node to outline for root declaration `decl`. An expression input is
-/// wrapped `const __repl_input = ( EXPR )`, so unwrap the synthetic decl and
-/// parens to EXPR; any other declaration is its own node.
+/// The node to outline for root declaration `decl`. An expression input is wrapped in a function whose
+/// body's single local binds `( EXPR )`, so dive to that initializer and unwrap its parens to EXPR; any
+/// other declaration is its own node.
 fn outlineNode(tree: Ast, decl: Ast.Node.Index) Ast.Node.Index {
-    if (tree.nodeTag(decl) == .simple_var_decl and isWrapperDecl(tree, decl)) {
-        const init = tree.nodeData(decl).opt_node_and_opt_node[1].unwrap() orelse return decl;
-        if (tree.nodeTag(init) == .grouped_expression) {
-            return tree.nodeData(init).node_and_token[0];
-        }
-        return init;
+    if (tree.nodeTag(decl) != .fn_decl or !isWrapperDecl(tree, decl)) return decl;
+    const body = tree.nodeData(decl).node_and_node[1];
+    const first_stmt = switch (tree.nodeTag(body)) {
+        .block_two, .block_two_semicolon => tree.nodeData(body).opt_node_and_opt_node[0].unwrap() orelse return decl,
+        else => return decl,
+    };
+    if (tree.nodeTag(first_stmt) != .simple_var_decl) return decl;
+    const init = tree.nodeData(first_stmt).opt_node_and_opt_node[1].unwrap() orelse return decl;
+    if (tree.nodeTag(init) == .grouped_expression) {
+        return tree.nodeData(init).node_and_token[0];
     }
-    return decl;
+    return init;
 }
 
 fn isWrapperDecl(tree: Ast, decl: Ast.Node.Index) bool {

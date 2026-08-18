@@ -191,17 +191,14 @@ pub fn ptrField(parent_ptr: Value, field_idx: u32, pool: *InternPool) std.mem.Al
 
     switch (aggregate_ty.zigTypeTag(pool)) {
         .pointer => assert(aggregate_ty.isSlice(pool)),
-        // A packed field pointer is a bit pointer: the same address re-typed to the field's
-        // host-size/bit-offset pointer type (mirrors the compiler's `Value.ptrField`).
         .@"struct" => switch (aggregate_ty.containerLayout(pool)) {
             .auto => {},
-            .@"packed" => return .fromIndex(try pool.getCoerced(parent_ptr.index, field_ptr_ty.index)),
             .@"extern" => return parent_ptr.getOffsetPtr(aggregate_ty.structFieldOffset(pool, field_idx), field_ptr_ty, pool),
+            .@"packed" => return .fromIndex(try pool.getCoerced(parent_ptr.index, field_ptr_ty.index)),
         },
         .@"union" => switch (aggregate_ty.containerLayout(pool)) {
             .auto => {},
-            .@"packed" => return .fromIndex(try pool.getCoerced(parent_ptr.index, field_ptr_ty.index)),
-            .@"extern" => return parent_ptr.getOffsetPtr(0, field_ptr_ty, pool),
+            .@"packed", .@"extern" => return .fromIndex(try pool.getCoerced(parent_ptr.index, field_ptr_ty.index)),
         },
         else => unreachable,
     }
@@ -616,12 +613,7 @@ pub fn toFloat(val: Value, comptime T: type, pool: *const InternPool) T {
     return switch (pool.indexToKey(val.index)) {
         .int => |int| switch (int.storage) {
             .big_int => |big_int| big_int.toFloat(T, .nearest_even)[0],
-            inline .u64, .i64 => |x| {
-                if (T == f80) {
-                    @panic("TODO we can't lower this properly on non-x86 llvm backend yet");
-                }
-                return @floatFromInt(x);
-            },
+            inline .u64, .i64 => |x| @floatFromInt(x),
         },
         .float => |float| switch (float.storage) {
             inline else => |x| @floatCast(x),
@@ -630,10 +622,37 @@ pub fn toFloat(val: Value, comptime T: type, pool: *const InternPool) T {
     };
 }
 
+pub fn floatCast(val: Value, dest_ty: Type, pool: *InternPool) std.mem.Allocator.Error!Value {
+    if (val.isUndef(pool)) return .fromIndex(try pool.get(.{ .undef = dest_ty.index }));
+    return .fromIndex(try pool.internFloat(.{
+        .ty = dest_ty.index,
+        .storage = switch (dest_ty.floatBits()) {
+            16 => .{ .f16 = val.toFloat(f16, pool) },
+            32 => .{ .f32 = val.toFloat(f32, pool) },
+            64 => .{ .f64 = val.toFloat(f64, pool) },
+            80 => .{ .f80 = val.toFloat(f80, pool) },
+            128 => .{ .f128 = val.toFloat(f128, pool) },
+            else => unreachable,
+        },
+    }));
+}
+
 pub fn elemValue(val: Value, pool: *InternPool, index: usize) std.mem.Allocator.Error!Value {
     switch (pool.indexToKey(val.index)) {
         .undef => |ty| return .fromIndex(try pool.get(.{ .undef = Type.fromIndex(ty).childType(pool).index })),
-        .aggregate => |aggregate| return .fromIndex(try pool.aggregateElementAt(aggregate, index)),
+        .aggregate => |aggregate| {
+            const len = pool.aggregateTypeLen(aggregate.ty);
+            if (index < len) return .fromIndex(switch (aggregate.storage) {
+                .bytes => |bytes| try pool.get(.{ .int = .{
+                    .ty = .u8_type,
+                    .storage = .{ .u64 = bytes.at(index, pool) },
+                } }),
+                .elems => |elems| elems[index],
+                .repeated_elem => |elem| elem,
+            });
+            assert(index == len);
+            return Type.fromIndex(aggregate.ty).sentinel(pool).?;
+        },
         else => unreachable,
     }
 }
@@ -1363,7 +1382,40 @@ pub fn order(lhs: Value, rhs: Value, pool: *const InternPool) std.math.Order {
     return lhs_bigint.order(rhs_bigint);
 }
 
+pub fn pointerNav(val: Value, pool: *const InternPool) ?InternPool.Nav.Index {
+    return switch (pool.indexToKey(val.index)) {
+        .@"extern" => |e| e.owner_nav,
+        .func => |func| func.owner_nav.unwrap(),
+        .ptr => |ptr| if (ptr.byte_offset == 0) switch (ptr.base_addr) {
+            .nav => |nav| nav,
+            else => null,
+        } else null,
+        else => null,
+    };
+}
+
 pub fn compareHetero(lhs: Value, op: std.math.CompareOperator, rhs: Value, pool: *const InternPool) bool {
+    if (lhs.pointerNav(pool)) |lhs_nav| {
+        if (rhs.pointerNav(pool)) |rhs_nav| {
+            switch (op) {
+                .eq => return lhs_nav == rhs_nav,
+                .neq => return lhs_nav != rhs_nav,
+                else => {},
+            }
+        } else {
+            switch (op) {
+                .eq => return false,
+                .neq => return true,
+                else => {},
+            }
+        }
+    } else if (rhs.pointerNav(pool)) |_| {
+        switch (op) {
+            .eq => return false,
+            .neq => return true,
+            else => {},
+        }
+    }
     if (lhs.isNan(pool) or rhs.isNan(pool)) return op == .neq;
     return order(lhs, rhs, pool).compare(op);
 }
@@ -1472,10 +1524,22 @@ pub fn compareAllWithZero(lhs: Value, op: std.math.CompareOperator, pool: *const
             } else true,
             .repeated_elem => |elem| Value.fromIndex(elem).compareAllWithZero(op, pool),
         },
-        else => {
-            var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
-            return lhs.toBigInt(&space, pool).orderAgainstScalar(0).compare(op);
-        },
+        .undef => false,
+        else => order(lhs, .zero_comptime_int, pool).compare(op),
+    };
+}
+
+pub fn eql(a: Value, b: Value, ty: Type, pool: *const InternPool) bool {
+    assert(a.typeOf(pool).index == ty.index);
+    assert(b.typeOf(pool).index == ty.index);
+    return a.index == b.index;
+}
+
+pub fn compareScalar(lhs: Value, op: std.math.CompareOperator, rhs: Value, ty: Type, pool: *const InternPool) bool {
+    return switch (op) {
+        .eq => lhs.eql(rhs, ty, pool),
+        .neq => !lhs.eql(rhs, ty, pool),
+        else => compareHetero(lhs, op, rhs, pool),
     };
 }
 

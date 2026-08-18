@@ -79,8 +79,8 @@ fn sourceLocation(
 /// Render parse errors with positions translated into the user's
 /// coordinate frame.
 ///
-/// The Ast is parsed against the wrapped source (`const __repl_input
-/// = (<user>);` for expression shape), so a token's column inside
+/// The Ast is parsed against the wrapped source (the expression shape wraps
+/// `<user>` in a function body binding it), so a token's column inside
 /// the wrap leaks the prefix bytes into the diagnostic. The
 /// translation is essentially free: `std.zig.Ast.tokenLocation`
 /// takes a `start_offset` parameter to begin line/column counting

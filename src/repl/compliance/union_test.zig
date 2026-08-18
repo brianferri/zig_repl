@@ -199,7 +199,7 @@ test "compliance: union sad paths pin the REPL's diagnostics" {
     try compliance.expectDiagnostic(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 1 }; break :blk u.z; }"}, "no field named 'z' in union");
     try compliance.expectDiagnostic(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 1 }; break :blk u.z; }"}, "union declared here");
     try compliance.expectDiagnostic(a, &.{"blk: { " ++ U ++ " const u = U{ .a = 1, .b = 2 }; break :blk u.a; }"}, "union initialization expects exactly one field");
-    try compliance.expectDiagnostic(a, &.{"blk: { " ++ U ++ " const u = U{ .a = true }; break :blk u.a; }"}, "cannot coerce value to destination type");
+    try compliance.expectDiagnostic(a, &.{"blk: { " ++ U ++ " const u = U{ .a = true }; break :blk u.a; }"}, "expected type 'u32', found 'bool'");
     try compliance.expectDiagnostic(a, &.{"blk: { const S = struct { x: u8 }; const s = S{ .x = 1 }; break :blk @tagName(s); }"}, "expected enum or union");
     try compliance.expectDiagnostic(a, &.{"blk: { const V = union(u8) { a: u32, b: u8 }; const v = V{ .a = 1 }; break :blk v.a; }"}, "expected enum tag type, found 'u8'");
     try compliance.expectDiagnostic(a, &.{"blk: { const E = enum { a, b }; const V = union(E) { b: bool, a: u32 }; const v = V{ .a = 1 }; break :blk v.a; }"}, "union field order does not match tag enum field order");

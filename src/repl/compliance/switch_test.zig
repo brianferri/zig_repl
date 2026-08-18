@@ -194,3 +194,24 @@ test "compliance: switch else and scalar-prong captures bind the operand" {
         } },
     });
 }
+
+test "compliance: a duplicate switch prong names its value and points at the previous one" {
+    // Parity with the compiler's per-prong diagnostic: the value appears in the message and a
+    // "previous value here" note anchors the first occurrence.
+    try compliance.expectDiagnostic(a, &.{"blk: { const x: u8 = 3; break :blk switch (x) { 3 => @as(u8, 1), 3 => 2, else => 0 }; }"}, "duplicate switch value '3'");
+    try compliance.expectDiagnostic(a, &.{"blk: { const x: u8 = 3; break :blk switch (x) { 3 => @as(u8, 1), 3 => 2, else => 0 }; }"}, "previous value here");
+    try compliance.expectDiagnostic(a, &.{"blk: { const x: u8 = 3; break :blk switch (x) { 0...5 => @as(u8, 1), 3 => 2, else => 0 }; }"}, "duplicate switch value '3'");
+    try compliance.expectDiagnostic(a, &.{"blk: { const E = enum { a, b }; const x: E = .a; break :blk switch (x) { .a => @as(u8, 1), .a => 2, else => 0 }; }"}, "duplicate switch value '.a'");
+    try compliance.expectDiagnostic(a, &.{"blk: { const x: anyerror = error.Foo; break :blk switch (x) { error.Foo => @as(u8, 1), error.Foo => 2, else => 0 }; }"}, "duplicate switch value 'error.Foo'");
+    try compliance.expectDiagnostic(a, &.{"blk: { const x: bool = true; break :blk switch (x) { true => @as(u8, 1), true => 2, false => 3 }; }"}, "duplicate switch value 'true'");
+}
+
+test "compliance: a non-exhaustive switch names each unhandled value" {
+    // Parity with the compiler: every unhandled enumeration value is listed as a note. A union's
+    // tag enum is generated, so the note resolves through the owning union's field.
+    try compliance.expectDiagnostic(a, &.{"blk: { const E = enum { a, b, c }; const x: E = .a; break :blk switch (x) { .a => @as(u8, 1) }; }"}, "unhandled enumeration value: 'b'");
+    try compliance.expectDiagnostic(a, &.{"blk: { const E = enum { a, b, c }; const x: E = .a; break :blk switch (x) { .a => @as(u8, 1) }; }"}, "unhandled enumeration value: 'c'");
+    try compliance.expectDiagnostic(a, &.{"blk: { const U = union(enum) { a: u32, b: u8 }; const u = U{ .a = 1 }; break :blk switch (u) { .a => |v| v }; }"}, "unhandled enumeration value: 'b'");
+    // The '_' prong on an exhaustive enum carries the compiler's guidance note.
+    try compliance.expectDiagnostic(a, &.{"blk: { const E = enum { a, b }; const x: E = .a; break :blk switch (x) { .a => @as(u8, 1), .b => 2, _ => 3 }; }"}, "consider using 'else'");
+}

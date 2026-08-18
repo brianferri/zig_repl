@@ -192,7 +192,8 @@ fn replRun(gpa: std.mem.Allocator, inputs: []const []const u8) ![]u8 {
 
     var out_buf: [4096]u8 = undefined;
     var out_writer = Io.Writer.fixed(&out_buf);
-    try render.render(value, &pool, null, &out_writer);
+    // Render with the session, like the interactive REPL, so struct values print their field names.
+    try render.render(value, &pool, &session, &out_writer);
     return gpa.dupe(u8, std.mem.trimEnd(u8, out_writer.buffered(), "\n"));
 }
 
@@ -206,6 +207,7 @@ test {
     _ = @import("builtin_test.zig");
     _ = @import("cast_test.zig");
     _ = @import("coercion_test.zig");
+    _ = @import("comptime_scope_test.zig");
     _ = @import("control_flow_test.zig");
     _ = @import("diagnostics_test.zig");
     _ = @import("enum_test.zig");

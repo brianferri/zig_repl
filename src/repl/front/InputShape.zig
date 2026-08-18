@@ -27,14 +27,19 @@ pub const Wrapped = struct {
     }
 };
 
-/// Decl name the expression wrap exposes. Sema imports this so it
-/// can find the produced decl in the analysed Zir without
-/// re-stating the name independently -- a typo in one place would
-/// otherwise silently desynchronise the producer from the consumer.
+/// Names the expression wrap exposes. Sema imports these so it can find the produced function and its
+/// result local in the analysed Zir without re-stating the names independently -- a typo in one place
+/// would otherwise silently desynchronise the producer from the consumer.
+///
+/// The wrap is a runtime function body rather than a container `const`: a container const initializer
+/// is a comptime scope in AstGen, which elides the `block_comptime` markers around comptime-required
+/// operands (`@Int` bit width, array length, ...). A function body is a runtime scope, so those markers
+/// are emitted, and the expression evaluates with the same comptime/runtime boundary as real code.
 pub const expression_decl_name: []const u8 = "__repl_input";
+pub const expression_value_name: []const u8 = "__repl_value";
 
-const expression_prefix: []const u8 = "const " ++ expression_decl_name ++ " = (";
-const expression_suffix: []const u8 = ");\n";
+const expression_prefix: []const u8 = "fn " ++ expression_decl_name ++ "() void {\n    const " ++ expression_value_name ++ " = (";
+const expression_suffix: []const u8 = ");\n    _ = " ++ expression_value_name ++ ";\n}\n";
 
 pub const max_input_bytes: u32 = 16 * 1024;
 

@@ -89,6 +89,54 @@ test "compliance: function calls resolve same-input and cross-line" {
     });
 }
 
+test "compliance: a call resolves a fn-pointer field, binding no receiver" {
+    // `x.f(args)` where `f` is a field holding a callable (a vtable-style fn pointer) calls the
+    // field, not a method -- the mechanism the std `Io` interface dispatches through.
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const S = struct { f: *const fn (u8) u8 }; const s: S = .{ .f = struct { fn dbl(x: u8) u8 { return x *% 2; } }.dbl }; break :blk s.f(3); }"}, .want = blk: {
+            const S = struct { f: *const fn (u8) u8 };
+            const s: S = .{ .f = struct {
+                fn dbl(x: u8) u8 {
+                    return x *% 2;
+                }
+            }.dbl };
+            break :blk s.f(3);
+        } },
+        .{ .src = &.{"blk: { const S = struct { f: *const fn (u8) u8 }; const s: S = .{ .f = struct { fn dbl(x: u8) u8 { return x *% 2; } }.dbl }; const p = &s; break :blk p.f(3); }"}, .want = blk: {
+            const S = struct { f: *const fn (u8) u8 };
+            const s: S = .{ .f = struct {
+                fn dbl(x: u8) u8 {
+                    return x *% 2;
+                }
+            }.dbl };
+            const p = &s;
+            break :blk p.f(3);
+        } },
+        // A `comptime` field holding a callable binds through the comptime-field value directly,
+        // not through a materialized field pointer.
+        .{ .src = &.{"blk: { const S = struct { comptime f: *const fn (u8) u8 = struct { fn dbl(x: u8) u8 { return x *% 2; } }.dbl }; const s: S = .{}; break :blk s.f(21); }"}, .want = blk: {
+            const S = struct {
+                comptime f: *const fn (u8) u8 = struct {
+                    fn dbl(x: u8) u8 {
+                        return x *% 2;
+                    }
+                }.dbl,
+            };
+            const s: S = .{};
+            break :blk s.f(21);
+        } },
+        .{ .src = &.{"blk: { const U = union(enum) { f: *const fn (u8) u8, g: u8 }; const u: U = .{ .f = struct { fn inc(x: u8) u8 { return x +% 1; } }.inc }; break :blk u.f(4); }"}, .want = blk: {
+            const U = union(enum) { f: *const fn (u8) u8, g: u8 };
+            const u: U = .{ .f = struct {
+                fn inc(x: u8) u8 {
+                    return x +% 1;
+                }
+            }.inc };
+            break :blk u.f(4);
+        } },
+    });
+}
+
 test "compliance: defer runs at scope exit in LIFO order over live state" {
     try compliance.check(a, .{
         .{

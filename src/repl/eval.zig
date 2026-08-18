@@ -123,27 +123,37 @@ fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !O
             const src_path = err_file.sub_file_path orelse Diagnostic.repl_source_path;
             const rendered = caret: {
                 const file_zir = err_file.zir orelse break :caret false;
-                const node = em.src_loc.resolveNode(file_zir);
+
+                // Resolve against the error's own tree: a REPL line keeps its wrapped source +
+                // tree in the `File`; a loaded module keeps only ZIR, so re-read and re-parse on
+                // demand -- the compiler's `File.getSource`/`getTree` -- so a std error carets
+                // against std's own source. The tree is needed to resolve the src loc itself: a
+                // builtin-call-argument location selects an argument sub-node from it.
+                var owned_src: ?[:0]u8 = null;
+                var owned_tree: ?std.zig.Ast = null;
+                defer if (owned_src) |s| session.gpa.free(s);
+                defer if (owned_tree) |*t| t.deinit(session.gpa);
+
+                var tree: std.zig.Ast = undefined;
+                var view: Pipeline.UserView = undefined;
+                if (err_file.wrapped) |*wrapped| {
+                    tree = err_file.tree orelse break :caret false;
+                    view = .{ .text = wrapped.userText(), .offset_in_source = wrapped.user_offset };
+                } else {
+                    const provider = session.module_source orelse break :caret false;
+                    const src = provider.read(session.gpa, src_path) catch break :caret false;
+                    owned_src = src;
+                    tree = std.zig.Ast.parse(session.gpa, src, .{ .mode = .zig }) catch break :caret false;
+                    owned_tree = tree;
+                    view = .{ .text = src, .offset_in_source = 0 };
+                }
+
+                const node = em.src_loc.resolveNode(file_zir, tree);
                 var notes_buf: [16]Diagnostic.Note = undefined;
                 const n = @min(em.notes.len, notes_buf.len);
                 for (notes_buf[0..n], em.notes[0..n]) |*dst, note| {
-                    dst.* = .{ .node = note.src_loc.resolveNode(file_zir), .msg = note.msg };
+                    dst.* = .{ .node = note.src_loc.resolveNode(file_zir, tree), .msg = note.msg };
                 }
-                // A REPL line keeps its wrapped source + tree in the `File`. A loaded module
-                // keeps only ZIR; re-read and re-parse it on demand -- the compiler's
-                // `File.getSource`/`getTree` -- so a std error carets against std's own source.
-                if (err_file.wrapped) |*wrapped| {
-                    const tree = err_file.tree orelse break :caret false;
-                    const view: Pipeline.UserView = .{ .text = wrapped.userText(), .offset_in_source = wrapped.user_offset };
-                    Diagnostic.renderSemaError(session.gpa, src_path, tree, view, node, em.msg, notes_buf[0..n], diag) catch {};
-                    break :caret true;
-                }
-                const provider = session.module_source orelse break :caret false;
-                const src = provider.read(session.gpa, src_path) catch break :caret false;
-                defer session.gpa.free(src);
-                var tree = std.zig.Ast.parse(session.gpa, src, .{ .mode = .zig }) catch break :caret false;
-                defer tree.deinit(session.gpa);
-                const view: Pipeline.UserView = .{ .text = src, .offset_in_source = 0 };
                 Diagnostic.renderSemaError(session.gpa, src_path, tree, view, node, em.msg, notes_buf[0..n], diag) catch {};
                 break :caret true;
             };

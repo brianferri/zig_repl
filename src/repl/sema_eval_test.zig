@@ -320,9 +320,9 @@ test "@as rejects values that don't fit in the target int type" {
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
 
-    try expectEvalFails(gpa, &pool, "@as(u8, 256)", "does not fit in u8");
-    try expectEvalFails(gpa, &pool, "@as(i8, 128)", "does not fit in i8");
-    try expectEvalFails(gpa, &pool, "@as(u32, -1)", "does not fit in u32");
+    try expectEvalFails(gpa, &pool, "@as(u8, 256)", "cannot represent integer value");
+    try expectEvalFails(gpa, &pool, "@as(i8, 128)", "cannot represent integer value");
+    try expectEvalFails(gpa, &pool, "@as(u32, -1)", "cannot represent integer value");
 }
 
 test "fn return rejects a runtime value whose type does not coerce" {
@@ -368,10 +368,10 @@ test "array_init rejects elements that don't fit the element type" {
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
 
-    try expectEvalFails(gpa, &pool, "[_]u3{8}", "does not fit in u3");
-    try expectEvalFails(gpa, &pool, "[_]u8{256}", "does not fit in u8");
-    try expectEvalFails(gpa, &pool, "[_]i4{8}", "does not fit in i4"); // i4 holds -8..7
-    try expectEvalFails(gpa, &pool, "[_]u8{-1}", "does not fit in u8");
+    try expectEvalFails(gpa, &pool, "[_]u3{8}", "cannot represent integer value");
+    try expectEvalFails(gpa, &pool, "[_]u8{256}", "cannot represent integer value");
+    try expectEvalFails(gpa, &pool, "[_]i4{8}", "cannot represent integer value"); // i4 holds -8..7
+    try expectEvalFails(gpa, &pool, "[_]u8{-1}", "cannot represent integer value");
 }
 
 test "if branches with negative results" {
@@ -673,8 +673,8 @@ test "@intFromFloat truncates toward zero and range-checks" {
     try expectEvalTypedDecimal(gpa, &pool, "@as(u8, @intFromFloat(255.999))", .u8_type, "255");
     try expectEvalDecimal(gpa, &pool, "@as(comptime_int, @intFromFloat(1234567890.5))", "1234567890");
 
-    try expectEvalFails(gpa, &pool, "@as(u8, @intFromFloat(256.0))", "does not fit in u8");
-    try expectEvalFails(gpa, &pool, "@as(i32, @intFromFloat(1.0e30))", "does not fit in i32");
+    try expectEvalFails(gpa, &pool, "@as(u8, @intFromFloat(256.0))", "cannot be stored in integer type 'u8'");
+    try expectEvalFails(gpa, &pool, "@as(i32, @intFromFloat(1.0e30))", "cannot be stored in integer type 'i32'");
 }
 
 test "@floatFromInt rounds to nearest-even at the destination width" {
@@ -912,7 +912,7 @@ test "@intCast widens and narrows with range checks" {
 
     try expectEvalTypedDecimal(gpa, &pool, "@as(u32, @intCast(@as(u8, 200)))", .u32_type, "200");
     try expectEvalTypedDecimal(gpa, &pool, "@as(u8, @intCast(@as(u32, 200)))", .u8_type, "200");
-    try expectEvalFails(gpa, &pool, "@as(u8, @intCast(@as(u32, 500)))", "does not fit in u8");
+    try expectEvalFails(gpa, &pool, "@as(u8, @intCast(@as(u32, 500)))", "cannot represent integer value");
 }
 
 test "@truncate keeps low bits" {
@@ -1113,9 +1113,9 @@ test "coercion: void and non-void types do not coerce into each other" {
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
 
-    try expectEvalFails(gpa, &pool, "@as(i32, {})", "cannot coerce value");
-    try expectEvalFails(gpa, &pool, "@as(f128, {})", "cannot coerce value");
-    try expectEvalFails(gpa, &pool, "@as(void, 5)", "cannot coerce value");
+    try expectEvalFails(gpa, &pool, "@as(i32, {})", "expected type 'i32', found 'void'");
+    try expectEvalFails(gpa, &pool, "@as(f128, {})", "expected type 'f128', found 'void'");
+    try expectEvalFails(gpa, &pool, "@as(void, 5)", "expected type 'void', found 'comptime_int'");
 }
 
 test "vector_type: rejects element types without a fixed bit width" {
@@ -1268,9 +1268,9 @@ test "cast builtins reject ptr_type destinations with their own diagnostic" {
 
     // Each builtin uses `resolveDestType`, so a ptr_type dest is
     // accepted as a type Index -- the kind-specific check inside
-    // the handler rejects the mismatch. Each one names its
-    // own kind in the diagnostic, not "destination is not a type".
-    try expectEvalFails(gpa, &pool, "@as(*const u8, @intCast(5))", "destination is not a supported int type");
+    // the handler rejects the mismatch with the compiler's diagnostic,
+    // not "destination is not a type".
+    try expectEvalFails(gpa, &pool, "@as(*const u8, @intCast(5))", "expected integer or vector, found '*const u8'");
     try expectEvalFails(gpa, &pool, "@as(*u8, @bitCast(@as(u64, 0)))", "cannot @bitCast to '*u8'");
 }
 
@@ -1344,7 +1344,8 @@ test "mixed comptime_int + comptime_float promotes via peer-type resolution" {
     try expectEvalComptimeFloat(gpa, &pool, "1.5 + 1", 2.5);
     try expectEvalComptimeFloat(gpa, &pool, "10 - 2.5", 7.5);
     try expectEvalComptimeFloat(gpa, &pool, "3 * 2.5", 7.5);
-    try expectEvalComptimeFloat(gpa, &pool, "10 / 4.0", 2.5);
+    // An exact division: a non-zero remainder would be rejected as an ambiguous int/float coercion.
+    try expectEvalComptimeFloat(gpa, &pool, "10 / 5.0", 2.0);
     try expectEvalComptimeFloat(gpa, &pool, "-3 + 0.5", -2.5);
 
     // Mixed comparison: the int side promotes the same way.
@@ -1403,24 +1404,6 @@ test "alloc/store/load: wrap arith through a stored var" {
         .u8_type,
         "44",
     );
-}
-
-test "store through a pointer to a declaration is a comptime-only rejection" {
-    // The compiler lowers a store through a pointer to a declaration to a runtime
-    // instruction; a comptime-only evaluator has no runtime stage, so it rejects
-    // the store rather than silently mutating a copy of the decl.
-    const gpa = testing.allocator;
-    var pool = try InternPool.init(gpa);
-    defer pool.deinit();
-    const ns = try pool.createNamespace(gpa, .{});
-
-    var diag_buf: [4096]u8 = @splat(0);
-    const result = evalSessionLines(gpa, &pool, ns, &.{
-        "var x: u32 = 1;",
-        "blk: { const p = &x; p.* = 5; break :blk x; }",
-    }, &diag_buf);
-    try testing.expectError(error.AnalysisFail, result);
-    try testing.expect(std.mem.indexOf(u8, &diag_buf, "store requires runtime memory") != null);
 }
 
 /// Run a sequence of session inputs through the shared `eval.run` driver,

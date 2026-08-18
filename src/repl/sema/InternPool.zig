@@ -2161,6 +2161,23 @@ pub fn getOrPutString(
     return @fromBackingInt(@intCast(new_index));
 }
 
+/// Mirrors the compiler's `getOrPutStringFmt`. The compiler writes the formatted bytes straight into
+/// its per-thread string buffer via `getOrPutTrailingString`; the single-threaded pool here has no such
+/// buffer, so the bytes go through a scratch allocation before `getOrPutString`.
+pub fn getOrPutStringFmt(
+    pool: *InternPool,
+    gpa: Allocator,
+    comptime format: []const u8,
+    args: anytype,
+    comptime embedded_nulls: EmbeddedNulls,
+) Allocator.Error!embedded_nulls.StringType() {
+    const len: usize = @intCast(std.fmt.count(format, args));
+    const scratch = try gpa.alloc(u8, len);
+    defer gpa.free(scratch);
+    assert((std.fmt.bufPrint(scratch, format, args) catch unreachable).len == len);
+    return pool.getOrPutString(gpa, scratch, embedded_nulls);
+}
+
 pub fn stringSlice(pool: *const InternPool, string: NullTerminatedString) [:0]const u8 {
     const raw = @backingInt(string);
     assert(raw + 1 < pool.string_starts.items.len);

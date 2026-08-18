@@ -62,9 +62,13 @@ pub fn render(
         // (`&"..."`): show the pointee bytes as a string, not the raw address.
         // Mirrors src/print_value.zig printPtr's `.uav` aggregate shortcut.
         .ptr => |p| {
-            if (p.base_addr == .uav) {
+            // The string-literal shortcut is only for a pointer to the *whole* backing array (`&"..."`).
+            // A narrowed or offset subarray pointer (`a[1..3]`) has a smaller pointee type or a non-zero
+            // byte offset, and must go through the indexable path below, which respects both.
+            if (p.base_addr == .uav and p.byte_offset == 0) {
+                const pty0 = pool.indexToKey(p.ty);
                 const pointee = pool.indexToKey(p.base_addr.uav.val);
-                if (pointee == .aggregate)
+                if (pointee == .aggregate and pty0 == .ptr_type and pty0.ptr_type.child == pointee.aggregate.ty)
                     if (try renderBytes(pool, writer, pointee.aggregate, .ref)) return;
             }
             // `{any}` renders a single-item pointer to an array/vector as the `[]const T` it points

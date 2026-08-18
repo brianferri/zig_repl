@@ -162,6 +162,19 @@ test "compliance: struct init and field access" {
     });
 }
 
+// A comptime field is never written through its (standalone) comptime-field pointer, so a mutable
+// variable's storage never holds it; the value is read from the type default, and a whole-value
+// materialization carries it -- the compiler guarantees a struct value is complete.
+test "compliance: a comptime struct field survives a mutable variable" {
+    const S = "const S = struct { comptime x: u32 = 7, y: u32 = 0 };";
+    try compliance.check(a, .{
+        .{ .src = &.{ S, "blk: { var s: S = .{ .y = 3 }; s.y = 5; break :blk s.x; }" }, .want = @as(u32, 7) },
+        .{ .src = &.{ S, "blk: { var s: S = .{ .y = 3 }; s.y = 5; break :blk s.x + s.y; }" }, .want = @as(u32, 12) },
+        .{ .src = &.{ S, "blk: { var s: S = .{ .y = 3 }; s.y = 5; const t = s; break :blk t.x; }" }, .want = @as(u32, 7) },
+        .{ .src = &.{ S, "blk: { var s: S = .{ .y = 3 }; s.y = 5; break :blk s; }" }, .rendered = ".{ .x = 7, .y = 5 }" },
+    });
+}
+
 test "compliance: a struct type exposes its member declarations (P.decl)" {
     try compliance.check(a, .{
         .{

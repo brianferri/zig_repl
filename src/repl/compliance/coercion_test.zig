@@ -12,6 +12,43 @@ test "compliance: a comptime-known int coerces to a fixed-width int when it fits
     });
 }
 
+// A comptime-known float with no fractional part coerces to an integer type; a fractional value is
+// rejected (compiler: coerceExtra's int-dest / float-source arm, via `intFromFloat(.exact)`).
+test "compliance: a comptime-known float coerces to an integer when it has no fractional part" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const x: u8 = 2.0; break :blk x; }"}, .want = blk: {
+            const x: u8 = 2.0;
+            break :blk x;
+        } },
+        .{ .src = &.{"blk: { const z: i32 = 100.0; break :blk z; }"}, .want = blk: {
+            const z: i32 = 100.0;
+            break :blk z;
+        } },
+        .{ .src = &.{"@as(u8, 3.0)"}, .want = @as(u8, 3.0) },
+        .{ .src = &.{"blk: { const y: u8 = 2.5; break :blk y; }"}, .reject = {} },
+    });
+}
+
+// A comptime-known number coerces to a float type only when the float represents it exactly: a
+// `comptime_float` always fits (it rounds), a fixed-width float or an integer must survive a round-trip
+// (compiler: coerceExtra's float-dest arm, via `floatCast`/`floatValue` + representability check).
+test "compliance: a comptime-known number coerces to a float only when represented exactly" {
+    try compliance.check(a, .{
+        .{ .src = &.{"blk: { const x: f32 = @as(f64, 1.5); break :blk x; }"}, .want = blk: {
+            const x: f32 = @as(f64, 1.5);
+            break :blk x;
+        } },
+        .{ .src = &.{"blk: { const x: f64 = @as(f32, 1.5); break :blk x; }"}, .want = blk: {
+            const x: f64 = @as(f32, 1.5);
+            break :blk x;
+        } },
+        .{ .src = &.{"@as(f32, 5)"}, .want = @as(f32, 5) },
+        .{ .src = &.{"@as(f32, 16777217.0)"}, .want = @as(f32, 16777217.0) },
+        .{ .src = &.{"blk: { const x: f32 = @as(f64, 0.1); break :blk x; }"}, .reject = {} },
+        .{ .src = &.{"@as(f32, 16777217)"}, .reject = {} },
+    });
+}
+
 test "compliance: a function return coerces to the declared return type" {
     try compliance.check(a, .{
         .{ .src = &.{ "fn five() i32 { return 5; }", "five()" }, .want = (struct {
