@@ -59,13 +59,13 @@ const Segment = struct {
 pub fn writeJson(session: *Session, source: []const u8, w: *std.Io.Writer) !void {
     const split = InputShape.splitTrailingExpr(session.gpa, source) catch null;
     if (split) |s| {
-        var decls = Pipeline.runWithInjection(session.gpa, s.decls, session.intern_pool, .init(session.root_namespace)) catch return emitEmpty(w);
+        var decls = Pipeline.runWithInjection(session.gpa, s.decls, session.intern_pool, .init(session.root_namespace)) catch return emitEmpty(w, null);
         defer decls.deinit(session.gpa);
         // Bind the declarations so the expression run's ZIR resolves their
         // names; a failed bind just leaves the expression's ZIR with the
         // AstGen error (omitted), while both ASTs still emit.
         _ = eval.run(session, s.decls, w) catch {};
-        var expr = Pipeline.runWithInjection(session.gpa, s.expr, session.intern_pool, .init(session.root_namespace)) catch return emitEmpty(w);
+        var expr = Pipeline.runWithInjection(session.gpa, s.expr, session.intern_pool, .init(session.root_namespace)) catch return emitEmpty(w, null);
         defer expr.deinit(session.gpa);
         const expr_off: Offset = .{
             .id = @intCast(decls.tree.nodes.len),
@@ -78,13 +78,22 @@ pub fn writeJson(session: *Session, source: []const u8, w: *std.Io.Writer) !void
         return;
     }
 
-    var result = Pipeline.runWithInjection(session.gpa, source, session.intern_pool, .init(session.root_namespace)) catch return emitEmpty(w);
+    var result = Pipeline.runWithInjection(session.gpa, source, session.intern_pool, .init(session.root_namespace)) catch return emitEmpty(w, null);
     defer result.deinit(session.gpa);
     try emitOutline(session.gpa, w, source, &.{.{ .result = &result, .off = .{} }});
 }
 
-fn emitEmpty(w: *std.Io.Writer) !void {
-    try w.writeAll("{\"source\":\"\",\"ast\":[],\"zir\":[]}");
+/// Emit an empty `{ source, ast, zir }` outline, optionally carrying an
+/// `error` field for a front-end failure that produced no nodes.
+pub fn emitEmpty(w: *std.Io.Writer, message: ?[]const u8) !void {
+    const Empty = struct {
+        source: []const u8 = "",
+        ast: []const u32 = &[_]u32{},
+        zir: []const u32 = &[_]u32{},
+        @"error": ?[]const u8 = null,
+    };
+    var json: Json = .{ .writer = w, .options = .{ .emit_null_optional_fields = false } };
+    try json.write(Empty{ .@"error" = message });
 }
 
 /// Emit the merged `{ source, ast, zir }` for `segments` in order. Segment

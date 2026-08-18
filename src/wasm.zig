@@ -225,17 +225,17 @@ export fn replOutline(ptr: [*]u8, len: usize) void {
     defer gpa.free(ptr[0..len]);
     output.clearRetainingCapacity();
     buildOutline(ptr[0..len]) catch |err| {
-        output.writer.print("{{\"source\":\"\",\"ast\":[],\"zir\":[],\"error\":\"{s}\"}}", .{@errorName(err)}) catch {};
+        // Drop any partial outline so the error object is the whole result, not
+        // a second object concatenated onto a truncated one.
+        output.clearRetainingCapacity();
+        outline.emitEmpty(&output.writer, @errorName(err)) catch {};
     };
 }
 
 fn buildOutline(input: []const u8) !void {
     const w = &output.writer;
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
-    if (trimmed.len == 0) {
-        try w.writeAll("{\"source\":\"\",\"ast\":[],\"zir\":[]}");
-        return;
-    }
+    if (trimmed.len == 0) return outline.emitEmpty(w, null);
 
     var preview_pool = try InternPool.init(gpa);
     defer preview_pool.deinit();
