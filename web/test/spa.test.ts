@@ -37,7 +37,12 @@ declare global {
             outline: (line: string) => Outline,
             feed: (bytes: Uint8Array) => void,
             inputState: () => { buffer: string, cursor: number },
-            takeSubmitted: () => string | null
+            takeSubmitted: () => string | null,
+            themes: () => Array<{
+                name: string,
+                accent: { r: number, g: number, b: number },
+                palette: Record<string, { r: number, g: number, b: number }>
+            }>
         };
     }
 }
@@ -175,6 +180,33 @@ await describe("wasm repl", async () => {
         const zir = flattenZir(out.zir);
         assert.ok(zir.some((node) => node.label === "int")); // the 7 binding
         assert.ok(zir.some((node) => node.label === "mul")); // y * 2
+    });
+
+    await test("exposes the prompt theme registry with accent and surface palette", async () => {
+        const list = await page.evaluate(() => window.repl.themes());
+        assert.ok(list.length >= 1);
+        const zig = list.find((t) => t.name === "zig");
+        assert.ok(zig);
+        assert.deepEqual(zig.accent, { r: 247, g: 164, b: 29 });
+        assert.deepEqual(zig.palette.base, { r: 27, g: 26, b: 23 });
+        assert.deepEqual(zig.palette.text, { r: 234, g: 230, b: 223 });
+    });
+
+    await test("applies a chosen theme's palette to the css variables and remembers it", async () => {
+        const applied = await page.evaluate(() => {
+            const select = document.getElementById("theme-select") as HTMLSelectElement;
+            select.value = "zig";
+            select.dispatchEvent(new Event("change"));
+            const style = getComputedStyle(document.documentElement);
+            return {
+                accent: style.getPropertyValue("--accent").trim(),
+                base: style.getPropertyValue("--base").trim(),
+                stored: localStorage.getItem("zig_repl_theme")
+            };
+        });
+        assert.equal(applied.accent, "rgb(247 164 29)");
+        assert.equal(applied.base, "rgb(27 26 23)");
+        assert.equal(applied.stored, "zig");
     });
 
     await test("loads without page errors", () => {

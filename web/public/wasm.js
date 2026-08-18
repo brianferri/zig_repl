@@ -22,6 +22,7 @@
  * @property {() => number} replInputCursor
  * @property {() => number} replInputTakeSubmitted
  * @property {() => number} replInputSubmittedPtr
+ * @property {() => void} replThemes
  */
 
 /**
@@ -73,6 +74,25 @@
  * @property {(bytes: Uint8Array) => void} feed
  * @property {() => InputState} inputState
  * @property {() => (string | null)} takeSubmitted
+ * @property {() => Array<Theme>} themes
+ */
+
+/**
+ * An RGB color, each channel 0-255.
+ * @typedef {object} Rgb
+ * @property {number} r
+ * @property {number} g
+ * @property {number} b
+ */
+
+/**
+ * A prompt theme: its name, its accent (the terminal prompt color), and the
+ * scheme's surface palette keyed by role. A non-terminal frontend paints its
+ * background and body from `palette` and its prompt from `accent`.
+ * @typedef {object} Theme
+ * @property {string} name
+ * @property {Rgb} accent
+ * @property {Record<string, Rgb>} palette
  */
 
 /**
@@ -148,6 +168,16 @@ export async function loadRepl(env = {}) {
         return readString(wasm.replInputSubmittedPtr(), len);
     }
 
+    /** @returns {Array<Theme>} */
+    function themes() {
+        wasm.replThemes();
+        try {
+            return JSON.parse(readString(wasm.replResultPtr(), wasm.replResultLen()));
+        } catch {
+            return [];
+        }
+    }
+
     return {
         wasm,
         evalLine: (line) => call(wasm.replEval, line),
@@ -156,5 +186,6 @@ export async function loadRepl(env = {}) {
         feed,
         inputState,
         takeSubmitted,
+        themes,
     };
 }

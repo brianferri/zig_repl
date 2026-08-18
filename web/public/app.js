@@ -20,7 +20,8 @@ const {
     outline,
     feed,
     inputState,
-    takeSubmitted
+    takeSubmitted,
+    themes
 } = await loadRepl({
     replClearOutput() {
         replOutput.textContent = "";
@@ -34,8 +35,45 @@ window.repl = {
     outline,
     feed,
     inputState,
-    takeSubmitted
+    takeSubmitted,
+    themes
 };
+
+// Palette role names map 1:1 to the `--<role>` variables in style.css;
+// `--accent-dim` is a darkened accent for hover/active states.
+const themeSelect = /** @type {HTMLSelectElement} */ (document.getElementById("theme-select"));
+const themeList = themes();
+
+/** @param {{ r: number, g: number, b: number }} rgb @param {number} scale @returns {string} */
+function rgbCss(rgb, scale) {
+    return `rgb(${Math.round(rgb.r * scale)} ${Math.round(rgb.g * scale)} ${Math.round(rgb.b * scale)})`;
+}
+
+/** @param {string} name */
+function applyTheme(name) {
+    const theme = themeList.find((t) => t.name === name) ?? themeList[0];
+    if (theme === undefined) return;
+    const root = document.documentElement.style;
+    for (const [role, rgb] of Object.entries(theme.palette))
+        root.setProperty(`--${role}`, rgbCss(rgb, 1));
+    root.setProperty("--accent", rgbCss(theme.accent, 1));
+    root.setProperty("--accent-dim", rgbCss(theme.accent, 0.85));
+    themeSelect.value = theme.name;
+    try {
+        localStorage.setItem("zig_repl_theme", theme.name);
+    } catch {
+        // Storage disabled (private mode): the choice holds for the session.
+    }
+}
+
+for (const theme of themeList) {
+    const option = document.createElement("option");
+    option.value = theme.name;
+    option.textContent = theme.name;
+    themeSelect.appendChild(option);
+}
+themeSelect.addEventListener("change", () => applyTheme(themeSelect.value));
+applyTheme(localStorage.getItem("zig_repl_theme") ?? "");
 
 const tabs = /** @type {NodeListOf<HTMLElement>} */ (document.querySelectorAll("nav button"));
 tabs.forEach((btn) => {

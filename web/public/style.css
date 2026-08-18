@@ -80,6 +80,28 @@ nav button.active {
     border-bottom-color: var(--accent-dim);
 }
 
+nav select {
+    appearance: none;
+    margin-left: auto;
+    background: transparent;
+    border: 1px solid var(--surface1);
+    border-radius: 4px;
+    color: var(--subtext);
+    font: inherit;
+    padding: 0.25rem 0.5rem;
+    cursor: pointer;
+}
+
+nav select:hover {
+    color: var(--text);
+    border-color: var(--overlay);
+}
+
+nav select option {
+    background: var(--crust);
+    color: var(--text);
+}
+
 main {
     flex: 1;
     min-height: 0;

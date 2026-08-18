@@ -21,6 +21,7 @@ const Type = repl.sema.Type;
 const outline = drivers_wasm.outline;
 const Commands = drivers_wasm.commands;
 const LineInput = drivers_wasm.LineInput;
+const themes = drivers_wasm.themes;
 
 // `wasm_allocator` requires the module be single-threaded (build.zig sets
 // it); it grows linear memory as needed, which detaches the host's view of
@@ -119,6 +120,29 @@ export fn replInputTakeSubmitted() isize {
 
 export fn replInputSubmittedPtr() [*]const u8 {
     return line_input.submitted.items.ptr;
+}
+
+/// Write the registered themes as JSON into the result buffer, so a graphical
+/// frontend paints its surfaces and prompt from the same registry the tty draws
+/// from.
+export fn replThemes() void {
+    if (!ready and !replInit()) return;
+    output.clearRetainingCapacity();
+    writeThemesJson(&output.writer) catch {};
+}
+
+fn writeThemesJson(w: *std.Io.Writer) !void {
+    // Project away the prompt text and its SGR bytes; std.json renders the rest.
+    const Entry = struct {
+        name: []const u8,
+        accent: themes.Theme.Rgb,
+        palette: themes.Theme.Palette,
+    };
+    var entries: [themes.themes.len]Entry = undefined;
+    for (themes.themes, &entries) |theme, *entry| {
+        entry.* = .{ .name = theme.name, .accent = theme.primary.color.rgb, .palette = theme.palette };
+    }
+    try std.json.Stringify.value(entries[0..], .{}, w);
 }
 
 fn dispatch(input: []const u8) !void {

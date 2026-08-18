@@ -10,6 +10,7 @@ const Session = repl.Session;
 
 pub const outline = @import("outline.zig");
 pub const LineInput = @import("LineInput.zig");
+pub const themes = @import("editor").themes;
 
 pub const commands = Registry(&[_]type{
     help,
