@@ -9,6 +9,7 @@ const InternPool = @import("InternPool.zig");
 const Value = @import("Value.zig");
 const MutableValue = @import("MutableValue.zig").MutableValue;
 const comptime_ptr_access = @import("comptime_ptr_access.zig");
+const runtime = @import("../io/root.zig");
 const reinterpret = @import("reinterpret.zig");
 const Type = @import("Type.zig");
 const render_value = @import("../render/Value.zig");
@@ -246,6 +247,8 @@ pub fn analyze(session: *Session, file_index: Session.Index, writer: *std.Io.Wri
     defer sema.synthetic_addresses.deinit(gpa);
 
     sema.block.type_name_ctx = try intern_pool.namespaceName(gpa, namespace);
+
+    try runtime.install(&sema);
 
     if (findReplInputBody(zir)) |bound| {
         top_block.src_base_inst = bound.decl_inst;
@@ -4675,8 +4678,22 @@ fn loadValue(sema: *Sema, ptr: Value) Error!Value {
     }
     const src = sema.block.nodeOffset(.zero);
     const ptr_ty = ptr.typeOf(ip);
-    switch (try comptime_ptr_access.loadComptimePtr(sema, ptr)) {
-        .success => |mv| return try mv.intern(ip, sema.arena),
+    // Where the compiler emits an AIR load of runtime memory, the runtime layer retargets the pointer
+    // onto a copy of the mutable global's value; the reused comptime load then navigates it and the
+    // loaded value is marked runtime. Its error results flow through the same arms as a comptime load.
+    var is_runtime = false;
+    var result = try comptime_ptr_access.loadComptimePtr(sema, ptr);
+    if (result == .runtime_load) {
+        if (try runtime.retargetLoad(sema, ptr)) |rt_ptr| {
+            result = try comptime_ptr_access.loadComptimePtr(sema, rt_ptr);
+            is_runtime = true;
+        }
+    }
+    switch (result) {
+        .success => |mv| {
+            const val = try mv.intern(ip, sema.arena);
+            return if (is_runtime) .{ .index = val.index, .is_comptime = false } else val;
+        },
         .runtime_load => return sema.fail(sema.block, src, "unable to evaluate comptime expression: load requires runtime memory", .{}),
         .undef => return sema.failWithUseOfUndef(),
         .err_payload => |err_name| return sema.fail(sema.block, src, "attempt to unwrap error: {f}", .{err_name.fmt(ip)}),
@@ -9699,10 +9716,21 @@ pub fn storePtrVal(sema: *Sema, ptr: Value, value: Value) Error!void {
     const ip = sema.intern_pool;
     const src = sema.block.nodeOffset(.zero);
     const ptr_ty = ptr.typeOf(ip);
-    switch (try comptime_ptr_access.storeComptimePtr(sema, ptr, value)) {
-        .success => {},
-        // The compiler treats a runtime store as unreachable here (its use sites emit runtime AIR); a
-        // comptime-only evaluator has no runtime stage, so it fails instead.
+    // Where the compiler emits an AIR store to runtime memory, the runtime layer retargets the pointer
+    // onto an alloc-backed copy of the mutable global's value; the reused comptime store mutates it and
+    // `writeBack` persists the result. Its error results flow through the same arms as a comptime store.
+    var target: ?runtime.StoreTarget = null;
+    var result = try comptime_ptr_access.storeComptimePtr(sema, ptr, value);
+    if (result == .runtime_store) {
+        if (try runtime.retargetStore(sema, ptr)) |t| {
+            target = t;
+            result = try comptime_ptr_access.storeComptimePtr(sema, t.ptr, value);
+        }
+    }
+    switch (result) {
+        .success => {
+            if (target) |t| try runtime.writeBack(sema, t);
+        },
         .runtime_store => return sema.fail(sema.block, src, "unable to evaluate comptime expression: store requires runtime memory", .{}),
         .comptime_field_mismatch => return sema.fail(sema.block, src, "value stored in comptime field does not match the default value of the field", .{}),
         .undef => return sema.failWithUseOfUndef(),
@@ -12197,6 +12225,9 @@ fn evalCall(sema: *Sema, inst: Zir.Inst.Index, comptime kind: enum { direct, fie
     var callee_resolved = callee_value;
     while (sema.intern_pool.indexToKey(callee_resolved.index) == .ptr) callee_resolved = try sema.loadValue(callee_resolved);
     const callee_key = sema.intern_pool.indexToKey(callee_resolved.index);
+    if (callee_key == .@"extern") {
+        if (try runtime.callIntrinsic(sema, callee_key.@"extern", explicit_len, args_body, inst)) |result| return result;
+    }
     if (callee_key != .func) {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "call: callee is not a function value", .{});
     }

@@ -61,6 +61,20 @@ import_table: std.StringHashMapUnmanaged(Index) = .empty,
 /// `std`/`root`/`builtin` fails -- the case for freestanding wasm and for
 /// tests that never import.
 module_source: ?*ModuleSource = null,
+/// Runtime-layer state for the intrinsic `Io` (owned by `io/`). `io` is the single host `Io` the
+/// interpreter delegates every runtime leaf to -- the print sink (its stderr), the clock, the
+/// filesystem -- exactly as a compiled program holds one `Io`. Frontend-injected: the TTY passes its
+/// threaded `Io`, the wasm frontend a shim whose stderr routes to the output buffer. `null` leaves the
+/// runtime inert (no sink installed, runtime reads return a neutral value). `installed` tracks whether
+/// `root.std_options_debug_io` is bound yet. `open_files` is the handle table: a `__repl_open` returns
+/// an index into it, which the interpreter File's descriptor carries so `__repl_read` finds the host
+/// file. A `__repl_close` nulls the slot (so its descriptor is free to reuse, the way a kernel table
+/// hands back the lowest free descriptor); any still-open file is closed with `io` at session teardown.
+runtime: struct {
+    io: ?std.Io = null,
+    installed: bool = false,
+    open_files: std.ArrayListUnmanaged(?std.Io.File) = .empty,
+} = .{},
 
 /// Index into `files`; the REPL's `Zcu.File.Index`.
 pub const Index = u32;
@@ -104,6 +118,10 @@ pub fn init(
 }
 
 pub fn deinit(session: *Session) void {
+    if (session.runtime.io) |io| {
+        for (session.runtime.open_files.items) |file| if (file) |f| f.close(io);
+    }
+    session.runtime.open_files.deinit(session.gpa);
     if (session.failed_analysis) |em| em.destroy(session.gpa);
     // Tear down `import_table` first: its keys alias the `sub_file_path` strings
     // freed just below.

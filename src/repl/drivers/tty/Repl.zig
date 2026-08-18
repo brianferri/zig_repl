@@ -71,6 +71,10 @@ pub fn run(repl: *Repl, environ: *const std.process.Environ.Map) !void {
     const stdin = &stdin_reader.interface;
     const stdout = &stdout_writer.interface;
 
+    // The interpreter delegates every runtime leaf -- the `std.debug.print` sink (via this Io's stderr),
+    // the clock -- to the frontend's host Io.
+    repl.session.runtime.io = repl.io;
+
     // Piped stdin stays on `takeDelimiter` so shell pipelines and the
     // compliance harness keep working unchanged.
     if (repl.is_interactive) return repl.runInteractive(stdout, environ);

@@ -1406,6 +1406,71 @@ test "alloc/store/load: wrap arith through a stored var" {
     );
 }
 
+test "store through a pointer to a mutable global mutates the runtime store" {
+    // The runtime layer performs a store through a pointer to a mutable declaration against the
+    // persistent nav store, so the block's result and a later read both observe the new value.
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .{});
+
+    var diag_buf: [4096]u8 = @splat(0);
+    const value = (try evalSessionLines(gpa, &pool, ns, &.{
+        "var x: u32 = 1;",
+        "blk: { const p = &x; p.* = 5; break :blk x; }",
+        "x",
+    }, &diag_buf)).?;
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .int);
+    try testing.expectEqual(@as(u64, 5), key.int.storage.u64);
+}
+
+test "runtime store reaches into a mutable global's field, element, and nesting" {
+    // A store through a pointer into a mutable global (`&g.field`, `&g[i]`, nested) mutates the
+    // persistent nav store; the reused comptime store navigates an alloc-backed copy of the value.
+    try expectSessionYieldsInt(5, &.{
+        "var g: struct { a: u32, b: u32 } = .{ .a = 1, .b = 2 };",
+        "blk: { g.a = 5; break :blk g.a; }",
+    });
+    try expectSessionYieldsInt(9, &.{
+        "var arr: [3]u32 = .{ 1, 2, 3 };",
+        "blk: { arr[1] = 9; break :blk arr[1]; }",
+    });
+    try expectSessionYieldsInt(8, &.{
+        "var g: struct { p: struct { w: u32 } } = .{ .p = .{ .w = 3 } };",
+        "blk: { g.p.w = 8; break :blk g.p.w; }",
+    });
+}
+
+test "runtime store reaches an optional payload and a nested element of a mutable global" {
+    // The optional-payload (`&g.?`) and doubly-indexed (`&g[i][j]`) chains exercise the
+    // remaining pointer-root arms the field/element cases above do not reach.
+    try expectSessionYieldsInt(7, &.{
+        "var g: ?u32 = 0;",
+        "blk: { g.? = 7; break :blk g.?; }",
+    });
+    try expectSessionYieldsInt(9, &.{
+        "var g: [2][2]u32 = .{ .{ 1, 2 }, .{ 3, 4 } };",
+        "blk: { g[1][0] = 9; break :blk g[1][0]; }",
+    });
+}
+
+test "runtime store into a mutable global's field persists across lines" {
+    try expectSessionYieldsInt(5, &.{
+        "var g: struct { a: u32, b: u32 } = .{ .a = 1, .b = 2 };",
+        "blk: { g.a = 5; break :blk 0; }",
+        "g.a",
+    });
+}
+
+test "runtime load navigates a pointer into a mutable global" {
+    // Reading through a pointer into a mutable global navigates a read-only view of the value.
+    try expectSessionYieldsInt(3, &.{
+        "var g: struct { p: struct { w: u32 } } = .{ .p = .{ .w = 3 } };",
+        "blk: { const q = &g.p.w; break :blk q.*; }",
+    });
+}
+
 /// Run a sequence of session inputs through the shared `eval.run` driver,
 /// persisting bindings in `namespace`. Returns the final input's Value (or
 /// null when it was a declaration). Diagnostics for the (unexpected) error
@@ -1426,6 +1491,20 @@ fn evalSessionLines(
         last_value = (try eval.run(&session, source, &writer)).value;
     }
     return last_value;
+}
+
+/// Assert `inputs`' final line yields the integer `want` in a fresh session.
+fn expectSessionYieldsInt(want: u64, inputs: []const []const u8) !void {
+    const gpa = testing.allocator;
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .{});
+
+    var diag_buf: [4096]u8 = @splat(0);
+    const value = (try evalSessionLines(gpa, &pool, ns, inputs, &diag_buf)).?;
+    const key = pool.indexToKey(value.index);
+    try testing.expect(key == .int);
+    try testing.expectEqual(want, key.int.storage.u64);
 }
 
 test "struct_decl: `const P = struct {...}` evaluates to a struct_type named after P" {

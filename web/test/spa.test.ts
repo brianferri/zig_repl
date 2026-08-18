@@ -84,6 +84,11 @@ await describe("wasm repl", async () => {
         assert.match(second, /\b80\b/);
     });
 
+    await test("emits evaluated std.debug.print output inline", async () => {
+        const out = await page.evaluate(() => window.repl.evalLine("@import(\"std\").debug.print(\"Hi {d}!\\n\", .{42})"));
+        assert.match(out, /Hi 42!/);
+    });
+
     await test("the shared line editor drives typing, editing, submit, and history from key bytes", async () => {
         const r = await page.evaluate(() => {
             const te = new TextEncoder();

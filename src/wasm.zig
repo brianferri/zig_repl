@@ -35,6 +35,10 @@ var pool: InternPool = undefined;
 var session: Session = undefined;
 var module_source: repl.module.Buffer = undefined;
 var output: std.Io.Writer.Allocating = undefined;
+// Freestanding wasm has no OS `Io`, so the host Io the interpreter delegates to is one backed by
+// `output`: its stderr routes to the result buffer, so evaluated `std.debug.print` lands inline with
+// rendered values.
+var host_io: repl.io.WriterIo = undefined;
 var line_input: LineInput = undefined;
 var ready = false;
 
@@ -48,6 +52,11 @@ export fn replInit() bool {
     module_source = repl.module.Buffer.init(gpa, embedded_std) catch return false;
     session.module_source = &module_source.interface;
     output = .init(gpa);
+    // The single host Io the interpreter routes every runtime leaf through; its stderr writes land in
+    // `output`, so evaluated `std.debug.print` appears inline with rendered values. Installing it also
+    // bypasses the freestanding posix stack the default debug writer would reach.
+    host_io = .{ .writer = &output.writer };
+    session.runtime.io = host_io.io();
     line_input.setup(gpa);
     ready = true;
     return true;
@@ -150,6 +159,9 @@ fn preview(input: []const u8) !void {
     const root_namespace = try preview_pool.createNamespace(gpa, .{});
     var preview_session = Session.init(gpa, &preview_pool, root_namespace);
     preview_session.module_source = &module_source.interface;
+    // Reuse the live session's host Io (its stderr routes to `output`, this session's `w`), so a
+    // previewed `std.debug.print` behaves as in the real session rather than hitting the posix stack.
+    preview_session.runtime.io = session.runtime.io;
     defer preview_session.deinit();
 
     // For "declarations; trailing expression", bind the declarations into

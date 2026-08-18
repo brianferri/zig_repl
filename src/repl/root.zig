@@ -12,6 +12,7 @@ pub const render = @import("render/root.zig");
 /// an archive packed into the binary for targets with no filesystem. Locating or
 /// embedding that source is the frontend's job (the core opens no files itself).
 pub const module = @import("module/root.zig");
+pub const io = @import("io/root.zig");
 /// Generic command framework (`:name` dispatch). Frontends register their own
 /// command set with `commands.Registry`; the frontend-specific
 /// commands live in the frontend modules.
