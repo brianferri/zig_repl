@@ -25,8 +25,10 @@ continuation: Prompt,
 /// user's terminal set intact, unlike the blanket `\x1b[0m`.
 const reset: []const u8 = "\x1b[39m";
 
-/// A foreground color, one SGR sequence per capability tier.
+/// A foreground color: its RGB (for a non-terminal frontend), plus one SGR
+/// sequence per capability tier.
 pub const Color = struct {
+    rgb: [3]u8,
     truecolor: []const u8,
     palette256: []const u8,
     basic: []const u8,
@@ -81,6 +83,7 @@ pub const Prompt = struct {
 const testing = std.testing;
 
 const test_color: Color = .{
+    .rgb = .{ 1, 2, 3 },
     .truecolor = "\x1b[38;2;1;2;3m",
     .palette256 = "\x1b[38;5;9m",
     .basic = "\x1b[33m",
