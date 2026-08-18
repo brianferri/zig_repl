@@ -20,15 +20,34 @@ const Theme = @This();
 name: []const u8,
 primary: Prompt,
 continuation: Prompt,
+palette: Palette,
 
 /// SGR reset of the foreground only -- leaves any other attributes the
 /// user's terminal set intact, unlike the blanket `\x1b[0m`.
 const reset: []const u8 = "\x1b[39m";
 
+/// A 24-bit color for a non-terminal frontend. The terminal renders through the
+/// SGR sequences on `Color`, so raw RGB carries no escape form.
+pub const Rgb = struct { r: u8, g: u8, b: u8 };
+
+/// The scheme's surface colors, for a graphical frontend to paint background,
+/// panels, and body text; the terminal draws only the prompt. Role names follow
+/// the Catppuccin convention, darkest surface to lightest.
+pub const Palette = struct {
+    base: Rgb,
+    mantle: Rgb,
+    crust: Rgb,
+    surface0: Rgb,
+    surface1: Rgb,
+    text: Rgb,
+    subtext: Rgb,
+    overlay: Rgb,
+};
+
 /// A foreground color: its RGB (for a non-terminal frontend), plus one SGR
 /// sequence per capability tier.
 pub const Color = struct {
-    rgb: [3]u8,
+    rgb: Rgb,
     truecolor: []const u8,
     palette256: []const u8,
     basic: []const u8,
@@ -83,7 +102,7 @@ pub const Prompt = struct {
 const testing = std.testing;
 
 const test_color: Color = .{
-    .rgb = .{ 1, 2, 3 },
+    .rgb = .{ .r = 1, .g = 2, .b = 3 },
     .truecolor = "\x1b[38;2;1;2;3m",
     .palette256 = "\x1b[38;5;9m",
     .basic = "\x1b[33m",
