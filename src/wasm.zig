@@ -35,6 +35,10 @@ const embedded_std = @embedFile("embedded_std");
 var pool: InternPool = undefined;
 var session: Session = undefined;
 var module_source: repl.module.Buffer = undefined;
+// The user's editable files, stacked over the embedded std by `project`: an
+// `@import` resolves from `vfs` first and falls through to `module_source`.
+var vfs: repl.module.Vfs = undefined;
+var project: repl.module.Layered = undefined;
 var output: std.Io.Writer.Allocating = undefined;
 // Freestanding wasm has no OS `Io`, so the host Io the interpreter delegates to is one backed by
 // `output`: its stderr routes to the result buffer, so evaluated `std.debug.print` lands inline with
@@ -51,7 +55,9 @@ export fn replInit() bool {
     const root_namespace = pool.createNamespace(gpa, .{}) catch return false;
     session = Session.init(gpa, &pool, root_namespace);
     module_source = repl.module.Buffer.init(gpa, embedded_std) catch return false;
-    session.module_source = &module_source.interface;
+    vfs = repl.module.Vfs.init(gpa);
+    project = repl.module.Layered.init(&vfs.interface, &module_source.interface);
+    session.module_source = &project.interface;
     output = .init(gpa);
     // The single host Io the interpreter routes every runtime leaf through; its stderr writes land in
     // `output`, so evaluated `std.debug.print` appears inline with rendered values. Installing it also

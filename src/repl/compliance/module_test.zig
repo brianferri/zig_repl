@@ -9,7 +9,7 @@ const Session = @import("../Session.zig");
 const InternPool = @import("../sema/InternPool.zig");
 const Value = @import("../sema/Value.zig");
 const render = @import("../render/Value.zig");
-const ModuleSource = @import("../module/Source.zig");
+const ModuleSource = @import("../module/Fs.zig");
 const NativeModuleSource = @import("../module/Native.zig");
 
 /// A bool as the string `render` prints it, for comptime-derived `.want` values.
@@ -61,7 +61,13 @@ const FixtureSource = struct {
     src: [:0]const u8,
     interface: ModuleSource = .{ .vtable = &vtable },
 
-    const vtable: ModuleSource.VTable = .{ .read = read };
+    const vtable: ModuleSource.VTable = .{
+        .read = read,
+        .list = ModuleSource.emptyList,
+        .write = ModuleSource.read_only.write,
+        .remove = ModuleSource.read_only.remove,
+        .rename = ModuleSource.read_only.rename,
+    };
 
     fn read(source: *ModuleSource, gpa: std.mem.Allocator, path: []const u8) ModuleSource.Error![:0]u8 {
         _ = path;

@@ -1,7 +1,8 @@
-//! A module `Source` served from an in-memory tar archive -- the standard library
-//! packed into the binary and decompressed once at init. Where `Native` needs a
-//! real directory, this needs only bytes, so `@import("std")` resolves on a target
-//! with no filesystem (freestanding wasm), which otherwise injects no source.
+//! A read-only `Fs` leaf served from an in-memory tar archive -- the standard
+//! library packed into the binary and decompressed once at init. Where `Native`
+//! needs a real directory, this needs only bytes, so `@import("std")` resolves on
+//! a target with no filesystem (freestanding wasm), which otherwise injects no
+//! source. `Layered` stacks a writable project over it; its own mutators reject.
 //!
 //! The archive is a gzip-compressed tar rooted at the standard library
 //! directory's contents (built by `build.zig` from the pinned toolchain, so it
@@ -11,7 +12,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const Source = @import("Source.zig");
+const Fs = @import("Fs.zig");
 
 const Buffer = @This();
 
@@ -20,9 +21,15 @@ gpa: std.mem.Allocator,
 /// iterates it. Std files are read once (the loader dedups via `import_table`),
 /// so a linear scan per import is cheaper than a persistent index.
 tar: []const u8,
-interface: Source = .{ .vtable = &vtable },
+interface: Fs = .{ .vtable = &vtable },
 
-const vtable: Source.VTable = .{ .read = read };
+const vtable: Fs.VTable = .{
+    .read = read,
+    .list = Fs.emptyList,
+    .write = Fs.read_only.write,
+    .remove = Fs.read_only.remove,
+    .rename = Fs.read_only.rename,
+};
 
 /// Upper bound on a tar entry name; `std.fs.max_path_bytes` is unavailable on
 /// freestanding, the very target this source exists for. Std's own paths sit far
@@ -45,12 +52,12 @@ pub fn deinit(self: *Buffer) void {
     self.* = undefined;
 }
 
-fn read(source: *Source, gpa: std.mem.Allocator, path: []const u8) Source.Error![:0]u8 {
-    const self: *Buffer = @alignCast(@fieldParentPtr("interface", source));
+fn read(fs: *Fs, gpa: std.mem.Allocator, path: []const u8) Fs.Error![:0]u8 {
+    const self: *Buffer = @alignCast(@fieldParentPtr("interface", fs));
     return readFromTar(self.tar, gpa, path);
 }
 
-fn readFromTar(tar: []const u8, gpa: std.mem.Allocator, path: []const u8) Source.Error![:0]u8 {
+fn readFromTar(tar: []const u8, gpa: std.mem.Allocator, path: []const u8) Fs.Error![:0]u8 {
     var reader: Io.Reader = .fixed(tar);
     var name_buffer: [max_name_bytes]u8 = undefined;
     var link_name_buffer: [max_name_bytes]u8 = undefined;

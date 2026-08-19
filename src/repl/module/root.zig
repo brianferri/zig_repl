@@ -1,13 +1,17 @@
-//! Module sources: where `@import` obtains bytes. `Source` is the interface the
-//! interpreter resolves imports against; `Native` reads a real directory (the
-//! system standard library), `Buffer` an in-memory archive packed into the binary
-//! for targets with no filesystem.
+//! The filesystem `@import` resolves against. `Fs` is the interface; `Native`
+//! backs it with a real directory, `Vfs` with a mutable in-memory tree, `Buffer`
+//! with a read-only embedded archive (the standard library on a target with no
+//! filesystem). `Layered` stacks a writable project over a read-only std.
 
-pub const Source = @import("Source.zig");
+pub const Fs = @import("Fs.zig");
 pub const Native = @import("Native.zig");
 pub const Buffer = @import("Buffer.zig");
+pub const Vfs = @import("Vfs.zig");
+pub const Layered = @import("Layered.zig");
 
 test {
     _ = Native;
     _ = Buffer;
+    _ = Vfs;
+    _ = Layered;
 }

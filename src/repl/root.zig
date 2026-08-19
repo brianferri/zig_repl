@@ -7,10 +7,10 @@ pub const eval = @import("eval.zig");
 pub const sema = @import("sema/root.zig");
 pub const front = @import("front/root.zig");
 pub const render = @import("render/root.zig");
-/// Module sources: where `@import` obtains bytes. `module.Source` is the
-/// interface; `module.Native` reads the on-disk standard library, `module.Buffer`
-/// an archive packed into the binary for targets with no filesystem. Locating or
-/// embedding that source is the frontend's job (the core opens no files itself).
+/// The filesystem `@import` resolves against. `module.Fs` is the interface;
+/// `module.Native` reads a real directory, `module.Vfs` a mutable in-memory tree,
+/// `module.Buffer` an archive packed into the binary for targets with no
+/// filesystem. Injecting a backend is the frontend's job (the core opens nothing).
 pub const module = @import("module/root.zig");
 pub const io = @import("io/root.zig");
 /// Generic command framework (`:name` dispatch). Frontends register their own
