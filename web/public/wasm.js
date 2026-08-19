@@ -22,6 +22,12 @@
  * @property {() => number} replInputTakeSubmitted
  * @property {() => number} replInputSubmittedPtr
  * @property {() => void} replThemes
+ * @property {() => void} replFsList
+ * @property {(ptr: number, len: number) => void} replFsRead
+ * @property {(pathPtr: number, pathLen: number, dataPtr: number, dataLen: number) => void} replFsWrite
+ * @property {(ptr: number, len: number) => void} replFsDelete
+ * @property {(oldPtr: number, oldLen: number, newPtr: number, newLen: number) => void} replFsRename
+ * @property {(ptr: number, len: number) => void} replRun
  */
 
 /**
@@ -74,6 +80,18 @@
  * @property {() => InputState} inputState
  * @property {() => (string | null)} takeSubmitted
  * @property {() => Array<Theme>} themes
+ * @property {Fs} fs
+ * @property {(path: string) => string} run
+ */
+
+/**
+ * The virtual filesystem the environment tab edits and `run` resolves `@import` against.
+ * @typedef {object} Fs
+ * @property {() => Array<string>} list
+ * @property {(path: string) => string} read
+ * @property {(path: string, data: string) => void} write
+ * @property {(path: string) => void} remove
+ * @property {(from: string, to: string) => void} rename
  */
 
 /**
@@ -177,6 +195,43 @@ export async function loadRepl(env = {}) {
         }
     }
 
+    /** @param {(ptr: number, len: number) => void} wasmFn @param {string} s */
+    function send(wasmFn, s) {
+        const bytes = encoder.encode(s);
+        const ptr = wasm.replAlloc(bytes.length);
+        if (ptr === 0) return;
+        new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
+        wasmFn(ptr, bytes.length);
+    }
+
+    /** @param {(ap: number, al: number, bp: number, bl: number) => void} wasmFn @param {string} a @param {string} b */
+    function sendTwo(wasmFn, a, b) {
+        const ab = encoder.encode(a);
+        const bb = encoder.encode(b);
+        const ap = wasm.replAlloc(ab.length);
+        const bp = wasm.replAlloc(bb.length);
+        if (ap === 0 || bp === 0) return;
+        new Uint8Array(wasm.memory.buffer, ap, ab.length).set(ab);
+        new Uint8Array(wasm.memory.buffer, bp, bb.length).set(bb);
+        wasmFn(ap, ab.length, bp, bb.length);
+    }
+
+    /** @type {Fs} */
+    const fs = {
+        list() {
+            wasm.replFsList();
+            try {
+                return JSON.parse(readString(wasm.replResultPtr(), wasm.replResultLen()));
+            } catch {
+                return [];
+            }
+        },
+        read: (path) => call(wasm.replFsRead, path),
+        write: (path, data) => sendTwo(wasm.replFsWrite, path, data),
+        remove: (path) => send(wasm.replFsDelete, path),
+        rename: (from, to) => sendTwo(wasm.replFsRename, from, to),
+    };
+
     return {
         wasm,
         evalLine: (line) => call(wasm.replEval, line),
@@ -186,5 +241,7 @@ export async function loadRepl(env = {}) {
         inputState,
         takeSubmitted,
         themes,
+        fs,
+        run: (path) => call(wasm.replRun, path),
     };
 }

@@ -145,6 +145,68 @@ fn writeThemesJson(w: *std.Io.Writer) !void {
     try std.json.Stringify.value(entries[0..], .{}, w);
 }
 
+export fn replFsList() void {
+    if (!ready and !replInit()) return;
+    output.clearRetainingCapacity();
+    std.json.Stringify.value(vfs.files.keys(), .{}, &output.writer) catch {};
+}
+
+export fn replFsRead(ptr: [*]u8, len: usize) void {
+    if (!ready and !replInit()) return;
+    defer gpa.free(ptr[0..len]);
+    output.clearRetainingCapacity();
+    if (vfs.get(ptr[0..len])) |bytes| output.writer.writeAll(bytes) catch {};
+}
+
+export fn replFsWrite(path: [*]u8, path_len: usize, data: [*]u8, data_len: usize) void {
+    if (!ready and !replInit()) return;
+    defer gpa.free(path[0..path_len]);
+    defer gpa.free(data[0..data_len]);
+    vfs.interface.write(path[0..path_len], data[0..data_len]) catch {};
+}
+
+export fn replFsDelete(ptr: [*]u8, len: usize) void {
+    if (!ready and !replInit()) return;
+    defer gpa.free(ptr[0..len]);
+    vfs.interface.remove(ptr[0..len]) catch {};
+}
+
+export fn replFsRename(old: [*]u8, old_len: usize, new: [*]u8, new_len: usize) void {
+    if (!ready and !replInit()) return;
+    defer gpa.free(old[0..old_len]);
+    defer gpa.free(new[0..new_len]);
+    vfs.interface.rename(old[0..old_len], new[0..new_len]) catch {};
+}
+
+export fn replRun(ptr: [*]u8, len: usize) void {
+    if (!ready and !replInit()) return;
+    defer gpa.free(ptr[0..len]);
+    output.clearRetainingCapacity();
+    runFile(ptr[0..len]) catch |err| {
+        output.writer.print("internal error: {s}\n", .{@errorName(err)}) catch {};
+    };
+}
+
+fn runFile(path: []const u8) !void {
+    const w = &output.writer;
+    var run_pool = try InternPool.init(gpa);
+    defer run_pool.deinit();
+    const root_namespace = try run_pool.createNamespace(gpa, .{});
+    var run_session = Session.init(gpa, &run_pool, root_namespace);
+    run_session.module_source = &project.interface;
+    run_session.runtime.io = session.runtime.io;
+    defer run_session.deinit();
+
+    var expr: std.Io.Writer.Allocating = .init(gpa);
+    defer expr.deinit();
+    try expr.writer.print("@import(\"{s}\").main()", .{path});
+
+    const value = (try eval.report(&run_session, expr.written(), w)) orelse return;
+    if (value.index == .void_value) return;
+    try render_value.render(value, run_session.intern_pool, &run_session, w);
+    try w.writeByte('\n');
+}
+
 // The interpreter asserts an input fits `max_input_bytes`; reject an over-long line
 // at this untrusted boundary so a large paste is a message, not a module-killing trap.
 fn overLength(input: []const u8) bool {

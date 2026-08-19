@@ -21,7 +21,9 @@ const {
     feed,
     inputState,
     takeSubmitted,
-    themes
+    themes,
+    fs,
+    run
 } = await loadRepl({
     replClearOutput() {
         replOutput.textContent = "";
@@ -36,7 +38,9 @@ window.repl = {
     feed,
     inputState,
     takeSubmitted,
-    themes
+    themes,
+    fs,
+    run
 };
 
 // Palette role names map 1:1 to the `--<role>` variables in style.css;

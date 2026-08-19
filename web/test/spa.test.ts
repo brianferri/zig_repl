@@ -42,7 +42,15 @@ declare global {
                 name: string,
                 accent: { r: number, g: number, b: number },
                 palette: Record<string, { r: number, g: number, b: number }>
-            }>
+            }>,
+            fs: {
+                list: () => Array<string>,
+                read: (path: string) => string,
+                write: (path: string, data: string) => void,
+                remove: (path: string) => void,
+                rename: (from: string, to: string) => void
+            },
+            run: (path: string) => string
         };
     }
 }
@@ -218,6 +226,21 @@ await describe("wasm repl", async () => {
         });
         assert.match(result.rejected, /too long/);
         assert.match(result.stillAlive, /\b3\b/);
+    });
+
+    await test("edits and runs a multi-file program from the virtual filesystem", async () => {
+        const result = await page.evaluate(() => {
+            const R = window.repl;
+            R.fs.write("util.zig", "pub fn greet() u32 { return 42; }");
+            R.fs.write("main.zig", "const util = @import(\"util.zig\");\npub fn main() void { @import(\"std\").debug.print(\"got {d}\\n\", .{util.greet()}); }");
+            const files = R.fs.list().sort();
+            const output = R.run("main.zig");
+            R.fs.remove("util.zig");
+            return { files, output, afterRemove: R.fs.list() };
+        });
+        assert.deepEqual(result.files, ["main.zig", "util.zig"]);
+        assert.match(result.output, /got 42/);
+        assert.deepEqual(result.afterRemove, ["main.zig"]);
     });
 
     await test("loads without page errors", () => {
