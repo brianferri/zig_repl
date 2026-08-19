@@ -164,11 +164,18 @@ fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !O
                 for (em.notes) |note| diag.print("note: {s}\n", .{note.msg}) catch {};
             }
         }
-        // Tombstone the failed line: free its ZIR but keep the `File` slot (and
-        // any modules it loaded, at later indices) so `File.Index` values stay
-        // stable.
-        if (session.files.items[line_index].zir) |*z| z.deinit(session.gpa);
-        session.files.items[line_index].zir = null;
+        // Tombstone the failed line: free its ZIR, AST, and wrapped source but
+        // keep the `File` slot (and any modules it loaded, at later indices) so
+        // `File.Index` values stay stable. Its diagnostic is already rendered, and
+        // nothing references a failed line afterward -- a later caret lookup bails
+        // at the now-null ZIR before it would reach the tree.
+        const failed = &session.files.items[line_index];
+        if (failed.zir) |*z| z.deinit(session.gpa);
+        failed.zir = null;
+        if (failed.tree) |*t| t.deinit(session.gpa);
+        failed.tree = null;
+        if (failed.wrapped) |*w| w.deinit(session.gpa);
+        failed.wrapped = null;
         return err;
     };
     return .{ .value = value, .shape = shape };
