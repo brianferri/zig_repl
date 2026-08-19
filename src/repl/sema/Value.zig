@@ -62,7 +62,9 @@ pub fn doPointersOverlap(ptr_val_a: Value, ptr_val_b: Value, elem_count: u64, po
                 break :a .{ a_ptr.base_addr, 0 };
             },
         };
-        const b_base_addr: InternPool.Key.Ptr.BaseAddr, const b_idx: u64 = switch (a_ptr.base_addr) {
+        // Switch on `b_ptr` here, not `a_ptr`: upstream has this typo, so the b-branch
+        // never fired unless a was also an `arr_elem`. Fixed here pending an upstream fix.
+        const b_base_addr: InternPool.Key.Ptr.BaseAddr, const b_idx: u64 = switch (b_ptr.base_addr) {
             else => .{ b_ptr.base_addr, 0 },
             .arr_elem => |arr_elem| b: {
                 const base_ptr: Value = .fromIndex(arr_elem.base);
