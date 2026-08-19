@@ -185,6 +185,8 @@ pub fn build(b: *std.Build) void {
     // scales a run from a quick pass to an overnight soak.
     test_options.addOption(usize, "fuzz_iterations", b.option(usize, "fuzz-iterations", "Randomized stress iterations (default 256; raise for a real fuzzing run)") orelse 256);
     test_options.addOption(u64, "fuzz_seed", b.option(u64, "fuzz-seed", "Seed for the randomized stress suite (default 0)") orelse 0);
+    test_options.addOption(bool, "reject_oracle", b.option(bool, "reject-oracle", "Cross-check every .reject compliance case against the real zig compiler") orelse false);
+    test_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
     const repl_test_module = b.createModule(.{
         .root_source_file = b.path("src/repl/root.zig"),
         .target = target,

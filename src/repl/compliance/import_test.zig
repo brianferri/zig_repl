@@ -4,7 +4,7 @@ const compliance = @import("root.zig");
 const a = std.testing.allocator;
 
 test "compliance: @import(\"root\") reaches the session's top-level decls" {
-    try compliance.check(a, .{
+    try compliance.check(a, &.{
         // A prior-line const, read back through root.
         .{ .src = &.{ "const x = 5;", "@import(\"root\").x" }, .rendered = "5" },
         .{ .src = &.{ "const y = 7;", "@import(\"root\").y + 1" }, .rendered = "8" },
@@ -21,22 +21,22 @@ test "compliance: @import(\"root\") reaches the session's top-level decls" {
         // The root container's identity is stable across imports.
         .{ .src = &.{"@TypeOf(@import(\"root\")) == @TypeOf(@import(\"root\"))"}, .rendered = "true" },
         // An unbound name is rejected.
-        .{ .src = &.{"@import(\"root\").nope"}, .reject = {} },
+        .{ .src = &.{"@import(\"root\").nope"}, .reject = true },
     });
 }
 
 test "compliance: pub-visibility on qualified member access" {
-    try compliance.check(a, .{
+    try compliance.check(a, &.{
         // Same-file (session) private decl is accessible, qualified.
-        .{ .src = &.{"blk: { const S = struct { const x: u8 = 5; }; break :blk S.x; }"}, .want = blk: {
+        .{ .src = &.{"blk: { const S = struct { const x: u8 = 5; }; break :blk S.x; }"}, .want = compliance.want(blk: {
             const S = struct {
                 const x: u8 = 5;
             };
             break :blk S.x;
-        } },
+        }) },
         // Cross-module private decl is rejected: `std` is a private decl of the
         // generated `builtin` module.
-        .{ .src = &.{"@import(\"builtin\").std"}, .reject = {} },
+        .{ .src = &.{"@import(\"builtin\").std"}, .reject = true },
     });
     try compliance.expectDiagnostic(a, &.{"@import(\"builtin\").std"}, "not marked 'pub'");
 }

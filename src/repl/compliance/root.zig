@@ -8,13 +8,12 @@
 //! interactive REPL takes.
 //!
 //! A case is one of:
-//!   .{ .src = &.{"<input>"...},  .want = <zig expr> }     -- output must match zig's
-//!   .{ .src = &.{"<input>"...},  .rendered = "<string>" } -- output must equal this
-//!   .{ .src = &.{"<input>"...},  .reject = {} }           -- interpreter must reject
-//! `want` is the same expression written as real zig, comptime-folded for the
-//! reference. `rendered` gives the expected output literally, for values zig has no
-//! comparable form for (build-specific names, deliberate divergences). `reject` cases
-//! can't carry a `want`: a compile error can't be written as comptime code.
+//!   .{ .src = &.{"<input>"...}, .want = compliance.want(<zig expr>) } -- output matches zig's fold
+//!   .{ .src = &.{"<input>"...}, .rendered = "<string>" }              -- output equals this literally
+//!   .{ .src = &.{"<input>"...}, .reject = true }                      -- interpreter must reject
+//! A reject that zig itself accepts (a deliberate divergence) adds `.skip = true`.
+//! `rendered` gives the expected output literally, for values zig has no comparable
+//! form for (build-specific names, deliberate divergences).
 
 const std = @import("std");
 const Io = std.Io;
@@ -25,34 +24,81 @@ const Value = @import("../sema/Value.zig");
 const render = @import("../render/Value.zig");
 const NativeModuleSource = @import("../module/Native.zig");
 const WriterIo = @import("../io/writer_io.zig");
+const build_options = @import("build_options");
 
-/// Assert each case's interpreter output matches zig's comptime rendering of its
-/// `.want` expression (or that the interpreter rejects a `.reject` case).
-pub fn check(gpa: std.mem.Allocator, comptime cases: anytype) !void {
-    inline for (cases) |case| {
-        if (@hasField(@TypeOf(case), "reject")) {
+pub const Case = struct {
+    src: []const []const u8,
+    want: ?[]const u8 = null,
+    rendered: ?[]const u8 = null,
+    reject: bool = false,
+    skip: bool = false,
+};
+
+/// Render a `.want` value as `check` compares it: the same expression written as
+/// real zig, comptime-folded to its string form.
+pub fn want(comptime v: anytype) []const u8 {
+    return std.fmt.comptimePrint("{any}", .{v});
+}
+
+/// Assert each case's interpreter output matches its `.want`/`.rendered` string,
+/// or that the interpreter rejects a `.reject` case.
+pub fn check(gpa: std.mem.Allocator, cases: []const Case) !void {
+    var oracle_diverged = false;
+    for (cases) |case| {
+        if (case.skip) continue;
+        if (case.reject) {
             if (replRun(gpa, case.src)) |out| {
                 gpa.free(out);
                 std.debug.print("expected rejection but evaluated: {s}\n", .{case.src[case.src.len - 1]});
                 return error.TestUnexpectedSuccess;
             } else |_| {}
+            if (build_options.reject_oracle and !try zigRejects(gpa, case.src)) {
+                std.debug.print("REPL rejects but zig accepts: {s}\n", .{case.src[case.src.len - 1]});
+                oracle_diverged = true;
+            }
         } else {
             const actual = try replRun(gpa, case.src);
             defer gpa.free(actual);
-            const want = comptime if (@hasField(@TypeOf(case), "rendered"))
-                normalize(case.rendered)
-            else
-                normalize(std.fmt.comptimePrint("{any}", .{case.want}));
-            std.testing.expectEqualStrings(want, normalize(actual)) catch |err| {
+            std.testing.expectEqualStrings(normalize(case.want orelse case.rendered.?), normalize(actual)) catch |err| {
                 std.debug.print("mismatch for: {s}\n", .{case.src[case.src.len - 1]});
                 return err;
             };
         }
     }
+    if (oracle_diverged) return error.RejectOracleDiverged;
 }
 
 fn normalize(text: []const u8) []const u8 {
     return std.mem.trim(u8, text, " \r\n\t");
+}
+
+/// Whether the real compiler rejects `src`, its trailing expression forced at
+/// comptime. False means the interpreter refuses what zig accepts.
+fn zigRejects(gpa: std.mem.Allocator, src: []const []const u8) !bool {
+    var io_instance: Io.Threaded = .init(gpa, .{});
+    defer io_instance.deinit();
+    const io = io_instance.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var program: Io.Writer.Allocating = .init(gpa);
+    defer program.deinit();
+    for (src[0 .. src.len - 1]) |decl| try program.writer.print("{s}\n", .{decl});
+    try program.writer.print("comptime {{ _ = {s}; }}\n", .{src[src.len - 1]});
+    try tmp.dir.writeFile(io, .{ .sub_path = "reject.zig", .data = program.written() });
+
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ build_options.zig_exe, "build-obj", "reject.zig", "-femit-bin=reject.o", "--cache-dir", "cache", "--global-cache-dir", "cache" },
+        .cwd = .{ .dir = tmp.dir },
+    }) catch |err| {
+        std.debug.print("reject oracle could not run zig for '{s}': {s}\n", .{ src[src.len - 1], @errorName(err) });
+        return err;
+    };
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    return !(result.term == .exited and result.term.exited == 0);
 }
 
 /// Assert the REPL rejects `inputs` and its rendered diagnostic contains `needle` --
@@ -133,9 +179,9 @@ fn fuzzRuntime(_: void, smith: *std.testing.Smith) anyerror!void {
     // is not a store/load defect, so tolerate it. A run that succeeds must round-trip.
     const out = replRun(gpa, &.{prog.written()}) catch return;
     defer gpa.free(out);
-    var want_buf: [32]u8 = undefined;
-    const want = std.fmt.bufPrint(&want_buf, "{d}", .{expected}) catch return;
-    std.testing.expectEqualStrings(want, normalize(out)) catch |err| {
+    var expected_buf: [32]u8 = undefined;
+    const expected_str = std.fmt.bufPrint(&expected_buf, "{d}", .{expected}) catch return;
+    std.testing.expectEqualStrings(expected_str, normalize(out)) catch |err| {
         std.debug.print("runtime store/load mismatch for:\n{s}\n", .{prog.written()});
         return err;
     };

@@ -8,15 +8,15 @@ const InternPool = @import("../sema/InternPool.zig");
 const a = std.testing.allocator;
 
 test "mixed input: declarations then a trailing expression persist across passes" {
-    try compliance.check(a, .{
-        .{ .src = &.{"const mx = 10; mx + 1"}, .want = blk: {
+    try compliance.check(a, &.{
+        .{ .src = &.{"const mx = 10; mx + 1"}, .want = compliance.want(blk: {
             const mx = 10;
             break :blk mx + 1;
-        } },
-        .{ .src = &.{ "const mz = 5; mz", "mz * 2" }, .want = blk: {
+        }) },
+        .{ .src = &.{ "const mz = 5; mz", "mz * 2" }, .want = compliance.want(blk: {
             const mz = 5;
             break :blk mz * 2;
-        } },
+        }) },
     });
 }
 

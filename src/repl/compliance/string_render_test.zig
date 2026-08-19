@@ -10,7 +10,7 @@ const a = std.testing.allocator;
 // printAggregate's `.bytes` arm, including the `.*` on a by-value array and the
 // stripped trailing sentinel.
 test "compliance: u8 arrays and slices render as strings" {
-    try compliance.check(a, .{
+    try compliance.check(a, &.{
         // String literal: a `*const [N:0]u8`, the pointer/ref form (no `.*`).
         .{ .src = &.{"\"hi\""}, .rendered = "\"hi\"" },
         .{ .src = &.{"\"\""}, .rendered = "\"\"" },
@@ -25,9 +25,9 @@ test "compliance: u8 arrays and slices render as strings" {
         .{ .src = &.{ "const z: [:0]const u8 = \"zt\";", "z" }, .rendered = "\"zt\"" },
         .{ .src = &.{"@as([]const u8, \"abc\")"}, .rendered = "\"abc\"" },
         // A non-`u8` array is untouched: still a positional list, so `.want` holds.
-        .{ .src = &.{ "const n = [_]u32{ 1, 2 };", "n" }, .want = [_]u32{ 1, 2 } },
+        .{ .src = &.{ "const n = [_]u32{ 1, 2 };", "n" }, .want = compliance.want([_]u32{ 1, 2 }) },
         // A single byte is a scalar `u8`, not an array -- an integer, not a string.
-        .{ .src = &.{"@as(u8, 65)"}, .want = @as(u8, 65) },
+        .{ .src = &.{"@as(u8, 65)"}, .want = compliance.want(@as(u8, 65)) },
     });
 }
 
@@ -35,7 +35,7 @@ test "compliance: u8 arrays and slices render as strings" {
 // printer (src/print_value.zig). `.rendered` is used because `{any}` formats floats differently
 // (it switches to scientific notation for large magnitudes).
 test "compliance: floats render like the compiler's value printer" {
-    try compliance.check(a, .{
+    try compliance.check(a, &.{
         .{ .src = &.{"@as(f64, 4.0)"}, .rendered = "4" },
         .{ .src = &.{"@as(f32, 1.5)"}, .rendered = "1.5" },
         // A magnitude whose decimal form overruns any small fixed buffer.

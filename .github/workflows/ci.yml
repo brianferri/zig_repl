@@ -22,6 +22,16 @@ jobs:
           use-cache: false
       - run: zig build test
 
+  reject-oracle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: false
+      - run: zig build test -Dreject-oracle=true
+
   spa:
     runs-on: ubuntu-latest
     steps:
