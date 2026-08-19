@@ -20,6 +20,7 @@ const vtable: Fs.VTable = .{
     .read = read,
     .list = Fs.emptyList,
     .write = Fs.read_only.write,
+    .mkdir = Fs.read_only.mkdir,
     .remove = Fs.read_only.remove,
     .rename = Fs.read_only.rename,
 };

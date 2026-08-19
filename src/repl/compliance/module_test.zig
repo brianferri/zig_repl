@@ -60,6 +60,7 @@ const FixtureSource = struct {
         .read = read,
         .list = ModuleSource.emptyList,
         .write = ModuleSource.read_only.write,
+        .mkdir = ModuleSource.read_only.mkdir,
         .remove = ModuleSource.read_only.remove,
         .rename = ModuleSource.read_only.rename,
     };

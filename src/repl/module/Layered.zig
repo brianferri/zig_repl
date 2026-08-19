@@ -15,6 +15,7 @@ const vtable: Fs.VTable = .{
     .read = read,
     .list = list,
     .write = write,
+    .mkdir = mkdir,
     .remove = remove,
     .rename = rename,
 };
@@ -31,7 +32,7 @@ fn read(fs: *Fs, gpa: std.mem.Allocator, path: []const u8) Fs.Error![:0]u8 {
     };
 }
 
-fn list(fs: *Fs, gpa: std.mem.Allocator) Fs.Error![][]u8 {
+fn list(fs: *Fs, gpa: std.mem.Allocator) Fs.Error![]Fs.Entry {
     const self: *Layered = @alignCast(@fieldParentPtr("interface", fs));
     return self.primary.list(gpa);
 }
@@ -39,6 +40,11 @@ fn list(fs: *Fs, gpa: std.mem.Allocator) Fs.Error![][]u8 {
 fn write(fs: *Fs, path: []const u8, bytes: []const u8) Fs.Error!void {
     const self: *Layered = @alignCast(@fieldParentPtr("interface", fs));
     return self.primary.write(path, bytes);
+}
+
+fn mkdir(fs: *Fs, path: []const u8) Fs.Error!void {
+    const self: *Layered = @alignCast(@fieldParentPtr("interface", fs));
+    return self.primary.mkdir(path);
 }
 
 fn remove(fs: *Fs, path: []const u8) Fs.Error!void {
@@ -78,5 +84,5 @@ test "reads fall through to the fallback; writes and listing stay on the primary
     const names = try layered.interface.list(gpa);
     defer Fs.freeList(gpa, names);
     try testing.expectEqual(@as(usize, 1), names.len);
-    try testing.expectEqualStrings("main.zig", names[0]);
+    try testing.expectEqualStrings("main.zig", names[0].path);
 }

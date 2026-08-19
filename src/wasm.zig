@@ -148,7 +148,15 @@ fn writeThemesJson(w: *std.Io.Writer) !void {
 export fn replFsList() void {
     if (!ready and !replInit()) return;
     output.clearRetainingCapacity();
-    std.json.Stringify.value(vfs.files.keys(), .{}, &output.writer) catch {};
+    const entries = vfs.interface.list(gpa) catch return;
+    defer repl.module.Fs.freeList(gpa, entries);
+    const w = &output.writer;
+    w.writeByte('[') catch return;
+    for (entries, 0..) |entry, i| {
+        if (i != 0) w.writeByte(',') catch return;
+        std.json.Stringify.value(.{ .path = entry.path, .kind = @tagName(entry.kind) }, .{}, w) catch return;
+    }
+    w.writeByte(']') catch return;
 }
 
 export fn replFsRead(ptr: [*]u8, len: usize) void {
@@ -163,6 +171,12 @@ export fn replFsWrite(path: [*]u8, path_len: usize, data: [*]u8, data_len: usize
     defer gpa.free(path[0..path_len]);
     defer gpa.free(data[0..data_len]);
     vfs.interface.write(path[0..path_len], data[0..data_len]) catch {};
+}
+
+export fn replFsMkdir(ptr: [*]u8, len: usize) void {
+    if (!ready and !replInit()) return;
+    defer gpa.free(ptr[0..len]);
+    vfs.interface.mkdir(ptr[0..len]) catch {};
 }
 
 export fn replFsDelete(ptr: [*]u8, len: usize) void {
