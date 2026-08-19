@@ -1,0 +1,51 @@
+name: CI
+
+# Keep `ZIG_VERSION` in step with the Pages deploy workflow and the local
+# toolchain; the setup-zig mirror purges old nightlies, so a stale pin fails.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  ZIG_VERSION: 0.17.0-dev.1786+75044cb04
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: false
+      - run: zig build test
+
+  spa:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: false
+      - run: zig build wasm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - working-directory: web/test
+        run: npm ci
+      - working-directory: web/test
+        run: npx playwright install --with-deps chromium
+      - working-directory: web/test
+        run: npm run check
+      # Serve the built frontend, wait for it, then drive the headless suite.
+      - name: Run the SPA suite
+        run: |
+          npx --prefix web/test serve -l 3000 zig-out/web &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3000/ >/dev/null && break
+            sleep 1
+          done
+          npm --prefix web/test test

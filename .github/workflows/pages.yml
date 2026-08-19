@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ZIG_VERSION: 0.17.0-dev.1745+ac8a8d0c5
+  ZIG_VERSION: 0.17.0-dev.1786+75044cb04
 
 jobs:
   build:
@@ -34,7 +34,7 @@ jobs:
           # every run, so a restored cache points the std-packing step at a std
           # dir that no longer exists. The tarball download stays cached.
           use-cache: false
-      - run: zig build wasm
+      - run: zig build wasm -Doptimize=ReleaseSafe
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
