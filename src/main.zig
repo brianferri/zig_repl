@@ -15,16 +15,30 @@ pub fn main(init: std.process.Init) !void {
     var session = repl.Session.init(init.gpa, &pool, root_namespace);
     defer session.deinit();
 
-    // Point `@import("std")` at the system standard library when it can be
-    // located. Best-effort: without it the REPL still runs and std imports report
-    // the usual unloaded-module diagnostic. The directory handle and the source
-    // both outlive the session, which only borrows the interface pointer.
+    // Resolve `@import` against the working directory, with the system standard
+    // library stacked beneath it (`@import("std")`, and any `std`-internal path,
+    // falls through). Both are best-effort: the REPL still runs if either is
+    // missing, and every handle/source below outlives the borrowing session.
+    var project_dir = std.Io.Dir.cwd().openDir(init.io, ".", .{ .iterate = true }) catch null;
+    defer if (project_dir) |*d| d.close(init.io);
     var std_root = openSystemStd(init.gpa, init.io, init.environ_map);
     defer if (std_root) |*d| d.close(init.io);
-    var source: repl.module.Native = undefined;
-    if (std_root) |root| {
-        source = .{ .io = init.io, .root = root };
-        session.module_source = &source.interface;
+
+    var project: repl.module.Native = undefined;
+    var std_source: repl.module.Native = undefined;
+    var layered: repl.module.Layered = undefined;
+    if (project_dir) |dir| {
+        project = .{ .io = init.io, .root = dir };
+        if (std_root) |root| {
+            std_source = .{ .io = init.io, .root = root };
+            layered = .init(&project.interface, &std_source.interface);
+            session.module_source = &layered.interface;
+        } else {
+            session.module_source = &project.interface;
+        }
+    } else if (std_root) |root| {
+        std_source = .{ .io = init.io, .root = root };
+        session.module_source = &std_source.interface;
     }
 
     var driver = try tty.Repl.init(&session, init.io);

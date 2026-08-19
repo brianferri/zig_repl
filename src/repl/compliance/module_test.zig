@@ -122,6 +122,32 @@ test "@hasDecl on the root namespace resolves session decls" {
     try expectReplValue(&session, "@hasDecl(@import(\"root\"), \"nope\")", "false");
 }
 
+test "a REPL line resolves a project import anchored at the source root" {
+    const gpa = testing.allocator;
+    var io_instance: Io.Threaded = .init(gpa, .{});
+    defer io_instance.deinit();
+    const io = io_instance.io();
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "widget.zig", .data = "pub const answer = 42;" });
+    // A sibling module whose own relative import must anchor at *its* directory.
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.zig", .data = "const widget = @import(\"widget.zig\");\npub const name = widget.answer;" });
+
+    var native: NativeModuleSource = .{ .io = io, .root = tmp.dir };
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .{});
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+    session.module_source = &native.interface;
+
+    // The prompt has no path of its own, yet a relative `.zig` import resolves.
+    try expectReplValue(&session, "@import(\"widget.zig\").answer", "42");
+    // And a loaded module's own relative import resolves against its directory.
+    try expectReplValue(&session, "@import(\"other.zig\").name", "42");
+}
+
 test "@import(std) reaches std.lang across files" {
     const gpa = testing.allocator;
     var io_instance: Io.Threaded = .init(gpa, .{});

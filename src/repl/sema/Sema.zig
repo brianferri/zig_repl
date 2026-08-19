@@ -7019,9 +7019,9 @@ fn importPath(sema: *Sema, path: []const u8) Error!InternPool.Index {
     if (std.mem.eql(u8, path, "builtin")) return sema.loadBuiltinModule("builtin");
 
     if (std.mem.endsWith(u8, path, ".zig")) {
-        const importer = sema.importerSubPath() orelse {
-            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "no module named '{s}' available", .{path});
-        };
+        // A REPL line has no path of its own; anchor its relative imports at the
+        // source root, so the prompt resolves project files as the main module would.
+        const importer = sema.importerSubPath() orelse "";
         const anchored = try std.fs.path.resolvePosix(sema.gpa, &.{ "/", importer, "..", path });
         defer sema.gpa.free(anchored);
         return sema.loadModuleFile(anchored[1..]);
