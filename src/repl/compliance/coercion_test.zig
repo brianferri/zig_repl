@@ -12,8 +12,6 @@ test "compliance: a comptime-known int coerces to a fixed-width int when it fits
     });
 }
 
-// A comptime-known float with no fractional part coerces to an integer type; a fractional value is
-// rejected (compiler: coerceExtra's int-dest / float-source arm, via `intFromFloat(.exact)`).
 test "compliance: a comptime-known float coerces to an integer when it has no fractional part" {
     try compliance.check(a, &.{
         .{ .src = &.{"blk: { const x: u8 = 2.0; break :blk x; }"}, .want = compliance.want(blk: {
@@ -29,9 +27,6 @@ test "compliance: a comptime-known float coerces to an integer when it has no fr
     });
 }
 
-// A comptime-known number coerces to a float type only when the float represents it exactly: a
-// `comptime_float` always fits (it rounds), a fixed-width float or an integer must survive a round-trip
-// (compiler: coerceExtra's float-dest arm, via `floatCast`/`floatValue` + representability check).
 test "compliance: a comptime-known number coerces to a float only when represented exactly" {
     try compliance.check(a, &.{
         .{ .src = &.{"blk: { const x: f32 = @as(f64, 1.5); break :blk x; }"}, .want = compliance.want(blk: {
@@ -415,8 +410,6 @@ test "compliance: an anonymous array literal initializes through ?/! result type
     });
 }
 
-// A single-item pointer to a sentinel-terminated array drops the sentinel through the pointer
-// (`*const [n:s]T` -> `*const [n]T`), the special case in coerceInMemoryAllowedPtrs.
 test "compliance: a pointer to a sentinel array coerces to the same pointer without the sentinel" {
     try compliance.check(a, &.{
         .{ .src = &.{"blk: { const p: *const [5]u8 = \"hello\"; break :blk p[1]; }"}, .want = compliance.want(blk: {

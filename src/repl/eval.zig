@@ -1,14 +1,12 @@
-//! The single owner of "run one REPL input against a session": wrap +
-//! inject prior decls, gate parse/ZIR errors, analyze, and commit the
-//! pipeline so later lines resolve cross-references. `Repl` and the test
-//! harnesses call `run` instead of re-walking this loop -- which also
-//! means the test suite exercises the same path the interactive REPL does.
+//! The single owner of "run one REPL input against a session": wrap + inject prior
+//! decls, gate parse/ZIR errors, analyze, and commit so later lines resolve
+//! cross-references. `Repl` and the test harnesses share this path.
 //!
-//! Lives at `src/` (not a subdir) so it can import both `front/` and
-//! `sema/`, which Zig blocks across sibling subdirs.
+//! Lives at `src/` (not a subdir) so it can import both `front/` and `sema/`, which
+//! Zig blocks across sibling subdirs.
 //!
-//! Not for single-shot Sema unit tests: those want no injection, no
-//! commit, and no session lifecycle (see `evalSource` in sema_eval_test).
+//! Not for single-shot Sema unit tests -- those want no injection or commit (see
+//! `evalSource` in sema_eval_test).
 
 const std = @import("std");
 const assert = std.debug.assert;

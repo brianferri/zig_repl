@@ -1,23 +1,14 @@
-//! Terminal color capability. A `ColorLevel` is what the *terminal*
-//! can display; it lives here beside the other capability knowledge
-//! (keyboard protocols, negotiation) because it describes the device,
-//! not a render preference. The `Terminal` resolves it at init via
-//! `fromEnv`, the same place it negotiates protocol support.
-//!
-//! `detect` is pure -- it takes the environment strings as arguments,
-//! so the tier policy is testable without an environment. `fromEnv`
-//! is the thin wrapper that pulls those strings from the process
-//! environment (only reachable as data, via the env map).
+//! Terminal color capability -- what the terminal can display, resolved at init
+//! via `fromEnv`. `detect` takes the environment strings as arguments so the
+//! tier policy is testable without a real environment.
 
 const std = @import("std");
 
-/// Color capability, widest to narrowest. A non-terminal context never
-/// constructs a `Terminal`, so it never leaves the `.none` default and
-/// emits no escapes.
+/// Widest to narrowest. A non-terminal context never constructs a `Terminal`,
+/// so it stays at `.none` and emits no escapes.
 pub const ColorLevel = enum { none, basic, palette256, truecolor };
 
-/// Resolve tier from the environment strings. Precedence: `no_color`,
-/// then `COLORTERM`, then `TERM`.
+/// Precedence: `no_color`, then `COLORTERM`, then `TERM`.
 pub fn detect(no_color: bool, colorterm: ?[]const u8, term: ?[]const u8) ColorLevel {
     if (no_color) return .none;
     if (colorterm) |c| {
@@ -31,9 +22,7 @@ pub fn detect(no_color: bool, colorterm: ?[]const u8, term: ?[]const u8) ColorLe
     return .basic;
 }
 
-/// Resolve the level from the process environment. A present,
-/// non-empty `NO_COLOR` disables color (per the no-color.org spec).
-/// `Map.get` borrows, so there is nothing to free.
+/// A present, non-empty `NO_COLOR` disables color (per the no-color.org spec).
 pub fn fromEnv(environ: *const std.process.Environ.Map) ColorLevel {
     const no_color = if (environ.get("NO_COLOR")) |v| v.len != 0 else false;
     return detect(no_color, environ.get("COLORTERM"), environ.get("TERM"));

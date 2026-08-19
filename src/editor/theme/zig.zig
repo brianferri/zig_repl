@@ -2,8 +2,6 @@
 
 const Theme = @import("../Theme.zig");
 
-/// Zig brand orange (#F7A41D) at each capability tier: exact truecolor,
-/// nearest 256-palette entry, then plain yellow.
 const zig_orange: Theme.Color = .{
     .rgb = .{ .r = 247, .g = 164, .b = 29 },
     .truecolor = "\x1b[38;2;247;164;29m",

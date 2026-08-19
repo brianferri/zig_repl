@@ -3,9 +3,7 @@ const compliance = @import("root.zig");
 
 const a = std.testing.allocator;
 
-// A comptime-required operand (an `@Int` bit width, an array length, a `@Vector` length) folds a value
-// computed by a function call: the operand's `block_comptime` makes the call inline, so its parameters
-// and the result are comptime-known. This is the boundary that a container-`const` wrap used to hide.
+// A comptime-required operand makes a function call in that position inline, so its parameters and result are comptime-known.
 test "comptime scope: a comptime-required operand folds a function-call result" {
     try compliance.check(a, &.{
         .{ .src = &.{ "const f = struct { fn g(n: usize) usize { return n; } }.g;", "@Int(.unsigned, f(8))" }, .rendered = "u8" },
@@ -17,9 +15,7 @@ test "comptime scope: a comptime-required operand folds a function-call result" 
     });
 }
 
-// A container-level declaration's initializer is itself a comptime scope, so a function call there
-// folds without an explicit comptime-required operand -- matching AstGen lowering a `const` value body
-// in a comptime scope.
+// A container-level declaration's initializer is itself a comptime scope, so a call there folds without an explicit comptime-required operand.
 test "comptime scope: a container declaration initializer folds a call" {
     try compliance.check(a, &.{
         .{
@@ -40,9 +36,7 @@ test "comptime scope: a container declaration initializer folds a call" {
     });
 }
 
-// A top-level REPL expression evaluates in a runtime function body, so a function whose body narrows a
-// runtime parameter without a cast is rejected exactly as the compiler rejects it at a runtime call
-// site -- the same wording, anchored in the user's frame.
+// A top-level REPL expression evaluates in a runtime function body, so a runtime narrowing without a cast is rejected at the call site as the compiler does.
 test "comptime scope: a runtime narrowing in a called function is rejected" {
     try compliance.check(a, &.{
         .{ .src = &.{"blk: { const S = struct { fn f(x: u32) u8 { return x; } }; break :blk S.f(5); }"}, .reject = true, .skip = true },
@@ -55,9 +49,7 @@ test "comptime scope: a runtime narrowing in a called function is rejected" {
     );
 }
 
-// A container nested inside another container reads an enclosing declaration through a closure capture
-// -- which arises once the outer container is declared in a runtime function body. The capture resolves
-// the enclosing name to its value.
+// A nested container reads an enclosing declaration through a closure capture, which arises once the outer container is declared in a runtime function body.
 test "comptime scope: a nested container captures an enclosing declaration" {
     try compliance.check(a, &.{
         .{

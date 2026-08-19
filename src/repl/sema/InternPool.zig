@@ -863,10 +863,9 @@ pub const Key = union(enum) {
         owner_nav: Nav.Index.Optional = .none,
     };
 
-    /// An external symbol whose value is supplied by the linker at runtime. The comptime
-    /// layer only ever holds it; name/is_const/alignment come from `owner_nav`, matching
-    /// the compiler's `Tag.Extern`. The linker-only fields (linkage, visibility, relocation,
-    /// decoration, source) have no comptime meaning here and are not modelled.
+    /// An external symbol supplied by the linker; name/is_const/alignment come from `owner_nav`.
+    /// The linker-only fields (linkage, visibility, relocation, decoration, source) carry no
+    /// comptime meaning and are not modelled.
     pub const Extern = struct {
         ty: Index,
         owner_nav: Nav.Index,
@@ -1429,13 +1428,13 @@ const PackedCallingConvention = packed struct(u18) {
             inline else => |pl, tag| switch (@TypeOf(pl)) {
                 void => .{
                     .tag = tag,
-                    .incoming_stack_alignment = .none, // unused
-                    .extra = 0, // unused
+                    .incoming_stack_alignment = .none,
+                    .extra = 0,
                 },
                 std.lang.CallingConvention.CommonOptions => .{
                     .tag = tag,
                     .incoming_stack_alignment = .fromByteUnits(pl.incoming_stack_alignment orelse 0),
-                    .extra = 0, // unused
+                    .extra = 0,
                 },
                 std.lang.CallingConvention.X86RegparmOptions => .{
                     .tag = tag,
@@ -2161,9 +2160,8 @@ pub fn getOrPutString(
     return @fromBackingInt(@intCast(new_index));
 }
 
-/// Mirrors the compiler's `getOrPutStringFmt`. The compiler writes the formatted bytes straight into
-/// its per-thread string buffer via `getOrPutTrailingString`; the single-threaded pool here has no such
-/// buffer, so the bytes go through a scratch allocation before `getOrPutString`.
+/// The compiler formats straight into its per-thread string buffer; lacking one, the bytes here go
+/// through a scratch allocation before `getOrPutString`.
 pub fn getOrPutStringFmt(
     pool: *InternPool,
     gpa: Allocator,
@@ -3838,9 +3836,8 @@ pub fn unionLayoutResolved(pool: *const InternPool, union_ty: Index) bool {
     return pool.extraData(TypeUnion, item.data).flags.want_layout;
 }
 
-// The REPL analog of the compiler's Type.assertHasLayout, which asserts (in runtime-safety builds) that a
-// type's layout is resolved. The compiler builds that on Zcu.assertUpToDate (incremental-analysis currency),
-// which the REPL doesn't model; here it checks the container's own resolved flag.
+// Analog of the compiler's Type.assertHasLayout, minus the incremental-analysis currency check
+// (Zcu.assertUpToDate) the REPL doesn't model; here it checks the container's own resolved flag.
 pub fn assertLayoutResolved(pool: *const InternPool, ty: Index) void {
     switch (pool.indexToKey(ty)) {
         .struct_type => assert(pool.structLayoutResolved(ty)),
@@ -4656,7 +4653,7 @@ pub fn getCoercedInts(pool: *InternPool, int: Key.Int, new_ty: Index) Allocator.
 }
 
 /// The base-address tag reached by following a pointer value through its bases, or null if `val`
-/// is not a pointer. Ported from the compiler's `getBackingAddrTag`.
+/// is not a pointer.
 pub fn getBackingAddrTag(pool: *const InternPool, val: Index) ?@typeInfo(Key.Ptr.BaseAddr).@"union".tag_type.? {
     var base = val;
     while (true) {

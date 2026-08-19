@@ -75,7 +75,6 @@ test "compliance: @alignOf matches the host target ABI" {
         .{ .src = &.{"@alignOf(*u8)"}, .want = compliance.want(@alignOf(*u8)) },
         .{ .src = &.{"@alignOf(*align(16) u8)"}, .want = compliance.want(@alignOf(*align(16) u8)) },
         .{ .src = &.{"@alignOf(comptime_int)"}, .want = compliance.want(@alignOf(comptime_int)) },
-        // An explicit field alignment is stored as an Alignment and drives the container's layout.
         .{ .src = &.{"@alignOf(struct { a: u8, b: u32 align(16) })"}, .want = compliance.want(@alignOf(struct { a: u8, b: u32 align(16) })) },
         .{ .src = &.{"@sizeOf(struct { a: u8, b: u32 align(16) })"}, .want = compliance.want(@sizeOf(struct { a: u8, b: u32 align(16) })) },
     });
@@ -93,7 +92,6 @@ test "compliance: @sizeOf matches the host target ABI" {
         .{ .src = &.{"@sizeOf(usize)"}, .want = compliance.want(@sizeOf(usize)) },
         .{ .src = &.{"@sizeOf(comptime_int)"}, .reject = true },
         .{ .src = &.{"@sizeOf(noreturn)"}, .reject = true },
-        // Packed struct/union layout resolves via the backing integer.
         .{ .src = &.{"@sizeOf(packed struct(u16) { a: u8, b: u8 })"}, .want = compliance.want(@sizeOf(packed struct(u16) { a: u8, b: u8 })) },
         .{ .src = &.{"@sizeOf(packed union { a: u8, b: u8 })"}, .want = compliance.want(@sizeOf(packed union { a: u8, b: u8 })) },
     });
@@ -184,9 +182,7 @@ test "compliance: @bitSizeOf matches the host target ABI" {
         .{ .src = &.{"@bitSizeOf(f64)"}, .want = compliance.want(@bitSizeOf(f64)) },
         .{ .src = &.{"@bitSizeOf(*u8)"}, .want = compliance.want(@bitSizeOf(*u8)) },
         .{ .src = &.{"@bitSizeOf([4]u8)"}, .want = compliance.want(@bitSizeOf([4]u8)) },
-        // Exercises the int_tag_mode `.explicit` path: enum bitSize routes through intInfo -> int tag.
         .{ .src = &.{"@bitSizeOf(enum(u8) { a, b })"}, .want = compliance.want(@bitSizeOf(enum(u8) { a, b })) },
-        // hasBitRepresentation rejects comptime-only operands.
         .{ .src = &.{"@bitSizeOf(comptime_int)"}, .reject = true },
         .{ .src = &.{"@bitSizeOf(type)"}, .reject = true },
     });
@@ -202,9 +198,8 @@ test "compliance: &decl carries the binding's constness and alignment" {
 }
 
 test "compliance: @intFromPtr honors the pointer's alignment" {
-    // The REPL's address is synthetic, so it never equals a `zig run` address.
-    // Both sides honor `@intFromPtr(&x) % align == 0` and pointer identity, so
-    // pin those invariants rather than a concrete (unfoldable) address.
+    // The REPL's address is synthetic, so it never equals a `zig run` address; pin the
+    // alignment and pointer-identity invariants rather than a concrete (unfoldable) address.
     try compliance.check(a, &.{
         .{ .src = &.{ "var x: u32 align(8) = 5;", "@intFromPtr(&x) % 8" }, .rendered = "0" },
         .{ .src = &.{ "var w: u64 align(16) = 5;", "@intFromPtr(&w) % 16" }, .rendered = "0" },
@@ -255,7 +250,6 @@ test "compliance: var mutation and pointer store/load" {
     });
 }
 
-// A field pointer routes through structFieldPtrByIndex / unionFieldPtr, then loads or stores through it.
 test "compliance: struct and union field pointers" {
     try compliance.check(a, &.{
         .{ .src = &.{"blk: { const S = struct { a: u32, b: u32 }; const s: S = .{ .a = 3, .b = 4 }; const p = &s.b; break :blk p.*; }"}, .want = compliance.want(blk: {
@@ -282,7 +276,6 @@ test "compliance: struct and union field pointers" {
             const u: U = .{ .a = 9 };
             break :blk (&u.a).*;
         }) },
-        // A pointer to an inactive union field is rejected, like the value access.
         .{ .src = &.{"blk: { const U = union(enum) { a: u32, b: u32 }; const u: U = .{ .a = 9 }; break :blk (&u.b).*; }"}, .reject = true },
     });
 }
@@ -294,18 +287,14 @@ test "compliance: @ptrFromInt builds a pointer at an address" {
             const p: ?*const u8 = @ptrFromInt(0);
             break :blk p == null;
         }) },
-        // Address zero for a non-optional, non-allowzero pointer is rejected.
         .{ .src = &.{"@as(*const u8, @ptrFromInt(0))"}, .reject = true },
-        // An address that does not satisfy the pointee alignment is rejected.
         .{ .src = &.{"@as(*const u32, @ptrFromInt(0x1001))"}, .reject = true },
-        // The destination must be a pointer type.
         .{ .src = &.{"@as(u32, @ptrFromInt(0x10))"}, .reject = true },
     });
 }
 
-// A single-item pointer coerces to `*anyopaque` by re-typing the pointer, not the
-// pointee (the compiler's to_anyopaque). This is the coercion a reified struct's
-// `default_value_ptr` (a `?*const anyopaque`) relies on.
+// A single-item pointer coerces to `*anyopaque` by re-typing the pointer, not the pointee --
+// the coercion a reified struct's `default_value_ptr` (a `?*const anyopaque`) relies on.
 test "compliance: a pointer coerces to *anyopaque" {
     try compliance.check(a, &.{
         .{ .src = &.{"blk: { const p: ?*const anyopaque = &@as(u32, 5); break :blk @as(u8, @intFromBool(p != null)); }"}, .want = compliance.want(blk: {
@@ -317,20 +306,15 @@ test "compliance: a pointer coerces to *anyopaque" {
 
 test "compliance: pointer-cast family" {
     try compliance.check(a, &.{
-        // @ptrCast changes element type; result type is the destination.
         .{ .src = &.{"blk: { const p: *const u32 = @ptrFromInt(0x1000); const q: *const u8 = @ptrCast(p); break :blk @intFromPtr(q); }"}, .want = compliance.want(blk: {
             const p: *const u32 = @ptrFromInt(0x1000);
             const q: *const u8 = @ptrCast(p);
             break :blk @intFromPtr(q);
         }) },
-        // @constCast / @volatileCast need no result type; they clear a qualifier.
         .{ .src = &.{ "const p: *const u32 = @ptrFromInt(0x1000);", "@TypeOf(@constCast(p))" }, .want = compliance.want(*u32) },
         .{ .src = &.{ "const p: *volatile u32 = @ptrFromInt(0x1000);", "@TypeOf(@volatileCast(p))" }, .want = compliance.want(*u32) },
-        // @alignCast asserts a higher alignment; the address already satisfies it.
         .{ .src = &.{ "const p: *u32 = @ptrFromInt(0x1000);", "@intFromPtr(@as(*align(4) u32, @alignCast(p)))" }, .want = compliance.want(@intFromPtr(@as(*align(4) u32, @alignCast(@as(*u32, @ptrFromInt(0x1000)))))) },
-        // A slice @ptrCast recomputes the length from element sizes.
         .{ .src = &.{ "var arr = [_]u32{ 1, 2, 3 };", "const s: []u32 = &arr;", "@as([]const u8, @ptrCast(s)).len" }, .rendered = "12" },
-        // Rejections: each qualifier/alignment change requires its own builtin.
         .{ .src = &.{"blk: { const p: *const u32 = @ptrFromInt(0x1000); const q: *u32 = @ptrCast(p); break :blk @intFromPtr(q); }"}, .reject = true },
         .{ .src = &.{"blk: { const p: *volatile u32 = @ptrFromInt(0x1000); const q: *u32 = @ptrCast(p); break :blk @intFromPtr(q); }"}, .reject = true },
     });
@@ -356,13 +340,10 @@ test "compliance: pointer equality compares base and offset" {
     });
 }
 
-// The C-pointer coercion family: `*[N]T`/`[*]T`/`null`/integer sources coerce into a `[*c]T`, and a
-// `[*c]T` source retypes back into any non-slice pointer whose element type matches -- but a coercion that
-// would drop `const` is rejected (compiler: coerceExtra's src_array_ptr/src_c_ptr/`.c` arms guarded by
-// checkPtrAttributes). Null-ness of a C pointer is its address, so `c == null` follows the address.
+// A `[*c]T` retypes back into any non-slice pointer whose element type matches, but a coercion that
+// would drop `const` is rejected. A C pointer's null-ness is its address, so `c == null` follows it.
 test "compliance: the C-pointer coercion family" {
     try compliance.check(a, &.{
-        // *[N]T -> [*c]T (decay by retype), then index and slice.
         .{ .src = &.{"blk: { const a2 = [_]u8{ 10, 20, 30, 40 }; const c: [*c]const u8 = &a2; break :blk c[1]; }"}, .want = compliance.want(blk: {
             const a2 = [_]u8{ 10, 20, 30, 40 };
             const c: [*c]const u8 = &a2;
@@ -374,14 +355,12 @@ test "compliance: the C-pointer coercion family" {
             const s = c[1..3];
             break :blk s[0];
         }) },
-        // [*c]T source -> [*]T, retyped through checkPtrAttributes.
         .{ .src = &.{"blk: { const a2 = [_]u8{ 7, 8, 9 }; const c: [*c]const u8 = &a2; const m: [*]const u8 = c; break :blk m[2]; }"}, .want = compliance.want(blk: {
             const a2 = [_]u8{ 7, 8, 9 };
             const c: [*c]const u8 = &a2;
             const m: [*]const u8 = c;
             break :blk m[2];
         }) },
-        // null and integer sources: a C pointer's null-ness is its address.
         .{ .src = &.{"blk: { const c: [*c]const u8 = null; break :blk c == null; }"}, .want = compliance.want(blk: {
             const c: [*c]const u8 = null;
             break :blk c == null;
@@ -395,7 +374,6 @@ test "compliance: the C-pointer coercion family" {
             const c: [*c]const u8 = &a2;
             break :blk c != null;
         }) },
-        // Dropping `const` through the C pointer is rejected.
         .{ .src = &.{"blk: { const a2 = [_]u8{ 1, 2 }; const c: [*c]const u8 = &a2; const m: [*]u8 = c; break :blk m[0]; }"}, .reject = true },
     });
 }

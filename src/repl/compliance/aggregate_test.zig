@@ -137,10 +137,8 @@ test "compliance: void and explicit tuple types" {
         .{ .src = &.{"const x: struct { void } = .{ 420 };"}, .reject = true },
         .{ .src = &.{"const x: struct { i32, f128 } = .{ 1 };"}, .reject = true },
         .{ .src = &.{"const x: struct { i32 } = .{ 1, 2 };"}, .reject = true },
-        // A tuple type may carry a comptime field default (tuple_decl field init); the comptime
-        // field takes no runtime space.
+        // A tuple's comptime field takes no runtime space.
         .{ .src = &.{"@sizeOf(struct { u32, comptime i32 = 7 })"}, .want = compliance.want(@sizeOf(struct { u32, comptime i32 = 7 })) },
-        // Constructing a value of such a tuple (array_init_elem_ptr on a tuple).
         .{ .src = &.{"blk: { const T = struct { u32, comptime i32 = 7 }; const t: T = .{ 3, 7 }; break :blk t[1]; }"}, .want = compliance.want(blk: {
             const T = struct { u32, comptime i32 = 7 };
             const t: T = .{ 3, 7 };

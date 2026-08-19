@@ -1,9 +1,6 @@
-//! Frontend-agnostic interpreter session: the state a backend needs to
-//! evaluate input -- allocator, intern pool, root namespace, and the
-//! committed pipeline snapshots. No terminal, file, or IO surface; those
-//! live in the frontend (`frontend/tty/Repl.zig` for the TTY REPL). Any
-//! frontend -- the TTY REPL, a wasm module, or a test -- creates one of
-//! these directly.
+//! Frontend-agnostic interpreter session: the state a backend needs to evaluate
+//! input -- allocator, intern pool, root namespace, and committed pipeline
+//! snapshots. No terminal, file, or IO surface; those live in the frontend.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -16,11 +13,8 @@ const InputShape = @import("front/InputShape.zig");
 const Session = @This();
 
 gpa: std.mem.Allocator,
-/// Borrowed: caller owns the InternPool and is responsible for
-/// `deinit`-ing it. Session.deinit does not touch the pool.
-/// Decoupling lets tests share a pool across multiple Sessions
-/// or construct minimal Sessions on top of an existing pool
-/// without lifecycle complications.
+/// Borrowed: caller owns the InternPool and `deinit`s it; Session.deinit does not
+/// touch the pool. Lets tests share one pool across Sessions.
 intern_pool: *InternPool,
 /// The session-root namespace -- the parent-less scope into which
 /// top-level `const` / `var` lines bind. Mirrors the role of the
@@ -123,8 +117,7 @@ pub fn deinit(session: *Session) void {
     }
     session.runtime.open_files.deinit(session.gpa);
     if (session.failed_analysis) |em| em.destroy(session.gpa);
-    // Tear down `import_table` first: its keys alias the `sub_file_path` strings
-    // freed just below.
+    // Tear down `import_table` first: its keys alias the `sub_file_path` strings freed just below.
     session.import_table.deinit(session.gpa);
     for (session.files.items) |*file| {
         if (file.zir) |*z| z.deinit(session.gpa);

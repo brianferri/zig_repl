@@ -4247,7 +4247,6 @@ fn ptrCastFull(
         }
     }
 
-    // Type validation done -- perform the cast on the comptime-known operand.
     if (operand.isUndef(ip)) {
         if (!dest_ty.ptrAllowsZero(ip)) return sema.failWithUseOfUndef();
         return .fromIndex(try ip.get(.{ .undef = dest_ty.index }));
@@ -10072,7 +10071,6 @@ fn evalElemPtrLoad(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(bin.lhs != .none);
     assert(bin.rhs != .none);
 
-    // The operand is a pointer to the indexable; dereference it, then index the loaded value.
     const indexable = try sema.loadValue(try sema.resolveInst(bin.lhs));
     return try sema.elemVal(indexable, bin.rhs);
 }

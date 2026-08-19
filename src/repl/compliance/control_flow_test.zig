@@ -82,8 +82,7 @@ test "compliance: for loops (range and array)" {
             }
             break :blk arr[2];
         }) },
-        // The length of a `&array` operand comes from the array type, so an
-        // as-yet-undefined destination is a valid loop operand (std.enums.valuesFromFields).
+        // A `&array` operand's length comes from the array type, so an undefined destination is a valid loop operand.
         .{ .src = &.{"blk: { var result: [3]u8 = undefined; const src = [_]u8{ 4, 5, 6 }; for (&result, src) |*r, v| { r.* = v; } break :blk result[0] + result[2]; }"}, .want = compliance.want(blk: {
             var result: [3]u8 = undefined;
             const src = [_]u8{ 4, 5, 6 };
@@ -117,7 +116,6 @@ test "compliance: nested aggregate init and element store" {
 
 test "compliance: unreachable errors only when reached" {
     try compliance.check(a, &.{
-        // The taken arm returns; the `unreachable` arm is never evaluated.
         .{ .src = &.{"blk: { const x: u8 = 3; break :blk switch (x) { 3 => @as(i32, 7), else => unreachable }; }"}, .want = compliance.want(blk: {
             const x: u8 = 3;
             break :blk switch (x) {

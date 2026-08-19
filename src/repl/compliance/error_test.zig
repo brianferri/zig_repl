@@ -133,24 +133,16 @@ test "compliance: @intFromError / @errorFromInt round-trip" {
 }
 
 test "compliance: @errorCast recasts across error sets and unions" {
-    // @errorCast takes one argument; its destination is the result-location type,
-    // supplied here by the enclosing @as.
+    // @errorCast's destination is the result-location type, supplied here by the enclosing @as.
     try compliance.check(a, &.{
-        // Widen a subset into a superset, and to anyerror.
         .{ .src = &.{"@as(error{ A, B, C }, @errorCast(@as(error{ A, B }, error.A)))"}, .want = compliance.want(@as(error{ A, B, C }, @errorCast(@as(error{ A, B }, error.A)))) },
         .{ .src = &.{"@as(anyerror, @errorCast(@as(error{A}, error.A)))"}, .want = compliance.want(@as(anyerror, @errorCast(@as(error{A}, error.A)))) },
-        // Narrow a superset to a subset the value belongs to.
         .{ .src = &.{"@as(error{A}, @errorCast(@as(error{ A, B }, error.A)))"}, .want = compliance.want(@as(error{A}, @errorCast(@as(error{ A, B }, error.A)))) },
-        // Error set -> error union (the value wraps as the error arm).
         .{ .src = &.{"@as(error{A}!u8, @errorCast(@as(error{A}, error.A)))"}, .want = compliance.want(@as(error{A}!u8, @errorCast(@as(error{A}, error.A)))) },
-        // Error union -> error union: error arm and payload arm both recast.
         .{ .src = &.{"@as(error{ A, B }!u8, @errorCast(@as(error{A}!u8, error.A)))"}, .want = compliance.want(@as(error{ A, B }!u8, @errorCast(@as(error{A}!u8, error.A)))) },
         .{ .src = &.{"@as(error{ A, B }!u8, @errorCast(@as(error{A}!u8, 5)))"}, .want = compliance.want(@as(error{ A, B }!u8, @errorCast(@as(error{A}!u8, 5)))) },
-        // An optional destination peels one layer (.remove_opt): the cast targets
-        // the error set, then the outer @as re-wraps the optional.
+        // An optional destination peels one layer: the cast targets the error set, then the outer @as re-wraps the optional.
         .{ .src = &.{"@as(?error{ A, B }, @errorCast(@as(error{A}, error.A)))"}, .want = compliance.want(@as(?error{ A, B }, @errorCast(@as(error{A}, error.A)))) },
-        // Rejections: non-error destination, EU -> error set, payload mismatch,
-        // disjoint sets, and a value outside an overlapping destination set.
         .{ .src = &.{"@as(u8, @errorCast(error.A))"}, .reject = true },
         .{ .src = &.{"@as(error{A}, @errorCast(@as(error{A}!u8, error.A)))"}, .reject = true },
         .{ .src = &.{"@as(error{A}!u16, @errorCast(@as(error{A}!u8, error.A)))"}, .reject = true },
@@ -162,8 +154,7 @@ test "compliance: @errorCast recasts across error sets and unions" {
     try compliance.expectDiagnostic(a, &.{"@as(error{A}!u16, @errorCast(@as(error{A}!u8, error.A)))"}, "payload types of error unions must match");
 }
 
-// Equality of error sets folds on the error name; error-union vs error-set unwraps the code, and a
-// payload never equals an error -- bool_false for both == and != (op-independent), matching Zig.
+// A payload never equals an error -- false for both == and !=, independent of the operator.
 test "compliance: error-set and error-union equality" {
     try compliance.check(a, &.{
         .{ .src = &.{"error.A == error.B"}, .want = compliance.want(error.A == error.B) },
@@ -204,7 +195,6 @@ test "compliance: member access on an error set type yields the error value" {
             const e = anyerror.Whatever;
             break :blk e == error.Whatever;
         }) },
-        // A name outside the set is rejected.
         .{ .src = &.{"blk: { const E = error{A}; break :blk E.C; }"}, .reject = true },
     });
 }

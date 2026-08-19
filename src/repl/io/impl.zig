@@ -1,24 +1,17 @@
-//! The intrinsic `Io`, as source the interpreter evaluates (not compiled into the REPL binary -- it
-//! references the externs the interpreter supplies). `runtime.install` binds its `io` as
-//! `root.std_options_debug_io`, so real `std` reaches its vtable. Unoverridden slots are reused from
-//! `Io.failing`; the overrides route the leaves a compiled program would reach by syscall to externs the
-//! interpreter performs -- `operate` writes to `__repl_write(fd, ...)` (so stdout and stderr both flow,
-//! keyed by file descriptor), `now` reads the clock via `__repl_now`. `std.debug.print` reaches this
-//! through `lockStderr`, which hands back a standard `File.Writer` whose drain calls `operate`.
-//! Target-agnostic today, so `root` embeds it for every target.
+//! The intrinsic `Io`, evaluated by the interpreter (not compiled into the REPL binary) so its overrides
+//! can reference the externs the interpreter supplies. `runtime.install` binds it as
+//! `root.std_options_debug_io`; overridden slots route the leaves a compiled program would reach by
+//! syscall to those externs, unoverridden slots reuse `Io.failing`.
 
 const std = @import("std");
 const Io = std.Io;
 
 extern fn __repl_write(fd: i64, ptr: [*]const u8, len: usize) void;
 extern fn __repl_now(clock: u32) i64;
-// Opens `path` on the host, returns an index into the session's file table (the descriptor the returned
-// `File` carries), or a negative value on failure.
+// Returns the session file-table index of the opened file, or negative on failure.
 extern fn __repl_open(path_ptr: [*]const u8, path_len: usize) i64;
-// Reads up to `len` bytes from the file at descriptor `fd` into the interpreter buffer at `ptr`; returns
-// the count, 0 at end of file, or a negative value on failure.
+// Returns the byte count read, 0 at end of file, or negative on failure.
 extern fn __repl_read(fd: i64, ptr: [*]u8, len: usize) i64;
-// Ends the lifetime of the file at descriptor `fd`, freeing it for reuse.
 extern fn __repl_close(fd: i64) void;
 
 fn handleFromIndex(index: i64) Io.File.Handle {
@@ -31,9 +24,8 @@ fn dirOpenFile(_: ?*anyopaque, _: Io.Dir, sub_path: []const u8, _: Io.Dir.OpenFi
     return .{ .handle = handleFromIndex(index), .flags = .{ .nonblocking = false } };
 }
 
-// stderr as a raw-handle `File`: `File.stderr()` references a posix constant absent on freestanding,
-// whose handle type is `void` there anyway. Handle 2 is the posix stderr descriptor; the interpreter
-// routes the write by it (and the freestanding host Io ignores it).
+// `File.stderr()` references a posix constant absent on freestanding; handle 2 is the posix stderr
+// descriptor the interpreter routes on (and the freestanding host Io ignores).
 const stderr_file: Io.File = .{
     .handle = if (Io.File.Handle == void) {} else 2,
     .flags = .{ .nonblocking = false },
@@ -78,8 +70,8 @@ fn operate(_: ?*anyopaque, op: Io.Operation) Io.Cancelable!Io.Operation.Result {
                 read += @intCast(got);
                 if (@as(usize, @intCast(got)) < slice.len) break;
             }
-            // Only a request for bytes that yields none is end-of-file; a zero-length request is not
-            // (the `FileReadStreaming` contract distinguishes a 0-length read from `error.EndOfStream`).
+            // Only a nonzero request that yields nothing is end-of-file; the `FileReadStreaming` contract
+            // distinguishes a 0-length read from `error.EndOfStream`.
             if (requested != 0 and read == 0) return .{ .file_read_streaming = error.EndOfStream };
             return .{ .file_read_streaming = read };
         },

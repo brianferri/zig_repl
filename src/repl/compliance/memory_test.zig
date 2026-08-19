@@ -1,13 +1,8 @@
-//! Memory-safety of the eval pipeline: no leak or double-free on the OOM error
-//! path (every allocation site must release what it took), and no per-eval leak
-//! into the long-lived InternPool across a repeated line. The leak-checking
-//! `std.testing.allocator` backs both.
+//! Memory-safety of the eval pipeline on the OOM path and against per-eval InternPool leaks.
 //!
-//! The OOM path is driven by a manual `FailingAllocator` sweep rather than
-//! `std.testing.checkAllAllocationFailures`: the front end (`std.zig.AstGen`) has
-//! benign heap-address-dependent rehashing that shifts the allocation count by one
-//! between otherwise-identical runs, which the stricter helper rejects as
-//! nondeterministic. The sweep only cares that no fail point leaks or crashes.
+//! The OOM path uses a manual `FailingAllocator` sweep, not `std.testing.checkAllAllocationFailures`:
+//! `std.zig.AstGen`'s benign address-dependent rehashing shifts the allocation count between
+//! otherwise-identical runs, which the stricter helper rejects as nondeterministic.
 
 const std = @import("std");
 const Io = std.Io;
@@ -18,11 +13,8 @@ const NativeModuleSource = @import("../module/Native.zig");
 
 const gpa = std.testing.allocator;
 
-/// Evaluate one input in a throwaway session under `allocator`. On an injected
-/// allocation failure, `eval.report` propagates `error.OutOfMemory` (parse/ZIR/
-/// analysis errors are swallowed to null); the session and pool teardown then
-/// free everything already allocated (verified by the leak-checking backing
-/// allocator).
+/// Evaluate one input in a throwaway session, propagating an injected `error.OutOfMemory`
+/// (parse/ZIR/analysis errors are swallowed to null) so teardown's leak checking can run.
 fn evalUnderOom(allocator: std.mem.Allocator, input: []const u8) !void {
     var pool = try InternPool.init(allocator);
     defer pool.deinit();
@@ -51,13 +43,10 @@ test "OOM: eval releases all memory on any allocation failure" {
         while (true) : (fail_index += 1) {
             var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
             evalUnderOom(failing.allocator(), input) catch |err| switch (err) {
-                // Injected failure: the teardown must have freed everything (the
-                // backing gpa asserts no leak at test end). Advance to the next site.
                 error.OutOfMemory => continue,
                 else => return err,
             };
-            // A run that reached the end without hitting the injected failure means
-            // fail_index is past the last allocation -- every site has been covered.
+            // Reached the end without the injected failure: fail_index is past the last allocation, so every site is covered.
             break;
         }
     }
@@ -73,9 +62,8 @@ test "no per-eval leak into the pool across a repeated line" {
     var scratch: [256]u8 = undefined;
     var discarding: std.Io.Writer.Discarding = .init(&scratch);
 
-    // The same expression interns the same values every time, so once warmed up
-    // the pool's item count must not keep climbing -- a climb means a value is
-    // re-interned (or leaked) per eval rather than deduped.
+    // The same expression interns the same values every time, so once warmed up the pool's item
+    // count must not keep climbing -- a climb means a value is re-interned or leaked per eval.
     const line = "@as(u32, 6) * @as(u32, 7)";
     _ = try eval.report(&session, line, &discarding.writer);
     _ = try eval.report(&session, line, &discarding.writer);
@@ -101,9 +89,7 @@ test "no leak loading and re-importing modules across a session" {
 
     var scratch: [256]u8 = undefined;
     var discarding: std.Io.Writer.Discarding = .init(&scratch);
-    // The module loader owns file sources, ZIR, and generated builtin text; a
-    // second import of an already-loaded module must reuse it, not reload and
-    // leak. The leak-checking allocator asserts both at teardown.
+    // A second import of an already-loaded module must reuse it, not reload and leak its sources/ZIR.
     const lines = [_][]const u8{
         "@import(\"std\").mem.eql(u8, \"a\", \"a\")",
         "@import(\"builtin\").is_test",

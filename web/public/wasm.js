@@ -1,7 +1,6 @@
 // Memory-growth trap: any call that allocates (replAlloc, replEval) can grow
 // wasm linear memory, detaching the old `memory.buffer`. So every Uint8Array
-// view is built *after* the call that produced the bytes, never cached across
-// a wasm call.
+// view is built *after* the call that produced the bytes, never cached across a wasm call.
 
 /**
  * The wasm exports this binding drives. The module is line-in / text-out: the

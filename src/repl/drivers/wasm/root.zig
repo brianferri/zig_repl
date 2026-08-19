@@ -1,6 +1,5 @@
 //! The wasm frontend's driver module: its command set and the explorer
-//! outline, over the shared core (`repl`). `commands` is ordered as `:help`
-//! shows them.
+//! outline, over the shared core (`repl`). `commands` is ordered as `:help` shows them.
 
 const repl = @import("repl");
 const Registry = repl.commands.Registry;

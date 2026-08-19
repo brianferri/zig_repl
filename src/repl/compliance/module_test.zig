@@ -20,14 +20,9 @@ fn comptimeBool(comptime b: bool) []const u8 {
 /// One compliance probe: an expression and the string `render` should print.
 const Probe = struct { src: []const u8, want: []const u8 };
 
-/// A probe for every scalar `builtin` declaration, derived from the evaluating
-/// binary's own `@import("builtin")` so the expected values follow the host.
-/// `generate()` emits exactly the bool and enum decls; the struct/string/slice
-/// decls (target, cpu, zig_version_string, test_functions) are reached through
-/// their own probes. An enum tag is compared with an escaped literal so keyword
-/// tags (e.g. unwind_tables `.@"async"`) parse. A new emitted enum/bool decl is
-/// covered automatically; a decl the compiler adds that `generate()` omits
-/// surfaces here as a resolution failure.
+/// A probe for every scalar (bool/enum) `builtin` declaration, derived from the evaluating binary's
+/// own `@import("builtin")` so expected values follow the host and a decl the module omits surfaces
+/// here as a resolution failure. Enum tags compare against an escaped literal so keyword tags parse.
 fn builtinDeclProbes() []const Probe {
     var list: []const Probe = &.{};
     inline for (comptime std.meta.declarations(builtin)) |name| {
@@ -78,7 +73,6 @@ const FixtureSource = struct {
     }
 };
 
-/// Run one REPL expression against `session` and assert its rendered value.
 fn expectReplValue(session: *Session, source: []const u8, expected: []const u8) !void {
     var diag: std.Io.Writer.Allocating = .init(session.gpa);
     defer diag.deinit();
@@ -113,8 +107,7 @@ test "@hasDecl on the root namespace resolves session decls" {
     var session = Session.init(gpa, &pool, ns);
     defer session.deinit();
 
-    // The root namespace's decls are bound across line files and it keeps no ZIR of its
-    // own, so @hasDecl must look them up through the namespace rather than a defining ZIR.
+    // The root namespace keeps no ZIR of its own, so @hasDecl looks its decls up through the namespace.
     var diag: std.Io.Writer.Allocating = .init(gpa);
     defer diag.deinit();
     _ = try eval.run(&session, "const marker = 42;", &diag.writer);
@@ -414,8 +407,7 @@ test "render: a struct value prints .{ .field = val }" {
 
     var buf: [256]u8 = undefined;
     var w = Io.Writer.fixed(&buf);
-    // A struct prints `.{ .field = val }` (no type-name prefix), matching `{any}` and the
-    // compiler's `printAggregate`; without a session to read field names, positionally.
+    // Without a session to read field names, a struct prints positionally; with one, as `.{ .field = val }`.
     try render.render(value, &pool, &session, &w);
     try testing.expectEqualStrings(".{ .x = 3, .y = 7 }", w.buffered());
 
@@ -479,7 +471,6 @@ test "render: a packed struct value unpacks its fields; a packed union shows the
 }
 
 test "compliance: a failure raised inside a loaded module still surfaces its message" {
-    // A @compileError reached inside std's own source must surface its message rather
-    // than vanish into an empty result; the caret re-reads the module's source on demand.
+    // A @compileError inside std's own source must surface its message, not vanish into an empty result; the caret re-reads the module source on demand.
     try compliance.expectDiagnostic(testing.allocator, &.{ "const std = @import(\"std\");", "std.math.sqrt(@as(i32, 4))" }, "sqrt not implemented");
 }

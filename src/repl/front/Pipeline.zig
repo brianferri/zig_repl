@@ -17,9 +17,7 @@ pub const Result = struct {
         result.* = undefined;
     }
 
-    /// Hand the analysed `zir` to the caller and free the rest -- the Ast
-    /// and wrapped source, which only the front end and diagnostics need.
-    /// Consumes the result; do not use it afterward.
+    /// Hand the analysed `zir` to the caller and free the rest. Consumes the result.
     pub fn takeZir(result: *Result, gpa: std.mem.Allocator) std.zig.Zir {
         const zir = result.zir;
         result.tree.deinit(gpa);
@@ -41,9 +39,7 @@ pub const Result = struct {
         return result.wrapped.text;
     }
 
-    /// View of the user-visible coordinate space inside `source()`.
-    /// Diagnostic renderers translate wrapped positions into this
-    /// frame so the user never sees the wrap prefix or suffix.
+    /// View of the user-visible coordinate space inside `source()`, past the wrap prefix/suffix.
     pub fn userView(result: *const Result) UserView {
         return .{
             .text = result.wrapped.userText(),
@@ -52,25 +48,14 @@ pub const Result = struct {
     }
 };
 
-/// Translates wrapped-source positions back into the user's frame.
-/// All wrap-shape knowledge lives here so the diagnostic renderer
-/// can treat positions opaquely.
+/// Translates wrapped-source positions back into the user's frame, keeping all wrap-shape knowledge here.
 pub const UserView = struct {
     text: []const u8,
     offset_in_source: u32,
 
-    /// Translate a wrapped-source span into the user's frame.
-    ///
-    /// Returns `null` when the span anchors entirely in the
-    /// wrap-injection prefix -- those bytes don't exist in the
-    /// user's typed input, so any line/col we synthesised would
-    /// point at the wrong source. Callers drop the diagnostic
-    /// rather than mislead.
-    ///
-    /// Spans partly in the prefix (straddling the user-frame
-    /// boundary) clip to `[0, user_len]` -- the diagnostic still
-    /// points at "where the user can see it" with the wrap chars
-    /// elided.
+    /// Translate a wrapped-source span into the user's frame. Returns `null` when the span anchors
+    /// entirely in the wrap-injection prefix (callers drop the diagnostic rather than mislead); a
+    /// span straddling the boundary clips to `[0, user_len]`.
     pub fn translate(view: UserView, wrapped: std.zig.Ast.Span) ?std.zig.Ast.Span {
         if (anchorsInInjection(view, wrapped)) return null;
         const len: u32 = @intCast(view.text.len);
@@ -81,9 +66,6 @@ pub const UserView = struct {
         };
     }
 
-    /// Compute `Loc` for a user-frame byte offset against the user
-    /// text. Centralises the `findLineColumn` call so callers don't
-    /// need to know whether the user text is sentinel-terminated.
     pub fn findLoc(view: UserView, user_byte_offset: u32) std.zig.Loc {
         return std.zig.findLineColumn(view.text, user_byte_offset);
     }
@@ -103,13 +85,8 @@ pub fn run(gpa: std.mem.Allocator, input: []const u8) !Result {
     return runWithInjection(gpa, input, null, .none);
 }
 
-/// Like `run`, but when `pool` + `namespace` are provided, builds an
-/// injection prefix from the namespace's `pub_decls` / `priv_decls`
-/// so AstGen sees session bindings as in-scope container decls. The
-/// REPL uses this to make `const x = 10;` on one line then `x` on
-/// the next resolve cleanly without any Sema-side scope hacks --
-/// AstGen's normal scope chain does the work, including shadow /
-/// rebind rejection.
+/// Like `run`, but when `pool` + `namespace` are provided, builds an injection prefix from the
+/// namespace's decls so AstGen's own scope chain resolves session bindings (including rebind rejection).
 pub fn runWithInjection(
     gpa: std.mem.Allocator,
     input: []const u8,
@@ -125,9 +102,8 @@ pub fn runWithInjection(
     var wrapped = try InputShape.wrapWithInjection(gpa, injection_prefix, input);
     errdefer wrapped.deinit(gpa);
 
-    // Reject pathologically nested input before the recursive parse can
-    // overflow the stack; surfaced as a parse-level rejection so the existing
-    // diagnostic paths handle it rather than the input trapping the host.
+    // Reject pathologically nested input before the recursive parse overflows the stack, as a
+    // parse-level rejection so the existing diagnostic paths handle it rather than trapping the host.
     if (exceedsNestingDepth(wrapped.text)) return error.ParseError;
 
     var tree = try std.zig.Ast.parse(gpa, wrapped.text, .{ .mode = .zig });
@@ -139,8 +115,8 @@ pub fn runWithInjection(
     return .{ .wrapped = wrapped, .tree = tree, .zir = zir };
 }
 
-/// Whether `source`'s bracket nesting exceeds `InputShape.max_nesting_depth`.
-/// Tokenizing keeps brackets inside strings and comments from counting.
+/// Whether `source`'s bracket nesting exceeds `InputShape.max_nesting_depth`. Tokenizing keeps
+/// brackets inside strings and comments from counting.
 fn exceedsNestingDepth(source: [:0]const u8) bool {
     var tokenizer = std.zig.Tokenizer.init(source);
     var depth: u32 = 0;
@@ -157,16 +133,9 @@ fn exceedsNestingDepth(source: [:0]const u8) bool {
     }
 }
 
-/// Render `const <name> = undefined;\n` per session-bound decl,
-/// returning the concatenated prefix. The caller frees with `gpa`.
-/// Returns an empty owned slice when there is no session context or
-/// the namespace has no decls; callers can pass either branch to
-/// `InputShape.wrapWithInjection` uniformly.
-///
-/// The placeholder `= undefined;` is enough for AstGen to add the
-/// name to its scope chain. The actual bound value is substituted by
-/// `Sema.evalDeclVal` at lookup time, so the `undefined` initializer
-/// never participates in evaluation.
+/// Render `const <name> = undefined;\n` per session-bound decl (an empty owned slice when there is no
+/// session context). The `= undefined` only adds the name to AstGen's scope chain; `Sema.evalDeclVal`
+/// substitutes the real value at lookup, so the initializer never participates in evaluation.
 fn buildInjectionPrefix(
     gpa: std.mem.Allocator,
     pool: ?*const InternPool,
@@ -197,10 +166,6 @@ fn appendDeclLine(
     const nav = pool.getNav(nav_idx);
     _ = nav.resolved orelse return; // test / comptime / unresolved extern
     const name = pool.stringSlice(nav.name);
-    // Scaffold only: puts the name in scope so a later line's reference
-    // lowers to `decl_val` instead of erroring. `bindOneDecl` skips it
-    // (already bound from its real line), so the type is never analysed
-    // and `= undefined` needs none.
     try writer.print("const {s} = undefined;\n", .{name});
 }
 

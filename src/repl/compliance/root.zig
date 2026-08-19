@@ -139,18 +139,14 @@ pub fn expectDiagnostic(gpa: std.mem.Allocator, inputs: []const []const u8, need
     }
 }
 
-// Fuzz target: generate plausible zig with `AstSmith` and run it through the
-// evaluator, discarding the result -- what matters is that no input panics, corrupts,
-// or leaks. In a normal `zig build test` this runs once on an empty seed (a
-// deterministic smoke test); `zig build test --fuzz` drives it for real.
+// Run generated zig through the evaluator, discarding the result -- what matters is that no input
+// panics, corrupts, or leaks. `zig build test` runs it once on an empty seed; `--fuzz` drives it for real.
 test "fuzz: the evaluator survives arbitrary zig source" {
     try std.testing.fuzz({}, fuzzEval, .{});
 }
 
-// A comptime shift by billions of bits requests gigabytes in a single limb
-// allocation -- the same evaluation the compiler performs (both OOM on it). Under
-// the per-allocation cap that request fails as `error.OutOfMemory` instead of
-// OS-killing the process, and the eval path surfaces it gracefully.
+// A comptime shift by billions of bits requests gigabytes in one allocation; the per-allocation cap
+// turns that into `error.OutOfMemory` instead of an OS kill, which the eval path surfaces gracefully.
 test "fuzz-harness: a pathological comptime allocation fails gracefully" {
     var capped: CappedAllocator = .{ .child = std.testing.allocator, .max_alloc_bytes = 512 * 1024 * 1024 };
     const gpa = capped.allocator();
@@ -158,13 +154,9 @@ test "fuzz-harness: a pathological comptime allocation fails gracefully" {
     gpa.free(out);
 }
 
-// Fuzz target: exercise the runtime layer directly. The generic fuzzer above feeds
-// arbitrary token streams, which almost never assemble into a top-level `var` plus a
-// store reaching into it -- the exact shape the runtime store/load path handles. This
-// generates that shape: a mutable global of a chosen type, a run of stores through a
-// field/element/optional chain, and a final read. The grammar stays well-defined, so a
-// value read back that disagrees with the shadow model is a real defect, not generated
-// undefined behavior -- catching a wrong result, not just a crash.
+// Exercise the runtime store/load path directly, since the generic fuzzer almost never assembles a
+// top-level `var` with stores reaching into it. The grammar stays well-defined, so a value that
+// disagrees with the shadow model is a real defect, not generated undefined behavior.
 test "fuzz: runtime mutable-global store/load round-trips" {
     try std.testing.fuzz({}, fuzzRuntime, .{});
 }
@@ -187,10 +179,9 @@ fn fuzzRuntime(_: void, smith: *std.testing.Smith) anyerror!void {
     };
 }
 
-/// Emit a program that declares a mutable global, applies Smith-chosen stores through a
-/// field/element/optional chain, and reads one location back; return the value that read
-/// must produce. Indices stay in bounds and the optional stays non-null, so the program
-/// is always well-defined.
+/// Emit a program that stores through a field/element/optional chain and reads one location back,
+/// returning the value that read must produce. Indices stay in bounds and the optional stays
+/// non-null, so the program is always well-defined.
 fn genRuntimeProgram(smith: *std.testing.Smith, w: *Io.Writer) !u64 {
     const Shape = enum { scalar, array, record, nested_record, matrix, optional };
     const max_ops = 8;
@@ -238,7 +229,6 @@ fn genRuntimeProgram(smith: *std.testing.Smith, w: *Io.Writer) !u64 {
             for (0..max_ops) |_| {
                 if (smith.eos()) break;
                 model = smith.value(u32);
-                // Alternate reaching the leaf and replacing the whole inner struct.
                 if (smith.value(bool))
                     try w.print("g.p.w = {d};\n", .{model})
                 else
@@ -278,12 +268,9 @@ fn genRuntimeProgram(smith: *std.testing.Smith, w: *Io.Writer) !u64 {
 }
 
 fn fuzzEval(_: void, smith: *std.testing.Smith) anyerror!void {
-    // A pathological comptime computation -- e.g. a shift by billions of bits --
-    // requests gigabytes in a single allocation. Uncapped, that request succeeds
-    // under memory overcommit and the fuzz process is OS-killed on first write,
-    // before the allocator can report failure. Capping the per-allocation size
-    // turns it into `error.OutOfMemory`, which the eval path already surfaces and
-    // the `catch return` below tolerates, so the fuzzer survives the input.
+    // A pathological comptime computation can request gigabytes in one allocation; uncapped, overcommit
+    // lets it succeed and the process is OS-killed on first write. The cap turns it into
+    // `error.OutOfMemory`, which the eval path surfaces and the `catch return` below tolerates.
     var capped: CappedAllocator = .{ .child = std.testing.allocator, .max_alloc_bytes = 512 * 1024 * 1024 };
     const gpa = capped.allocator();
     const token_smith = try gpa.create(std.zig.TokenSmith);
@@ -363,9 +350,8 @@ fn replRun(gpa: std.mem.Allocator, inputs: []const []const u8) ![]u8 {
     return gpa.dupe(u8, std.mem.trimEnd(u8, out_writer.buffered(), "\n"));
 }
 
-// The evaluated Io helper's writer drain calls `__repl_write(ptr, len)`; the interpreter performs that
-// leaf against the host Io's stderr. A `WriterIo` over `out` captures it. The extern and call here stand
-// in for that helper, exercising the runtime-I/O sink end to end without the full `std.debug.print` stack.
+// The interpreter performs the `__repl_write` leaf against the host Io, captured here by a `WriterIo`.
+// The extern and call stand in for the Io helper, exercising the sink without the full `std.debug.print` stack.
 test "runtime I/O: __repl_write emits its argument bytes to the session sink" {
     const gpa = std.testing.allocator;
     var io_instance: Io.Threaded = .init(gpa, .{});
@@ -394,9 +380,8 @@ test "runtime I/O: __repl_write emits its argument bytes to the session sink" {
     try std.testing.expectEqualStrings("Hi", out.written());
 }
 
-// The full `std.debug.print` stack, end to end: with a host Io wired, the intrinsic `Io` is installed
-// and the formatted bytes reach that Io's stderr (here a `WriterIo` over `out`). Reaching the write leaf
-// required folding the comptime-required `@Int` operands inside `std.Progress`, so this guards that path.
+// The full `std.debug.print` stack, end to end. Reaching the write leaf requires folding the
+// comptime-required `@Int` operands inside `std.Progress`, so this guards that path.
 test "runtime I/O: std.debug.print emits formatted bytes to the session sink" {
     const gpa = std.testing.allocator;
     var io_instance: Io.Threaded = .init(gpa, .{});

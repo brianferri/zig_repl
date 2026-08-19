@@ -1,11 +1,7 @@
-//! Randomized stress: drive the interpreter with many mutated inputs under the
-//! leak-checking allocator so a leak, double free, out-of-bounds read, or panic
-//! surfaces. It mutates the seed corpus (corpus.zig) rather than generating from
-//! raw bytes, because the parser rejects random bytes on sight -- perturbing
-//! working programs keeps inputs near-valid and drives them into AstGen/Sema/eval,
-//! where the memory bugs are. Deterministic per `-Dfuzz-seed` (reproduce a
-//! failure with the same seed) and scaled by `-Dfuzz-iterations`. When a run finds
-//! a crash, add its minimized input to `regression_test.zig`.
+//! Randomized stress: drive the interpreter with mutated inputs so a leak or crash
+//! surfaces. Mutates the seed corpus rather than raw bytes -- the parser rejects
+//! random bytes on sight, so perturbing working programs keeps inputs near-valid and
+//! reaches AstGen/Sema/eval. Deterministic per `-Dfuzz-seed`, scaled by `-Dfuzz-iterations`.
 
 const std = @import("std");
 const options = @import("build_options");
@@ -18,11 +14,8 @@ const Random = std.Random;
 
 const max_bytes = InputShape.max_input_bytes;
 
-// The coverage-guided entry point (`zig build fuzz --fuzz`): the libfuzzer runtime
-// mutates the seed corpus and drives each candidate here, using edge coverage of the
-// instrumented interpreter (see build.zig `repl_fuzz`) to steer toward new paths.
-// Without `--fuzz` it replays the corpus once as a deterministic smoke test. Newlines
-// split a candidate into a session so cross-line state paths are reached too.
+// Coverage-guided entry point (`zig build fuzz --fuzz`); without `--fuzz` it replays
+// the corpus once. Newlines split a candidate into a session for cross-line paths.
 test "coverage-guided interpreter stress" {
     try std.testing.fuzz({}, fuzzOne, .{ .corpus = &corpus.lines });
 }
@@ -80,7 +73,6 @@ fn mutate(rand: Random, buf: []u8) []const u8 {
     var len = @min(base.len, buf.len);
     @memcpy(buf[0..len], base[0..len]);
 
-    // Splice a second seed over a random span half the time.
     if (rand.boolean()) {
         const other = corpus.lines[rand.uintLessThanBiased(usize, corpus.lines.len)];
         const at = rand.uintLessThanBiased(usize, len + 1);

@@ -1,21 +1,10 @@
-//! Multi-line REPL editor over the `terminal/` subsystem.
-//! Consumes canonical `Event`s and emits one assembled input per
-//! `readLine`. Whether Shift+Enter is actually distinguishable from
-//! Enter is the terminal's concern -- this file just dispatches on
-//! `Event.key_press { codepoint: enter, modifiers: shift }`.
+//! Multi-line REPL editor over the `terminal/` subsystem: consumes
+//! canonical `Event`s, emits one assembled input per `readLine`.
 //!
-//! Display model: full-redraw on every state change. The whole
-//! buffer is re-emitted with continuation prompts on each `\n` and
-//! the cursor is repositioned via CSI escapes. Flicker is invisible
-//! on typical REPL input sizes; the alternative (incremental edit
-//! sequences) is significantly more complex without observable
-//! benefit at this scale.
-//!
-//! Cursor position is a byte index into `buffer`. Movement (arrow
-//! keys, Home/End) mutates `cursor`; insert/delete mutates `buffer`
-//! and `cursor` together. Line-join on backspace falls out for free
-//! because deleting the `\n` at `cursor - 1` is the same byte-level
-//! operation as any other backspace.
+//! Full-redraw on every state change -- the whole buffer is re-emitted
+//! and the cursor repositioned via CSI escapes; incremental edits buy
+//! nothing at REPL input sizes. Cursor is a byte index into `buffer`,
+//! so line-join on backspace is just deleting the `\n` at `cursor - 1`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -29,31 +18,26 @@ const LineEditor = @This();
 pub const max_input_bytes: u32 = 4096;
 pub const history_max_entries: u32 = 1000;
 
-/// Output sink. `readLine` reads input via the session's terminal;
-/// every other method (applyEvent, redraw, etc.) writes only here,
-/// which keeps the editor core unit-testable without a real terminal.
+/// Output sink. Every method but `readLine` writes only here, which
+/// keeps the editor core unit-testable without a real terminal.
 writer: *std.Io.Writer,
 gpa: std.mem.Allocator,
 buffer: std.ArrayListUnmanaged(u8),
 cursor: u32,
-/// Number of visible rows the current draw occupies (prompt line +
-/// one per embedded `\n`). The next redraw uses this to know how
-/// far to clear below; combined with `cursor_row_drawn` it doesn't
-/// over-reach above the input area.
+/// Visible rows the current draw occupies (prompt line + one per
+/// embedded `\n`); the next redraw clears this far below.
 lines_drawn: u32,
 /// Display row the cursor sat at after the previous draw (0 = top
-/// row of the input). The next redraw moves up by this amount to
-/// reach row 0 before clearing -- moving by `lines_drawn - 1` would
-/// over-shoot whenever the cursor wasn't on the bottom row, wiping
-/// prompt + history above the input area.
+/// row). The next redraw moves up by exactly this to reach row 0;
+/// `lines_drawn - 1` would overshoot when the cursor wasn't on the
+/// bottom row, wiping prompt + history above the input area.
 cursor_row_drawn: u32,
-/// Ring of previously-submitted inputs, oldest-first. Each entry
-/// is gpa-owned. Older-than-cap entries rotate out on push.
+/// Ring of previously-submitted inputs, oldest-first; entries are gpa-owned.
 history: std.ArrayListUnmanaged([]u8),
 /// 0 = newest entry; null = not in recall mode (editing live draft).
 history_offset: ?u32,
-/// Snapshot of `buffer` before entering history mode so down-past-
-/// newest can restore the in-progress edit.
+/// Snapshot of `buffer` before entering history mode, so down-past-newest
+/// can restore the in-progress edit.
 draft: std.ArrayListUnmanaged(u8),
 
 pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer) LineEditor {
@@ -71,8 +55,8 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer) LineEditor {
     };
 }
 
-/// Clear the buffer and per-line state for a fresh input line. `readLine` calls
-/// this then redraws; an event-driven frontend (wasm) calls it after a submit.
+/// Clear the buffer and per-line state for a fresh input line. `readLine`
+/// calls this then redraws; the event-driven wasm frontend calls it after a submit.
 pub fn beginLine(editor: *LineEditor) void {
     editor.buffer.clearRetainingCapacity();
     editor.cursor = 0;
@@ -90,10 +74,9 @@ pub fn deinit(editor: *LineEditor) void {
     editor.* = undefined;
 }
 
-/// Read one logical input from the user. Returns `null` on EOF
-/// (Ctrl+D on empty buffer, or the underlying terminal closing).
-/// The returned slice is borrowed from the editor's buffer and is
-/// invalidated on the next `readLine` call.
+/// Read one logical input. Returns `null` on EOF (Ctrl+D on empty buffer,
+/// or the terminal closing). The returned slice is borrowed from the
+/// editor's buffer and invalidated on the next `readLine` call.
 pub fn readLine(editor: *LineEditor, device: *Device, theme: *const themes.Theme) !?[]const u8 {
     assert(@intFromPtr(editor) != 0);
     assert(@intFromPtr(device) != 0);
@@ -121,11 +104,9 @@ pub fn readLine(editor: *LineEditor, device: *Device, theme: *const themes.Theme
     }
 }
 
-/// Position the terminal cursor on a fresh row below the last
-/// rendered input row. Without this, the caller's output starts
-/// wherever the cursor happened to sit after the final redraw --
-/// typically mid-buffer -- and overwrites already-displayed input
-/// lines.
+/// Position the terminal cursor on a fresh row below the last rendered
+/// input row, so the caller's output doesn't overwrite input lines the
+/// final redraw left the cursor sitting among.
 fn moveCursorBelowInput(editor: *LineEditor) !void {
     assert(editor.lines_drawn >= 1);
     assert(editor.cursor_row_drawn < editor.lines_drawn);
@@ -301,7 +282,7 @@ fn moveUpWithinBuffer(editor: *LineEditor) !Outcome {
         editor.cursor -= 1;
     }
     if (editor.cursor == 0) return editor.beep();
-    editor.cursor -= 1; // step over the `\n` into the previous line's last char
+    editor.cursor -= 1;
     while (editor.cursor > 0 and editor.buffer.items[editor.cursor - 1] != '\n') {
         editor.cursor -= 1;
     }
@@ -321,7 +302,7 @@ fn moveDownWithinBuffer(editor: *LineEditor) !Outcome {
         editor.cursor += 1;
     }
     if (editor.cursor >= editor.buffer.items.len) return editor.beep();
-    editor.cursor += 1; // step past the `\n` into the next line
+    editor.cursor += 1;
     var step: u32 = 0;
     while (step < col and
         editor.cursor < editor.buffer.items.len and
@@ -340,7 +321,7 @@ fn recallOlder(editor: *LineEditor) !Outcome {
         0;
     if (editor.history_offset == null) try editor.saveDraft();
     if (editor.history_offset != null and next_offset == editor.history_offset.?) {
-        return editor.beep(); // already at oldest
+        return editor.beep();
     }
     editor.history_offset = next_offset;
     try editor.replaceWithHistory(next_offset);
@@ -350,7 +331,6 @@ fn recallOlder(editor: *LineEditor) !Outcome {
 fn recallNewer(editor: *LineEditor) !Outcome {
     const offset = editor.history_offset orelse return editor.beep();
     if (offset == 0) {
-        // Past the newest entry -> restore the draft.
         editor.history_offset = null;
         try editor.restoreDraft();
         return .keep_reading;
@@ -400,9 +380,8 @@ fn cancelInput(editor: *LineEditor) !Outcome {
 }
 
 fn clearScreen(editor: *LineEditor) !Outcome {
-    // CSI 2J clears the screen, CSI H homes the cursor. Next redraw
-    // paints fresh -- reset both tracking fields so we don't try to
-    // move up through a row that no longer exists.
+    // Reset the tracking fields so the next redraw doesn't move up
+    // through a row that no longer exists.
     try editor.writer.writeAll("\x1b[2J\x1b[H");
     editor.lines_drawn = 0;
     editor.cursor_row_drawn = 0;
@@ -415,23 +394,14 @@ fn beep(editor: *LineEditor) !Outcome {
     return .keep_reading;
 }
 
-/// Rewrite the entire input area: cursor to start of input region,
-/// erase below, emit prompt + buffer (with continuation prompts on
-/// embedded `\n`), reposition cursor at its logical location. `theme`
-/// and `level` come from the caller (the session theme + the
-/// terminal's color capability) so the editor core stays session-free.
+/// Rewrite the entire input area. `theme` and `level` come from the
+/// caller so the editor core stays session-free.
 fn redraw(editor: *LineEditor, theme: *const themes.Theme, level: ColorLevel) !void {
     assert(@intFromPtr(editor) != 0);
     assert(editor.cursor <= editor.buffer.items.len);
-    // Previous-draw invariant: the cursor row was within the
-    // rendered area. (lines_drawn == 0 on the first redraw, so the
-    // check trivially holds there too.)
     assert(editor.lines_drawn == 0 or editor.cursor_row_drawn < editor.lines_drawn);
     const writer = editor.writer;
 
-    // Move from wherever the cursor currently sits (set by the
-    // previous redraw at `cursor_row_drawn`) up to row 0 of the
-    // input area, then to col 0, then erase everything below.
     if (editor.cursor_row_drawn > 0) {
         try writer.print("\x1b[{d}A", .{editor.cursor_row_drawn});
     }
@@ -567,9 +537,8 @@ test "arrow up + edit keeps cursor bookkeeping inside drawn area" {
     _ = try ed.applyEvent(keyPress('X'));
     try ed.redraw(themes.default, .none);
     try testing.expectEqualStrings("abcX\ndef", ed.buffer.items);
-    // The bug we're guarding against: cursor_row_drawn was set
-    // higher than lines_drawn, causing the next redraw's CSI A
-    // move to overshoot into already-rendered terminal lines.
+    // Guard: cursor_row_drawn set above lines_drawn made the next
+    // redraw's CSI A overshoot into already-rendered terminal lines.
     try testing.expect(ed.cursor_row_drawn < ed.lines_drawn);
 }
 
@@ -587,9 +556,8 @@ test "moveCursorBelowInput descends past last input row before newline" {
     aw.clearRetainingCapacity();
     try ed.moveCursorBelowInput();
     const out = aw.writer.buffered();
-    // The submit-overwrite bug: without a cursor-down, the trailing
-    // `\r\n` lands inside the input area and the caller's diagnostic
-    // overwrites the last input row.
+    // Guard: without a cursor-down the trailing `\r\n` lands inside the
+    // input area and the caller's output overwrites the last input row.
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[1B") != null);
     try testing.expect(std.mem.endsWith(u8, out, "\r\n"));
 }

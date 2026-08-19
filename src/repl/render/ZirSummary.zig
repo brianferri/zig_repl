@@ -1,8 +1,4 @@
-//! Renders one ZIR instruction's data as the operand/value summary shown in
-//! `:dump` (` lhs=%2 rhs=%3`, ` int 40`, ` operand=%5 src_node=12`, ...).
-//! Shared by the `:dump` command and the web explorer so both surface the
-//! same per-instruction detail. `%N` is an instruction index; well-known
-//! refs print under their stdlib tag name (`bool_true`, `u32_type`).
+//! Renders one ZIR instruction's operand/value summary, shared by `:dump` and the web explorer.
 
 const std = @import("std");
 const Zir = std.zig.Zir;
@@ -385,11 +381,7 @@ fn writeCall(
     }
 }
 
-/// Render a `Zir.Inst.Ref` as the same `%N` shorthand used in the
-/// `zir` listing. Well-known refs print under their stdlib tag name
-/// (e.g. `bool_true`, `u32_type`). Writes directly to the stream so
-/// callers can emit several refs in one line without a per-call
-/// scratch buffer.
+/// Renders an instruction index as `%N`; a well-known ref under its stdlib tag name.
 fn writeRef(stdout: *std.Io.Writer, ref: Zir.Inst.Ref) !void {
     if (ref == .none) {
         try stdout.writeAll(".none");

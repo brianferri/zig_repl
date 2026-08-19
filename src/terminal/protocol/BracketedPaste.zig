@@ -1,24 +1,11 @@
-//! Bracketed-paste protocol. xterm-originated, supported by every
-//! modern terminal. When enabled (DECSET 2004), pasted text arrives
-//! framed as:
-//!
-//!   CSI 200 ~  <bytes ...>  CSI 201 ~
-//!
-//! Bytes between the markers are LITERAL paste content even if they
-//! look like escape sequences -- editors using bracketed paste avoid
-//! the classic "pasted code triggers Ctrl+X" hazard.
-//!
-//! Stateful: once we see `CSI 200 ~` we accumulate every subsequent
-//! token's bytes, claiming them via `Result.consumed` so other
-//! protocols don't try to interpret keystrokes inside the paste.
-//! `CSI 201 ~` ends the paste and emits one `Event.paste` with the
-//! full payload.
-//!
-//! Backing storage is a fixed-size file-scope buffer (64 KiB).
-//! Pastes past the cap are silently truncated; bracketed-paste
-//! payloads above 64 KiB are unusual and a polished editor would
-//! refuse them outright. Static storage means `known_protocols` can
-//! be a `const`-not-a-fn -- no allocator threading required.
+//! Bracketed-paste protocol (DECSET 2004): pasted text arrives framed as
+//! `CSI 200 ~ <bytes> CSI 201 ~`, and bytes between the markers are literal even
+//! when they look like escape sequences. Stateful -- from `CSI 200 ~` onward
+//! every token's bytes are accumulated and claimed via `Result.consumed` so no
+//! other protocol interprets keystrokes inside the paste, until `CSI 201 ~`
+//! emits one `Event.paste`. Storage is a fixed file-scope buffer; pastes past
+//! the cap are silently truncated, and static storage keeps `known_protocols` a
+//! `const` with no allocator threading.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -96,9 +83,8 @@ fn append(self: *BracketedPaste, token: Standard.Token) void {
     assert(self.in_paste);
     switch (token) {
         .ground => |b| self.pushByte(b),
-        // Inside a paste, escape sequences are still literal paste
-        // content. Reconstruct the on-the-wire form from the
-        // classified token so the editor sees what the user pasted.
+        // Escape sequences inside a paste are literal; rebuild the on-the-wire
+        // form so the editor sees exactly what was pasted.
         .csi => |csi| self.reconstructCsi(csi),
         .ss3 => |ss3| {
             self.pushBytes("\x1bO");

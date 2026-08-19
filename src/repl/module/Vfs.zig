@@ -1,9 +1,5 @@
-//! An in-memory `Fs` leaf: a mutable map of path to bytes, for a target with no
-//! real filesystem (freestanding wasm). It holds the user's editable files;
-//! `Layered` stacks it over a read-only standard library. The wasm frontend owns
-//! one for the session, and the editor mutates and persists it.
-//!
-//! Insertion order is preserved so a listing is stable across edits.
+//! An in-memory `Fs` leaf: a mutable map of path to bytes holding the user's editable files, for a target
+//! with no real filesystem (freestanding wasm). Insertion order is preserved so a listing is stable.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -61,9 +57,8 @@ fn list(fs: *Fs, gpa: std.mem.Allocator) Fs.Error![][]u8 {
     return out;
 }
 
-/// Create `path` or overwrite its contents with a copy of `bytes`. The key is
-/// duplicated only when the path is new, so a path's key stays stable across
-/// rewrites (a caller may hold it across a `write`).
+/// Create `path` or overwrite its contents with a copy of `bytes`. The key is duplicated only when the
+/// path is new, so a caller may hold a path's key across a `write`.
 fn write(fs: *Fs, path: []const u8, bytes: []const u8) Fs.Error!void {
     const self: *Vfs = @alignCast(@fieldParentPtr("interface", fs));
     assert(path.len > 0);

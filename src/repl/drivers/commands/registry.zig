@@ -1,7 +1,5 @@
 //! A frontend's command set: the command descriptors plus an O(1) name lookup,
-//! both comptime-derived from `mods` (the command modules) for context `Ctx`.
-//! Each module exposes `command(Ctx) Command(Ctx)`, so registering a command is
-//! writing its module and adding it to the `mods` a frontend instantiates with.
+//! comptime-derived from `mods` (the command modules) for context `Ctx`.
 
 const std = @import("std");
 
@@ -16,8 +14,7 @@ pub fn Registry(comptime mods: []const type, comptime Ctx: type) type {
             break :blk set;
         };
 
-        /// Name -> index, derived from the descriptors' own names so it cannot
-        /// drift from the set and `find` is O(1).
+        /// Name -> index, derived from the descriptors so it cannot drift from the set.
         const index = blk: {
             var pairs: [all.len]struct { []const u8, usize } = undefined;
             for (all, 0..) |cmd, i| pairs[i] = .{ cmd.name, i };
@@ -29,9 +26,7 @@ pub fn Registry(comptime mods: []const type, comptime Ctx: type) type {
         }
 
         /// Run a `:command` line against `ctx`. `command_line` is the text
-        /// after the leading `:` (`name [args]`); an unrecognised name is
-        /// reported to `w`. Each frontend's own line handling decides what
-        /// counts as a command line before delegating here.
+        /// after the leading `:` (`name [args]`); an unrecognised name is reported to `w`.
         pub fn dispatch(ctx: Ctx, command_line: []const u8, w: *std.Io.Writer) anyerror!void {
             var iter = std.mem.splitScalar(u8, command_line, ' ');
             const name = iter.first();

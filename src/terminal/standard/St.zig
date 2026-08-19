@@ -1,16 +1,6 @@
-//! ST (String Terminator) standalone consumer. ECMA-48 sec 5.5.
-//! Wire form:
-//!
-//!   ESC \
-//!
-//! ST normally appears as the terminator of an OSC / DCS / SOS /
-//! PM / APC payload, where it's matched inline by those parsers.
-//! Registered here so a stray standalone `ESC \` (received outside
-//! any string command's body) is consumed cleanly instead of
-//! mis-dispatching as `escape_alt('\\')`.
-//!
-//! Emits no token -- the dispatcher drops the bytes and pulls the
-//! next sequence: ST carries no input-event payload.
+//! Standalone ST (String Terminator) consumer, `ESC \` (ECMA-48 sec 5.5).
+//! Registered so a stray ST outside any string-command body is consumed cleanly
+//! instead of mis-dispatching as `escape_alt('\\')`. Emits no token.
 
 const std = @import("std");
 const assert = std.debug.assert;

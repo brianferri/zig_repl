@@ -30,8 +30,7 @@ test "diagnostic: a Sema error renders a source-anchored caret with notes" {
 
     var diag: std.Io.Writer.Allocating = .init(gpa);
     defer diag.deinit();
-    // A `u16 -> u8` @memcpy element mismatch anchors on the `@memcpy` node and
-    // carries an `int_not_coercible` note.
+    // A `u16 -> u8` @memcpy element mismatch anchors on the `@memcpy` node with an `int_not_coercible` note.
     try std.testing.expectError(error.AnalysisFail, eval.run(
         &session,
         "blk: { var dst = [_]u8{ 0, 0 }; const src = [_]u16{ 1, 2 }; @memcpy(dst[0..2], src[0..2]); break :blk dst[0]; }",

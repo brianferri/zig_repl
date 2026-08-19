@@ -1,11 +1,5 @@
-//! SS2 (Single Shift 2) parser. ECMA-48 sec 8.3.139. Wire form:
-//!
-//!   ESC N <final>
-//!
-//! Designates G2 character set for the immediately-following byte.
-//! Rare on input (xterm uses SS3 for keypad / arrow keys; few
-//! terminals emit SS2 for keyboard) but covered here for Fe-family
-//! completeness.
+//! SS2 (Single Shift 2) parser, `ESC N <final>` (ECMA-48 sec 8.3.139). Rare on
+//! input; covered for Fe-family completeness.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -23,8 +17,7 @@ fn parse(input: []const u8) Standard.Result {
     assert(input[0] == 0x1b);
     assert(input[1] == 'N');
     if (input.len < 3) return .{ .token = null, .consumed = 0 };
-    // SS2 carries the same shape as SS3 in the input direction --
-    // reuse the SS3 variant so downstream protocols that handle SS3
-    // arrows automatically pick up the rare SS2-encoded equivalent.
+    // Same input-direction shape as SS3; reuse the variant so SS3 handlers pick
+    // up the rare SS2-encoded equivalent.
     return .{ .token = .{ .ss3 = .{ .final = input[2] } }, .consumed = 3 };
 }

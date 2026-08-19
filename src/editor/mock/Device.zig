@@ -1,10 +1,6 @@
-//! Mock `Device`: events are queued up front rather than read from a
-//! terminal. Implements the `device/Device.zig` interface from a replayed
-//! event queue, so tests can drive a `Device` consumer (e.g. `LineEditor`)
-//! without a raw-mode tty.
-//!
-//! `readEvent` is non-blocking: it yields the next queued event, then
-//! `null` once the queue drains (end-of-input).
+//! Mock `Device` backed by a replayed event queue, so tests can drive a
+//! `Device` consumer without a raw-mode tty. `readEvent` yields the next
+//! queued event, then `null` once the queue drains.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -15,9 +11,8 @@ const Color = @import("device").Color;
 const Mock = @This();
 
 interface: Device,
-/// Pending events, oldest at `head`. The host enqueues with `push`;
-/// `readEvent` advances `head` rather than shifting, so a drained
-/// queue keeps its capacity for the next batch.
+/// Pending events, oldest at `head`; `readEvent` advances `head` rather
+/// than shifting, so a drained queue keeps its capacity.
 queue: std.ArrayListUnmanaged(Event.Event),
 head: usize,
 gpa: std.mem.Allocator,
@@ -36,15 +31,14 @@ pub fn deinit(self: *Mock) void {
     self.* = undefined;
 }
 
-/// Hand out the device interface. Valid
-/// only for a live `Mock` at a stable address: the vtable
-/// recovers `*Mock` from `&interface` via `@fieldParentPtr`.
+/// Hand out the device interface. Valid only for a live `Mock` at a stable
+/// address: the vtable recovers `*Mock` from `&interface` via `@fieldParentPtr`.
 pub fn device(self: *Mock) *Device {
     return &self.interface;
 }
 
-/// Enqueue one event for the editor to read. A `paste` payload is
-/// borrowed, not copied -- its bytes must outlive the matching read.
+/// Enqueue one event. A `paste` payload is borrowed, not copied -- its
+/// bytes must outlive the matching read.
 pub fn push(self: *Mock, event: Event.Event) !void {
     try self.queue.append(self.gpa, event);
 }
@@ -58,9 +52,6 @@ fn vtableReadEvent(d: *Device) anyerror!?Event.Event {
     self.head += 1;
     return event;
 }
-
-// `readLine`'s read loop has no other unit-test entry: its only other
-// device, `Terminal`, needs a raw-mode tty.
 
 const testing = std.testing;
 const LineEditor = @import("../LineEditor.zig");

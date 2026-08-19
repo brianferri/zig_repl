@@ -1,21 +1,14 @@
-//! Canonical input event surface. Every protocol parser normalises
-//! its wire encoding into one of these variants so the consumer
-//! (LineEditor, future TUI layers) never branches on protocol
-//! identity.
+//! Canonical input event surface. Each protocol parser normalises its wire
+//! encoding into one of these, so consumers never branch on protocol identity.
 
 const std = @import("std");
 
 pub const Event = union(enum) {
     key_press: Key,
-    /// Emitted only when a protocol's release-reporting mode is
-    /// negotiated; most terminals never produce this variant.
+    /// Emitted only when a protocol's release-reporting mode is negotiated.
     key_release: Key,
-    /// Same as `key_press` for most consumers; surfaced separately
-    /// so hold-to-repeat editors can act on it.
     key_repeat: Key,
-    /// Bracketed-paste payload (`CSI 200~ ... CSI 201~`). Borrowed
-    /// from the parser's scratch buffer; copy if it outlives the
-    /// next parse call.
+    /// Borrowed from the parser's scratch buffer; copy if it outlives the next parse call.
     paste: []const u8,
     resize: WindowSize,
     /// `CSI I` -- requires DECSET 1004.
@@ -25,18 +18,16 @@ pub const Event = union(enum) {
     eof,
 };
 
-/// Clamp a raw wire value to a Unicode code point (0..0x10FFFF). Values
-/// above the Unicode maximum map to U+FFFD so a malformed wire form still yields a
-/// key event rather than tripping an unreachable. Real terminals don't
-/// emit these; this is fuzz-safety for the protocol parsers.
+/// Values above the Unicode max map to U+FFFD so malformed wire input still
+/// yields a key event instead of tripping an unreachable (fuzz-safety).
 pub fn clampCodepoint(raw: u32) u21 {
     if (raw > 0x10ffff) return 0xfffd;
     return @intCast(raw);
 }
 
 pub const Key = struct {
-    /// Functional keys (arrows, F-keys) use the `key.*` constants
-    /// below; character keys carry the typed codepoint directly.
+    /// Functional keys use the `key.*` constants; character keys carry the
+    /// typed codepoint directly.
     codepoint: u21,
     modifiers: Modifiers = .{},
 
@@ -57,12 +48,8 @@ pub const Modifiers = packed struct(u8) {
     caps_lock: bool = false,
     num_lock: bool = false,
 
-    /// Decode the modifier-parameter wire encoding:
-    /// `(actual_mods << 1) | 1`. Wire `0` means absent, `1` means
-    /// no modifiers, `2` means Shift, `3` means Alt, etc. After
-    /// subtracting 1, the resulting byte's bits match this struct's
-    /// packed layout: bit0=shift, bit1=alt, bit2=ctrl, bit3=super,
-    /// bit4=hyper, bit5=meta, bit6=caps_lock, bit7=num_lock.
+    /// Decodes the wire encoding `(mods << 1) | 1`: `0` is absent, `1` no
+    /// modifiers; after subtracting 1 the bits match this struct's packed layout.
     pub fn fromParam(raw: u32) Modifiers {
         if (raw == 0) return .{};
         const decoded: u8 = @intCast((raw -% 1) & 0xff);
@@ -79,10 +66,8 @@ pub const WindowSize = struct {
     cols: u16,
 };
 
-/// Functional key codepoints. Tab/Enter/Escape/Backspace use their
-/// ASCII codepoints; everything else lives in the Unicode Private-
-/// Use Area (U+E000 block). Each protocol implementation translates
-/// from its wire encoding to these values at its own dispatch site.
+/// Tab/Enter/Escape/Backspace use their ASCII codepoints; everything else lives
+/// in the Unicode Private-Use Area (U+E000 block).
 pub const key = struct {
     pub const tab: u21 = 0x09;
     pub const enter: u21 = 0x0d;

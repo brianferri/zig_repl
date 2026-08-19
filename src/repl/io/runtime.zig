@@ -1,10 +1,7 @@
-//! The interpreter's runtime layer: what a compiled program lowers to machine instructions, performed
-//! here directly against session state. Runtime-original -- no compiler function to mirror; where the
-//! compiler emits AIR, `Sema` hands off here. Two kinds: runtime memory (retarget a mutable global's
-//! pointer so the reused `comptime_ptr_access` navigation reaches it, `writeBack` persisting a store),
-//! and runtime I/O (bind the intrinsic `Io` as `root.std_options_debug_io`, and perform the leaves a
-//! compiled program would reach by syscall -- `__repl_write` out to the host, `__repl_now` reading the
-//! host clock back in).
+//! The interpreter's runtime layer: where the compiler emits AIR, `Sema` hands off here. Runtime-original
+//! -- no compiler function to mirror. Two kinds: runtime memory (retarget a mutable global's pointer so
+//! the reused `comptime_ptr_access` navigation reaches it, `writeBack` persisting a store) and runtime
+//! I/O (bind the intrinsic `Io`, and perform the leaves a compiled program would reach by syscall).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -16,14 +13,13 @@ const Session = @import("../Session.zig");
 const Type = @import("../sema/Type.zig");
 const Value = @import("../sema/Value.zig");
 
-/// Standard streams occupy descriptors 0/1/2 (posix stdin/stdout/stderr); opened files are numbered
-/// above them in the session's file table, so the two descriptor namespaces never alias.
+/// Standard streams occupy descriptors 0/1/2; opened files are numbered above them so the two descriptor
+/// namespaces never alias.
 const first_file_fd = 3;
 
-/// Bind `root.std_options_debug_io` to the intrinsic `Io` as a hidden `pub_decls` Nav -- as if root
-/// declared it, so nothing surfaces as a user binding or importable module. A no-op unless the session
-/// both loads `std` and has an output sink; a failed impl eval is swallowed so print degrades to the
-/// default `Io` at the print site rather than breaking every line.
+/// Bind `root.std_options_debug_io` to the intrinsic `Io` as a hidden `pub_decls` Nav. A no-op unless the
+/// session both loads `std` and has an output sink; a failed impl eval is swallowed so print degrades to
+/// the default `Io` rather than breaking every line.
 pub fn install(sema: *Sema, impl_source: [:0]const u8) Sema.Error!void {
     assert(impl_source.len > 0);
     const session = sema.session orelse return;
@@ -51,11 +47,9 @@ pub fn install(sema: *Sema, impl_source: [:0]const u8) Sema.Error!void {
     try ip.namespacePtr(session.root_namespace).pub_decls.putContext(sema.gpa, nav, {}, .{ .pool = ip });
 }
 
-/// Perform a call whose callee is one of the runtime intrinsics the interpreter supplies for the leaves
-/// a compiled program would reach by syscall -- what the intrinsic `Io`'s vtable slots call instead.
-/// Null for any other extern, so the caller reports the usual non-function-callee error. Each intrinsic
-/// is one direction of the runtime boundary: `__repl_write` reads bytes out of interpreter values to the
-/// host; `__repl_now` reads host state (the clock) back in as a fresh interpreter value.
+/// Perform a call whose callee is one of the runtime intrinsics the interpreter supplies for the leaves a
+/// compiled program would reach by syscall. Null for any other extern, so the caller reports the usual
+/// non-function-callee error.
 pub fn callIntrinsic(
     sema: *Sema,
     ext: InternPool.Key.Extern,
@@ -67,9 +61,6 @@ pub fn callIntrinsic(
     const name = ip.getNav(ext.owner_nav).name;
     const param_types = ip.indexToKey(ext.ty).func_type.param_types;
 
-    // The write leaf `__repl_write(fd: i64, ptr: [*]const u8, len: usize)` -- what the intrinsic `Io`'s
-    // `operate(.file_write_streaming)` reaches instead of a syscall. `fd` names the stream (posix stdout
-    // 1, stderr 2), so both flow to the right place.
     if (name.eqlSlice("__repl_write", ip)) {
         assert(param_types.len == 3);
         assert(explicit_len == 3);
@@ -80,8 +71,6 @@ pub fn callIntrinsic(
         return .{ .index = .void_value };
     }
 
-    // The clock `__repl_now(clock: u32) i64` -- the leaf `Io.Clock.now` reaches. Returns the host
-    // reading as a runtime `i64` interpreter value.
     if (name.eqlSlice("__repl_now", ip)) {
         assert(param_types.len == 1);
         assert(explicit_len == 1);
@@ -89,8 +78,6 @@ pub fn callIntrinsic(
         return try now(sema, clock);
     }
 
-    // The open leaf `__repl_open(path_ptr: [*]const u8, path_len: usize) i64` -- what the intrinsic
-    // `Io`'s `dirOpenFile` reaches. Opens the host file and returns its handle-table index (or -1).
     if (name.eqlSlice("__repl_open", ip)) {
         assert(param_types.len == 2);
         assert(explicit_len == 2);
@@ -99,9 +86,6 @@ pub fn callIntrinsic(
         return try open(sema, ptr, len);
     }
 
-    // The read leaf `__repl_read(fd: i64, ptr: [*]u8, len: usize) i64` -- what `operate(.file_read_
-    // streaming)` reaches. Reads host bytes into the interpreter buffer and returns the count (0 at EOF,
-    // -1 on failure).
     if (name.eqlSlice("__repl_read", ip)) {
         assert(param_types.len == 3);
         assert(explicit_len == 3);
@@ -111,8 +95,6 @@ pub fn callIntrinsic(
         return try read(sema, fd, ptr, len);
     }
 
-    // The close leaf `__repl_close(fd: i64) void` -- what the intrinsic `Io`'s `fileClose` reaches. Ends
-    // the host file's lifetime and frees its descriptor for reuse.
     if (name.eqlSlice("__repl_close", ip)) {
         assert(param_types.len == 1);
         assert(explicit_len == 1);
@@ -127,9 +109,7 @@ fn i64Value(ip: *InternPool, n: i64) Sema.Error!Value {
     return .{ .index = try ip.internInt(.{ .ty = .i64_type, .storage = .{ .i64 = n } }), .is_comptime = false };
 }
 
-/// Open the host file `__repl_open(path, ...)` names, returning its index in the session handle table
-/// as a runtime `i64` -- the descriptor the interpreter `File` carries. Negative on any failure, so the
-/// intrinsic `dirOpenFile` maps it to an error.
+/// Open a host file, returning its session-file-table index as a runtime `i64`, or negative on failure.
 fn open(sema: *Sema, ptr: Value, len_val: Value) Sema.Error!Value {
     const ip = sema.intern_pool;
     const session = sema.session orelse return i64Value(ip, -1);
@@ -138,8 +118,8 @@ fn open(sema: *Sema, ptr: Value, len_val: Value) Sema.Error!Value {
     defer sema.gpa.free(path);
     const file = (hostOpen(host, path)) orelse return i64Value(ip, -1);
 
-    // Reuse the lowest freed descriptor before growing the table, the way a kernel hands back the
-    // lowest unused fd; a closed slot is left null by `close`.
+    // Reuse the lowest freed descriptor before growing the table, the way a kernel hands back the lowest
+    // unused fd; a closed slot is left null by `close`.
     const files = &session.runtime.open_files;
     for (files.items, 0..) |slot, i| {
         if (slot != null) continue;
@@ -154,9 +134,8 @@ fn open(sema: *Sema, ptr: Value, len_val: Value) Sema.Error!Value {
     return i64Value(ip, @intCast(first_file_fd + index));
 }
 
-/// Close the open file at descriptor `fd` and free its table slot, so the descriptor is available to a
-/// later `open`. A standard-stream or already-free descriptor is a no-op (its lifetime is not the
-/// session's to end).
+/// Close the open file at descriptor `fd` and free its table slot. A standard-stream or already-free
+/// descriptor is a no-op (its lifetime is not the session's to end).
 fn close(sema: *Sema, fd_val: Value) Sema.Error!Value {
     const ip = sema.intern_pool;
     const session = sema.session orelse return .{ .index = .void_value };
@@ -174,7 +153,7 @@ fn close(sema: *Sema, fd_val: Value) Sema.Error!Value {
 }
 
 /// Open `path` relative to the host cwd. `Dir.cwd()` references a posix constant absent on freestanding,
-/// where there is no filesystem anyway; a comptime switch keeps that path out of the freestanding build.
+/// so a comptime switch keeps it out of that build (which has no filesystem anyway).
 fn hostOpen(host: std.Io, path: []const u8) ?std.Io.File {
     return switch (@import("builtin").target.os.tag) {
         .freestanding => null,
@@ -183,8 +162,7 @@ fn hostOpen(host: std.Io, path: []const u8) ?std.Io.File {
 }
 
 /// Read from the open file at descriptor `fd` into the interpreter buffer `ptr` names, materializing the
-/// host bytes as interpreter values -- the read-in direction, the reverse of `write`. Returns the count
-/// (0 at EOF, -1 on failure).
+/// host bytes as interpreter values. Returns the count (0 at EOF, -1 on failure).
 fn read(sema: *Sema, fd_val: Value, buf_ptr: Value, len_val: Value) Sema.Error!Value {
     const ip = sema.intern_pool;
     const session = sema.session orelse return i64Value(ip, -1);
@@ -200,9 +178,8 @@ fn read(sema: *Sema, fd_val: Value, buf_ptr: Value, len_val: Value) Sema.Error!V
         else => return i64Value(ip, -1),
     };
 
-    // The buffer write-back: store each host byte into the interpreter buffer through the reused store
-    // path, the mirror of `write` reading bytes out. The `[*]u8` buffer pointer is a `.ptr` over some
-    // base; each element pointer is `*u8` at the same base advanced by the byte offset (`u8` is 1 byte).
+    // Each element pointer is `*u8` at the buffer's base advanced by the byte offset (`u8` is 1 byte),
+    // stored through the reused store path.
     const buf_key = ip.indexToKey(buf_ptr.index).ptr;
     const u8_ptr_ty = try ip.internPtrType(info: {
         var info = buf_ptr.typeOf(ip).ptrInfo(ip);
@@ -220,8 +197,8 @@ fn read(sema: *Sema, fd_val: Value, buf_ptr: Value, len_val: Value) Sema.Error!V
     return i64Value(ip, @intCast(n));
 }
 
-/// Read the `len`-byte `[]const u8` at `ptr` into a freshly-allocated host buffer, or null when the
-/// bytes are out of the reader's reach. Caller frees.
+/// Read the `len`-byte `[]const u8` at `ptr` into a freshly-allocated host buffer (caller frees), or null
+/// when the bytes are out of the reader's reach.
 fn readBytes(sema: *Sema, ptr: Value, len_val: Value) Sema.Error!?[]u8 {
     const ip = sema.intern_pool;
     const len: usize = @intCast(intOf(ip, len_val.index) orelse return null);
@@ -240,9 +217,8 @@ fn readBytes(sema: *Sema, ptr: Value, len_val: Value) Sema.Error!?[]u8 {
     return buf;
 }
 
-/// The host clock reading `__repl_now(clock)` names, materialized as a runtime `i64` interpreter value
-/// -- the read-back direction, host state becoming an interpreter Value. Zero when no host `Io` is
-/// wired (a freestanding frontend), so the call stays total.
+/// The host clock reading `__repl_now(clock)` names, as a runtime `i64`. Zero when no host `Io` is wired,
+/// so the call stays total.
 fn now(sema: *Sema, clock_val: Value) Sema.Error!Value {
     const ip = sema.intern_pool;
     const nanoseconds: i64 = ns: {
@@ -255,8 +231,8 @@ fn now(sema: *Sema, clock_val: Value) Sema.Error!Value {
 }
 
 /// Evaluate call argument `arg_index` from `args_body`, coerced to its parameter type. Argument bodies
-/// follow the `explicit_len` leading end-offset words; body `i` runs from the previous argument's end
-/// (or `explicit_len` for the first) to its own, mirroring the call-argument layout in `Sema.evalCall`.
+/// follow the `explicit_len` leading end-offset words; body `i` runs from the previous argument's end (or
+/// `explicit_len` for the first) to its own, mirroring `Sema.evalCall`.
 fn resolveArg(sema: *Sema, args_body: []const Zir.Inst.Index, explicit_len: u32, arg_index: u32, param_ty: InternPool.Index, inst: Zir.Inst.Index) Sema.Error!Value {
     const start = if (arg_index == 0) explicit_len else @backingInt(args_body[arg_index - 1]);
     const end = @backingInt(args_body[arg_index]);
@@ -265,9 +241,8 @@ fn resolveArg(sema: *Sema, args_body: []const Zir.Inst.Index, explicit_len: u32,
     return try sema.coerceValueToType(raw, param_ty);
 }
 
-/// Emit `len` bytes at the `[*]const u8` `ptr` names to the host `Io`, on the stream `fd` selects
-/// (posix stdout 1, stderr 2). Drops the write when the bytes are out of the reader's reach or no host
-/// Io is set.
+/// Emit `len` bytes at the `[*]const u8` `ptr` names to the host `Io` on the stream `fd` selects. Drops
+/// the write when the bytes are out of the reader's reach or no host Io is set.
 fn write(sema: *Sema, fd_val: Value, ptr: Value, len_val: Value) Sema.Error!void {
     const ip = sema.intern_pool;
     const session = sema.session orelse return;
@@ -280,8 +255,8 @@ fn write(sema: *Sema, fd_val: Value, ptr: Value, len_val: Value) Sema.Error!void
 }
 
 /// The host `File` a descriptor names: 0/1/2 are the standard streams; higher descriptors index the
-/// session's open-file table. Null for an out-of-range or already-closed opened-file descriptor, so a
-/// read/write to it is dropped rather than crashing (using a stale descriptor is an error, not a bug).
+/// session's open-file table. Null for an out-of-range or closed descriptor, so a read/write to it is
+/// dropped rather than crashing (a stale descriptor is a caller error, not a bug).
 fn hostFile(session: *Session, fd: u64) ?std.Io.File {
     if (fd < first_file_fd) return streamFile(fd);
     const descriptor = fd - first_file_fd;
@@ -289,9 +264,9 @@ fn hostFile(session: *Session, fd: u64) ?std.Io.File {
     return session.runtime.open_files.items[@intCast(descriptor)];
 }
 
-/// The `File` for a standard-stream descriptor (posix stdin 0 / stdout 1 / stderr 2), routed by the host
-/// Io. On freestanding the handle type is `void` and the host Io (a `WriterIo`) ignores it, so a
-/// void-handle file stands in; elsewhere the descriptor is the real one the host Io dispatches on.
+/// The `File` for a standard-stream descriptor, routed by the host Io. On freestanding the handle type is
+/// `void` and the host Io (a `WriterIo`) ignores it, so a void-handle file stands in; elsewhere the
+/// descriptor is the real one the host Io dispatches on.
 fn streamFile(fd: u64) std.Io.File {
     return switch (@import("builtin").target.os.tag) {
         .freestanding => .{ .handle = {}, .flags = .{ .nonblocking = false } },
@@ -304,10 +279,9 @@ const PtrBacking = struct {
     start: u64,
 };
 
-/// The backing aggregate and start element a `[*]const u8`/`[]const u8` points at, following the bases
-/// the reader can reach. Mirrors the render module's `ptrBacking`, plus the `comptime_alloc` base a
-/// runtime-mutated buffer (the intrinsic `Io`'s writer buffer) resolves to -- that one needs `sema` to
-/// read the alloc's live value, so this takes `sema` rather than a bare pool.
+/// The backing aggregate and start element a `[*]const u8`/`[]const u8` points at. Mirrors the render
+/// module's `ptrBacking`, plus the `comptime_alloc` base a runtime-mutated buffer resolves to -- that one
+/// needs `sema` to read the alloc's live value, so this takes `sema` rather than a bare pool.
 fn ptrBacking(sema: *Sema, ptr_index: InternPool.Index) Sema.Error!?PtrBacking {
     const ip = sema.intern_pool;
     if (ip.indexToKey(ptr_index) != .ptr) return null;
@@ -387,9 +361,8 @@ fn rebaseTo(
     return try ip.internPtr(.{ .ty = ptr.ty, .base_addr = base_addr, .byte_offset = ptr.byte_offset });
 }
 
-/// Retarget a pointer for a runtime load onto a read-only view of the mutable global's current value.
-/// Null when the interpreter cannot perform the load, so the caller reports it. A load only reads, so
-/// no alloc is needed.
+/// Retarget a pointer for a runtime load onto a read-only view of the mutable global's current value
+/// (no alloc, since a load only reads). Null when the interpreter cannot perform the load.
 pub fn retargetLoad(sema: *Sema, ptr: Value) Sema.Error!?Value {
     const ip = sema.intern_pool;
     const nav_id = navRoot(ip, ptr.index) orelse return null;

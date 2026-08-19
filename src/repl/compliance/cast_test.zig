@@ -54,8 +54,7 @@ test "compliance: int/float casts and coercions" {
         .{ .src = &.{"@as(u8, @truncate(@as(u32, 0x1234)))"}, .want = compliance.want(@as(u8, @truncate(@as(u32, 0x1234)))) },
         .{ .src = &.{"@as(u32, @bitCast(@as(f32, 1.5)))"}, .want = compliance.want(@as(u32, @bitCast(@as(f32, 1.5)))) },
         .{ .src = &.{"@as(u8, @bitCast(@as(i8, -1)))"}, .want = compliance.want(@as(u8, @bitCast(@as(i8, -1)))) },
-        // @bitCast to/from a vector routes through the packed-memory serializer: int -> vector reads each
-        // element out of the backing bits, and the round-trip writes them back.
+        // @bitCast to/from a vector routes through the packed-memory serializer.
         .{ .src = &.{"@as(@Vector(4, u8), @bitCast(@as(u32, 0x04030201)))"}, .want = compliance.want(@as(@Vector(4, u8), @bitCast(@as(u32, 0x04030201)))) },
         .{ .src = &.{"@as(u32, @bitCast(@as(@Vector(4, u8), @bitCast(@as(u32, 0x04030201)))))"}, .want = compliance.want(@as(u32, @bitCast(@as(@Vector(4, u8), @bitCast(@as(u32, 0x04030201)))))) },
         .{ .src = &.{"@as(usize, 100) + 1"}, .want = compliance.want(@as(usize, 100) + 1) },
@@ -135,7 +134,6 @@ test "compliance: bit_not and negate" {
     try compliance.check(a, &.{
         .{ .src = &.{"~@as(u8, 5)"}, .want = compliance.want(~@as(u8, 5)) },
         .{ .src = &.{"~@as(i32, 100)"}, .want = compliance.want(~@as(i32, 100)) },
-        // bit_not on a bool and element-wise on a vector, via arith.bitwiseNot.
         .{ .src = &.{"~true"}, .want = compliance.want(~true) },
         .{ .src = &.{"~@as(@Vector(2, u8), .{ 1, 254 })"}, .want = compliance.want(~@as(@Vector(2, u8), .{ 1, 254 })) },
         .{ .src = &.{"-%@as(i8, -128)"}, .want = compliance.want(-%@as(i8, -128)) },

@@ -2,8 +2,6 @@
 
 const Theme = @import("../Theme.zig");
 
-/// Mocha Mauve (#CBA6F7) at each tier: exact truecolor, nearest 256-palette
-/// entry, then 16-color bright magenta.
 const mocha_mauve: Theme.Color = .{
     .rgb = .{ .r = 203, .g = 166, .b = 247 },
     .truecolor = "\x1b[38;2;203;166;247m",

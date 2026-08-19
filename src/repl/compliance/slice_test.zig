@@ -195,7 +195,6 @@ test "compliance: slicing an array pointer yields a pointer-to-array" {
         .{ .src = &.{"(&[_]i32{ 1, 2, 3, 4, 5 })[1..3].*"}, .want = compliance.want((&[_]i32{ 1, 2, 3, 4, 5 })[1..3].*) },
         .{ .src = &.{"(&[_]i32{ 1, 2, 3, 4, 5 })[1..3 :4].*"}, .want = compliance.want((&[_]i32{ 1, 2, 3, 4, 5 })[1..3 :4].*) },
         .{ .src = &.{"(&[_]i32{ 1, 2, 3, 4, 5 })[1..][0..2].*"}, .want = compliance.want((&[_]i32{ 1, 2, 3, 4, 5 })[1..][0..2].*) },
-        // A `[3]u8` value renders as a string, not `{any}`'s byte list.
         .{ .src = &.{"\"hello\"[1..4].*"}, .rendered = "\"ell\".*" },
         .{ .src = &.{"blk: { const s: []const i32 = &.{ 1, 2, 3, 4 }; break :blk s[1..3].*; }"}, .want = compliance.want(blk: {
             const s: []const i32 = &.{ 1, 2, 3, 4 };

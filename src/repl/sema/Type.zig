@@ -614,7 +614,7 @@ pub fn toIndex(ty: Type) InternPool.Index {
     return ty.index;
 }
 
-/// Returns the field type. Supports tuples, structs, and unions.
+/// Supports tuples, structs, and unions.
 pub fn fieldType(ty: Type, index: usize, pool: *const InternPool) Type {
     const types = switch (pool.indexToKey(ty.index)) {
         .struct_type => types: {
@@ -631,9 +631,7 @@ pub fn fieldType(ty: Type, index: usize, pool: *const InternPool) Type {
     return .fromIndex(types[index]);
 }
 
-/// If an alignment was explicitly specified for the given field of the struct or union type `ty`,
-/// returns that. Otherwise, returns `.none`. This function also supports tuples, for which it
-/// always returns `.none`.
+/// Explicit field alignment, or `.none` when unspecified. Tuples always return `.none`.
 pub fn explicitFieldAlignment(ty: Type, index: usize, pool: *const InternPool) InternPool.Alignment {
     return switch (pool.indexToKey(ty.index)) {
         .tuple_type => .none,
@@ -708,7 +706,7 @@ pub fn structPackedFieldBitOffset(struct_type: InternPool.LoadedStructType, fiel
         const field_ty: Type = .fromIndex(struct_type.field_types[i]);
         bit_sum += field_ty.bitSize(pool);
     }
-    unreachable; // index out of bounds
+    unreachable;
 }
 
 pub fn fieldPtrType(ptr_ty: Type, field_index: u32, pool: *InternPool) std.mem.Allocator.Error!Type {
@@ -874,7 +872,7 @@ pub fn structFieldDefaultValue(ty: Type, index: usize, pool: *const InternPool) 
 }
 
 /// The comptime-known value of struct/tuple field `index`, if the field is comptime or its type has
-/// one possible value; null for a runtime field. Mirrors the compiler's Type.structFieldValueComptime.
+/// one possible value; null for a runtime field.
 pub fn structFieldValueComptime(ty: Type, sema: *Sema, index: usize) Sema.Error!?Value {
     const pool = sema.intern_pool;
     switch (pool.indexToKey(ty.index)) {
@@ -1384,8 +1382,8 @@ pub fn unionTagTypeHypothetical(ty: Type, pool: *const InternPool) Type {
 }
 
 /// The payload type of the union field selected by `enum_tag`, or null if the tag names no field.
-/// Mirrors the compiler's `Type.unionFieldType`; the tag enum type is read from the tag value (the
-/// REPL's union stores `.none` for it until resolved), not from `loaded_union.enum_tag_type`.
+/// The tag enum type is read from the tag value (the REPL's union stores `.none` for it until
+/// resolved), not from `loaded_union.enum_tag_type`.
 pub fn unionFieldType(ty: Type, enum_tag: Value, pool: *const InternPool) ?Type {
     pool.assertLayoutResolved(ty.index);
     if (enum_tag.index == .none) return null;

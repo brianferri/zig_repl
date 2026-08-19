@@ -1,31 +1,6 @@
-//! Filters AstGen's compile-error stream against a REPL-specific
-//! suppression criterion. The compiler treats `var x = 7;` with no
-//! syntactic mutation as a hard error ("local variable is never
-//! mutated", from `std.zig.AstGen`) to push users toward
-//! `const`. For a REPL that is *advisory*: mutability is a Sema-time
-//! concern enforced by `evalStoreNode`'s `is_const` check against the
-//! pointer type, not a parsing concern. Surfacing the warning would
-//! block one-shot lines like `var x: u8 = 7; break :blk x;` for no
-//! semantic reason.
-//!
-//! Suppression keys on the AST shape of the error anchor, not the
-//! message text:
-//!
-//!   * AstGen anchors `local_var_*` advisories on the var's name
-//!     identifier token (`s.token_src = name_token` in `std.zig.AstGen`).
-//!   * In Zig grammar, an identifier token is preceded by
-//!     `keyword_var` exactly when it is the name in a `var_decl`.
-//!     No other production places those tokens adjacent.
-//!
-//! So `tree.tokenTag(token-1) == .keyword_var` is a structural
-//! fingerprint for "this diagnostic anchors on a var-decl name" --
-//! insensitive to AstGen rewording, sensitive only to grammar shape.
-//!
-//! All wrap-shape knowledge -- where the user's text begins, which
-//! spans anchor in synthesized wrap-injection bytes -- lives in
-//! `Pipeline.UserView`. This module asks `view.translate(span)` and
-//! drops or emits based on the answer, never inspecting wrap
-//! offsets directly.
+//! Drops AstGen's never-mutated / unused-local advisories, which are style guidance a REPL has no
+//! use for (they would block one-shot lines like `var x: u8 = 7; break :blk x;`). Suppression keys
+//! on the AST shape of the error anchor, not the message text, so AstGen rewording cannot break it.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -35,14 +10,9 @@ const ErrorBundle = std.zig.ErrorBundle;
 const Ast = std.zig.Ast;
 const Pipeline = @import("Pipeline.zig");
 
-/// True if `item` is a REPL-advisory diagnostic we drop: any error
-/// anchored on a var-decl name identifier (covers both "local variable
-/// is never mutated" and "unused local variable" -- both are style
-/// guidance the REPL has no use for).
+/// True if `item` is an advisory we drop: any error anchored on a var-decl name identifier.
 fn isSuppressed(zir: Zir, tree: Ast, item: Zir.Inst.CompileErrors.Item) bool {
-    // Suppression exists to let analysis proceed past a benign error. A ZIR with
-    // no instructions has no root to analyse, so whatever error AstGen recorded is
-    // fatal -- surface it rather than swallow it into an empty, unanalysable ZIR.
+    // A ZIR with no instructions has no root to analyse, so its error is fatal -- surface it.
     if (zir.instructions.len == 0) return false;
     const opt_token = item.token.unwrap() orelse return false;
     if (opt_token == 0) return false;
@@ -50,9 +20,7 @@ fn isSuppressed(zir: Zir, tree: Ast, item: Zir.Inst.CompileErrors.Item) bool {
     return tree.tokenTag(opt_token - 1) == .keyword_var;
 }
 
-/// Count of compile-error items that survive the suppression filter.
-/// Zero means the REPL can proceed to Sema even though
-/// `zir.hasCompileErrors()` reports `true`.
+/// Count of compile-error items surviving the suppression filter; zero means the REPL may proceed to Sema.
 pub fn countActionable(zir: Zir, tree: Ast) u32 {
     const payload_index = zir.extra[@backingInt(Zir.ExtraIndex.compile_errors)];
     if (payload_index == 0) return 0;
@@ -68,13 +36,7 @@ pub fn countActionable(zir: Zir, tree: Ast) u32 {
     return actionable;
 }
 
-/// Render only the actionable compile errors to `writer` via an
-/// `ErrorBundle.Wip`, skipping suppressed items entirely so they
-/// neither block nor surface.
-///
-/// `view` provides the user-frame translation: all wrap-shape
-/// knowledge (where the user's text starts inside the wrapped
-/// source, which spans anchor in injection bytes) lives there.
+/// Render only the actionable compile errors to `writer`, skipping suppressed items.
 pub fn renderActionable(
     gpa: std.mem.Allocator,
     zir: Zir,
@@ -107,9 +69,7 @@ pub fn renderActionable(
     return bundle.errorMessageCount();
 }
 
-/// An item whose span anchors entirely in the injection prefix is
-/// dropped (`view.translate` returns null) -- the main error message
-/// has no place to render in the user's frame.
+/// An item anchoring entirely in the injection prefix is dropped: it has no place in the user's frame.
 fn appendItem(
     wip: *ErrorBundle.Wip,
     zir: Zir,

@@ -20,8 +20,6 @@ pub fn command(comptime Ctx: type) Command(Ctx) {
         .summary = "Dump AST + ZIR for an expression: :dump <expr>",
         .run = struct {
             fn run(ctx: Ctx, _: []const Command(Ctx), argument: []const u8, stdout: *std.Io.Writer) anyerror!void {
-                // The wasm frontend passes the session directly; the TTY
-                // frontend passes its `*Repl`, which holds one.
                 const session: *Session = if (Ctx == *Session) ctx else ctx.session;
                 assert(@intFromPtr(session) != 0);
                 assert(@intFromPtr(stdout) != 0);
@@ -32,13 +30,9 @@ pub fn command(comptime Ctx: type) Command(Ctx) {
                     return;
                 }
 
-                // Route through the same splitter the evaluator uses so
-                // `:dump` of a mixed input (declarations + a trailing
-                // expression) shows what the REPL would actually run -- two
-                // passes -- rather than wrapping it as one file and reporting
-                // the spurious "file cannot be a tuple". Each segment is dumped
-                // on its own; the expression segment is shown in isolation (the
-                // declarations are not persisted by `:dump`).
+                // Route through the same splitter the evaluator uses, so a
+                // mixed input dumps as the two passes the REPL would run rather
+                // than wrapping it as one file and reporting "file cannot be a tuple".
                 if (try InputShape.splitTrailingExpr(session.gpa, trimmed)) |split| {
                     try stdout.writeAll("=== declarations ===\n");
                     try dumpInput(session, split.decls, stdout);
@@ -71,9 +65,8 @@ fn dumpInput(session: *Session, input: []const u8, stdout: *std.Io.Writer) !void
         return;
     }
     try dumpAst(result.tree, stdout);
-    // A failed AstGen emits error-ZIR with no instructions; walking it
-    // (typeDecls reads the root container at index 0) would panic. Mirror
-    // the eval path and surface the compile errors instead.
+    // Error-ZIR has no instructions; walking it would panic, so surface the
+    // compile errors instead (mirrors the eval path).
     if (result.hasZirErrors()) {
         return Diagnostic.renderZirErrors(
             session.gpa,
@@ -130,13 +123,9 @@ fn dumpZir(zir: Zir, stdout: *std.Io.Writer) !void {
         zir.string_bytes.len,
     });
 
-    // A failed AstGen produces error-ZIR with no instructions, so the
-    // root container `typeDecls` reads at index 0 is absent and the walk
-    // would index out of bounds. Compile errors can be present yet
-    // suppressed (so the caller's `hasZirErrors` gate lets them through,
-    // matching `Sema.analyze`), so guard on the instruction list rather
-    // than the error flag -- a user typo must surface as the rendered
-    // diagnostic, never a panic.
+    // Error-ZIR has no instructions, so the root container the walk reads at
+    // index 0 is absent; guard on the instruction list (compile errors can be
+    // suppressed, so the error flag alone would let a walk-then-panic through).
     if (zir.instructions.len == 0) return;
 
     var sink: TextSink = .{ .zir = zir, .stdout = stdout };

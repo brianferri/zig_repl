@@ -1,7 +1,5 @@
-//! A host `Io` backed by a `std.Io.Writer`: its stderr write path routes to the writer, its clock reads
-//! zero, and every other slot fails via `Io.failing`. A frontend without a real OS `Io` (freestanding
-//! wasm) and tests capturing evaluated output use it as `session.runtime.io`, so `std.debug.print` and
-//! the other write leaves land in a buffer instead of a file descriptor.
+//! A host `Io` whose write path routes to a `std.Io.Writer` and whose other slots fail via `Io.failing`,
+//! for a frontend without an OS `Io` (freestanding wasm) and for tests capturing evaluated output.
 
 const std = @import("std");
 const Io = std.Io;

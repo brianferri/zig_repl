@@ -1,12 +1,9 @@
-//! Wasm frontend entry: a line-in / text-out REPL the browser drives. The
-//! host writes an input line into wasm memory, calls `replEval`, then reads
-//! the rendered output back out -- there is no terminal, no `LineEditor` (the
-//! page's input box does the editing). It builds on the `repl` core module and
-//! the `drivers_wasm` driver, neither of which pulls in the posix tty stack.
+//! Wasm frontend entry: a line-in / text-out REPL the browser drives -- the host
+//! writes an input line into wasm memory, calls `replEval`, and reads the rendered
+//! output back out. Builds on `repl` + `drivers_wasm`, neither pulling the tty stack.
 //!
-//! Reentrancy: the page calls `replEval` once per submitted line. The result
-//! buffer is a module global, reset at the start of each call and read via
-//! `replResultPtr` / `replResultLen` before the next.
+//! Reentrancy: the result buffer is a module global, reset at the start of each
+//! call and read via `replResultPtr`/`replResultLen` before the next.
 
 const std = @import("std");
 const repl = @import("repl");
@@ -23,9 +20,8 @@ const Commands = drivers_wasm.commands;
 const LineInput = drivers_wasm.LineInput;
 const themes = drivers_wasm.themes;
 
-// `wasm_allocator` requires the module be single-threaded (build.zig sets
-// it); it grows linear memory as needed, which detaches the host's view of
-// `memory.buffer` -- the page re-reads it after every call that allocates.
+// `wasm_allocator` grows linear memory as needed, which detaches the host's view of
+// `memory.buffer`; the page re-reads it after every call that allocates.
 const gpa = std.heap.wasm_allocator;
 
 // The standard library, gzip-tarred into the binary by `build.zig`. Freestanding
@@ -59,8 +55,7 @@ export fn replInit() bool {
     project = repl.module.Layered.init(&vfs.interface, &module_source.interface);
     session.module_source = &project.interface;
     output = .init(gpa);
-    // The single host Io the interpreter routes every runtime leaf through; its stderr writes land in
-    // `output`, so evaluated `std.debug.print` appears inline with rendered values. Installing it also
+    // Route every runtime leaf through this host Io; its stderr lands in `output` and
     // bypasses the freestanding posix stack the default debug writer would reach.
     host_io = .{ .writer = &output.writer };
     session.runtime.io = host_io.io();
@@ -129,8 +124,7 @@ export fn replInputSubmittedPtr() [*]const u8 {
 }
 
 /// Write the registered themes as JSON into the result buffer, so a graphical
-/// frontend paints its surfaces and prompt from the same registry the tty draws
-/// from.
+/// frontend paints its surfaces and prompt from the same registry the tty draws from.
 export fn replThemes() void {
     if (!ready and !replInit()) return;
     output.clearRetainingCapacity();
@@ -151,10 +145,8 @@ fn writeThemesJson(w: *std.Io.Writer) !void {
     try std.json.Stringify.value(entries[0..], .{}, w);
 }
 
-// The page can submit any number of bytes, but the interpreter asserts an input
-// fits `max_input_bytes` as an internal precondition. Reject an over-long line at
-// this untrusted boundary so a large paste is a message, not a trap that kills the
-// module for the rest of the session.
+// The interpreter asserts an input fits `max_input_bytes`; reject an over-long line
+// at this untrusted boundary so a large paste is a message, not a module-killing trap.
 fn overLength(input: []const u8) bool {
     return input.len > InputShape.max_input_bytes;
 }
@@ -204,9 +196,8 @@ fn preview(input: []const u8) !void {
     preview_session.runtime.io = session.runtime.io;
     defer preview_session.deinit();
 
-    // For "declarations; trailing expression", bind the declarations into
-    // the throwaway session first so the trailing expression resolves them.
-    // The lone-segment case (pure expression or pure declarations) runs as-is.
+    // Bind the declarations first so the trailing expression resolves them; a lone
+    // segment (pure expression or pure declarations) runs as-is.
     var expr = trimmed;
     if (try InputShape.splitTrailingExpr(gpa, trimmed)) |split| {
         _ = eval.run(&preview_session, split.decls, w) catch |err| switch (err) {
@@ -234,8 +225,7 @@ fn preview(input: []const u8) !void {
 /// Emit the source-mapped lowering of `input` as JSON for the explorer:
 /// `{ source, ast, zir }`, each AST node / ZIR instruction carrying the
 /// user-text byte range it came from. Runs in a throwaway session;
-/// declarations and a trailing expression are outlined together (see
-/// `outline.writeJson`).
+/// declarations and a trailing expression are outlined together (see `outline.writeJson`).
 export fn replOutline(ptr: [*]u8, len: usize) void {
     if (!ready and !replInit()) return;
     defer gpa.free(ptr[0..len]);

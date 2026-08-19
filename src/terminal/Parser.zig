@@ -1,18 +1,7 @@
-//! Stateless byte-stream classifier. ECMA-48 escape framing only:
-//!
-//!   non-ESC byte               -> Token.ground
-//!   ESC alone (no follow-on)   -> Token.bare_escape
-//!   ESC <printable c>          -> Token.escape_alt(c)   (xterm Alt+c)
-//!   ESC <introducer> ...       -> dispatched to a registered Standard
-//!
-//! Each per-standard wire form (CSI, SS3, OSC, DCS, ...) lives in
-//! its own file under `standard/`. This file is the registry +
-//! dispatch shell -- adding a new standard means dropping a sibling
-//! file and appending one entry to `standards`.
-//!
-//! Stateless across calls: each `parse` invocation gets the whole
-//! pending buffer and decides. The caller buffers more bytes on
-//! incomplete (`null token`, `consumed = 0`) and re-calls.
+//! Stateless ECMA-48 escape-framing classifier: dispatches the byte after ESC
+//! to a registered Standard, else yields ground / bare_escape / escape_alt.
+//! Each call gets the whole pending buffer; on incomplete input (`null` token,
+//! `consumed = 0`) the caller buffers more and re-calls.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -46,22 +35,18 @@ pub fn parse(input: []const u8) Result {
     if (input[0] != 0x1b) {
         return .{ .token = .{ .ground = input[0] }, .consumed = 1 };
     }
-    // Lone ESC with no follow-on yet: surface bare_escape so an
-    // Esc keypress without follow-on bytes doesn't block forever.
+    // Surface a lone ESC so an Esc keypress doesn't block forever.
     if (input.len == 1) {
         return .{ .token = .bare_escape, .consumed = 1 };
     }
     for (standards) |s| {
         if (s.introducer == input[1]) return s.parse(input);
     }
-    // ESC <printable> -- xterm Alt+<c> encoding. The skip range
-    // excludes the introducer bytes already dispatched above.
+    // ESC <printable> -- xterm Alt+<c>; introducer bytes already dispatched above.
     if (input[1] >= 0x20 and input[1] <= 0x7E) {
         return .{ .token = .{ .escape_alt = input[1] }, .consumed = 2 };
     }
-    // Anything else after ESC: swallow as bare_escape so the
-    // editor keeps making progress instead of hanging on malformed
-    // wire input.
+    // Malformed: swallow so the editor keeps making progress.
     return .{ .token = .bare_escape, .consumed = 1 };
 }
 

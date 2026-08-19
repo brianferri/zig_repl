@@ -7,18 +7,14 @@ const ZirErrors = @import("../front/ZirErrors.zig");
 const max_renderable_parse_errors: u32 = 64;
 pub const repl_source_path: []const u8 = "<repl>";
 
-/// A sub-note on a Sema error: the compiler's `ErrorMsg.notes`, each already
-/// resolved to an absolute AST node by the driver (which holds the ZIR).
+/// A sub-note on a Sema error, resolved by the driver to an absolute AST node.
 pub const Note = struct {
     node: std.zig.Ast.Node.Index,
     msg: []const u8,
 };
 
-/// Render a Sema error anchored at `node`, with its `notes`, through the same
-/// `std.zig.ErrorBundle` path the compiler and `ZirErrors` use, so the source line
-/// + caret + `note:` lines match std's output exactly. A node that anchors entirely
-/// in the injected wrap prefix (`view.translate` returns null) is emitted without a
-/// source location.
+/// Render a Sema error anchored at `node`, with its `notes`, through `std.zig.ErrorBundle` so output
+/// matches std's exactly. A node anchoring entirely in the wrap prefix is emitted without a location.
 pub fn renderSemaError(
     gpa: std.mem.Allocator,
     src_path: []const u8,
@@ -76,19 +72,9 @@ fn sourceLocation(
     });
 }
 
-/// Render parse errors with positions translated into the user's
-/// coordinate frame.
-///
-/// The Ast is parsed against the wrapped source (the expression shape wraps
-/// `<user>` in a function body binding it), so a token's column inside
-/// the wrap leaks the prefix bytes into the diagnostic. The
-/// translation is essentially free: `std.zig.Ast.tokenLocation`
-/// takes a `start_offset` parameter to begin line/column counting
-/// from. Pass `view.offset_in_source` and the returned `Location`
-/// already lives in the user's frame -- multi-line-safe because
-/// tokenLocation walks newlines itself. When the offending token
-/// lands in the suffix wrap we substitute a clean "unexpected end of
-/// input" message instead of `renderError`'s `, found ')'`.
+/// Render parse errors with positions translated into the user's coordinate frame:
+/// `tokenLocation` counts line/column from `view.offset_in_source`, past the wrap prefix. A token
+/// landing in the suffix wrap gets a clean "unexpected end of input" instead of `, found ')'`.
 pub fn renderParseErrors(
     tree: std.zig.Ast,
     view: Pipeline.UserView,
@@ -105,12 +91,7 @@ pub fn renderParseErrors(
             try writer.writeAll("... further parse errors elided\n");
             break;
         }
-        // Cascade suppression: when the parser fires multiple errors
-        // anchored at the same byte, only the first is the root
-        // cause; the rest are recovery noise (often referencing the
-        // wrapper's `)` for expression shape). One error per
-        // position keeps the stream focused on what the user can act
-        // on.
+        // Multiple errors at the same byte are recovery noise; only the first is the root cause.
         const token_offset = tree.tokenStart(parse_error.token);
         if (last_token_offset) |prev| {
             if (prev == token_offset) continue;
@@ -148,11 +129,8 @@ fn renderOneParseError(
     try writer.writeAll("\n");
 }
 
-/// Render ZIR errors via `ZirErrors.renderActionable`. When every
-/// diagnostic anchors on a wrap-injected line (cross-line rebind
-/// is the canonical case), `renderActionable` emits nothing -- so
-/// surface a fallback line, otherwise the user sees a silent
-/// success indistinguishable from a clean declaration.
+/// Render ZIR errors via `ZirErrors.renderActionable`. When every diagnostic anchors on a
+/// wrap-injected line it emits nothing, so surface a fallback rather than a silent success.
 pub fn renderZirErrors(
     gpa: std.mem.Allocator,
     zir: std.zig.Zir,

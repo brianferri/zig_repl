@@ -14,8 +14,8 @@ pub const themes = [_]*const Theme{
 
 pub const default = themes[0];
 
-/// Write every registered theme name to `w`, colored to `level` and
-/// comma-separated. The caller supplies any surrounding label and newline.
+/// Write every registered theme name, colored and comma-separated. The
+/// caller supplies any surrounding label and newline.
 pub fn writeList(w: *std.Io.Writer, level: ColorLevel) !void {
     for (themes, 0..) |theme, i| {
         if (i != 0) try w.writeAll(", ");

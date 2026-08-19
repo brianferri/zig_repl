@@ -1,13 +1,5 @@
-//! OSC (Operating System Command) parser. ECMA-48 sec 5.5. Wire
-//! form:
-//!
-//!   ESC ] <payload> ST
-//!
-//! Where ST is either `ESC \` (true String Terminator) or BEL
-//! (0x07, xterm's de-facto alternate terminator). The payload is
-//! returned verbatim; classification of well-known prefixes
-//! (e.g. `52;c;...` clipboard, `0;...` title) is the consumer's
-//! concern.
+//! OSC (Operating System Command) parser, `ESC ] <payload> ST` (ECMA-48 sec 5.5),
+//! where ST is `ESC \` or BEL (0x07, xterm's alternate). Payload returned verbatim.
 
 const std = @import("std");
 const assert = std.debug.assert;

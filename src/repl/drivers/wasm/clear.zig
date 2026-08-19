@@ -5,9 +5,7 @@ const std = @import("std");
 
 const Command = @import("repl").commands.Command;
 
-/// Provided by the page's import object (`env.replClearOutput`): clears the
-/// scrolling output element. The wasm side only signals intent; the DOM
-/// mutation is the host's.
+/// Provided by the page's import object; clears the scrolling output element.
 extern "env" fn replClearOutput() void;
 
 pub fn command(comptime Ctx: type) Command(Ctx) {

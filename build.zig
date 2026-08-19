@@ -180,9 +180,7 @@ pub fn build(b: *std.Build) void {
     // `repl` (exe/tty/docs) never carries a build-machine path.
     const test_options = b.addOptions();
     test_options.addOption([]const u8, "zig_std_dir", zigStdDir(b));
-    // Knobs for the randomized stress suite (src/fuzz). Deterministic per
-    // seed, so a failure reproduces with the same `-Dfuzz-seed`; `-Dfuzz-iterations`
-    // scales a run from a quick pass to an overnight soak.
+    // Knobs for the randomized stress suite (src/fuzz).
     test_options.addOption(usize, "fuzz_iterations", b.option(usize, "fuzz-iterations", "Randomized stress iterations (default 256; raise for a real fuzzing run)") orelse 256);
     test_options.addOption(u64, "fuzz_seed", b.option(u64, "fuzz-seed", "Seed for the randomized stress suite (default 0)") orelse 0);
     test_options.addOption(bool, "reject_oracle", b.option(bool, "reject-oracle", "Cross-check every .reject compliance case against the real zig compiler") orelse false);
@@ -207,10 +205,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(terminal_tests).step);
     test_step.dependOn(&b.addRunArtifact(editor_tests).step);
 
-    // The fuzz suite is a standalone module that imports `repl` by name, so it is fully decoupled
-    // from the interpreter's internals. It holds a `std.testing.fuzz` target (coverage-guided when
-    // driven by `zig build fuzz --fuzz`) plus a deterministic corpus-mutation stress loop scaled by
-    // `-Dfuzz-iterations` and reproduced with `-Dfuzz-seed`.
+    // Standalone fuzz module; imports `repl` by name (see src/fuzz).
     const fuzz_module = b.createModule(.{
         .root_source_file = b.path("src/fuzz/root.zig"),
         .target = target,

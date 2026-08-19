@@ -1,8 +1,6 @@
-//! An `Fs` that stacks a writable `primary` over a read-only `fallback`: a read
-//! tries the project layer, then the standard library beneath it, so a user's
-//! files and `std` resolve through one filesystem with the user's files
-//! shadowing. Listing and every mutation act on `primary` alone -- the standard
-//! library is not part of the editable tree.
+//! An `Fs` that stacks a writable `primary` over a read-only `fallback`: a read tries `primary`, then
+//! `fallback`, so a project's files and `std` resolve through one filesystem with the project shadowing.
+//! Listing and every mutation act on `primary` alone.
 
 const std = @import("std");
 const Fs = @import("Fs.zig");
@@ -73,12 +71,10 @@ test "reads fall through to the fallback; writes and listing stay on the primary
     defer gpa.free(main);
     try testing.expectEqualStrings("const x = 1;", main);
 
-    // A miss in the project resolves through the fallback.
     const std_bytes = try layered.interface.read(gpa, "std.zig");
     defer gpa.free(std_bytes);
     try testing.expectEqualStrings("pub const std = {};", std_bytes);
 
-    // Listing shows only the project, never the standard library beneath it.
     const names = try layered.interface.list(gpa);
     defer Fs.freeList(gpa, names);
     try testing.expectEqual(@as(usize, 1), names.len);

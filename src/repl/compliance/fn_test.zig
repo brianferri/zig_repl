@@ -90,8 +90,7 @@ test "compliance: function calls resolve same-input and cross-line" {
 }
 
 test "compliance: a call resolves a fn-pointer field, binding no receiver" {
-    // `x.f(args)` where `f` is a field holding a callable (a vtable-style fn pointer) calls the
-    // field, not a method -- the mechanism the std `Io` interface dispatches through.
+    // `x.f(args)` where `f` holds a callable calls the field, not a method -- the std `Io` dispatch mechanism.
     try compliance.check(a, &.{
         .{ .src = &.{"blk: { const S = struct { f: *const fn (u8) u8 }; const s: S = .{ .f = struct { fn dbl(x: u8) u8 { return x *% 2; } }.dbl }; break :blk s.f(3); }"}, .want = compliance.want(blk: {
             const S = struct { f: *const fn (u8) u8 };
@@ -112,8 +111,7 @@ test "compliance: a call resolves a fn-pointer field, binding no receiver" {
             const p = &s;
             break :blk p.f(3);
         }) },
-        // A `comptime` field holding a callable binds through the comptime-field value directly,
-        // not through a materialized field pointer.
+        // A `comptime` field binds through the comptime-field value directly, not a materialized field pointer.
         .{ .src = &.{"blk: { const S = struct { comptime f: *const fn (u8) u8 = struct { fn dbl(x: u8) u8 { return x *% 2; } }.dbl }; const s: S = .{}; break :blk s.f(21); }"}, .want = compliance.want(blk: {
             const S = struct {
                 comptime f: *const fn (u8) u8 = struct {
@@ -203,7 +201,7 @@ test "compliance: a later arg's result type resolves from an earlier comptime pa
         }) },
         .{ .src = &.{ "const std = @import(\"std\");", "std.math.log2(@as(u32, 48))" }, .want = compliance.want(std.math.log2(@as(u32, 48))) },
         .{ .src = &.{ "const std = @import(\"std\");", "std.math.gcd(@as(u32, 48), 36)" }, .want = compliance.want(std.math.gcd(@as(u32, 48), 36)) },
-        // A comptime-only arg to an anytype param stays comptime-known, so u16 + (comptime int) peers.
+        // A comptime-only arg to an anytype param stays comptime-known, so it peers with a runtime int.
         .{ .src = &.{ "const std = @import(\"std\");", "std.math.IntFittingRange(0, 48)" }, .want = compliance.want(std.math.IntFittingRange(0, 48)) },
         // Reflecting a runtime param's type (@sizeOf of @TypeOf) yields a comptime-known
         // comptime_int, so it peers with a concrete int instead of reading as runtime.

@@ -1,11 +1,6 @@
-//! An `Fs` leaf backed by a real directory: each path is read, written, and
-//! listed as a file under `root`. Both the `Io` and the root directory are
-//! supplied by the frontend (the core never opens either itself), so the
-//! filesystem dependency stays at the edge. `Layered` stacks a project root over
-//! the standard-library root; freestanding wasm has no directory and uses `Vfs`.
-//!
-//! `list` recurses, so `root` must be opened with `OpenOptions.iterate` when the
-//! caller intends to enumerate it (the standard-library root need not be).
+//! An `Fs` leaf backed by a real directory: each path is read, written, and listed under `root`. Both
+//! the `Io` and the root directory are supplied by the frontend, so the filesystem dependency stays at
+//! the edge. `root` must be opened with `OpenOptions.iterate` for a caller that intends to `list` it.
 
 const std = @import("std");
 const Fs = @import("Fs.zig");
@@ -13,13 +8,13 @@ const Fs = @import("Fs.zig");
 const Native = @This();
 
 io: std.Io,
-/// The root every path resolves against -- the standard-library directory for
-/// the std layer (`zig env`'s `std_dir`), the working directory for a project.
+/// The root every path resolves against -- the std directory (`zig env`'s `std_dir`) for the std layer,
+/// the working directory for a project.
 root: std.Io.Dir,
 interface: Fs = .{ .vtable = &vtable },
 
-/// A file larger than this is treated as unreadable rather than exhausting
-/// memory; source files sit far below it.
+/// A file larger than this is treated as unreadable rather than exhausting memory; source files sit far
+/// below it.
 const max_bytes: std.Io.Limit = .limited(4 * 1024 * 1024);
 
 const vtable: Fs.VTable = .{

@@ -1,14 +1,9 @@
 //! Raw-mode terminal input stack: negotiates keyboard protocols, parses the
-//! ECMA-48 byte stream, and yields canonical `device.Event`s through the
-//! `device.Device` interface. `Terminal` is the entry point; the `standard/`
-//! and `protocol/` parsers and the `platform/` backends are internal.
-//! Depends only on `std` and the sibling `device/` vocabulary.
+//! ECMA-48 byte stream, and yields canonical `device.Event`s.
 
 pub const Terminal = @import("Terminal.zig");
 
-// The parser and the legacy Xterm keyboard protocol, without the platform
-// backends `Terminal` carries -- a frontend that supplies its own byte stream
-// (the wasm REPL) parses it into `device.Event`s with these directly.
+// Exposed for a frontend that supplies its own byte stream (the wasm REPL).
 pub const Parser = @import("Parser.zig");
 pub const Protocol = @import("Protocol.zig");
 pub const Xterm = @import("protocol/Xterm.zig");
@@ -30,8 +25,7 @@ test {
     _ = @import("protocol/Kitty.zig");
     _ = @import("protocol/BracketedPaste.zig");
     _ = @import("terminal_test.zig");
-    // Platform backends import OS-specific headers; pick the one matching
-    // the host so cross-target test runs stay clean.
+    // Only the host's backend compiles; its OS-specific headers won't cross-build.
     _ = switch (@import("builtin").os.tag) {
         .windows => @import("platform/Windows.zig"),
         else => @import("platform/Posix.zig"),

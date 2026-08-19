@@ -1,14 +1,9 @@
-//! Prompt-theme interface. A `Theme` names a set of `Prompt`s drawn in
-//! a `Color`. A theme is a *preference*; the terminal's
-//! `Color.ColorLevel` (a capability) decides how much of its color
-//! actually renders. Instances live one-per-file under `theme/`;
-//! `theme/root.zig` registers them.
+//! Prompt-theme interface. A `Theme` is a *preference*; the terminal's
+//! `Color.ColorLevel` (a capability) decides how much color renders.
 //!
-//! `Prompt` keeps visible width (`width`) separate from emitted bytes
-//! (`write`): cursor positioning reads `width` and never counts the
-//! zero-width SGR escapes `write` emits, so a colored prompt cannot
-//! desync the cursor. The escape forms (`38;2;`, `38;5;`, `3x`) match
-//! ECMA-48 SGR and the de-facto truecolor encoding terminals accept.
+//! `Prompt` keeps visible `width` separate from emitted bytes: cursor
+//! positioning counts `width`, never the zero-width SGR escapes, so a
+//! colored prompt cannot desync the cursor.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -22,17 +17,14 @@ primary: Prompt,
 continuation: Prompt,
 palette: Palette,
 
-/// SGR reset of the foreground only -- leaves any other attributes the
-/// user's terminal set intact, unlike the blanket `\x1b[0m`.
+/// SGR reset of the foreground only, unlike the blanket `\x1b[0m`.
 const reset: []const u8 = "\x1b[39m";
 
-/// A 24-bit color for a non-terminal frontend. The terminal renders through the
-/// SGR sequences on `Color`, so raw RGB carries no escape form.
+/// A 24-bit color for a non-terminal frontend; the terminal renders via `Color`'s SGR sequences.
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
-/// The scheme's surface colors, for a graphical frontend to paint background,
-/// panels, and body text; the terminal draws only the prompt. Role names follow
-/// the Catppuccin convention, darkest surface to lightest.
+/// The scheme's surface colors for a graphical frontend; the terminal draws only
+/// the prompt. Role names follow the Catppuccin convention, darkest to lightest.
 pub const Palette = struct {
     base: Rgb,
     mantle: Rgb,
@@ -44,17 +36,15 @@ pub const Palette = struct {
     overlay: Rgb,
 };
 
-/// A foreground color: its RGB (for a non-terminal frontend), plus one SGR
-/// sequence per capability tier.
+/// A foreground color: RGB plus one SGR sequence per capability tier.
 pub const Color = struct {
     rgb: Rgb,
     truecolor: []const u8,
     palette256: []const u8,
     basic: []const u8,
 
-    /// The SGR sequence for `level`, or "" when uncolored. A colored
-    /// level must resolve to a non-empty sequence: a theme that left a
-    /// tier blank is a construction bug, not a runtime "no color".
+    /// The SGR sequence for `level`, or "" when uncolored. A colored level
+    /// must resolve non-empty: a blank tier is a construction bug, not "no color".
     pub fn escape(color: Color, level: ColorLevel) []const u8 {
         const sequence = switch (level) {
             .none => "",
@@ -66,9 +56,8 @@ pub const Color = struct {
         return sequence;
     }
 
-    /// Write `text` wrapped in this color at `level`: escape (when
-    /// `level` colors), text, then reset. At `.none` this is exactly
-    /// `text`, so piped output carries no escapes.
+    /// Write `text` wrapped in this color at `level`. At `.none` this is
+    /// exactly `text`, so piped output carries no escapes.
     pub fn write(color: Color, writer: *std.Io.Writer, text: []const u8, level: ColorLevel) !void {
         assert(@intFromPtr(writer) != 0);
         const sequence = color.escape(level);
@@ -78,21 +67,18 @@ pub const Color = struct {
     }
 };
 
-/// One prompt line: visible `text` wrapped in `color`.
 pub const Prompt = struct {
     text: []const u8,
     color: Color,
 
-    /// Byte length of `text` -- the column count cursor positioning
-    /// uses. The editor counts one byte as one column (no wide-character
+    /// The editor counts one byte as one column (no wide-character
     /// handling), so prompt text must be single-width.
     pub fn width(prompt: Prompt) usize {
         assert(prompt.text.len != 0);
         return prompt.text.len;
     }
 
-    /// Emit the prompt's text in its color at `level`. At `.none` this
-    /// is exactly `text`, so piped output carries no escapes.
+    /// Emit the prompt's text in its color at `level`.
     pub fn write(prompt: Prompt, writer: *std.Io.Writer, level: ColorLevel) !void {
         assert(prompt.text.len != 0);
         try prompt.color.write(writer, prompt.text, level);

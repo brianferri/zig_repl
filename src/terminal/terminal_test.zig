@@ -1,7 +1,4 @@
-//! End-to-end test suite for the `terminal/` subsystem. Per-file
-//! tests cover one module; this file composes them through the
-//! Parser -> Protocol stack so behaviour drifts surface as
-//! integration failures, not just unit-level breakage.
+//! Integration tests exercising the full Parser -> Protocol stack.
 
 const std = @import("std");
 const testing = std.testing;
@@ -15,10 +12,6 @@ const Xterm = @import("protocol/Xterm.zig");
 const ModifyOtherKeys = @import("protocol/ModifyOtherKeys.zig");
 const BracketedPaste = @import("protocol/BracketedPaste.zig");
 
-/// Dispatch the same way `Terminal.parsePending` does: walk the
-/// protocol list in priority order; return the first event a
-/// protocol surfaces. `null` means no event (either incomplete
-/// input or no protocol claimed it).
 fn dispatch(bytes: []const u8, protocols: []const *Protocol) ?Event.Event {
     var remaining = bytes;
     while (remaining.len > 0) {
@@ -93,8 +86,7 @@ test "xterm CSI A still dispatches when Kitty is also registered" {
 }
 
 test "ESC[1;5D is Ctrl+Left via Xterm even with Kitty registered" {
-    // Kitty only claims `u`-final sequences; anything else falls
-    // through to ModifyOtherKeys / Xterm.
+    // Kitty claims only `u`-final sequences; the rest fall through.
     const e = dispatch("\x1b[1;5D", &kitty_first).?;
     try testing.expect(e == .key_press);
     try testing.expectEqual(Event.key.left, e.key_press.codepoint);

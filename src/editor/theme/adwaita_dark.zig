@@ -1,8 +1,6 @@
 //! Adwaita dark theme: prompts in the GNOME Adwaita accent blue (#3584E4)
 const Theme = @import("../Theme.zig");
 
-/// Adwaita accent blue (#3584E4) at each fallback tier: truecolor, nearest
-/// 256-palette entry, then 16-color blue.
 const adwaita_blue: Theme.Color = .{
     .rgb = .{ .r = 53, .g = 132, .b = 228 },
     .truecolor = "\x1b[38;2;53;132;228m",

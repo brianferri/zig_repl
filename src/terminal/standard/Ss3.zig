@@ -1,18 +1,11 @@
-//! SS3 (Single Shift 3) parser. ECMA-48 sec 8.3.140 plus the
-//! VT100 application-mode usage (manual sec 8.6.5). Wire form:
-//!
-//!   ESC O <final>
-//!
-//! Carries no parameters in the input direction; the single final
-//! byte selects the key (e.g. `ESC O A` = application-mode arrow
-//! up).
+//! SS3 (Single Shift 3) parser, `ESC O <final>` (ECMA-48 sec 8.3.140, VT100
+//! application mode). The final byte selects the key (`ESC O A` = app-mode up).
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Standard = @import("../Standard.zig");
 
 pub const Sequence = struct {
-    /// Single byte following `ESC O`, selecting the key.
     final: u8,
 };
 

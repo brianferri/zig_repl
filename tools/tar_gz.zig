@@ -1,8 +1,7 @@
-//! Build-time tool: pack a directory into a gzip-compressed tar, so `build.zig`
-//! can `@embedFile` a standard library without shelling out to a system `tar`
-//! (keeping the build hermetic). Entry names are each file's path relative to the
-//! source directory (`std.zig`, `os/linux.zig`), which is exactly what the module
-//! loader asks `Buffer.read` for. Usage: `tar_gz <src_dir> <out.tar.gz>`.
+//! Build-time tool: pack a directory into a gzip-compressed tar so `build.zig` can
+//! `@embedFile` a standard library without a system `tar`. Entry names are each
+//! file's path relative to the source dir, as the module loader's `Buffer.read`
+//! expects. Usage: `tar_gz <src_dir> <out.tar.gz>`.
 
 const std = @import("std");
 
@@ -14,14 +13,13 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     var arg_it: std.process.Args.Iterator = .init(init.minimal.args);
-    _ = arg_it.skip(); // argv0
+    _ = arg_it.skip();
     const src_path = arg_it.next() orelse return error.ExpectedSrcDir;
     const out_path = arg_it.next() orelse return error.ExpectedOutPath;
 
     var src = try std.Io.Dir.openDirAbsolute(io, src_path, .{ .iterate = true });
     defer src.close(io);
 
-    // Tar every regular file into memory, named by its path relative to the root.
     var tar_buf: std.Io.Writer.Allocating = .init(gpa);
     defer tar_buf.deinit();
     var tar_writer: std.tar.Writer = .{ .underlying_writer = &tar_buf.writer };
@@ -36,7 +34,6 @@ pub fn main(init: std.process.Init) !void {
     }
     try tar_writer.finishPedantically();
 
-    // Gzip-compress the tar to the output file.
     if (std.fs.path.dirname(out_path)) |parent| {
         try std.Io.Dir.cwd().createDirPath(io, parent);
     }

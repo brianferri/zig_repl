@@ -1,16 +1,12 @@
-//! Single recursive traversal of a ZIR body tree. ZIR is a flat instruction
-//! array; its blocks, conditionals, and function bodies nest sub-sequences,
-//! and this walks that nesting once, reporting it to a sink. A textual dump
-//! and a structured (JSON) view then share one notion of the tree instead of
-//! each re-deriving it.
+//! Single recursive traversal of a ZIR body tree, reporting nesting to a sink so a textual dump and
+//! a structured view share one notion of the tree.
 //!
 //! A sink is any value exposing:
 //!   openDeclaration(decl_inst, base_node) / closeDeclaration()
 //!   openSection(label)                    / closeSection()
 //!   openInstruction(inst, tag, data, base_node) / closeInstruction()
-//! `base_node` is the enclosing declaration's AST node. A ZIR `src_node` is an
-//! `Ast.Node.Offset` relative to it (see `src/print_zir.zig`), so a sink that
-//! maps instructions back to source resolves offsets against this base.
+//! `base_node` is the enclosing declaration's AST node; a ZIR `src_node` is an `Ast.Node.Offset`
+//! relative to it, so a sink mapping instructions to source resolves offsets against this base.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -93,12 +89,9 @@ pub fn Walker(comptime Sink: type) type {
                     try self.section("body", self.zir.bodySlice(data.@"defer".index, data.@"defer".len), base);
                 },
                 .func, .func_inferred, .func_fancy => {
-                    // `info.param_body` is the enclosing block that contains
-                    // this func instruction; recursing into it re-walks `inst`
-                    // and loops. The compiler's print_zir filters params by tag
-                    // (param / param_comptime / param_anytype) rather than
-                    // walking the whole enclosing block; ret_ty_body + body are
-                    // self-contained, so show those.
+                    // `info.param_body` is the enclosing block containing this func instruction;
+                    // recursing into it re-walks `inst` and loops. `ret_ty_body` + `body` are
+                    // self-contained, so show only those.
                     const info = self.zir.getFnInfo(inst);
                     try self.section("ret_ty_body", info.ret_ty_body, base);
                     try self.section("body", info.body, base);
@@ -109,16 +102,13 @@ pub fn Walker(comptime Sink: type) type {
     };
 }
 
-/// Walk every top-level declaration in `zir`, reporting its
-/// declaration / section / instruction structure to `sink` (a pointer to a
-/// value implementing the sink methods).
+/// Walk every top-level declaration in `zir`, reporting its structure to `sink`.
 pub fn walk(comptime Sink: type, zir: Zir, sink: *Sink) anyerror!void {
     var w = Walker(Sink){ .zir = zir, .sink = sink };
     try w.run();
 }
 
-/// Walk a single declaration. Callers that want only one of several
-/// declarations (e.g. the last, dropping an injected prelude) select it.
+/// Walk a single declaration, for callers wanting only one of several (e.g. dropping an injected prelude).
 pub fn walkDecl(comptime Sink: type, zir: Zir, decl_inst: Zir.Inst.Index, sink: *Sink) anyerror!void {
     var w = Walker(Sink){ .zir = zir, .sink = sink };
     try w.declaration(decl_inst);

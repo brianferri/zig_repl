@@ -1,13 +1,9 @@
-//! Windows console backend. Puts the host in virtual-terminal mode
-//! so the upstream Parser / Protocol layers see the same ANSI
-//! escape sequence stream they do on POSIX.
+//! Windows console backend: puts the host in virtual-terminal mode so the
+//! Parser / Protocol layers see the same ANSI stream they do on POSIX.
 //!
-//! Handle acquisition goes through the PEB (`hStdInput` /
-//! `hStdOutput`), the same path `std/Io/Threaded.zig` uses --
-//! avoids loading kernel32 just to call `GetStdHandle`. Console
-//! mode and CtrlHandler ARE done via kernel32 because the codeberg
-//! issue tracking the kernel32 -> ntdll migration explicitly
-//! exempts console APIs (zig issue #31131).
+//! Handles come from the PEB (avoids loading kernel32 for `GetStdHandle`);
+//! console mode and CtrlHandler stay on kernel32, which the kernel32 -> ntdll
+//! migration exempts (zig issue #31131).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -50,8 +46,7 @@ extern "kernel32" fn SetConsoleCtrlHandler(
     Add: Bool,
 ) callconv(.winapi) Bool;
 
-/// File-local because Win32 console-control handlers carry no
-/// userdata, mirroring the POSIX backend's signal-handler constraint.
+/// File-local because console-control handlers carry no userdata.
 var saved_input_mode: ?Dword = null;
 var saved_output_mode: ?Dword = null;
 var saved_codepage: ?c_uint = null;
@@ -103,11 +98,9 @@ pub fn deinit(self: *Windows, _: std.mem.Allocator) void {
     self.* = undefined;
 }
 
-/// `phase` is comptime so the body monomorphizes per call site.
-/// Windows has no equivalent of POSIX VMIN/VTIME -- both phases set
-/// identical mode bits; probe-vs-interactive timing folds into the
-/// caller's read loop. Kept in the signature for API parity with
-/// `Posix.setRawMode`.
+/// Both phases set identical mode bits (no VMIN/VTIME equivalent; probe-vs-
+/// interactive timing folds into the caller's read loop). `phase` is kept only
+/// for parity with `Posix.setRawMode`.
 pub fn setRawMode(self: *Windows, comptime phase: enum { probe, interactive }) Error!void {
     assert(live);
     _ = phase;
@@ -122,8 +115,7 @@ pub fn setRawMode(self: *Windows, comptime phase: enum { probe, interactive }) E
         windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     if (SetConsoleMode(self.stdout_handle, new_output) == .FALSE) return error.SetConsoleModeFailed;
 
-    // UTF-8 output so renderers can emit multibyte sequences. A
-    // legacy code page is harmless -- bytes still pass through.
+    // UTF-8 output so renderers can emit multibyte sequences.
     _ = SetConsoleOutputCP(CP_UTF8);
 }
 

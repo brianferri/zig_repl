@@ -23,7 +23,6 @@ test "compliance: anonymous struct (.{ .a = ... }) field access" {
             }),
         },
         // Anon struct fields are all comptime, so the type carries no runtime layout (size 0).
-        // Exercises resolveStructLayout on a reified struct that has field defaults.
         .{ .src = &.{"@sizeOf(@TypeOf(.{ .a = 1, .b = 2 }))"}, .want = compliance.want(@sizeOf(@TypeOf(.{ .a = 1, .b = 2 }))) },
         .{
             .src = &.{"blk: { const p = .{ .x = @as(u8, 5), .y = true }; break :blk p.x; }"},
@@ -148,8 +147,7 @@ test "compliance: struct init and field access" {
                 break :blk r.a + 5;
             }),
         },
-        // An omitted default is stored through the field pointer; when the init target is
-        // itself a field (a nested init), that pointer's base is not a comptime alloc.
+        // When the init target is itself a field (a nested init), the stored default's base is not a comptime alloc.
         .{
             .src = &.{"blk: { const Inner = struct { x: u8, y: u8 = 9 }; const Outer = struct { inner: Inner, z: u8 = 3 }; const o: Outer = .{ .inner = .{ .x = 1 } }; break :blk o.inner.y + o.z; }"},
             .want = compliance.want(blk: {
@@ -299,8 +297,7 @@ test "compliance: a struct value method binds the receiver (p.method())" {
                 break :blk p.addk(5);
             }),
         },
-        // A method whose receiver is already a pointer (`self: *T`) calls a sibling method on
-        // that pointer; resolution peels the pointer to the container (the iterator pattern).
+        // A `self: *T` receiver calling a sibling method peels the pointer to the container (the iterator pattern).
         .{
             .src = &.{"blk: { const P = struct { x: u8, fn peek(self: *@This()) u8 { return self.x; } fn next(self: *@This()) u8 { return self.peek(); } }; var p: P = .{ .x = 7 }; break :blk p.next(); }"},
             .want = compliance.want(blk: {
@@ -488,8 +485,7 @@ test "compliance: explicit-type struct init (T{ ... })" {
             .src = &.{"blk: { const Q = struct { a: u8 }; const q = Q{ .a = 300 }; break :blk q.a; }"},
             .reject = true,
         },
-        // The type position of `T{}` must be a type; a value there is rejected,
-        // not passed on to a layout query.
+        // The type position of `T{}` must be a type; a value there is rejected, not passed on to a layout query.
         .{
             .src = &.{"blk: { const x = 5; break :blk x{}; }"},
             .reject = true,

@@ -1,14 +1,10 @@
-//! Kitty Keyboard Protocol full progressive-enhancement spec.
-//! Reference: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
+//! Kitty Keyboard Protocol (https://sw.kovidgoyal.net/kitty/keyboard-protocol/).
+//! Input wire form:
+//!   CSI <key>[:<alt1>:<alt2>][;<modifiers>[:<event_type>]][;<text_codepoint>]u
 //!
-//! Wire form (input side):
-//!   CSI <unicode_key_code>[:<alt1>:<alt2>][;<modifiers>[:<event_type>]][;<text_codepoint>]u
-//!
-//! Setup sequence pushes flag 1 ("disambiguate escape codes") onto
-//! the terminal's progressive-enhancement stack; teardown pops one
-//! stack frame. Flag 1 is the minimum for Shift+Enter / Ctrl+Tab.
-//! Event-report flag (0b10000) is intentionally not requested, to
-//! keep the editor loop simple.
+//! Setup pushes flag 1 ("disambiguate escape codes") -- the minimum for
+//! Shift+Enter / Ctrl+Tab; teardown pops it. The event-report flag (0b10000) is
+//! deliberately not requested, to keep the editor loop simple.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -22,10 +18,8 @@ const Kitty = @This();
 
 interface: Protocol = .{
     .name = "kitty",
-    // `CSI ? u` asks the terminal "do you speak the Kitty Keyboard
-    // Protocol?" Supported terminals reply with `CSI ? <flags> u`;
-    // unsupported ones stay silent. Detection scans for the reply
-    // shape -- presence is the signal; we don't need the flags here.
+    // `CSI ? u` queries support; a supported terminal replies `CSI ? <flags> u`,
+    // an unsupported one stays silent. Detection keys on the reply's presence.
     .query_sequence = "\x1b[?u",
     .setup_sequence = "\x1b[>1u",
     .teardown_sequence = "\x1b[<u",
@@ -59,10 +53,8 @@ fn tryInterpret(token: Standard.Token) ?Event.Event {
 fn interpretKitty(csi: Csi.Sequence) ?Event.Event {
     assert(csi.final == 'u');
     assert(csi.params_count >= 1);
-    // The wire form's optional sub-params (alternate codepoint at
-    // `params[0]:<alt>`, text codepoint at the third primary slot)
-    // are parsed by the byte-level Parser but not surfaced on
-    // Event.Key: no consumer in the editor reads them.
+    // The optional alternate/text codepoints are parsed but not surfaced: no
+    // editor consumer reads them.
     const cp_raw = csi.params[0];
     const modifier_param: u32 = if (csi.params_count >= 2) csi.params[1] else 0;
     const event_type: u32 = if (csi.params_count >= 2 and csi.subparams_count[1] >= 1)
@@ -78,15 +70,13 @@ fn interpretKitty(csi: Csi.Sequence) ?Event.Event {
     return switch (event_type) {
         2 => .{ .key_repeat = key },
         3 => .{ .key_release = key },
-        // Forward-compat: unknown event_type values treated as press.
+        // Unknown event_type treated as press (forward-compat).
         else => .{ .key_press = key },
     };
 }
 
 fn vtableDetectSupport(_: *const Protocol, response: []const u8) bool {
-    // The Kitty reply has the shape `ESC [ ? <decimal_flags> u`. The
-    // leading `?` discriminates it from a bare `ESC [ N u` keypress (a
-    // Kitty key report, not a capability reply).
+    // The reply's leading `?` discriminates it from a bare `ESC [ N u` keypress.
     return Csi.containsFinal(response, '?', 'u');
 }
 

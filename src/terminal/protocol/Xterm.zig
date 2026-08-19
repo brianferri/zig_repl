@@ -1,22 +1,10 @@
-//! xterm keypress interpretation -- the de-facto compatibility
-//! baseline. Covers the CSI / SS3 sequences xterm defines for arrow
-//! keys, function keys, navigation keys, and their Ctrl/Shift-
-//! modified forms, plus the ASCII/C0 ground-byte mapping every
-//! xterm-compatible terminal assumes (Ctrl+letter encoding, Tab,
-//! Enter via CR/LF, Backspace via BS/DEL).
+//! xterm keypress interpretation -- the de-facto compatibility baseline for
+//! arrow/function/navigation keys, their Ctrl/Shift forms, and the ASCII/C0
+//! ground-byte mapping. Always registered, since every modern terminal speaks
+//! at least this dialect.
 //!
-//! Always registered; assumed supported because every modern
-//! terminal speaks at least this dialect.
-//!
-//! Spec refs:
-//!   * xterm ctlseqs (https://invisible-island.net/xterm/ctlseqs/
-//!     ctlseqs.html), sections "PC-Style Function Keys" and
-//!     "Vt220-Style Function Keys".
-//!   * VT100 manual sec 8.6.5 (SS3 application-mode keys), the
-//!     historical predecessor xterm extended.
-//!
-//! Modifier encoding lives in `Event.Modifiers.fromParam`: the
-//! second primary parameter is `(mods << 1) | 1`.
+//! Refs: xterm ctlseqs ("PC-Style" / "VT220-Style Function Keys"); VT100 manual
+//! sec 8.6.5 (SS3 application-mode keys).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -36,14 +24,11 @@ interface: Protocol = .{
     .teardown_sequence = "",
     .vtable = &.{
         .tryInterpret = vtableTryInterpret,
-        // No probe -- every modern terminal speaks at least this.
         .detectSupport = Protocol.alwaysSupported,
     },
 },
 
-/// File-scope instance for the stateless protocol. Callers grab
-/// `&instance.interface` for dispatch; no state to mutate. Matches
-/// `std.heap.page_allocator`'s single-static-instance pattern.
+/// File-scope instance for the stateless protocol; callers grab `&instance.interface` for dispatch.
 pub var instance: Xterm = .{};
 
 pub fn protocol() *Protocol {
@@ -76,14 +61,13 @@ fn tryInterpret(token: Standard.Token) ?Event.Event {
 
 fn interpretGround(b: u8) ?Event.Event {
     return switch (b) {
-        // C0 controls -> Ctrl+letter (with the documented exceptions).
         0x00 => .{ .key_press = .{ .codepoint = '@', .modifiers = .{ .ctrl = true } } },
         0x08 => .{ .key_press = .{ .codepoint = Event.key.backspace } },
         0x09 => .{ .key_press = .{ .codepoint = Event.key.tab } },
         0x0A, 0x0D => .{ .key_press = .{ .codepoint = Event.key.enter } },
         0x1B => .{ .key_press = .{ .codepoint = Event.key.escape } },
         0x7F => .{ .key_press = .{ .codepoint = Event.key.backspace } },
-        // Other C0 -> Ctrl + lowercase letter. 0x01 -> 'a', etc.
+        // Other C0 -> Ctrl + lowercase letter (0x01 -> 'a').
         0x01...0x07,
         0x0B...0x0C,
         0x0E...0x1A,
@@ -91,9 +75,7 @@ fn interpretGround(b: u8) ?Event.Event {
             .codepoint = @as(u21, b) + 0x60,
             .modifiers = .{ .ctrl = true },
         } },
-        // Printable ASCII -- pass through. UTF-8 multibyte sequences
-        // arrive byte-at-a-time and aren't yet assembled into
-        // codepoints; multibyte assembly is unsupported.
+        // UTF-8 multibyte arrives byte-at-a-time and isn't assembled; unsupported.
         0x20...0x7E => .{ .key_press = .{ .codepoint = b } },
         else => null,
     };
@@ -103,14 +85,11 @@ fn interpretCsi(csi: Csi.Sequence) ?Event.Event {
     assert(Csi.isFinal(csi.final));
     assert(csi.params_count <= Csi.max_params);
     assert(csi.intermediates_count <= Csi.max_intermediates);
-    // Sequences with `?` / `>` / `<` private intermediates are
-    // capability replies (DA1, progressive enhancement) -- not key
-    // events; don't claim them here.
+    // Private-lead sequences are capability replies, not key events.
     if (csi.hasPrivateLead()) return null;
 
-    // xterm modifier convention: when present, modifiers live in
-    // the second primary parameter and the leading position is the
-    // sentinel `1`. Unmodified sequences have a single param or none.
+    // xterm convention: modifiers in the second primary parameter, leading
+    // position the sentinel `1`.
     const modifier_param = csi.param(1, 0);
     const modifiers = Event.Modifiers.fromParam(modifier_param);
 
@@ -130,8 +109,7 @@ fn interpretCsi(csi: Csi.Sequence) ?Event.Event {
             .modifiers = .{ .shift = true },
         } },
         '~' => return interpretCsiTilde(csi.param(0, 0), modifiers),
-        // 'u' final without intermediates belongs to progressive-
-        // enhancement protocols; let them claim it.
+        // 'u' finals belong to the progressive-enhancement protocols.
         'u' => return null,
         else => return null,
     }

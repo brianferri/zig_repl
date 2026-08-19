@@ -94,17 +94,14 @@ test "eval.report: value for an expression, null otherwise, errors swallowed" {
 
     var buf: [4096]u8 = undefined;
 
-    // An expression yields its value and writes nothing.
     var w_expr = std.Io.Writer.fixed(&buf);
     try testing.expect((try eval.report(&session, "1 + 2", &w_expr)) != null);
     try testing.expectEqual(@as(usize, 0), w_expr.end);
 
-    // A declaration yields no value and no "(no value)" marker.
     var w_decl = std.Io.Writer.fixed(&buf);
     try testing.expect((try eval.report(&session, "const x = 1;", &w_decl)) == null);
     try testing.expectEqual(@as(usize, 0), w_decl.end);
 
-    // A parse error is swallowed (null) with diagnostics already written.
     var w_err = std.Io.Writer.fixed(&buf);
     try testing.expect((try eval.report(&session, "1 +", &w_err)) == null);
     try testing.expect(w_err.end > 0);
@@ -652,8 +649,7 @@ test "@floatCast widens and narrows between float widths" {
 
     // f64 -> f32 (narrowing, precision loss permitted). The expected
     // bits are computed via `@floatCast` rather than `@as` because Zig's
-    // comptime guard would reject the latter for a value f32 cannot
-    // represent exactly.
+    // comptime guard would reject the latter for a value f32 cannot represent exactly.
     try expectEvalTypedFloat(
         gpa,
         &pool,
@@ -1205,8 +1201,6 @@ test "ptr_type: e2e through Pipeline produces interned Key.ptr_type" {
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
 
-    // Drive the expression through the full front end and confirm the
-    // pool returns the expected Key shape, not just a rendered string.
     var diag_buf: [4096]u8 = undefined;
     const value = try evalSource(gpa, &pool, "*const u8", &diag_buf);
     const key = pool.indexToKey(value.index);
@@ -1215,8 +1209,6 @@ test "ptr_type: e2e through Pipeline produces interned Key.ptr_type" {
     try testing.expectEqual(true, key.ptr_type.flags.is_const);
     try testing.expectEqual(InternPool.Key.PtrType.Size.one, key.ptr_type.flags.size);
 
-    // Interning dedup at the e2e layer: same source twice gives
-    // the same Index.
     const second = try evalSource(gpa, &pool, "*const u8", &diag_buf);
     try testing.expectEqual(value.index, second.index);
 }
@@ -1250,8 +1242,7 @@ test "ptr_type integrates with @as as a destination type" {
     try expectEvalTypeName(gpa, &pool, "@as(type, [*]i32)", "[*]i32");
 
     // `@as(*const u8, undefined)` re-tags the untyped undef as a typed
-    // undef of `*const u8`. The resulting Key.undef carries the
-    // ptr_type Index.
+    // undef of `*const u8`. The resulting Key.undef carries the ptr_type Index.
     var diag_buf: [4096]u8 = undefined;
     const value = try evalSource(gpa, &pool, "@as(*const u8, undefined)", &diag_buf);
     const key = pool.indexToKey(value.index);
@@ -1624,8 +1615,7 @@ test "decl: rebinding the same name fails with duplicate-member error" {
     _ = try evalSessionLines(gpa, &pool, ns, &.{"const x = 10;"}, &diag_buf);
 
     // Second line tries to rebind x; wrap-injection re-emits the
-    // first binding, so AstGen rejects the new one with "duplicate
-    // struct member name".
+    // first binding, so AstGen rejects the new one with "duplicate struct member name".
     var result = try Pipeline.runWithInjection(gpa, "const x = 20;", &pool, .init(ns));
     defer result.deinit(gpa);
     try testing.expect(result.hasZirErrors());
@@ -1737,8 +1727,7 @@ test "decl: cross-line rebind preserves the original binding (silent-drop limita
     // `UserView.translate` drops that span, so the whole error item
     // is discarded. The Diagnostic renderer surfaces a fallback
     // line so the user doesn't see silent failure; the semantic
-    // contract is also pinned -- the original binding survives the
-    // attempted rebind.
+    // contract is also pinned -- the original binding survives the attempted rebind.
     var out_buf: [4096]u8 = undefined;
     const rendered = try renderZirDiagnostic(gpa, &pool, ns, "const z = 2;", &out_buf);
 
@@ -1863,7 +1852,6 @@ test "error_union_value: @as(E!T, payload) wraps as .payload arm" {
     try testing.expect(key == .error_union);
     try testing.expect(key.error_union.val == .payload);
 
-    // The wrapped payload is the coerced int value.
     const payload_key = pool.indexToKey(key.error_union.val.payload);
     try testing.expect(payload_key == .int);
     try testing.expectEqual(InternPool.Index.u32_type, payload_key.int.ty);
@@ -2003,9 +1991,7 @@ test "fn decl: dedup -- same signature reuses FuncType Index" {
     const fn_f = pool.indexToKey(pool.getNav(ns.lookupNav(&pool, try pool.getOrPutString(gpa, "f", .no_embedded_nulls)).?).resolved.?.value).func;
     const fn_g = pool.indexToKey(pool.getNav(ns.lookupNav(&pool, try pool.getOrPutString(gpa, "g", .no_embedded_nulls)).?).resolved.?.value).func;
 
-    // Same signature -> same fn_type Index.
     try testing.expectEqual(fn_f.ty, fn_g.ty);
-    // Different bodies -> different Func Index.
     try testing.expect(fn_f.zir_body_inst != fn_g.zir_body_inst);
 }
 
@@ -2225,8 +2211,7 @@ test "aggregate: structural eql dedups all-equal elems vs repeated_elem" {
         .storage = .{ .repeated_elem = seven },
     });
     // hash/eql canonicalize across flavors so both calls return the
-    // same Index. Storage flavor preserved from the first insertion
-    // -- here `.elems`.
+    // same Index. Storage flavor preserved from the first insertion -- here `.elems`.
     try testing.expectEqual(via_elems, via_repeat);
     const decoded = pool.indexToKey(via_elems).aggregate;
     try testing.expect(decoded.storage == .elems);

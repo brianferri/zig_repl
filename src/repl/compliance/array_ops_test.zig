@@ -58,7 +58,6 @@ test "compliance: @memset writes a value to every element" {
             @memset(buf[0..2], 0);
             break :blk buf[0] + buf[2];
         }) },
-        // A const destination cannot be written.
         .{ .src = &.{"blk: { const buf = [_]u8{ 1, 2, 3 }; @memset(&buf, 0); break :blk buf[0]; }"}, .reject = true },
     });
 }
@@ -84,8 +83,7 @@ test "compliance: @memcpy ported behavior cases" {
             @memcpy(s, s);
             break :blk @as(u8, 42);
         }) },
-        // Comptime-only element type ([N]type): `zig run` can't be an oracle, but the
-        // reference is comptime-folded here just the same.
+        // Comptime-only element type ([N]type): `zig run` can't be an oracle, but the reference still comptime-folds.
         .{ .src = &.{"blk: { const in: [2]type = .{ u8, u16 }; var out: [2]type = undefined; @memcpy(&out, &in); break :blk out[0] == u8 and out[1] == u16; }"}, .want = compliance.want(blk: {
             const in: [2]type = .{ u8, u16 };
             var out: [2]type = undefined;
@@ -112,13 +110,11 @@ test "compliance: typed array initialization ([N]T = .{ ... })" {
 
 test "compliance: empty init to array and slice-via-address-of" {
     try compliance.check(a, &.{
-        // `T{}` on an array type yields an empty array.
         .{ .src = &.{"([0]u8{}).len"}, .want = compliance.want(([0]u8{}).len) },
         .{ .src = &.{"@as([0]u8, .{}).len"}, .want = compliance.want(@as([0]u8, .{}).len) },
-        // `&.{}` builds a zero-length array behind a slice, carrying the slice's sentinel.
         .{ .src = &.{"@as([]const u8, &.{}).len"}, .want = compliance.want(@as([]const u8, &.{}).len) },
         .{ .src = &.{"@as([:0]const u8, &.{}).len"}, .want = compliance.want(@as([:0]const u8, &.{}).len) },
-        // The std.process.Environ.PosixBlock.empty shape: a sentinel slice of optional many-ptrs.
+        // A sentinel slice of optional many-ptrs (the std.process.Environ.PosixBlock.empty shape).
         .{ .src = &.{"@as([:null]const ?[*:0]const u8, &.{}).len"}, .want = compliance.want(@as([:null]const ?[*:0]const u8, &.{}).len) },
         .{ .src = &.{"blk: { const S = struct { slice: [:null]const ?[*:0]const u8 }; const e: S = .{ .slice = &.{} }; break :blk e.slice.len; }"}, .want = compliance.want(blk: {
             const S = struct { slice: [:null]const ?[*:0]const u8 };
