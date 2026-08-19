@@ -151,10 +151,19 @@ fn writeThemesJson(w: *std.Io.Writer) !void {
     try std.json.Stringify.value(entries[0..], .{}, w);
 }
 
+// The page can submit any number of bytes, but the interpreter asserts an input
+// fits `max_input_bytes` as an internal precondition. Reject an over-long line at
+// this untrusted boundary so a large paste is a message, not a trap that kills the
+// module for the rest of the session.
+fn overLength(input: []const u8) bool {
+    return input.len > InputShape.max_input_bytes;
+}
+
 fn dispatch(input: []const u8) !void {
     const w = &output.writer;
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
     if (trimmed.len == 0) return;
+    if (overLength(trimmed)) return w.print("input too long: {d} bytes (max {d})\n", .{ trimmed.len, InputShape.max_input_bytes });
     if (trimmed[0] != ':') return evaluate(trimmed, w);
     try Commands.dispatch(&session, trimmed[1..], w);
 }
@@ -183,6 +192,7 @@ fn preview(input: []const u8) !void {
     const w = &output.writer;
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
     if (trimmed.len == 0) return;
+    if (overLength(trimmed)) return w.print("input too long: {d} bytes (max {d})\n", .{ trimmed.len, InputShape.max_input_bytes });
 
     var preview_pool = try InternPool.init(gpa);
     defer preview_pool.deinit();
@@ -242,6 +252,7 @@ fn buildOutline(input: []const u8) !void {
     const w = &output.writer;
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
     if (trimmed.len == 0) return outline.emitEmpty(w, null);
+    if (overLength(trimmed)) return outline.emitEmpty(w, "input too long");
 
     var preview_pool = try InternPool.init(gpa);
     defer preview_pool.deinit();

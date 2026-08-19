@@ -209,6 +209,17 @@ await describe("wasm repl", async () => {
         assert.equal(applied.stored, "zig");
     });
 
+    await test("rejects an over-long paste without trapping the module", async () => {
+        const result = await page.evaluate(() => {
+            const huge = "1".repeat(20000); // past the 16 KiB interpreter cap
+            const rejected = window.repl.evalLine(huge);
+            const stillAlive = window.repl.evalLine("1 + 2"); // module survives for the next line
+            return { rejected, stillAlive };
+        });
+        assert.match(result.rejected, /too long/);
+        assert.match(result.stillAlive, /\b3\b/);
+    });
+
     await test("loads without page errors", () => {
         assert.deepEqual(errors, []);
     });
