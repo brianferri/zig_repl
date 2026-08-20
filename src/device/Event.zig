@@ -1,5 +1,5 @@
-//! Canonical input event surface. Each protocol parser normalises its wire
-//! encoding into one of these, so consumers never branch on protocol identity.
+//! Canonical input event surface. Each protocol parser normalises its wire encoding into one of these, so
+//! consumers need not branch on protocol identity.
 
 const std = @import("std");
 
@@ -8,7 +8,7 @@ pub const Event = union(enum) {
     /// Emitted only when a protocol's release-reporting mode is negotiated.
     key_release: Key,
     key_repeat: Key,
-    /// Borrowed from the parser's scratch buffer; copy if it outlives the next parse call.
+    /// Points into the parser's scratch buffer; copy if it outlives the next parse call.
     paste: []const u8,
     resize: WindowSize,
     /// `CSI I` -- requires DECSET 1004.

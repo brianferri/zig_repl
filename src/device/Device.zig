@@ -1,7 +1,5 @@
-//! Input-device interface the `LineEditor` drives, modelled on `std.Io.Reader`:
-//! an implementation embeds a `Device` as a field named `interface` and recovers
-//! its concrete `*Self` inside the vtable via `@fieldParentPtr("interface", d)`.
-//! The editor reads only this interface, so any frontend supplies its own source.
+//! Input-device interface the `LineEditor` drives, modelled on `std.Io.Reader`. The editor reads only this
+//! interface, so any frontend supplies its own source.
 
 const std = @import("std");
 const assert = std.debug.assert;

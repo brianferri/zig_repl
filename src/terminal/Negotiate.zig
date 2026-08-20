@@ -1,7 +1,5 @@
-//! Capability negotiation: emits each protocol's `query_sequence` plus a DA1
-//! request as a synchronisation sentinel, then drains every reply in a single
-//! read. Batching behind one DA1 avoids the serialised latency of a per-probe
-//! round-trip; the DA1 `c` final byte marks the terminal done talking.
+//! Capability negotiation: emits each protocol's `query_sequence` plus a DA1 request as a sync sentinel,
+//! then drains every reply in one batched read; the DA1 `c` final byte marks the terminal done talking.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -11,15 +9,14 @@ const Csi = @import("standard/Csi.zig");
 pub const response_buffer_bytes: u32 = 512;
 
 pub const Result = struct {
-    /// Borrowed from the caller's buffer.
+    /// Points into the caller's buffer.
     bytes: []const u8,
     /// False means the read timed out without a sentinel; treat the response as
     /// final anyway (some terminals answer capability queries but not DA1).
     da1_terminated: bool,
 };
 
-/// `buffer` must hold at least `response_buffer_bytes`; the returned slice
-/// borrows from it for the call's lifetime.
+/// `buffer` must hold at least `response_buffer_bytes`; the returned slice points into it.
 pub fn run(
     comptime Backend: type,
     backend: *Backend,

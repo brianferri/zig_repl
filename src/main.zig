@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
     // Resolve `@import` against the working directory, with the system standard
     // library stacked beneath it (`@import("std")`, and any `std`-internal path,
     // falls through). Both are best-effort: the REPL still runs if either is
-    // missing, and every handle/source below outlives the borrowing session.
+    // missing, and every handle/source below outlives the session that references them.
     var project_dir = std.Io.Dir.cwd().openDir(init.io, ".", .{ .iterate = true }) catch null;
     defer if (project_dir) |*d| d.close(init.io);
     var std_root = openSystemStd(init.gpa, init.io, init.environ_map);

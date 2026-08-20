@@ -1,7 +1,6 @@
-//! Stateless ECMA-48 escape-framing classifier: dispatches the byte after ESC
-//! to a registered Standard, else yields ground / bare_escape / escape_alt.
-//! Each call gets the whole pending buffer; on incomplete input (`null` token,
-//! `consumed = 0`) the caller buffers more and re-calls.
+//! Stateless ECMA-48 escape-framing classifier: dispatches the byte after ESC to a registered Standard,
+//! else yields ground/bare_escape/escape_alt. On incomplete input (`null` token, `consumed = 0`) the
+//! caller buffers more and re-calls.
 
 const std = @import("std");
 const assert = std.debug.assert;

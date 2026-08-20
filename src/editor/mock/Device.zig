@@ -37,8 +37,7 @@ pub fn device(self: *Mock) *Device {
     return &self.interface;
 }
 
-/// Enqueue one event. A `paste` payload is borrowed, not copied -- its
-/// bytes must outlive the matching read.
+/// A `paste` payload is not copied, so its bytes must outlive the matching read.
 pub fn push(self: *Mock, event: Event.Event) !void {
     try self.queue.append(self.gpa, event);
 }

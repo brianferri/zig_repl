@@ -1,8 +1,6 @@
 //! The filesystem `@import` and a running program resolve against: read a source by path, and (for a
-//! writable backend) list, write, remove, and rename entries. The interpreter core is IO-free, so a
-//! frontend injects a backend. Concrete backends embed this struct as a field named `interface` and
-//! recover themselves via `@fieldParentPtr("interface", fs)`; a read-only backend returns
-//! `error.ReadOnly` from the mutators.
+//! writable backend) list, write, mkdir, remove, and rename entries. The IO-free interpreter core takes a
+//! frontend-injected backend; a read-only backend returns `error.ReadOnly` from the mutators.
 
 const std = @import("std");
 

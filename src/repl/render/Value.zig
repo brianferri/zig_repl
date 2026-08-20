@@ -75,7 +75,7 @@ pub fn render(
             const child = pool.indexToKey(s.ty).ptr_type.child;
             const len = intOf(pool, s.len) orelse -1;
             if (len >= 0 and try renderIndexable(pool, session, writer, s.ptr, child, @intCast(len))) return;
-            // Elements the renderer cannot reach (a Sema comptime alloc): render just the length.
+            // The renderer can't follow the elements (a Sema comptime alloc), so render just the length.
             var space: InternPool.Key.Int.Storage.BigIntSpace = undefined;
             const slice_len = pool.indexToKey(s.len).int.storage.toBigInt(&space);
             return writer.print("slice[{f}]", .{slice_len});
@@ -89,8 +89,6 @@ pub fn render(
         .enum_tag => |et| renderEnumTag(et, pool, session, writer),
         .un => |uv| renderUnion(uv, pool, session, writer),
         .bitpack => |bp| renderBitpack(bp, pool, session, writer),
-        // The value Keys above are exhaustive; a bare type Key is the type itself. The assert
-        // turns a future unclassified Key into a crash rather than a mis-render as a type.
         else => blk: {
             assert(key.isType());
             break :blk renderTypeRef(value.index, pool, writer);
@@ -204,7 +202,7 @@ fn renderBytes(pool: *InternPool, writer: *std.Io.Writer, agg: InternPool.Key.Ag
 }
 
 /// The backing array and start element for a pointer the read-only renderer can follow (`.uav`,
-/// `.nav`, or `.arr_elem`). Null for `comptime_alloc`/`field` bases, out of the renderer's reach.
+/// `.nav`, or `.arr_elem`). Null for `comptime_alloc`/`field` bases, which it does not follow.
 const PtrBacking = struct { array: InternPool.Index, start: u64 };
 fn ptrBacking(pool: *const InternPool, ptr_index: InternPool.Index) ?PtrBacking {
     if (pool.indexToKey(ptr_index) != .ptr) return null;
@@ -231,7 +229,7 @@ fn ptrBacking(pool: *const InternPool, ptr_index: InternPool.Index) ?PtrBacking 
 
 /// Render the `len` elements a pointer indexes (a slice's `ptr` or a `*[N]T` treated as `[]const T`).
 /// An all-concrete `u8` run renders as a quoted string, else positionally. False (no output) when the
-/// backing is out of the renderer's reach.
+/// backing pointer can't be followed.
 fn renderIndexable(pool: *InternPool, session: ?*const Session, writer: *std.Io.Writer, ptr_index: InternPool.Index, child: InternPool.Index, len: u64) Error!bool {
     const backing = ptrBacking(pool, ptr_index) orelse return false;
     if (pool.indexToKey(backing.array) != .aggregate) return false;

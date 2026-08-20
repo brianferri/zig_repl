@@ -1,19 +1,4 @@
-//! Validates the interpreter against zig's own evaluation.
-//!
-//! A case pairs interpreter source with the *same expression written as real zig code*.
-//! The zig reference is whatever the build's compiler folds that expression to at
-//! comptime -- so there is no separate compile step: the build and the zig test runner
-//! compile and run the references as part of the test binary itself. `replRun` supplies
-//! the interpreter side, running a case's inputs through the same `eval.run` path the
-//! interactive REPL takes.
-//!
-//! A case is one of:
-//!   .{ .src = &.{"<input>"...}, .want = compliance.want(<zig expr>) } -- output matches zig's fold
-//!   .{ .src = &.{"<input>"...}, .rendered = "<string>" }              -- output equals this literally
-//!   .{ .src = &.{"<input>"...}, .reject = true }                      -- interpreter must reject
-//! A reject that zig itself accepts (a deliberate divergence) adds `.skip = true`.
-//! `rendered` gives the expected output literally, for values zig has no comparable
-//! form for (build-specific names, deliberate divergences).
+//! Validates the interpreter against the same expression comptime-folded by the build's own zig compiler.
 
 const std = @import("std");
 const Io = std.Io;
@@ -29,19 +14,17 @@ const build_options = @import("build_options");
 pub const Case = struct {
     src: []const []const u8,
     want: ?[]const u8 = null,
+    /// Literal expected output, for values zig has no comparable form for (build-specific names, divergences).
     rendered: ?[]const u8 = null,
     reject: bool = false,
+    /// A reject that zig itself accepts: a deliberate divergence, skipped and excluded from the oracle.
     skip: bool = false,
 };
 
-/// Render a `.want` value as `check` compares it: the same expression written as
-/// real zig, comptime-folded to its string form.
 pub fn want(comptime v: anytype) []const u8 {
     return std.fmt.comptimePrint("{any}", .{v});
 }
 
-/// Assert each case's interpreter output matches its `.want`/`.rendered` string,
-/// or that the interpreter rejects a `.reject` case.
 pub fn check(gpa: std.mem.Allocator, cases: []const Case) !void {
     var oracle_diverged = false;
     for (cases) |case| {
@@ -72,8 +55,6 @@ fn normalize(text: []const u8) []const u8 {
     return std.mem.trim(u8, text, " \r\n\t");
 }
 
-/// Whether the real compiler rejects `src`, its trailing expression forced at
-/// comptime. False means the interpreter refuses what zig accepts.
 fn zigRejects(gpa: std.mem.Allocator, src: []const []const u8) !bool {
     var io_instance: Io.Threaded = .init(gpa, .{});
     defer io_instance.deinit();
@@ -101,9 +82,8 @@ fn zigRejects(gpa: std.mem.Allocator, src: []const []const u8) !bool {
     return !(result.term == .exited and result.term.exited == 0);
 }
 
-/// Assert the REPL rejects `inputs` and its rendered diagnostic contains `needle` --
-/// unlike a `.reject` case, this pins the REPL's own wording, so it stays in the test
-/// body rather than the data table.
+/// Pins the REPL's own diagnostic wording (a `.reject` case only checks that it rejects), so these
+/// live in the test body, not the data table.
 pub fn expectDiagnostic(gpa: std.mem.Allocator, inputs: []const []const u8, needle: []const u8) !void {
     var io_instance: Io.Threaded = .init(gpa, .{});
     defer io_instance.deinit();
@@ -145,8 +125,6 @@ test "fuzz: the evaluator survives arbitrary zig source" {
     try std.testing.fuzz({}, fuzzEval, .{});
 }
 
-// A comptime shift by billions of bits requests gigabytes in one allocation; the per-allocation cap
-// turns that into `error.OutOfMemory` instead of an OS kill, which the eval path surfaces gracefully.
 test "fuzz-harness: a pathological comptime allocation fails gracefully" {
     var capped: CappedAllocator = .{ .child = std.testing.allocator, .max_alloc_bytes = 512 * 1024 * 1024 };
     const gpa = capped.allocator();
@@ -268,9 +246,6 @@ fn genRuntimeProgram(smith: *std.testing.Smith, w: *Io.Writer) !u64 {
 }
 
 fn fuzzEval(_: void, smith: *std.testing.Smith) anyerror!void {
-    // A pathological comptime computation can request gigabytes in one allocation; uncapped, overcommit
-    // lets it succeed and the process is OS-killed on first write. The cap turns it into
-    // `error.OutOfMemory`, which the eval path surfaces and the `catch return` below tolerates.
     var capped: CappedAllocator = .{ .child = std.testing.allocator, .max_alloc_bytes = 512 * 1024 * 1024 };
     const gpa = capped.allocator();
     const token_smith = try gpa.create(std.zig.TokenSmith);
@@ -282,8 +257,9 @@ fn fuzzEval(_: void, smith: *std.testing.Smith) anyerror!void {
     gpa.free(out);
 }
 
-/// Wraps a child allocator, failing any single allocation or in-place grow that
-/// exceeds `max_alloc_bytes` instead of forwarding it. Frees and shrinks pass
+/// Wraps a child allocator, failing any single allocation or in-place grow over `max_alloc_bytes` instead
+/// of forwarding it, so a pathological comptime request (gigabytes in one alloc) becomes
+/// `error.OutOfMemory` rather than an overcommit the OS kills on first write. Frees and shrinks pass
 /// straight through, so the child's leak tracking stays intact.
 const CappedAllocator = struct {
     child: std.mem.Allocator,
@@ -410,10 +386,9 @@ test "runtime I/O: std.debug.print emits formatted bytes to the session sink" {
     try std.testing.expectEqualStrings("Hi 42!\n", out.written());
 }
 
-// The clock read-back: `Io.Clock.now` reaches `__repl_now`, which the interpreter performs against the
-// host Io, materializing the reading as a runtime `i64`. The value is real time, so the case asserts a
-// derived boolean rather than a fixed number: a `.real` reading is past 2020, and consecutive `.awake`
-// readings do not go backwards. Uses the threaded Io directly -- its clock is the real one.
+// The clock read-back materializes `Io.Clock.now` (via `__repl_now`) as a runtime `i64`. It's real time,
+// so the case asserts a derived boolean: a `.real` reading is past 2020, and consecutive `.awake` readings
+// don't go backwards.
 test "runtime I/O: the clock read-back returns a real host timestamp" {
     const gpa = std.testing.allocator;
     var io_instance: Io.Threaded = .init(gpa, .{});
@@ -439,11 +414,9 @@ test "runtime I/O: the clock read-back returns a real host timestamp" {
     try expectRendersTrue(gpa, &session, "blk: { const std = @import(\"std\"); const a = std.Io.Clock.now(.awake, io); const b = std.Io.Clock.now(.awake, io); break :blk b.nanoseconds >= a.nanoseconds; }");
 }
 
-// The filesystem read: `openFile` reaches `__repl_open`, which opens the host file and returns its
-// handle-table index; `readStreaming` reaches `__repl_read`, which reads host bytes and stores them back
-// into the interpreter buffer. Reads `build.zig.zon` from the test's cwd (it begins with `.`), and
-// checks a missing file surfaces the error. Uses the threaded Io directly -- its filesystem is the real
-// one.
+// The filesystem read: `openFile`/`readStreaming` reach `__repl_open`/`__repl_read`, opening the host file
+// and storing its bytes into the interpreter buffer. Reads `build.zig.zon` from the test cwd, and checks a
+// missing file surfaces the error.
 test "runtime I/O: openFile + read materializes host bytes into the interpreter buffer" {
     const gpa = std.testing.allocator;
     var io_instance: Io.Threaded = .init(gpa, .{});
@@ -469,11 +442,8 @@ test "runtime I/O: openFile + read materializes host bytes into the interpreter 
     try expectRendersTrue(gpa, &session, "if (std.Io.Dir.cwd().openFile(io, \"no-such-file-zzz\", .{})) |_| false else |_| true");
 }
 
-// The filesystem close: `File.close` reaches `__repl_close`, which ends the host file's lifetime and
-// frees its descriptor. Opening and closing the same file repeatedly keeps every read working (close
-// does not disturb later opens) and reuses the freed slot, so the handle table stays bounded rather than
-// growing once per open. The bound is the property the descriptor namespace fix guarantees, so the case
-// asserts the table's size directly.
+// `File.close` frees the descriptor and reuses the slot, so repeated open/close keeps every read working
+// and the handle table stays bounded; the case asserts its size directly.
 test "runtime I/O: close frees the descriptor and the handle table stays bounded" {
     const gpa = std.testing.allocator;
     var io_instance: Io.Threaded = .init(gpa, .{});

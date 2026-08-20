@@ -1,6 +1,6 @@
 //! Drops AstGen's never-mutated / unused-local advisories, which are style guidance a REPL has no
 //! use for (they would block one-shot lines like `var x: u8 = 7; break :blk x;`). Suppression keys
-//! on the AST shape of the error anchor, not the message text, so AstGen rewording cannot break it.
+//! on the AST shape of the error anchor, not the message text, so AstGen rewording should not break it.
 
 const std = @import("std");
 const assert = std.debug.assert;

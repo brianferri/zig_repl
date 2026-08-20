@@ -96,9 +96,8 @@ test "compliance: anonymous struct (.{ .a = ... }) field access" {
     });
 }
 
-// An anon literal is comptime-known, so `&anon.field` points to a comptime field; a
-// global holding that pointer is rejected by the compiler ("global variable contains
-// reference to comptime var"). The comptime-only REPL has no runtime-escape notion, so
+// A global holding `&anon.field` (a pointer to a comptime field) is rejected by the compiler ("global
+// variable contains reference to comptime var"). The comptime-only REPL has no runtime-escape notion, so
 // it reads the field -- a deliberate divergence, pinned with `.rendered`.
 test "divergence: global pointer to a comptime anon-struct field" {
     try compliance.check(a, &.{

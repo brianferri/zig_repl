@@ -1,6 +1,4 @@
-//! Frontend-agnostic interpreter session: the state a backend needs to evaluate
-//! input -- allocator, intern pool, root namespace, and committed pipeline
-//! snapshots. No terminal, file, or IO surface; those live in the frontend.
+//! Frontend-agnostic interpreter session: allocator, intern pool, root namespace, and committed pipeline snapshots.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -13,57 +11,33 @@ const InputShape = @import("front/InputShape.zig");
 const Session = @This();
 
 gpa: std.mem.Allocator,
-/// Borrowed: caller owns the InternPool and `deinit`s it; Session.deinit does not
-/// touch the pool. Lets tests share one pool across Sessions.
+/// The caller owns and `deinit`s it; `Session.deinit` does not.
 intern_pool: *InternPool,
-/// The session-root namespace -- the parent-less scope into which
-/// top-level `const` / `var` lines bind. Mirrors the role of the
-/// compiler's per-file-root namespace; modules hang their own
-/// namespaces off this root via the `parent` chain.
+/// Where top-level `const`/`var` lines bind; modules hang their own namespaces off it via the `parent`
+/// chain (the compiler's per-file-root namespace).
 root_namespace: InternPool.NamespaceIndex,
-/// The file that backs `@import("root")` -- the REPL's `Zcu.root_mod`. The root's
-/// decls live in `root_namespace` as resolved Navs spread across line files, not
-/// one walkable container, so root has no ZIR of its own; this reserves an empty
-/// `File` purely to give root a permanent, distinct `File.Index`, so its container
-/// identity `(file_index, main_struct_inst)` can never alias a line or module.
-/// Root's type lives in that file's `root_type` slot, read back via `fileRootType`
-/// like any file. `null` until first `@import("root")`.
+/// The empty `File` reserved for `@import("root")`: root's decls live in `root_namespace`, not one
+/// container, so it has no ZIR, but it needs a permanent distinct `File.Index` so its identity
+/// `(file_index, main_struct_inst)` never aliases a line or module. `null` until first `@import("root")`.
 root_file: ?Index = null,
-/// Every source file the session has lowered to ZIR: each committed REPL line
-/// and each loaded module (`std` and the files it imports). Mirrors the
-/// compiler's `Zcu.File` collection; `source_zir_id` (on a Func or a container
-/// type) is a `File.Index` into this list, so crossing into another file's ZIR
-/// is one indexed lookup, exactly as the compiler resolves a `TrackedInst`'s
-/// file. Persist for the session lifetime, together with each file's Ast and
-/// wrapped source -- a Sema diagnostic resolves its `LazySrcLoc` against the owning
-/// file's tree, so the tree must outlive analysis, as `Zcu.File` keeps `tree`/`source`.
+/// Each lowered source file (committed REPL lines + loaded modules); a `File.Index` indexes here. Each
+/// file's Ast and wrapped source persist for the session because a Sema diagnostic resolves its
+/// `LazySrcLoc` against the owning file's tree, so the tree must outlive analysis.
 files: std.ArrayListUnmanaged(File) = .empty,
-/// The pending Sema failure, set by `Sema.failWithOwnedErrorMsg` when a session is
-/// present. The REPL's single-slot analog of the compiler's `Zcu.failed_analysis`
-/// (a map keyed by `AnalUnit`): one unit is analyzed per call, so at most one
-/// failure is pending at the analyze boundary. The driver, which holds the `Ast`,
-/// resolves the carried `LazySrcLoc` and renders a caret, then `destroy`s it. gpa-owned.
+/// Pending Sema failure (the compiler's `Zcu.failed_analysis`, single-slot here since one unit is analyzed
+/// per call). The driver resolves its `LazySrcLoc`, renders a caret, then `destroy`s it. gpa-owned.
 failed_analysis: ?*ErrorMsg = null,
-/// Loaded on-disk files by canonical sub-path -> `File.Index`, so each is read
-/// and lowered once. The compiler's `Zcu.import_table`. REPL lines are not
-/// here: they have no path. Keys alias each `File.sub_file_path` (no separate
-/// allocation), so the map is torn down before those strings are freed.
+/// Loaded on-disk files by canonical sub-path (the compiler's `Zcu.import_table`); REPL lines are absent
+/// (no path). Keys alias each `File.sub_file_path`, so the map is torn down before those strings are freed.
 import_table: std.StringHashMapUnmanaged(Index) = .empty,
-/// How `@import` obtains module bytes, injected by the frontend (a pointer to
-/// the `interface` field of a concrete reader it owns). `null` (the default)
-/// means the environment cannot load modules, so `@import` of
-/// `std`/`root`/`builtin` fails -- the case for freestanding wasm and for
-/// tests that never import.
+/// How `@import` obtains module bytes, injected by the frontend. `null` means modules cannot load, so
+/// `@import` of std/root/builtin fails -- freestanding wasm and tests that never import.
 module_source: ?*ModuleSource = null,
-/// Runtime-layer state for the intrinsic `Io` (owned by `io/`). `io` is the single host `Io` the
-/// interpreter delegates every runtime leaf to -- the print sink (its stderr), the clock, the
-/// filesystem -- exactly as a compiled program holds one `Io`. Frontend-injected: the TTY passes its
-/// threaded `Io`, the wasm frontend a shim whose stderr routes to the output buffer. `null` leaves the
-/// runtime inert (no sink installed, runtime reads return a neutral value). `installed` tracks whether
-/// `root.std_options_debug_io` is bound yet. `open_files` is the handle table: a `__repl_open` returns
-/// an index into it, which the interpreter File's descriptor carries so `__repl_read` finds the host
-/// file. A `__repl_close` nulls the slot (so its descriptor is free to reuse, the way a kernel table
-/// hands back the lowest free descriptor); any still-open file is closed with `io` at session teardown.
+/// Runtime-layer state for the intrinsic `Io`: `io` is the single host `Io` every runtime leaf (print
+/// sink, clock, filesystem) delegates to, frontend-injected; `null` leaves the runtime inert.
+/// `installed` tracks whether `root.std_options_debug_io` is bound. `open_files` is the handle table a
+/// `__repl_open` indexes into; `__repl_close` nulls the slot for reuse, and any still-open file is closed
+/// at session teardown.
 runtime: struct {
     io: ?std.Io = null,
     installed: bool = false,
@@ -73,29 +47,21 @@ runtime: struct {
 /// Index into `files`; the REPL's `Zcu.File.Index`.
 pub const Index = u32;
 
-/// A lowered source file, the REPL's `Zcu.File`. No incremental rebuild, ZON,
-/// or multi-module graph here.
+/// A lowered source file, the REPL's `Zcu.File`.
 pub const File = struct {
-    /// The lowered ZIR, or `null` for a REPL line whose analysis failed -- kept
-    /// as a tombstone so later `File.Index` values stay stable, as the compiler
-    /// retains a failed file (`status == astgen_failure`).
+    /// The lowered ZIR, or `null` for a failed line kept as a tombstone so later `File.Index` values stay stable.
     zir: ?std.zig.Zir,
-    /// The Ast this file was lowered from, kept so a Sema diagnostic can resolve its
-    /// `LazySrcLoc` (base declaration node + offset) into a byte span. Mirrors
-    /// `Zcu.File.tree`; the compiler additionally makes it droppable and re-parses via
-    /// `getTree`, an optimization not adopted here. `null` only before it is set.
+    /// The Ast the file was lowered from, kept so a Sema diagnostic can resolve its `LazySrcLoc` into a
+    /// byte span. `null` only before it is set.
     tree: ?std.zig.Ast = null,
-    /// The wrapped source the Ast was parsed from, and the coordinates that map it
-    /// back to what the user typed. Mirrors `Zcu.File.source`; a diagnostic renderer
-    /// slices the caret's source line out of it. `null` for files with no wrap.
+    /// The wrapped source the Ast was parsed from, plus the coordinates mapping it back to the user's text;
+    /// a diagnostic slices the caret's source line from it. `null` for files with no wrap.
     wrapped: ?InputShape.Wrapped = null,
-    /// Path relative to the source root, the base for this file's own relative
-    /// imports (`Zcu.File.sub_file_path`). `null` for a REPL line, which has no
-    /// on-disk path. Owned when non-null.
+    /// Path relative to the source root, the base for this file's relative imports. `null` for a REPL line
+    /// (no on-disk path); owned when non-null.
     sub_file_path: ?[]const u8,
-    /// The file-root container type (`main_struct_inst`), set once the file is
-    /// analysed as a module. The compiler's `Zcu.fileRootType`. `.none` for a
-    /// REPL line (its decls bind into the session namespace, not a root type).
+    /// The file-root container type (`main_struct_inst`), set once the file is analysed as a module. `.none`
+    /// for a REPL line (its decls bind into the session namespace).
     root_type: InternPool.Index = .none,
 };
 

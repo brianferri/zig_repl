@@ -1,5 +1,4 @@
-//! Lives at src/ rather than src/sema/ so it can import from front/ and
-//! sema/ both; Zig blocks cross-directory imports inside one subdir.
+//! Single-shot Sema evaluation tests: eval a source and assert the rendered value or diagnostic.
 
 const std = @import("std");
 const testing = std.testing;
@@ -11,8 +10,7 @@ const Session = @import("Session.zig");
 const InternPool = @import("sema/InternPool.zig");
 const Value = @import("sema/Value.zig");
 
-/// Register `zir` as a session file and analyse it, the way `eval.run` drives
-/// Sema (the file must exist before analysis so its `File.Index` is fixed).
+/// Registers `zir` as a session file (its `File.Index` must be fixed before analysis) and analyses it.
 /// Takes ownership of `zir`; the session frees it at `deinit`.
 fn analyzeZir(session: *Session, zir: std.zig.Zir, writer: *std.Io.Writer) anyerror!?Value {
     var owned = zir;
@@ -328,9 +326,8 @@ test "fn return rejects a runtime value whose type does not coerce" {
     defer pool.deinit();
     const ns = try pool.createNamespace(gpa, .{});
 
-    // `a` and `b` are non-comptime params, so `a + b` is a runtime u32; u32
-    // does not coerce to the i32 return type (type-based, regardless of the
-    // value), so the call is rejected -- as the compiler rejects the body.
+    // `a`/`b` are runtime params, so `a + b` is a runtime u32 that doesn't coerce to the `i32` return
+    // (type-based), so it's rejected -- as the compiler rejects the body.
     var diag_buf: [4096]u8 = undefined;
     try testing.expectError(error.AnalysisFail, evalSessionLines(gpa, &pool, ns, &.{
         "fn add(a: u32, b: u32) i32 { return a + b; }",
@@ -647,9 +644,8 @@ test "@floatCast widens and narrows between float widths" {
         @as(u64, @bitCast(@as(f64, @as(f32, 1.5)))),
     );
 
-    // f64 -> f32 (narrowing, precision loss permitted). The expected
-    // bits are computed via `@floatCast` rather than `@as` because Zig's
-    // comptime guard would reject the latter for a value f32 cannot represent exactly.
+    // f64 -> f32 narrowing. Expected bits via `@floatCast`, not `@as` -- Zig's comptime guard would reject
+    // `@as` for a value f32 can't represent exactly.
     try expectEvalTypedFloat(
         gpa,
         &pool,
@@ -941,9 +937,7 @@ test "@bitCast reinterprets matching-width bits" {
     try expectEvalTypedDecimal(gpa, &pool, "@as(u8, @bitCast(@as(i8, -1)))", .u8_type, "255");
 }
 
-/// Drive a type-expression through the full Pipeline + Sema + render,
-/// asserting that the rendered name matches `expected`. Used for
-/// ptr_type and aggregate / function types.
+/// Asserts a type-expression renders to `expected` (through the full Pipeline + Sema + render).
 fn expectEvalTypeName(
     gpa: std.mem.Allocator,
     intern_pool: *InternPool,
@@ -1351,10 +1345,8 @@ test "alloc/store/load: var read after init" {
     const gpa = testing.allocator;
     var pool = try InternPool.init(gpa);
     defer pool.deinit();
-    // The REPL suppresses AstGen's "local variable is never mutated"
-    // diagnostic at the front-end boundary (front/ZirErrors.zig), so a
-    // never-mutated `var` is accepted; mutability is enforced at Sema
-    // store time, not at parse time.
+    // The REPL suppresses AstGen's "local variable is never mutated" advisory (front/ZirErrors.zig), so a
+    // never-mutated `var` is accepted; mutability is enforced at Sema store time.
     try expectEvalTypedDecimal(gpa, &pool, "blk: { var x: u8 = 7; break :blk x; }", .u8_type, "7");
 }
 
@@ -1464,10 +1456,8 @@ test "runtime load navigates a pointer into a mutable global" {
     });
 }
 
-/// Run a sequence of session inputs through the shared `eval.run` driver,
-/// persisting bindings in `namespace`. Returns the final input's Value (or
-/// null when it was a declaration). Diagnostics for the (unexpected) error
-/// case go to `diag_buf`.
+/// Runs a sequence of inputs through `eval.run`, persisting bindings in `namespace`. Returns the final
+/// input's Value (null for a declaration); error diagnostics go to `diag_buf`.
 fn evalSessionLines(
     gpa: std.mem.Allocator,
     pool: *InternPool,
@@ -1660,11 +1650,8 @@ test "decl: comptime block binds into comptime_decls" {
 
 const Diagnostic = @import("render/Diagnostic.zig");
 
-/// Run `source` through the same Pipeline + Diagnostic path the
-/// REPL uses, capturing whatever the ZIR-error renderer would
-/// surface to the user. The session is supplied by the caller so a
-/// preceding line can establish a binding before this line tries to
-/// shadow / rebind it.
+/// Runs `source` through the REPL's Pipeline + Diagnostic path, capturing the rendered ZIR-error output.
+/// The caller supplies the session so a preceding line can establish a binding to shadow/rebind.
 fn renderZirDiagnostic(
     gpa: std.mem.Allocator,
     pool: *InternPool,
@@ -1692,12 +1679,8 @@ test "diagnostic: shadow rejection renders main error in user frame" {
     var diag_buf: [4096]u8 = undefined;
     _ = try evalSessionLines(gpa, &pool, ns, &.{"const w = 10;"}, &diag_buf);
 
-    // Next line tries to shadow `w` inside a block. AstGen rejects
-    // with "local constant shadows declaration"; the note that
-    // would normally point at the original declaration ("declared
-    // here") anchors on the wrap-injected `const w: comptime_int =
-    // undefined;` line. UserView.translate returns null for that
-    // anchor and the note is suppressed -- the main error stands.
+    // The "declared here" note would anchor on the wrap-injected `const w = undefined;` line, which
+    // `UserView.translate` drops, so only the main "local constant shadows declaration" error renders.
     var out_buf: [4096]u8 = undefined;
     const rendered = try renderZirDiagnostic(
         gpa,
@@ -1708,8 +1691,6 @@ test "diagnostic: shadow rejection renders main error in user frame" {
     );
 
     try testing.expect(std.mem.indexOf(u8, rendered, "local constant shadows declaration") != null);
-    // No misleading "declared here" note pointing at the wrap-injected
-    // line -- our injection-anchor suppression dropped it.
     try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, rendered, "declared here"));
 }
 
@@ -1722,14 +1703,9 @@ test "decl: cross-line rebind preserves the original binding (silent-drop limita
     var diag_buf: [4096]u8 = undefined;
     _ = try evalSessionLines(gpa, &pool, ns, &.{"const z = 1;"}, &diag_buf);
 
-    // Known limitation: cross-line rebind via wrap-injection
-    // produces a ZIR "duplicate struct member name" error whose main
-    // span anchors on the *injected* `const z: ... = undefined;`
-    // line (the original occurrence from AstGen's perspective).
-    // `UserView.translate` drops that span, so the whole error item
-    // is discarded. The Diagnostic renderer surfaces a fallback
-    // line so the user doesn't see silent failure; the semantic
-    // contract is also pinned -- the original binding survives the attempted rebind.
+    // Known limitation: a cross-line rebind's ZIR "duplicate struct member name" error anchors on the
+    // injected `const z = undefined;` line, which `UserView.translate` drops, discarding the item. The
+    // renderer surfaces a fallback, and the original binding survives the rebind.
     var out_buf: [4096]u8 = undefined;
     const rendered = try renderZirDiagnostic(gpa, &pool, ns, "const z = 2;", &out_buf);
 

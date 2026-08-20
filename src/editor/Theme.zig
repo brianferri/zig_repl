@@ -1,9 +1,8 @@
 //! Prompt-theme interface. A `Theme` is a *preference*; the terminal's
 //! `Color.ColorLevel` (a capability) decides how much color renders.
 //!
-//! `Prompt` keeps visible `width` separate from emitted bytes: cursor
-//! positioning counts `width`, never the zero-width SGR escapes, so a
-//! colored prompt cannot desync the cursor.
+//! `Prompt` keeps visible `width` separate from emitted bytes: cursor positioning counts `width`, not the
+//! zero-width SGR escapes, so a colored prompt should not desync the cursor.
 
 const std = @import("std");
 const assert = std.debug.assert;

@@ -11,8 +11,7 @@ const Fs = @import("Fs.zig");
 const Buffer = @This();
 
 gpa: std.mem.Allocator,
-/// The decompressed tar bytes, owned for the session. A linear scan per import is cheaper than a
-/// persistent index: std files are read once (the loader dedups via `import_table`).
+/// The decompressed tar bytes, owned for the session; std files are read once, deduped by the loader's `import_table`.
 tar: []const u8,
 interface: Fs = .{ .vtable = &vtable },
 
@@ -29,7 +28,7 @@ const vtable: Fs.VTable = .{
 /// this source exists for. Std's own paths sit far below it.
 const max_name_bytes = 4096;
 
-/// Decompress a gzip tar into memory, borrowing nothing from `gzip_tar`; `deinit` frees the copy.
+/// Decompresses a gzip tar into owned memory (keeping no reference to `gzip_tar`); `deinit` frees it.
 pub fn init(gpa: std.mem.Allocator, gzip_tar: []const u8) !Buffer {
     var input: Io.Reader = .fixed(gzip_tar);
     const window = try gpa.alloc(u8, std.compress.flate.max_window_len);

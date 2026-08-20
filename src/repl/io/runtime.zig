@@ -1,7 +1,6 @@
-//! The interpreter's runtime layer: where the compiler emits AIR, `Sema` hands off here. Runtime-original
-//! -- no compiler function to mirror. Two kinds: runtime memory (retarget a mutable global's pointer so
-//! the reused `comptime_ptr_access` navigation reaches it, `writeBack` persisting a store) and runtime
-//! I/O (bind the intrinsic `Io`, and perform the leaves a compiled program would reach by syscall).
+//! The interpreter's runtime layer (where the compiler would emit AIR): runtime memory (retarget a mutable
+//! global's pointer so the reused comptime navigation reaches it) and runtime I/O (the leaves a compiled
+//! program reaches by syscall). Runtime-original -- no compiler function to mirror.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -17,9 +16,8 @@ const Value = @import("../sema/Value.zig");
 /// namespaces never alias.
 const first_file_fd = 3;
 
-/// Bind `root.std_options_debug_io` to the intrinsic `Io` as a hidden `pub_decls` Nav. A no-op unless the
-/// session both loads `std` and has an output sink; a failed impl eval is swallowed so print degrades to
-/// the default `Io` rather than breaking every line.
+/// Binds `root.std_options_debug_io` to the intrinsic `Io`. A failed impl eval is swallowed so print
+/// degrades to the default `Io`.
 pub fn install(sema: *Sema, impl_source: [:0]const u8) Sema.Error!void {
     assert(impl_source.len > 0);
     const session = sema.session orelse return;
@@ -47,8 +45,7 @@ pub fn install(sema: *Sema, impl_source: [:0]const u8) Sema.Error!void {
     try ip.namespacePtr(session.root_namespace).pub_decls.putContext(sema.gpa, nav, {}, .{ .pool = ip });
 }
 
-/// Perform a call whose callee is one of the runtime intrinsics the interpreter supplies for the leaves a
-/// compiled program would reach by syscall. Null for any other extern, so the caller reports the usual
+/// Null for any extern that is not a runtime intrinsic, so the caller reports the usual
 /// non-function-callee error.
 pub fn callIntrinsic(
     sema: *Sema,
@@ -109,7 +106,7 @@ fn i64Value(ip: *InternPool, n: i64) Sema.Error!Value {
     return .{ .index = try ip.internInt(.{ .ty = .i64_type, .storage = .{ .i64 = n } }), .is_comptime = false };
 }
 
-/// Open a host file, returning its session-file-table index as a runtime `i64`, or negative on failure.
+/// The opened file's descriptor index, or -1 on failure.
 fn open(sema: *Sema, ptr: Value, len_val: Value) Sema.Error!Value {
     const ip = sema.intern_pool;
     const session = sema.session orelse return i64Value(ip, -1);
@@ -118,8 +115,7 @@ fn open(sema: *Sema, ptr: Value, len_val: Value) Sema.Error!Value {
     defer sema.gpa.free(path);
     const file = (hostOpen(host, path)) orelse return i64Value(ip, -1);
 
-    // Reuse the lowest freed descriptor before growing the table, the way a kernel hands back the lowest
-    // unused fd; a closed slot is left null by `close`.
+    // Reuse the lowest freed descriptor before growing the table; a closed slot is left null by `close`.
     const files = &session.runtime.open_files;
     for (files.items, 0..) |slot, i| {
         if (slot != null) continue;
@@ -134,8 +130,7 @@ fn open(sema: *Sema, ptr: Value, len_val: Value) Sema.Error!Value {
     return i64Value(ip, @intCast(first_file_fd + index));
 }
 
-/// Close the open file at descriptor `fd` and free its table slot. A standard-stream or already-free
-/// descriptor is a no-op (its lifetime is not the session's to end).
+/// A standard-stream or already-free descriptor is a no-op.
 fn close(sema: *Sema, fd_val: Value) Sema.Error!Value {
     const ip = sema.intern_pool;
     const session = sema.session orelse return .{ .index = .void_value };
@@ -161,8 +156,7 @@ fn hostOpen(host: std.Io, path: []const u8) ?std.Io.File {
     };
 }
 
-/// Read from the open file at descriptor `fd` into the interpreter buffer `ptr` names, materializing the
-/// host bytes as interpreter values. Returns the count (0 at EOF, -1 on failure).
+/// Materializes the host bytes into the buffer `buf_ptr` names; returns the count (0 at EOF, -1 on failure).
 fn read(sema: *Sema, fd_val: Value, buf_ptr: Value, len_val: Value) Sema.Error!Value {
     const ip = sema.intern_pool;
     const session = sema.session orelse return i64Value(ip, -1);
@@ -178,8 +172,6 @@ fn read(sema: *Sema, fd_val: Value, buf_ptr: Value, len_val: Value) Sema.Error!V
         else => return i64Value(ip, -1),
     };
 
-    // Each element pointer is `*u8` at the buffer's base advanced by the byte offset (`u8` is 1 byte),
-    // stored through the reused store path.
     const buf_key = ip.indexToKey(buf_ptr.index).ptr;
     const u8_ptr_ty = try ip.internPtrType(info: {
         var info = buf_ptr.typeOf(ip).ptrInfo(ip);
@@ -197,8 +189,7 @@ fn read(sema: *Sema, fd_val: Value, buf_ptr: Value, len_val: Value) Sema.Error!V
     return i64Value(ip, @intCast(n));
 }
 
-/// Read the `len`-byte `[]const u8` at `ptr` into a freshly-allocated host buffer (caller frees), or null
-/// when the bytes are out of the reader's reach.
+/// Caller frees the returned buffer; null when the pointer can't be resolved to concrete bytes.
 fn readBytes(sema: *Sema, ptr: Value, len_val: Value) Sema.Error!?[]u8 {
     const ip = sema.intern_pool;
     const len: usize = @intCast(intOf(ip, len_val.index) orelse return null);
@@ -217,8 +208,7 @@ fn readBytes(sema: *Sema, ptr: Value, len_val: Value) Sema.Error!?[]u8 {
     return buf;
 }
 
-/// The host clock reading `__repl_now(clock)` names, as a runtime `i64`. Zero when no host `Io` is wired,
-/// so the call stays total.
+/// The host clock reading, as an `i64`; zero when no host `Io` is wired.
 fn now(sema: *Sema, clock_val: Value) Sema.Error!Value {
     const ip = sema.intern_pool;
     const nanoseconds: i64 = ns: {
@@ -241,8 +231,7 @@ fn resolveArg(sema: *Sema, args_body: []const Zir.Inst.Index, explicit_len: u32,
     return try sema.coerceValueToType(raw, param_ty);
 }
 
-/// Emit `len` bytes at the `[*]const u8` `ptr` names to the host `Io` on the stream `fd` selects. Drops
-/// the write when the bytes are out of the reader's reach or no host Io is set.
+/// Drops the write when the bytes are out of reach or no host `Io` is set.
 fn write(sema: *Sema, fd_val: Value, ptr: Value, len_val: Value) Sema.Error!void {
     const ip = sema.intern_pool;
     const session = sema.session orelse return;
@@ -254,9 +243,8 @@ fn write(sema: *Sema, fd_val: Value, ptr: Value, len_val: Value) Sema.Error!void
     file.writeStreamingAll(host, buf) catch {};
 }
 
-/// The host `File` a descriptor names: 0/1/2 are the standard streams; higher descriptors index the
-/// session's open-file table. Null for an out-of-range or closed descriptor, so a read/write to it is
-/// dropped rather than crashing (a stale descriptor is a caller error, not a bug).
+/// 0/1/2 are the standard streams; higher descriptors index the open-file table. Null for an out-of-range
+/// or closed descriptor.
 fn hostFile(session: *Session, fd: u64) ?std.Io.File {
     if (fd < first_file_fd) return streamFile(fd);
     const descriptor = fd - first_file_fd;
@@ -320,13 +308,11 @@ fn intOf(ip: *const InternPool, index: InternPool.Index) ?u64 {
     };
 }
 
-/// Whether `nav` names an external symbol whose data lives in the linker, not the session store.
 fn isExternData(ip: *const InternPool, nav: InternPool.Nav) bool {
     return nav.resolved.?.is_extern_decl and Type.fromIndex(nav.resolved.?.type).zigTypeTag(ip) != .@"fn";
 }
 
-/// The `Nav` a pointer chain roots at, or null if it roots elsewhere (an integer address, an anonymous
-/// decl, an already-comptime alloc).
+/// Null when the chain roots elsewhere (an integer address, an anonymous decl, a comptime alloc).
 fn navRoot(ip: *const InternPool, ptr_index: InternPool.Index) ?InternPool.Nav.Index {
     return switch (ip.indexToKey(ptr_index).ptr.base_addr) {
         .nav => |nav_id| nav_id,
@@ -336,8 +322,8 @@ fn navRoot(ip: *const InternPool, ptr_index: InternPool.Index) ?InternPool.Nav.I
     };
 }
 
-/// Re-intern a nav-rooted pointer chain with its root swapped to `new_root`, preserving each level's
-/// type and byte offset. Null for a chain this interpreter cannot yet re-root.
+/// Re-roots a nav-rooted pointer chain at `new_root`, preserving each level's type and offset. Null for a
+/// chain this interpreter cannot re-root.
 fn rebaseTo(
     sema: *Sema,
     ptr_index: InternPool.Index,
@@ -361,8 +347,8 @@ fn rebaseTo(
     return try ip.internPtr(.{ .ty = ptr.ty, .base_addr = base_addr, .byte_offset = ptr.byte_offset });
 }
 
-/// Retarget a pointer for a runtime load onto a read-only view of the mutable global's current value
-/// (no alloc, since a load only reads). Null when the interpreter cannot perform the load.
+/// A load only reads, so it retargets onto a read-only view of the global's value with no alloc (unlike
+/// `retargetStore`, which needs a mutable one).
 pub fn retargetLoad(sema: *Sema, ptr: Value) Sema.Error!?Value {
     const ip = sema.intern_pool;
     const nav_id = navRoot(ip, ptr.index) orelse return null;
@@ -373,16 +359,15 @@ pub fn retargetLoad(sema: *Sema, ptr: Value) Sema.Error!?Value {
     return .{ .index = rooted };
 }
 
-/// A mutable global backed by a temporary comptime alloc for a runtime store: after the reused comptime
-/// store mutates the alloc, `writeBack` persists it.
+/// A mutable global backed by a temporary comptime alloc for a runtime store; `writeBack` persists it.
 pub const StoreTarget = struct {
     ptr: Value,
     nav_id: InternPool.Nav.Index,
     alloc_index: InternPool.Key.ComptimeAllocIndex,
 };
 
-/// Retarget a pointer for a runtime store: back the mutable global with a temporary comptime alloc and
-/// re-root the chain at it. Null when the interpreter cannot perform the store.
+/// Backs the mutable global with a temporary comptime alloc so the reused comptime store can mutate it;
+/// `writeBack` then persists the result.
 pub fn retargetStore(sema: *Sema, ptr: Value) Sema.Error!?StoreTarget {
     const ip = sema.intern_pool;
     const nav_id = navRoot(ip, ptr.index) orelse return null;
@@ -394,7 +379,7 @@ pub fn retargetStore(sema: *Sema, ptr: Value) Sema.Error!?StoreTarget {
     return .{ .ptr = .{ .index = rooted }, .nav_id = nav_id, .alloc_index = alloc_index };
 }
 
-/// Persist an alloc-backed store into the mutable global's slot, after a successful store.
+/// Persists the alloc-backed store into the mutable global's slot.
 pub fn writeBack(sema: *Sema, target: StoreTarget) Sema.Error!void {
     const ip = sema.intern_pool;
     const new_value = try sema.getComptimeAlloc(target.alloc_index).val.intern(ip, sema.arena);

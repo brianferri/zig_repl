@@ -1,6 +1,5 @@
-//! TTY frontend: the interactive REPL over the `terminal/` stack. Owns the
-//! IO surface (Io + stdin/stdout files), the live terminal, the prompt theme,
-//! and the run loop, wrapping a borrowed `*Session` (the frontend-agnostic core).
+//! TTY frontend: the interactive REPL over the `terminal/` stack. Owns the IO surface, live terminal,
+//! prompt theme, and run loop over a `*Session` it does not own.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -23,13 +22,10 @@ session: *Session,
 io: std.Io,
 stdin_file: std.Io.File,
 stdout_file: std.Io.File,
-/// True when stdin is a terminal. Drives whether input is echoed back:
-/// interactive stdin echoes via the kernel's line discipline, so the REPL
-/// stays quiet; piped stdin does not, so the REPL mirrors each line (see
-/// `echoInput`) for readable transcripts.
+/// True when stdin is a terminal, which echoes via the kernel's line discipline; piped stdin does not, so
+/// the REPL mirrors each line itself (see `echoInput`).
 is_interactive: bool,
-/// Selected prompt theme (a preference; the terminal's color capability
-/// decides how much shows). Repoint to switch themes at runtime.
+/// A preference; the terminal's color capability decides how much shows. Repoint to switch themes at runtime.
 theme: *const themes.Theme,
 /// The live terminal while interactive; null in cooked/piped mode.
 terminal: ?*Terminal,
@@ -73,7 +69,7 @@ pub fn run(repl: *Repl, environ: *const std.process.Environ.Map) !void {
 }
 
 fn runInteractive(repl: *Repl, stdout: *std.Io.Writer, environ: *const std.process.Environ.Map) !void {
-    // A `var` local so `readEvent` can borrow a mutable `&terminal`.
+    // A `var` local so `readEvent` can take a mutable `&terminal`.
     var terminal = Terminal.init(repl.session.gpa, repl.io, stdout, environ) catch |err| {
         try stdout.print("raw-mode terminal unavailable ({s}); using cooked mode\n", .{@errorName(err)});
         try stdout.flush();
@@ -122,9 +118,7 @@ fn runCooked(repl: *Repl, stdin: *std.Io.Reader, stdout: *std.Io.Writer) !void {
     try stdout.flush();
 }
 
-/// Piped stdin doesn't echo to the terminal, so mirror the line (with the
-/// `\n` `takeDelimiter` stripped) for readable transcripts; interactive stdin
-/// already echoes via the kernel's line discipline.
+/// Interactive stdin already echoes via the kernel's line discipline; piped stdin does not, so mirror it here.
 fn echoInput(is_interactive: bool, line: []const u8, writer: *std.Io.Writer) !void {
     if (is_interactive) return;
     try writer.print("{s}\n", .{line});

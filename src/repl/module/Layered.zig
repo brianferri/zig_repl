@@ -1,6 +1,5 @@
-//! An `Fs` that stacks a writable `primary` over a read-only `fallback`: a read tries `primary`, then
-//! `fallback`, so a project's files and `std` resolve through one filesystem with the project shadowing.
-//! Listing and every mutation act on `primary` alone.
+//! An `Fs` that stacks a writable `primary` over a read-only `fallback`: a read tries `primary` then
+//! `fallback` (the project shadows `std`); listing and every mutation act on `primary` alone.
 
 const std = @import("std");
 const Fs = @import("Fs.zig");

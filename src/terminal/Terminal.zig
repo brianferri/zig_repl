@@ -1,7 +1,6 @@
-//! Terminal subsystem entry point. Owns the platform backend, capability
-//! negotiation, the parser, and the ordered list of active Protocols. Consumers
-//! call `readEvent` for one canonical `Event` at a time; no escape-sequence or
-//! OS detail leaks past this boundary.
+//! Terminal subsystem entry point: owns the platform backend, capability negotiation, the parser, and the
+//! active Protocols. Consumers call `readEvent` for one canonical `Event`; no escape-sequence or OS detail
+//! should leak past this boundary.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -19,8 +18,7 @@ const ModifyOtherKeys = @import("protocol/ModifyOtherKeys.zig");
 const Xterm = @import("protocol/Xterm.zig");
 const BracketedPaste = @import("protocol/BracketedPaste.zig");
 
-/// Comptime-selected backend module; backends share an identical public
-/// surface (`init`, `deinit`, `setRawMode`, `restore`, `read`).
+/// Comptime-selected backend module; backends share one public surface.
 pub const PlatformBackend = switch (builtin.os.tag) {
     .windows => @import("platform/Windows.zig"),
     else => @import("platform/Posix.zig"),
@@ -45,8 +43,7 @@ writer: *std.Io.Writer,
 gpa: std.mem.Allocator,
 /// Highest-priority first.
 protocols: []const *Protocol,
-/// Embedded by value so `device()` can hand out `&interface` and the vtable
-/// recovers `*Terminal` via `@fieldParentPtr`.
+/// Embedded by value so `device()` can hand out `&interface`.
 interface: Device,
 read_buffer: [read_buffer_bytes]u8 = @splat(0),
 read_buffer_len: u32 = 0,

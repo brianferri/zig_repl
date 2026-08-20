@@ -1,9 +1,5 @@
-//! Wasm frontend entry: a line-in / text-out REPL the browser drives -- the host
-//! writes an input line into wasm memory, calls `replEval`, and reads the rendered
-//! output back out. Builds on `repl` + `drivers_wasm`, neither pulling the tty stack.
-//!
-//! Reentrancy: the result buffer is a module global, reset at the start of each
-//! call and read via `replResultPtr`/`replResultLen` before the next.
+//! Wasm frontend entry: a line-in / text-out REPL the browser drives. The result buffer is a module global,
+//! reset at the start of each call and read via `replResultPtr`/`replResultLen` before the next.
 
 const std = @import("std");
 const repl = @import("repl");
@@ -64,16 +60,14 @@ export fn replInit() bool {
     return true;
 }
 
-/// Reserve `len` bytes for the host to write an input line into. The
-/// matching `replEval` frees it. Returns null on allocation failure.
+/// The matching `replEval` frees the returned buffer; null on allocation failure.
 export fn replAlloc(len: usize) ?[*]u8 {
     const buf = gpa.alloc(u8, len) catch return null;
     return buf.ptr;
 }
 
-/// Evaluate one input line (the `len` bytes at `ptr`, freed here). The
-/// rendered result and any diagnostics land in the result buffer; read
-/// them with `replResultPtr` / `replResultLen` before the next call.
+/// The `ptr` buffer is freed here; the rendered result and diagnostics land in the result buffer, read
+/// via `replResultPtr`/`replResultLen` before the next call.
 export fn replEval(ptr: [*]u8, len: usize) void {
     if (!ready and !replInit()) return;
     defer gpa.free(ptr[0..len]);

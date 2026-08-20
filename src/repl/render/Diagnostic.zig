@@ -130,7 +130,7 @@ fn renderOneParseError(
 }
 
 /// Render ZIR errors via `ZirErrors.renderActionable`. When every diagnostic anchors on a
-/// wrap-injected line it emits nothing, so surface a fallback rather than a silent success.
+/// wrap-injected line it emits nothing, so surface a fallback.
 pub fn renderZirErrors(
     gpa: std.mem.Allocator,
     zir: std.zig.Zir,

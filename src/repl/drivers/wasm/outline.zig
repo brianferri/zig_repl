@@ -1,7 +1,5 @@
-//! Source-mapped structured view of one input's lowering, for the web
-//! explorer. Emits JSON `{ source, ast, zir }`, both views rooted at the user's
-//! input and mapping every node/instruction back to its byte range in `source`.
-//! An instruction binds to its syntax by AST node identity, not overlapping spans.
+//! Source-mapped structured view of one input's lowering for the web explorer: JSON `{ source, ast, zir }`,
+//! each node/instruction bound to its source byte range by AST node identity, not overlapping spans.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -18,13 +16,11 @@ const ZirSummary = repl.render.ZirSummary;
 
 const UserView = Pipeline.UserView;
 
-/// Shift applied to a segment's emitted ids and spans when several segments
-/// share one outline (see `writeJson`).
+/// Shift applied to a segment's ids and spans when several segments share one outline.
 const Offset = struct {
-    /// Moves the segment's AST node ids (and the ZIR `node` refs that key into
-    /// them) past the previous segment's.
+    /// Shifts the segment's AST node ids (and the ZIR `node` refs into them) past the previous segment's.
     id: u32 = 0,
-    /// Moves the segment's spans to its place in the full source.
+    /// Shifts the segment's spans to its place in the full source.
     byte: u32 = 0,
 };
 
@@ -33,13 +29,10 @@ const Segment = struct {
     off: Offset,
 };
 
-/// Outline `source` as JSON `{ source, ast, zir }` for the explorer. On a
-/// front-end failure the arrays are empty (the explorer falls back to diagnostics).
-///
-/// "Declarations then a trailing expression" can't share one parse (a container
-/// rejects a bare trailing expression), so they are outlined as two runs and
-/// merged: the declarations bind into `session` so the expression's run
-/// resolves them, and the expression segment is shifted past them in both id and byte space.
+/// Outlines `source` as JSON `{ source, ast, zir }`; the arrays are empty on a front-end failure.
+/// Declarations + a trailing expression can't share one parse (a container rejects a bare expression), so
+/// they run as two segments and merge -- the declarations bind so the expression run resolves them, and
+/// the expression segment is shifted past them in id and byte space.
 pub fn writeJson(session: *Session, source: []const u8, w: *std.Io.Writer) !void {
     const split = InputShape.splitTrailingExpr(session.gpa, source) catch null;
     if (split) |s| {
@@ -79,9 +72,8 @@ pub fn emitEmpty(w: *std.Io.Writer, message: ?[]const u8) !void {
     try json.write(Empty{ .@"error" = message });
 }
 
-/// Emit the merged `{ source, ast, zir }` for `segments` in order. Segment
-/// nodes that map into injected/prelude bytes are dropped (no user-frame
-/// span); the rest are shifted by the segment's `off`.
+/// Emits the merged `{ source, ast, zir }`. Nodes mapping into injected/prelude bytes are dropped; the
+/// rest are shifted by the segment's `off`.
 fn emitOutline(gpa: std.mem.Allocator, w: *std.Io.Writer, source: []const u8, segments: []const Segment) !void {
     var json: Json = .{ .writer = w, .options = .{ .emit_null_optional_fields = false } };
     try json.beginObject();
@@ -110,9 +102,8 @@ fn emitOutline(gpa: std.mem.Allocator, w: *std.Io.Writer, source: []const u8, se
         defer scratch.deinit();
         var sink: ZirSink = .{ .json = &json, .zir = zir, .scratch = &scratch, .id_offset = seg.off.id };
         const datas = zir.instructions.items(.data);
-        // Skip injected-prelude decls, whose node maps into hidden bytes -- but
-        // always walk the expression wrapper: its own node is injected, yet its
-        // body holds the user expression that maps back into user bytes.
+        // Skip injected-prelude decls (their node maps into hidden bytes), but always walk the expression
+        // wrapper -- its own node is injected, yet its body holds the user expression.
         for (zir.typeDecls(.main_struct_inst)) |decl_inst| {
             const decl_node = datas[@backingInt(decl_inst)].declaration.src_node;
             if (!isWrapperDecl(seg.result.tree, decl_node) and
@@ -125,9 +116,8 @@ fn emitOutline(gpa: std.mem.Allocator, w: *std.Io.Writer, source: []const u8, se
     try json.endObject();
 }
 
-/// The node to outline for root declaration `decl`. An expression input is wrapped in a function whose
-/// body's single local binds `( EXPR )`, so dive to that initializer and unwrap its parens to EXPR; any
-/// other declaration is its own node.
+/// For an expression input (wrapped in a function whose local binds `( EXPR )`), dives to that initializer
+/// and unwraps the parens to EXPR; any other declaration is its own node.
 fn outlineNode(tree: Ast, decl: Ast.Node.Index) Ast.Node.Index {
     if (tree.nodeTag(decl) != .fn_decl or !isWrapperDecl(tree, decl)) return decl;
     const body = tree.nodeData(decl).node_and_node[1];
@@ -148,9 +138,7 @@ fn isWrapperDecl(tree: Ast, decl: Ast.Node.Index) bool {
     return std.mem.eql(u8, name, InputShape.expression_decl_name);
 }
 
-/// Emit `node` and its children as a nested JSON object
-/// `{ id, label, lo, hi, children }`. A node mapping into injected bytes (no
-/// user-frame span) drops out with its subtree.
+/// A node mapping into the injected wrap, not the user's text, drops out with its subtree.
 fn emitAstNode(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index, off: Offset) anyerror!void {
     const span = view.translate(tree.nodeToSpan(node)) orelse return;
     try json.beginObject();
@@ -169,11 +157,9 @@ fn emitAstNode(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index, off
     try json.endObject();
 }
 
-/// Recurse into `node`'s children. The AST has no generic child iterator, so
-/// children are read per tag from the operand slots the tag's grammar fills; an
-/// unhandled tag is a leaf rather than a guess. `fn_proto` is left a leaf on
-/// purpose: its parameter names are tokens, not nodes, so the signature reads
-/// better as text than as its (often repeated) type-expression children.
+/// The AST has no generic child iterator, so children are read per tag from the slots its grammar fills;
+/// an unhandled tag is a leaf. `fn_proto` is left a leaf on purpose -- its parameter names are tokens,
+/// not nodes.
 fn emitChildren(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index, off: Offset) anyerror!void {
     switch (tree.nodeTag(node)) {
         .mul,
@@ -257,21 +243,17 @@ fn emitChildren(json: *Json, tree: Ast, view: UserView, node: Ast.Node.Index, of
     }
 }
 
-/// `ZirWalk` sink that emits the instruction tree as nested JSON objects
-/// `{ label, detail?, node?, children }`. Section headers are structural
-/// (no `detail`/`node`); an instruction carries its operand/value summary
-/// (`detail`, via `ZirSummary`) and the AST node it lowered from (`node`,
-/// when its shape resolves one).
+/// `ZirWalk` sink emitting the instruction tree as JSON. A section header has no `detail`/`node`; an
+/// instruction carries its summary (`detail`) and the AST node it lowered from (`node`, when its shape
+/// resolves one).
 const ZirSink = struct {
     json: *Json,
     zir: Zir,
     scratch: *std.Io.Writer.Allocating,
-    /// Shift for the `node` refs so they key into this segment's AST ids
-    /// after they were moved past an earlier segment's (see `Offset`).
+    /// Shift for the `node` refs so they key into this segment's AST ids (see `Offset`).
     id_offset: u32 = 0,
 
-    // Declarations are elided so their bodies surface as top-level sections:
-    // hides the `__repl_input` wrapper, and matches how a lone `const` outlines.
+    // Declarations are elided so their bodies surface as top-level sections (hides the `__repl_input` wrapper).
     pub fn openDeclaration(self: *ZirSink, decl_inst: Zir.Inst.Index, base: Ast.Node.Index) !void {
         _ = self;
         _ = decl_inst;
@@ -335,10 +317,9 @@ const ZirSink = struct {
     }
 };
 
-/// AST node an instruction lowered from, or null when its shape carries no
-/// node-relative source. A ZIR `src_node` is relative to the enclosing
-/// declaration (`base`), so `toAbsolute` lifts it to the same `Ast` node index
-/// `emitAstNode` keys on. Only verified shapes are mapped; the rest stay unlinked.
+/// The AST node an instruction lowered from, or null when it has no source node. A ZIR `src_node` is
+/// relative to its enclosing declaration (`base`), so this lifts it to an absolute `Ast` node index; only
+/// verified shapes are mapped.
 fn instNode(base: Ast.Node.Index, tag: Zir.Inst.Tag, data: Zir.Inst.Data) ?Ast.Node.Index {
     return switch (tag) {
         .add,

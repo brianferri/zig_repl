@@ -1,6 +1,5 @@
-//! An `Fs` leaf backed by a real directory: each path is read, written, and listed under `root`. Both
-//! the `Io` and the root directory are supplied by the frontend, so the filesystem dependency stays at
-//! the edge. `root` must be opened with `OpenOptions.iterate` for a caller that intends to `list` it.
+//! An `Fs` leaf backed by a real directory: each path resolves under a frontend-supplied `root`, which
+//! must be opened with `OpenOptions.iterate` for a caller that intends to `list` it.
 
 const std = @import("std");
 const Fs = @import("Fs.zig");

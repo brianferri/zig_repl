@@ -1,8 +1,6 @@
-//! Memory-safety of the eval pipeline on the OOM path and against per-eval InternPool leaks.
-//!
-//! The OOM path uses a manual `FailingAllocator` sweep, not `std.testing.checkAllAllocationFailures`:
-//! `std.zig.AstGen`'s benign address-dependent rehashing shifts the allocation count between
-//! otherwise-identical runs, which the stricter helper rejects as nondeterministic.
+//! Memory-safety of the eval pipeline (OOM path + per-eval InternPool leaks). The OOM path uses a manual
+//! `FailingAllocator` sweep, not `checkAllAllocationFailures` -- AstGen's address-dependent rehashing
+//! shifts the allocation count between runs, which the stricter helper rejects as nondeterministic.
 
 const std = @import("std");
 const Io = std.Io;

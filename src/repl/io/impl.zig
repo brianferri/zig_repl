@@ -1,7 +1,5 @@
 //! The intrinsic `Io`, evaluated by the interpreter (not compiled into the REPL binary) so its overrides
-//! can reference the externs the interpreter supplies. `runtime.install` binds it as
-//! `root.std_options_debug_io`; overridden slots route the leaves a compiled program would reach by
-//! syscall to those externs, unoverridden slots reuse `Io.failing`.
+//! can reference the externs the interpreter supplies; unoverridden slots reuse `Io.failing`.
 
 const std = @import("std");
 const Io = std.Io;

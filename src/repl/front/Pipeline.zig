@@ -53,9 +53,8 @@ pub const UserView = struct {
     text: []const u8,
     offset_in_source: u32,
 
-    /// Translate a wrapped-source span into the user's frame. Returns `null` when the span anchors
-    /// entirely in the wrap-injection prefix (callers drop the diagnostic rather than mislead); a
-    /// span straddling the boundary clips to `[0, user_len]`.
+    /// Null when the span anchors entirely in the wrap-injection prefix; a span straddling the boundary
+    /// clips to `[0, user_len]`.
     pub fn translate(view: UserView, wrapped: std.zig.Ast.Span) ?std.zig.Ast.Span {
         if (anchorsInInjection(view, wrapped)) return null;
         const len: u32 = @intCast(view.text.len);
@@ -85,8 +84,8 @@ pub fn run(gpa: std.mem.Allocator, input: []const u8) !Result {
     return runWithInjection(gpa, input, null, .none);
 }
 
-/// Like `run`, but when `pool` + `namespace` are provided, builds an injection prefix from the
-/// namespace's decls so AstGen's own scope chain resolves session bindings (including rebind rejection).
+/// Like `run`, but builds an injection prefix from `namespace`'s decls so AstGen's scope chain resolves
+/// session bindings (including rebind rejection).
 pub fn runWithInjection(
     gpa: std.mem.Allocator,
     input: []const u8,
@@ -102,8 +101,8 @@ pub fn runWithInjection(
     var wrapped = try InputShape.wrapWithInjection(gpa, injection_prefix, input);
     errdefer wrapped.deinit(gpa);
 
-    // Reject pathologically nested input before the recursive parse overflows the stack, as a
-    // parse-level rejection so the existing diagnostic paths handle it rather than trapping the host.
+    // Reject pathologically nested input before the recursive parse overflows the stack -- a parse-level
+    // rejection routes through the existing diagnostic paths.
     if (exceedsNestingDepth(wrapped.text)) return error.ParseError;
 
     var tree = try std.zig.Ast.parse(gpa, wrapped.text, .{ .mode = .zig });
@@ -133,9 +132,8 @@ fn exceedsNestingDepth(source: [:0]const u8) bool {
     }
 }
 
-/// Render `const <name> = undefined;\n` per session-bound decl (an empty owned slice when there is no
-/// session context). The `= undefined` only adds the name to AstGen's scope chain; `Sema.evalDeclVal`
-/// substitutes the real value at lookup, so the initializer never participates in evaluation.
+/// Renders `const <name> = undefined;` per session-bound decl. The `= undefined` only adds the name to
+/// AstGen's scope chain; `Sema.evalDeclVal` substitutes the real value at lookup.
 fn buildInjectionPrefix(
     gpa: std.mem.Allocator,
     pool: ?*const InternPool,

@@ -22,7 +22,7 @@ pub const Wrapped = struct {
     }
 };
 
-/// Names the expression wrap exposes, shared with Sema so producer and consumer cannot desynchronise.
+/// Names the expression wrap exposes, shared with Sema so producer and consumer stay in sync.
 ///
 /// The wrap is a runtime function body, not a container `const`: a const initializer is a comptime
 /// scope that elides the `block_comptime` markers around comptime-required operands (`@Int` bit width,
@@ -39,10 +39,8 @@ pub const max_input_bytes: u32 = 16 * 1024;
 /// on wasm, whose ceiling cannot be raised); sized well under the observed wasm trap point.
 pub const max_nesting_depth: u32 = 32;
 
-/// Classifies an input line by its first token via the tokenizer.
-///
-/// `keyword_fn` is overloaded: `fn name(...)` is a declaration, but `fn (...) R` is an anonymous fn
-/// TYPE expression. Two-token lookahead disambiguates: an l_paren after `fn` means expression.
+/// `keyword_fn` is overloaded: `fn name(...)` is a declaration, but `fn (...) R` is an anonymous fn TYPE
+/// expression, so two-token lookahead disambiguates -- an l_paren after `fn` means expression.
 fn classify(input: [:0]const u8) Shape {
     assert(input.len > 0);
     assert(input.len <= max_input_bytes);
@@ -74,10 +72,9 @@ pub const Split = struct {
     expr: []const u8,
 };
 
-/// Split `input` into a declaration prefix and a single trailing expression (`const x = 1; x + 1`),
-/// which the REPL runs as two passes so each keeps a contiguous user region under the existing wrap.
-/// Returns null when a single wrap suffices (lone expression, pure declarations, or a declaration
-/// tail). The returned slices borrow from `input`.
+/// A declaration prefix and a trailing expression (`const x = 1; x + 1`), which the REPL runs as two
+/// passes so each keeps a contiguous user region under the wrap. Null when a single wrap suffices (lone
+/// expression, pure declarations, or a declaration tail); the returned slices point into `input`.
 pub fn splitTrailingExpr(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!?Split {
     assert(input.len > 0);
     assert(input.len <= max_input_bytes);

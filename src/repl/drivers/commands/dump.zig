@@ -30,9 +30,8 @@ pub fn command(comptime Ctx: type) Command(Ctx) {
                     return;
                 }
 
-                // Route through the same splitter the evaluator uses, so a
-                // mixed input dumps as the two passes the REPL would run rather
-                // than wrapping it as one file and reporting "file cannot be a tuple".
+                // Route through the same splitter the evaluator uses; wrapping a mixed input as one file
+                // would report "file cannot be a tuple".
                 if (try InputShape.splitTrailingExpr(session.gpa, trimmed)) |split| {
                     try stdout.writeAll("=== declarations ===\n");
                     try dumpInput(session, split.decls, stdout);
@@ -99,9 +98,7 @@ fn dumpAst(tree: Ast, stdout: *std.Io.Writer) !void {
     }
 }
 
-/// Identifier carried by a top-level decl AST node, when the tag's
-/// grammar specifies one. Returns null for decls without a
-/// user-visible name (test, comptime block).
+/// The decl's identifier, or null for a decl with no user-visible name (test, comptime block).
 fn astDeclName(tree: Ast, node: Ast.Node.Index, tag: Ast.Node.Tag) ?[]const u8 {
     return switch (tag) {
         .simple_var_decl,
@@ -123,9 +120,8 @@ fn dumpZir(zir: Zir, stdout: *std.Io.Writer) !void {
         zir.string_bytes.len,
     });
 
-    // Error-ZIR has no instructions, so the root container the walk reads at
-    // index 0 is absent; guard on the instruction list (compile errors can be
-    // suppressed, so the error flag alone would let a walk-then-panic through).
+    // Error-ZIR has no instructions, so guard on the instruction list -- the error flag alone can be
+    // suppressed, letting a walk-then-panic through.
     if (zir.instructions.len == 0) return;
 
     var sink: TextSink = .{ .zir = zir, .stdout = stdout };

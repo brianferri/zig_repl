@@ -1,6 +1,4 @@
-//! Terminal color capability -- what the terminal can display, resolved at init
-//! via `fromEnv`. `detect` takes the environment strings as arguments so the
-//! tier policy is testable without a real environment.
+//! Terminal color capability, resolved at init via `fromEnv`; `detect` takes the environment strings as arguments.
 
 const std = @import("std");
 

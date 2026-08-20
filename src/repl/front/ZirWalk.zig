@@ -1,12 +1,7 @@
-//! Single recursive traversal of a ZIR body tree, reporting nesting to a sink so a textual dump and
-//! a structured view share one notion of the tree.
-//!
-//! A sink is any value exposing:
-//!   openDeclaration(decl_inst, base_node) / closeDeclaration()
-//!   openSection(label)                    / closeSection()
-//!   openInstruction(inst, tag, data, base_node) / closeInstruction()
-//! `base_node` is the enclosing declaration's AST node; a ZIR `src_node` is an `Ast.Node.Offset`
-//! relative to it, so a sink mapping instructions to source resolves offsets against this base.
+//! Single recursive traversal of a ZIR body tree, reporting nesting to a sink so a textual dump and a
+//! structured view share one notion of the tree. `base_node` (passed to the sink) is the enclosing
+//! declaration's AST node; a ZIR `src_node` is an `Ast.Node.Offset` relative to it, so a sink mapping
+//! instructions to source resolves offsets against this base.
 
 const std = @import("std");
 const Ast = std.zig.Ast;

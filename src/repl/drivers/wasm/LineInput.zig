@@ -1,7 +1,5 @@
-//! Drives the shared `LineEditor` from a host-fed byte stream of xterm key
-//! sequences, so the wasm REPL reuses the tty's parsing, editing, and history.
-//! The host writes bytes with `feed`, reads `buffer`/`cursor` to render the
-//! input line, and takes a completed line with `takeSubmitted`.
+//! Drives the shared `LineEditor` from a host-fed byte stream of xterm key sequences, so the wasm REPL
+//! reuses the tty's parsing, editing, and history.
 
 const std = @import("std");
 const terminal = @import("terminal");

@@ -1,7 +1,5 @@
-//! Command interface, generic over the frontend context `Ctx` its `run`
-//! receives (`*Repl` for the TTY, `*Session` for wasm). A stateless descriptor:
-//! `run` takes the context, the full set (so `:help` can enumerate it), the
-//! argument text, and the output writer.
+//! Command interface, generic over the frontend context `Ctx` its `run` receives (`*Repl` for the TTY,
+//! `*Session` for wasm). Stateless; `run` gets the full command set too, so `:help` can enumerate it.
 
 const std = @import("std");
 

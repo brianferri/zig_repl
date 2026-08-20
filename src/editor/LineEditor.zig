@@ -1,10 +1,6 @@
-//! Multi-line REPL editor over the `terminal/` subsystem: consumes
-//! canonical `Event`s, emits one assembled input per `readLine`.
-//!
-//! Full-redraw on every state change -- the whole buffer is re-emitted
-//! and the cursor repositioned via CSI escapes; incremental edits buy
-//! nothing at REPL input sizes. Cursor is a byte index into `buffer`,
-//! so line-join on backspace is just deleting the `\n` at `cursor - 1`.
+//! Multi-line REPL editor over the `terminal/` subsystem: consumes canonical `Event`s, emits one assembled
+//! input per `readLine`. Full-redraw on every state change (the whole buffer is re-emitted, the cursor
+//! repositioned via CSI); the cursor is a byte index into `buffer`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -18,8 +14,7 @@ const LineEditor = @This();
 pub const max_input_bytes: u32 = 4096;
 pub const history_max_entries: u32 = 1000;
 
-/// Output sink. Every method but `readLine` writes only here, which
-/// keeps the editor core unit-testable without a real terminal.
+/// Every method but `readLine` writes only here.
 writer: *std.Io.Writer,
 gpa: std.mem.Allocator,
 buffer: std.ArrayListUnmanaged(u8),
@@ -55,8 +50,7 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer) LineEditor {
     };
 }
 
-/// Clear the buffer and per-line state for a fresh input line. `readLine`
-/// calls this then redraws; the event-driven wasm frontend calls it after a submit.
+/// `readLine` calls this then redraws; the wasm frontend calls it after a submit.
 pub fn beginLine(editor: *LineEditor) void {
     editor.buffer.clearRetainingCapacity();
     editor.cursor = 0;
@@ -74,9 +68,8 @@ pub fn deinit(editor: *LineEditor) void {
     editor.* = undefined;
 }
 
-/// Read one logical input. Returns `null` on EOF (Ctrl+D on empty buffer,
-/// or the terminal closing). The returned slice is borrowed from the
-/// editor's buffer and invalidated on the next `readLine` call.
+/// Null on EOF (Ctrl+D on empty buffer, or the terminal closing). The returned slice points into the
+/// editor's buffer and the next `readLine` overwrites it.
 pub fn readLine(editor: *LineEditor, device: *Device, theme: *const themes.Theme) !?[]const u8 {
     assert(@intFromPtr(editor) != 0);
     assert(@intFromPtr(device) != 0);
@@ -104,9 +97,8 @@ pub fn readLine(editor: *LineEditor, device: *Device, theme: *const themes.Theme
     }
 }
 
-/// Position the terminal cursor on a fresh row below the last rendered
-/// input row, so the caller's output doesn't overwrite input lines the
-/// final redraw left the cursor sitting among.
+/// Moves onto a fresh row below the last input row, so the caller's output doesn't overwrite the input
+/// rows the final redraw left the cursor among.
 fn moveCursorBelowInput(editor: *LineEditor) !void {
     assert(editor.lines_drawn >= 1);
     assert(editor.cursor_row_drawn < editor.lines_drawn);
@@ -394,8 +386,6 @@ fn beep(editor: *LineEditor) !Outcome {
     return .keep_reading;
 }
 
-/// Rewrite the entire input area. `theme` and `level` come from the
-/// caller so the editor core stays session-free.
 fn redraw(editor: *LineEditor, theme: *const themes.Theme, level: ColorLevel) !void {
     assert(@intFromPtr(editor) != 0);
     assert(editor.cursor <= editor.buffer.items.len);

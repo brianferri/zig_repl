@@ -92,10 +92,8 @@ test "compliance: wrap, saturating, shift, and bitwise arithmetic" {
     });
 }
 
-// Saturating shift `<<|` (ZIR shl_sat) requires integer operands, like `<<`.
-// Unlike `<<` it carries no `typeof_log2_int_type` coercion to enforce this, so
-// both operands are validated directly -- a float operand is rejected, not
-// silently shifted into a garbage value.
+// Saturating shift `<<|` requires integer operands like `<<`, but carries no `typeof_log2_int_type`
+// coercion to enforce it, so both operands are validated directly -- a float operand is rejected.
 test "compliance: saturating shift requires integer operands" {
     try compliance.check(a, &.{
         .{ .src = &.{"@as(u8, 5) <<| 2"}, .want = compliance.want(@as(u8, 5) <<| 2) },

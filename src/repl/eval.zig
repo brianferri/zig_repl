@@ -1,12 +1,5 @@
-//! The single owner of "run one REPL input against a session": wrap + inject prior
-//! decls, gate parse/ZIR errors, analyze, and commit so later lines resolve
-//! cross-references. `Repl` and the test harnesses share this path.
-//!
-//! Lives at `src/` (not a subdir) so it can import both `front/` and `sema/`, which
-//! Zig blocks across sibling subdirs.
-//!
-//! Not for single-shot Sema unit tests -- those want no injection or commit (see
-//! `evalSource` in sema_eval_test).
+//! Runs one REPL input against a session: wrap + inject prior decls, gate parse/ZIR errors, analyze, and
+//! commit so later lines resolve cross-references.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -18,20 +11,15 @@ const Sema = @import("sema/Sema.zig");
 const Session = @import("Session.zig");
 const Value = @import("sema/Value.zig");
 
-/// `value` is null for a declaration (or a Sema gap); `shape` lets the
-/// caller decide whether a null result is expected (declaration) or a
-/// gap to report (expression). Diagnostics are written to the caller's
-/// writer, not surfaced here.
+/// `value` is null for a declaration or a Sema gap; `shape` disambiguates (expected vs. a gap to report).
 pub const Outcome = struct {
     value: ?Value,
     shape: InputShape.Shape,
 };
 
-/// Evaluate a full REPL input. A line that is declarations followed by a
-/// trailing expression runs as two passes (bind, then evaluate with the
-/// bindings in scope); the returned `Outcome` is the last segment's. If
-/// the declaration pass fails, its error propagates and the expression
-/// pass is skipped -- it would only reference unbound names.
+/// Declarations followed by a trailing expression run as two passes (bind, then evaluate with the bindings
+/// in scope); the `Outcome` is the last segment's. A failed declaration pass skips the expression pass,
+/// which would only reference unbound names.
 pub fn run(session: *Session, input: []const u8, diag: *std.Io.Writer) !Outcome {
     assert(input.len > 0);
     assert(input.len <= InputShape.max_input_bytes);
@@ -42,11 +30,8 @@ pub fn run(session: *Session, input: []const u8, diag: *std.Io.Writer) !Outcome 
     return analyzeSegment(session, input, diag);
 }
 
-/// Run `input` for an interactive prompt and resolve its diagnostics. `run`
-/// already writes parse/ZIR/analysis errors to `diag`, so those are swallowed
-/// here (the prompt keeps going); an expression that produced no value writes
-/// the "(no value)" marker. Returns the Value the caller should render, or
-/// null when there is nothing to display. Host errors (OOM, writer) are fatal.
+/// Swallows the parse/ZIR/analysis errors `run` already wrote to `diag` so the prompt keeps going, and
+/// writes the `(no value)` marker for an expression with no value. Host errors (OOM, writer) are fatal.
 pub fn report(session: *Session, input: []const u8, diag: *std.Io.Writer) !?Value {
     const outcome = run(session, input, diag) catch |err| switch (err) {
         error.ParseError, error.ZirError, error.AnalysisFail => return null,
@@ -57,11 +42,8 @@ pub fn report(session: *Session, input: []const u8, diag: *std.Io.Writer) !?Valu
     return null;
 }
 
-/// One wrapped segment: front end + Sema + commit. Parse/ZIR errors are
-/// rendered to `diag` and returned as `error.ParseError`/`error.ZirError`;
-/// `Sema.analyze` writes its own diagnostics to `diag` and returns
-/// `error.AnalysisFail`. On success the pipeline is committed so a later
-/// segment/line can reference what it bound.
+/// Front end + Sema for one segment; errors are rendered to `diag`. On success the pipeline is committed,
+/// so a later segment/line can reference what it bound.
 fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !Outcome {
     assert(input.len > 0);
     assert(input.len <= InputShape.max_input_bytes);
@@ -86,11 +68,8 @@ fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !O
         return error.ZirError;
     }
 
-    // Register this line as a file BEFORE analysing it, so its `File.Index` is
-    // fixed and any module `@import`d mid-analysis takes a later index without
-    // colliding. A Func bound here replays its body on a later cross-line call by
-    // that index. The Ast + wrapped source move onto the `File`, kept so a Sema
-    // error resolves against this file's own tree.
+    // Register this line as a file BEFORE analysing it, so its `File.Index` is fixed and a module
+    // `@import`d mid-analysis takes a later index without colliding.
     const shape = result.wrapped.shape;
     committed = true;
     const line_index: Session.Index = @intCast(session.files.items.len);
@@ -105,28 +84,21 @@ fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !O
     };
 
     const value = Sema.analyze(session, line_index, diag) catch |err| {
-        // Render the source-anchored caret for a Sema failure. Resolve the error's
-        // `LazySrcLoc` against the file it was raised in (`em.file`) -- usually the
-        // current line, but a prior line when the error is inside a called
-        // function's body. Every committed `File` retains its ZIR/AST/wrapped
-        // source, so a prior line's are available here.
+        // Resolve the error's `LazySrcLoc` against the file it was raised in (`em.file`) -- a prior line
+        // when the error is inside a called function's body, whose retained source is still available.
         if (session.failed_analysis) |em| {
             defer {
                 em.destroy(session.gpa);
                 session.failed_analysis = null;
             }
             const err_file = &session.files.items[em.file];
-            // The diagnostic path comes from the error's own file, the way the compiler reads
-            // it from `src_loc.file_scope.path`; a REPL line has no on-disk path.
+            // A REPL line has no on-disk path; fall back to the placeholder.
             const src_path = err_file.sub_file_path orelse Diagnostic.repl_source_path;
             const rendered = caret: {
                 const file_zir = err_file.zir orelse break :caret false;
 
-                // Resolve against the error's own tree: a REPL line keeps its wrapped source +
-                // tree in the `File`; a loaded module keeps only ZIR, so re-read and re-parse on
-                // demand -- the compiler's `File.getSource`/`getTree` -- so a std error carets
-                // against std's own source. The tree is needed to resolve the src loc itself: a
-                // builtin-call-argument location selects an argument sub-node from it.
+                // A loaded module keeps only ZIR, so re-read and re-parse its source on demand (a REPL line
+                // still has its tree). The tree is needed to resolve the src loc into an AST node.
                 var owned_src: ?[:0]u8 = null;
                 var owned_tree: ?std.zig.Ast = null;
                 defer if (owned_src) |s| session.gpa.free(s);
@@ -155,18 +127,14 @@ fn analyzeSegment(session: *Session, input: []const u8, diag: *std.Io.Writer) !O
                 Diagnostic.renderSemaError(session.gpa, src_path, tree, view, node, em.msg, notes_buf[0..n], diag) catch {};
                 break :caret true;
             };
-            // No source anywhere (e.g. the reserved root file, zir==null); print the message
-            // alone, the way renderZirErrors falls back when it cannot locate a diagnostic.
+            // No source to anchor against (e.g. the reserved root file); print the message alone.
             if (!rendered) {
                 diag.print("error: {s}\n", .{em.msg}) catch {};
                 for (em.notes) |note| diag.print("note: {s}\n", .{note.msg}) catch {};
             }
         }
-        // Tombstone the failed line: free its ZIR, AST, and wrapped source but
-        // keep the `File` slot (and any modules it loaded, at later indices) so
-        // `File.Index` values stay stable. Its diagnostic is already rendered, and
-        // nothing references a failed line afterward -- a later caret lookup bails
-        // at the now-null ZIR before it would reach the tree.
+        // Tombstone the failed line: free its ZIR/AST/source but keep the `File` slot so later `File.Index`
+        // values stay stable. A later caret lookup bails at the now-null ZIR.
         const failed = &session.files.items[line_index];
         if (failed.zir) |*z| z.deinit(session.gpa);
         failed.zir = null;

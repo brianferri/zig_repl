@@ -1,7 +1,7 @@
-//! An in-memory `Fs` leaf holding the user's editable files as a directory tree, for a target with no real
-//! filesystem (freestanding wasm). Each directory is a map of one path component to a child node, so an
-//! empty directory is a node with no children and needs no separate bookkeeping. `remove` and `rename` act
-//! on a file or a whole subtree. Insertion order within a directory is preserved so a listing is stable.
+//! An in-memory `Fs` leaf holding the user's editable files as a directory tree (for freestanding wasm,
+//! which has no real filesystem): each directory maps one path component to a child node, so an empty
+//! directory is just a childless node. `remove`/`rename` act on a file or a whole subtree; insertion order
+//! within a directory is preserved so listings are stable.
 
 const std = @import("std");
 const assert = std.debug.assert;
