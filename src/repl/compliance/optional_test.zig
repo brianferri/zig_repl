@@ -23,7 +23,10 @@ test "compliance: optional values (payload, null, unwrap)" {
             }),
         },
         .{ .src = &.{"@as(?i32, null).?"}, .reject = true },
+        .{ .src = &.{"blk: { const x: u32 = 5; break :blk x.?; }"}, .reject = true },
     });
+    try compliance.expectDiagnostic(a, &.{"blk: { const x: u32 = 5; break :blk x.?; }"}, "expected optional type, found 'u32'");
+    try compliance.expectDiagnostic(a, &.{"blk: { const e: anyerror!u8 = 5; break :blk e.?; }"}, "consider using 'try', 'catch', or 'if'");
 }
 
 test "compliance: struct/union init through an optional result location" {

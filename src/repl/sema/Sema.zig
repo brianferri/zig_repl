@@ -2355,6 +2355,19 @@ pub fn addDeclaredHereNote(sema: *Sema, parent: *ErrorMsg, decl_ty: Type) Error!
     try sema.errNote(sema.containerTypeSrc(decl_ty.index), parent, "{s} declared here", .{category});
 }
 
+fn failWithExpectedOptionalType(sema: *Sema, src: LazySrcLoc, non_optional_ty: Type) Error {
+    const ip = sema.intern_pool;
+    return sema.failWithOwnedErrorMsg(sema.block, msg: {
+        const msg = try sema.errMsg(src, "expected optional type, found '{f}'", .{non_optional_ty.fmt(ip)});
+        errdefer msg.destroy(sema.gpa);
+        if (non_optional_ty.zigTypeTag(ip) == .error_union) {
+            try sema.errNote(src, msg, "consider using 'try', 'catch', or 'if'", .{});
+        }
+        try sema.addDeclaredHereNote(msg, non_optional_ty);
+        break :msg msg;
+    });
+}
+
 fn failWithTypeMismatch(sema: *Sema, src: LazySrcLoc, expected: Type, found: Type) Error {
     return sema.failWithOwnedErrorMsg(sema.block, msg: {
         const msg = try sema.typeMismatchErrMsg(src, expected, found);
@@ -6737,7 +6750,7 @@ fn evalOptionalPayload(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const operand = try sema.resolveInst(un_node.operand);
     const key = sema.intern_pool.indexToKey(operand.index);
     if (key != .opt) {
-        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "optional unwrap: operand is not an optional", .{});
+        return sema.failWithExpectedOptionalType(sema.block.nodeOffset(sema.srcNodeOffset(inst)), operand.typeOf(sema.intern_pool));
     }
     if (key.opt.val == .none) {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "unable to unwrap null", .{});
@@ -6756,7 +6769,7 @@ fn optPayloadPtr(sema: *Sema, optional_ptr: Value, comptime initializing: bool) 
     const ptr_type = ip.indexToKey(optional_ptr.typeOf(ip).toIndex()).ptr_type;
     const opt_key = ip.indexToKey(ptr_type.child);
     if (opt_key != .opt_type) {
-        return sema.fail(sema.block, sema.block.nodeOffset(.zero), "optional unwrap: pointer child is not an optional", .{});
+        return sema.failWithExpectedOptionalType(sema.block.nodeOffset(.zero), .fromIndex(ptr_type.child));
     }
     if (!initializing) {
         const opt_val = try sema.loadValue(optional_ptr);
@@ -11344,7 +11357,7 @@ fn evalForLen(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         };
         if (len) |existing| {
             if (existing != arg_len) {
-                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "for: non-matching loop lengths", .{});
+                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "non-matching for loop lengths", .{});
             }
         } else len = arg_len;
     }
