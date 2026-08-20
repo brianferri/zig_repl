@@ -2368,6 +2368,14 @@ fn failWithExpectedOptionalType(sema: *Sema, src: LazySrcLoc, non_optional_ty: T
     });
 }
 
+fn failWithStructInitNotSupported(sema: *Sema, src: LazySrcLoc, ty: Type) Error {
+    return sema.fail(sema.block, src, "type '{f}' does not support struct initialization syntax", .{ty.fmt(sema.intern_pool)});
+}
+
+fn failWithArrayInitNotSupported(sema: *Sema, src: LazySrcLoc, ty: Type) Error {
+    return sema.fail(sema.block, src, "type '{f}' does not support array initialization syntax", .{ty.fmt(sema.intern_pool)});
+}
+
 fn failWithTypeMismatch(sema: *Sema, src: LazySrcLoc, expected: Type, found: Type) Error {
     return sema.failWithOwnedErrorMsg(sema.block, msg: {
         const msg = try sema.typeMismatchErrMsg(src, expected, found);
@@ -6669,7 +6677,7 @@ fn evalVectorType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     };
     const child = try sema.resolveDestType(bin.rhs);
     if (!isVectorElemType(sema.intern_pool, child)) {
-        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "vector_type: expected integer, float, bool, or pointer for the vector element type", .{});
+        return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "expected integer, float, bool, or pointer for the vector element type; found '{f}'", .{Type.fromIndex(child).fmt(sema.intern_pool)});
     }
     const vector_ty = try sema.intern_pool.internVectorType(.{ .len = len, .child = child });
     return .{ .index = vector_ty };
@@ -9835,7 +9843,7 @@ fn evalValidateStructInitTy(sema: *Sema, inst: Zir.Inst.Index, comptime is_resul
     switch (sema.intern_pool.indexToKey(struct_ty)) {
         .struct_type, .union_type => return null,
         else => {
-            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "struct init: type does not support struct initialization syntax", .{});
+            return sema.failWithStructInitNotSupported(sema.block.nodeOffset(sema.srcNodeOffset(inst)), .fromIndex(struct_ty));
         },
     }
 }
@@ -9966,7 +9974,7 @@ fn evalStructInitEmpty(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .struct_type, .tuple_type => try sema.structInitEmpty(obj_ty),
         .array_type, .vector_type => try sema.arrayInitEmpty(obj_ty),
         .union_type => sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "union initializer must initialize one field", .{}),
-        else => sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "struct init: type does not support struct initialization syntax", .{}),
+        else => sema.failWithArrayInitNotSupported(sema.block.nodeOffset(sema.srcNodeOffset(inst)), .fromIndex(obj_ty)),
     };
 }
 
@@ -10015,7 +10023,7 @@ fn evalStructInitEmptyResult(sema: *Sema, inst: Zir.Inst.Index, comptime is_ref:
             return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "union initializer must initialize one field", .{});
         },
         else => {
-            return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "struct init: type does not support struct initialization syntax", .{});
+            return sema.failWithArrayInitNotSupported(sema.block.nodeOffset(sema.srcNodeOffset(inst)), .fromIndex(obj_ty));
         },
     };
     const value = if (init_ty == obj_ty) base else try sema.coerceValueToType(base, init_ty);
@@ -11345,7 +11353,19 @@ fn evalForLen(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             while (ip.indexToKey(operand_ty) == .ptr_type) operand_ty = ip.indexToKey(operand_ty).ptr_type.child;
             switch (ip.indexToKey(operand_ty)) {
                 .array_type, .vector_type, .tuple_type => break :blk ip.aggregateElementCount(operand_ty),
-                else => return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "for: operand is not a range or indexable", .{}),
+                else => {
+                    const object_ty = obj.typeOf(ip);
+                    const src = sema.block.nodeOffset(sema.srcNodeOffset(inst));
+                    return sema.failWithOwnedErrorMsg(sema.block, msg: {
+                        const msg = try sema.errMsg(src, "type '{f}' is not indexable and not a range", .{object_ty.fmt(ip)});
+                        errdefer msg.destroy(sema.gpa);
+                        try sema.errNote(src, msg, "for loop operand must be a range, array, slice, tuple, or vector", .{});
+                        if (object_ty.zigTypeTag(ip) == .error_union) {
+                            try sema.errNote(src, msg, "consider using 'try', 'catch', or 'if'", .{});
+                        }
+                        break :msg msg;
+                    });
+                },
             }
         } else blk: {
             const start = try sema.resolveUsizeInt(try sema.resolveInst(pair[0]));

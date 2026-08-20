@@ -396,4 +396,5 @@ test "compliance: @Vector and arrays are distinct but interconvertible" {
         .{ .src = &.{"blk: { const arr = [2]u8{ 1, 2, 3 }; break :blk arr[0]; }"}, .reject = true },
     });
     try compliance.expectDiagnostic(a, &.{"blk: { const arr = [2]u8{ 1, 2, 3 }; break :blk arr[0]; }"}, "expected 2 array elements; found 3");
+    try compliance.expectDiagnostic(a, &.{"@Vector(4, struct { a: u8 })"}, "for the vector element type; found");
 }

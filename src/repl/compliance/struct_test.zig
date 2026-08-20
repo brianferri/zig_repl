@@ -698,4 +698,7 @@ test "compliance: methods compose -- call each other and take struct args" {
             break :blk p.dot(q);
         }) },
     });
+    // A non-aggregate rejects init syntax; a named-field initializer is "struct", an empty one is "array".
+    try compliance.expectDiagnostic(a, &.{"u32{ .a = 1 }"}, "type 'u32' does not support struct initialization syntax");
+    try compliance.expectDiagnostic(a, &.{"@as(u32, .{})"}, "type 'u32' does not support array initialization syntax");
 }

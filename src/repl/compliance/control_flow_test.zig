@@ -94,6 +94,7 @@ test "compliance: for loops (range and array)" {
         .{ .src = &.{"blk: { const a = [_]u8{ 1, 2 }; const b = [_]u8{ 1, 2, 3 }; var s: u8 = 0; for (a, b) |x, y| { s += x + y; } break :blk s; }"}, .reject = true },
     });
     try compliance.expectDiagnostic(a, &.{"blk: { const a = [_]u8{ 1, 2 }; const b = [_]u8{ 1, 2, 3 }; var s: u8 = 0; for (a, b) |x, y| { s += x + y; } break :blk s; }"}, "non-matching for loop lengths");
+    try compliance.expectDiagnostic(a, &.{"for (@as(u32, 5)) |e| { _ = e; }"}, "type 'u32' is not indexable and not a range");
 }
 
 test "compliance: nested aggregate init and element store" {
