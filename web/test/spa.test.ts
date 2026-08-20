@@ -44,9 +44,10 @@ declare global {
                 palette: Record<string, { r: number, g: number, b: number }>
             }>,
             fs: {
-                list: () => Array<string>,
+                list: () => Array<{ path: string, kind: "file" | "directory" }>,
                 read: (path: string) => string,
                 write: (path: string, data: string) => void,
+                mkdir: (path: string) => void,
                 remove: (path: string) => void,
                 rename: (from: string, to: string) => void
             },
@@ -233,14 +234,74 @@ await describe("wasm repl", async () => {
             const R = window.repl;
             R.fs.write("util.zig", "pub fn greet() u32 { return 42; }");
             R.fs.write("main.zig", "const util = @import(\"util.zig\");\npub fn main() void { @import(\"std\").debug.print(\"got {d}\\n\", .{util.greet()}); }");
-            const files = R.fs.list().sort();
+            const files = R.fs.list().map((e) => e.path).sort();
             const output = R.run("main.zig");
             R.fs.remove("util.zig");
-            return { files, output, afterRemove: R.fs.list() };
+            return { files, output, afterRemove: R.fs.list().map((e) => e.path) };
         });
         assert.deepEqual(result.files, ["main.zig", "util.zig"]);
         assert.match(result.output, /got 42/);
         assert.deepEqual(result.afterRemove, ["main.zig"]);
+    });
+
+    await test("resolves @import across subdirectories in the virtual filesystem", async () => {
+        const output = await page.evaluate(() => {
+            const R = window.repl;
+            R.fs.write("lib/math.zig", "pub fn square(x: u32) u32 { return x * x; }");
+            R.fs.write("app.zig", "const math = @import(\"lib/math.zig\");\npub fn main() void { @import(\"std\").debug.print(\"sq {d}\\n\", .{math.square(7)}); }");
+            const out = R.run("app.zig");
+            R.fs.remove("lib/math.zig");
+            R.fs.remove("app.zig");
+            return out;
+        });
+        assert.match(output, /sq 49/);
+    });
+
+    await test("resolves relative @import against the importing file's directory", async () => {
+        const output = await page.evaluate(() => {
+            const R = window.repl;
+            R.fs.write("top.zig", "pub const w = 10;");
+            R.fs.write("lib/b.zig", "pub const v = 5;");
+            R.fs.write("lib/a.zig", "const b = @import(\"b.zig\");\nconst top = @import(\"../top.zig\");\npub fn main() void { @import(\"std\").debug.print(\"sum {d}\\n\", .{b.v + top.w}); }");
+            const out = R.run("lib/a.zig");
+            for (const f of ["top.zig", "lib/b.zig", "lib/a.zig"]) R.fs.remove(f);
+            return out;
+        });
+        assert.match(output, /sum 15/);
+    });
+
+    await test("writes and reads an empty file without a memory error", async () => {
+        const result = await page.evaluate(() => {
+            window.repl.fs.write("empty.zig", "");
+            const empty = window.repl.fs.read("empty.zig");
+            window.repl.fs.write("empty.zig", "pub const x = 1;");
+            const filled = window.repl.fs.read("empty.zig");
+            window.repl.fs.remove("empty.zig");
+            return { empty, filled };
+        });
+        assert.equal(result.empty, "");
+        assert.equal(result.filled, "pub const x = 1;");
+    });
+
+    await test("tracks an empty directory and moves or drops a whole subtree", async () => {
+        const result = await page.evaluate(() => {
+            const R = window.repl;
+            R.fs.mkdir("gamma");
+            const madeEmpty = R.fs.list().find((e) => e.path === "gamma");
+            R.fs.write("alpha/a.zig", "pub const a = 1;");
+            R.fs.write("alpha/nested/b.zig", "pub const b = 2;");
+            R.fs.rename("alpha", "beta");
+            const movedFile = R.fs.read("beta/nested/b.zig");
+            const alphaGone = R.fs.list().every((e) => !e.path.startsWith("alpha"));
+            R.fs.remove("beta");
+            const betaGone = R.fs.list().every((e) => !e.path.startsWith("beta"));
+            R.fs.remove("gamma");
+            return { kind: madeEmpty?.kind, movedFile, alphaGone, betaGone };
+        });
+        assert.equal(result.kind, "directory");
+        assert.match(result.movedFile, /pub const b = 2;/);
+        assert.ok(result.alphaGone);
+        assert.ok(result.betaGone);
     });
 
     await test("loads without page errors", () => {

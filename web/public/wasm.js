@@ -25,6 +25,7 @@
  * @property {() => void} replFsList
  * @property {(ptr: number, len: number) => void} replFsRead
  * @property {(pathPtr: number, pathLen: number, dataPtr: number, dataLen: number) => void} replFsWrite
+ * @property {(ptr: number, len: number) => void} replFsMkdir
  * @property {(ptr: number, len: number) => void} replFsDelete
  * @property {(oldPtr: number, oldLen: number, newPtr: number, newLen: number) => void} replFsRename
  * @property {(ptr: number, len: number) => void} replRun
@@ -85,11 +86,20 @@
  */
 
 /**
+ * One entry from `Fs.list`: its path and whether it names a file or a directory. An empty directory
+ * appears only as its own `directory` entry.
+ * @typedef {object} FsEntry
+ * @property {string} path
+ * @property {"file" | "directory"} kind
+ */
+
+/**
  * The virtual filesystem the environment tab edits and `run` resolves `@import` against.
  * @typedef {object} Fs
- * @property {() => Array<string>} list
+ * @property {() => Array<FsEntry>} list
  * @property {(path: string) => string} read
  * @property {(path: string, data: string) => void} write
+ * @property {(path: string) => void} mkdir
  * @property {(path: string) => void} remove
  * @property {(from: string, to: string) => void} rename
  */
@@ -127,6 +137,17 @@ export async function loadRepl(env = {}) {
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
 
+    // Pointer to a fresh wasm buffer holding `bytes`; 0 for empty (the export
+    // slices [0..0], freeing nothing), -1 on allocation failure.
+    /** @param {Uint8Array} bytes @returns {number} */
+    function writeBytes(bytes) {
+        if (bytes.length === 0) return 0;
+        const ptr = wasm.replAlloc(bytes.length);
+        if (ptr === 0) return -1;
+        new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
+        return ptr;
+    }
+
     /**
      * Run an export that takes (ptr, len) and leaves its bytes in the result
      * buffer, returning the decoded result.
@@ -136,13 +157,10 @@ export async function loadRepl(env = {}) {
      */
     function call(wasmFn, line) {
         const bytes = encoder.encode(line);
-        const ptr = wasm.replAlloc(bytes.length);
-        if (ptr === 0) return "out of memory\n";
-        new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
+        const ptr = writeBytes(bytes);
+        if (ptr < 0) return "out of memory\n";
         wasmFn(ptr, bytes.length);
-        const resultPtr = wasm.replResultPtr();
-        const resultLen = wasm.replResultLen();
-        return decoder.decode(new Uint8Array(wasm.memory.buffer, resultPtr, resultLen));
+        return decoder.decode(new Uint8Array(wasm.memory.buffer, wasm.replResultPtr(), wasm.replResultLen()));
     }
 
     /** @param {string} line @returns {Outline} */
@@ -164,9 +182,8 @@ export async function loadRepl(env = {}) {
 
     /** @param {Uint8Array} bytes */
     function feed(bytes) {
-        const ptr = wasm.replAlloc(bytes.length);
-        if (ptr === 0) return;
-        new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
+        const ptr = writeBytes(bytes);
+        if (ptr < 0) return;
         wasm.replInputFeed(ptr, bytes.length);
     }
 
@@ -198,9 +215,8 @@ export async function loadRepl(env = {}) {
     /** @param {(ptr: number, len: number) => void} wasmFn @param {string} s */
     function send(wasmFn, s) {
         const bytes = encoder.encode(s);
-        const ptr = wasm.replAlloc(bytes.length);
-        if (ptr === 0) return;
-        new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
+        const ptr = writeBytes(bytes);
+        if (ptr < 0) return;
         wasmFn(ptr, bytes.length);
     }
 
@@ -208,11 +224,9 @@ export async function loadRepl(env = {}) {
     function sendTwo(wasmFn, a, b) {
         const ab = encoder.encode(a);
         const bb = encoder.encode(b);
-        const ap = wasm.replAlloc(ab.length);
-        const bp = wasm.replAlloc(bb.length);
-        if (ap === 0 || bp === 0) return;
-        new Uint8Array(wasm.memory.buffer, ap, ab.length).set(ab);
-        new Uint8Array(wasm.memory.buffer, bp, bb.length).set(bb);
+        const ap = writeBytes(ab);
+        const bp = writeBytes(bb);
+        if (ap < 0 || bp < 0) return;
         wasmFn(ap, ab.length, bp, bb.length);
     }
 
@@ -228,6 +242,7 @@ export async function loadRepl(env = {}) {
         },
         read: (path) => call(wasm.replFsRead, path),
         write: (path, data) => sendTwo(wasm.replFsWrite, path, data),
+        mkdir: (path) => send(wasm.replFsMkdir, path),
         remove: (path) => send(wasm.replFsDelete, path),
         rename: (from, to) => sendTwo(wasm.replFsRename, from, to),
     };

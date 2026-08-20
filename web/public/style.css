@@ -342,6 +342,213 @@ main {
     background: var(--surface0);
 }
 
+#environment-view {
+    flex-direction: row;
+}
+
+#file-tree {
+    flex: 0 0 14rem;
+    min-width: 9rem;
+    display: flex;
+    flex-direction: column;
+    background: var(--mantle);
+    border-right: 1px solid var(--surface0);
+}
+
+.tree-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.5rem 0.75rem;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--subtext);
+    border-bottom: 1px solid var(--surface0);
+}
+
+.tree-header button {
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: var(--subtext);
+    font: inherit;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 0.3rem;
+}
+
+.tree-header button:hover {
+    color: var(--accent);
+}
+
+#file-list {
+    list-style: none;
+    margin: 0;
+    padding: 0.25rem 0;
+    overflow-y: auto;
+}
+
+.tree-sub {
+    list-style: none;
+    margin: 0 0 0 0.7rem;
+    padding-left: 0.6rem;
+    border-left: 1px solid var(--surface0);
+}
+
+.tree-sub > li {
+    position: relative;
+}
+
+.tree-sub > li::before {
+    content: "";
+    position: absolute;
+    left: -0.6rem;
+    top: 0.85em;
+    width: 0.5rem;
+    border-top: 1px solid var(--surface0);
+}
+
+.tree-sub > li:last-child::after {
+    content: "";
+    position: absolute;
+    left: -0.7rem;
+    top: calc(0.85em + 1px);
+    bottom: 0;
+    width: 2px;
+    background: var(--mantle);
+}
+
+summary.dir-name {
+    padding: 0.2rem 0.4rem;
+    cursor: pointer;
+    color: var(--subtext);
+    white-space: nowrap;
+    user-select: none;
+}
+
+summary.dir-name:hover {
+    color: var(--text);
+}
+
+summary.dir-name::marker {
+    color: var(--overlay);
+}
+
+.tree-file {
+    padding: 0.2rem 0.4rem;
+    cursor: pointer;
+    border-radius: 3px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tree-file:hover {
+    background: var(--surface0);
+}
+
+.tree-file.active {
+    background: var(--surface1);
+    color: var(--accent);
+}
+
+.context-menu {
+    position: fixed;
+    z-index: 10;
+    min-width: 9rem;
+    padding: 0.25rem;
+    display: flex;
+    flex-direction: column;
+    background: var(--surface0);
+    border: 1px solid var(--surface1);
+    border-radius: 6px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+
+.context-menu[hidden] {
+    display: none;
+}
+
+.context-menu button {
+    appearance: none;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    padding: 0.35rem 0.6rem;
+    cursor: pointer;
+}
+
+.context-menu button:hover {
+    background: var(--surface1);
+    color: var(--accent);
+}
+
+#env-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+#env-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.75rem;
+    background: var(--mantle);
+    border-bottom: 1px solid var(--surface0);
+}
+
+#env-active {
+    margin-right: auto;
+    color: var(--subtext);
+    font-size: 13px;
+}
+
+#env-toolbar button {
+    appearance: none;
+    background: var(--surface0);
+    border: 1px solid var(--surface1);
+    border-radius: 4px;
+    color: var(--text);
+    font: inherit;
+    padding: 0.2rem 0.7rem;
+    cursor: pointer;
+}
+
+#env-toolbar button:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+#env-editor {
+    flex: 1 1 60%;
+    resize: none;
+    background: var(--mantle);
+    border: none;
+    color: inherit;
+    font: inherit;
+    padding: 1rem;
+    outline: none;
+    tab-size: 4;
+}
+
+#env-output {
+    flex: 0 1 40%;
+    margin: 0;
+    padding: 0.75rem 1rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--crust);
+    border-top: 1px solid var(--surface0);
+}
+
 @media (max-width: 720px) {
     #explorer-view {
         flex-direction: column;

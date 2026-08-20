@@ -13,6 +13,7 @@
         <span class="brand">zig_repl</span>
         <button id="tab-repl" class="active" data-view="repl-view">repl</button>
         <button id="tab-explorer" data-view="explorer-view">explorer</button>
+        <button id="tab-environment" data-view="environment-view">environment</button>
         <select id="theme-select" aria-label="prompt theme"></select>
     </nav>
 
@@ -43,7 +44,29 @@
                 </section>
             </div>
         </section>
+
+        <section id="environment-view" class="view" hidden>
+            <aside id="file-tree">
+                <div class="tree-header">
+                    <span>files</span>
+                    <button id="file-new" title="New file">+</button>
+                </div>
+                <ul id="file-list"></ul>
+            </aside>
+            <div class="gutter gutter-col"></div>
+            <div id="env-main">
+                <div id="env-toolbar">
+                    <span id="env-active"></span>
+                    <button id="run-active">Run</button>
+                    <button id="run-main">Run main.zig</button>
+                </div>
+                <textarea id="env-editor" spellcheck="false" placeholder="select or create a file"></textarea>
+                <pre id="env-output"></pre>
+            </div>
+        </section>
     </main>
+
+    <div id="context-menu" class="context-menu" hidden></div>
 
     <script type="module" src="./app.js"></script>
 </body>

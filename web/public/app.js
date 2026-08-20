@@ -90,11 +90,6 @@ tabs.forEach((btn) => {
     });
 });
 
-// Drag the gutters to resize the editor/panels split and the panel sections.
-// Each gutter resizes the sibling before it, pinning that pane to a pixel size
-// while the rest of the flex column absorbs the remainder.
-const explorerView = /** @type {HTMLElement} */ (document.getElementById("explorer-view"));
-
 /**
  * @param {HTMLElement} gutter
  * @param {(dx: number, dy: number) => void} onDrag cumulative move since the last step.
@@ -126,8 +121,9 @@ function draggable(gutter, onDrag) {
 
 for (const gutter of document.querySelectorAll(".gutter-col")) {
     const pane = /** @type {HTMLElement} */ (gutter.previousElementSibling);
+    const view = /** @type {HTMLElement} */ (gutter.closest(".view"));
     draggable(/** @type {HTMLElement} */ (gutter), (dx) => {
-        const width = Math.min(Math.max(pane.offsetWidth + dx, 240), explorerView.clientWidth - 320);
+        const width = Math.max(0, Math.min(pane.offsetWidth + dx, view.clientWidth - 320));
         pane.style.flex = `0 0 ${width}px`;
     });
 }
@@ -425,6 +421,374 @@ const c = add(x, 2);
 
 c`;
 renderExplorer();
+
+// Environment tab: a file tree, editor, and runner over the virtual filesystem,
+// mirrored to OPFS when the browser grants it.
+const envEditor = /** @type {HTMLTextAreaElement} */ (document.getElementById("env-editor"));
+const fileTree = /** @type {HTMLElement} */ (document.getElementById("file-tree"));
+const fileList = /** @type {HTMLElement} */ (document.getElementById("file-list"));
+const envOutput = /** @type {HTMLElement} */ (document.getElementById("env-output"));
+const envActive = /** @type {HTMLElement} */ (document.getElementById("env-active"));
+const contextMenu = /** @type {HTMLElement} */ (document.getElementById("context-menu"));
+
+/** @type {string | null} */
+let activeFile = null;
+
+/** @param {number} x @param {number} y @param {Array<{ label: string, action: () => void }>} items */
+function showMenu(x, y, items) {
+    contextMenu.replaceChildren();
+    for (const { label, action } of items) {
+        const button = document.createElement("button");
+        button.textContent = label;
+        button.addEventListener("click", () => {
+            hideMenu();
+            action();
+        });
+        contextMenu.appendChild(button);
+    }
+    contextMenu.style.left = `${x}px`;
+    contextMenu.style.top = `${y}px`;
+    contextMenu.hidden = false;
+}
+
+function hideMenu() {
+    contextMenu.hidden = true;
+}
+
+document.addEventListener("click", hideMenu);
+document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") hideMenu();
+});
+
+fileTree.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    showMenu(event.clientX, event.clientY, [
+        { label: "New File", action: () => newFile("") },
+        { label: "New Folder", action: () => newFolder("") },
+    ]);
+});
+
+/**
+ * @typedef {FileSystemDirectoryHandle & {
+ *   entries(): AsyncIterableIterator<[string, FileSystemHandle]>
+ * }} OpfsDir
+ */
+
+/** @returns {Promise<OpfsDir | null>} */
+async function opfsDir() {
+    try {
+        return /** @type {OpfsDir} */ (await navigator.storage.getDirectory());
+    } catch {
+        return null;
+    }
+}
+
+// The parent directory handle of a `/`-separated path, and the basename within
+// it. Intermediate directories are created or navigated per `create`.
+/** @param {OpfsDir} dir @param {string} path @param {boolean} create @returns {Promise<{ parent: OpfsDir, name: string } | null>} */
+async function opfsParent(dir, path, create) {
+    const parts = path.split("/");
+    if (parts.some((segment) => segment.length === 0)) return null;
+    let node = dir;
+    for (const part of parts.slice(0, -1)) {
+        try {
+            node = /** @type {OpfsDir} */ (await node.getDirectoryHandle(part, { create }));
+        } catch {
+            return null;
+        }
+    }
+    return { parent: node, name: parts[parts.length - 1] };
+}
+
+/** @param {OpfsDir} dir @param {string} prefix @param {Array<[string, FileSystemFileHandle]>} out @param {Array<string>} [dirsOut] */
+async function opfsWalk(dir, prefix, out, dirsOut) {
+    for await (const [name, handle] of dir.entries()) {
+        const path = prefix ? `${prefix}/${name}` : name;
+        if (handle.kind === "file") {
+            out.push([path, /** @type {FileSystemFileHandle} */ (handle)]);
+        } else {
+            if (dirsOut !== undefined) dirsOut.push(path);
+            await opfsWalk(/** @type {OpfsDir} */ (handle), path, out, dirsOut);
+        }
+    }
+}
+
+/** @param {OpfsDir} dir @param {string} path */
+async function opfsMkdir(dir, path) {
+    let node = dir;
+    for (const part of path.split("/")) {
+        node = /** @type {OpfsDir} */ (await node.getDirectoryHandle(part, { create: true }));
+    }
+}
+
+// Every path prefix that must survive reconciliation: each file's ancestors plus
+// the explicitly-created directories and their ancestors.
+/** @param {Set<string>} names @param {Array<string>} explicitDirs @returns {Set<string>} */
+function liveDirs(names, explicitDirs) {
+    const live = new Set();
+    /** @param {string} path */
+    const ancestors = (path) => {
+        const parts = path.split("/");
+        for (let i = 1; i < parts.length; i += 1) live.add(parts.slice(0, i).join("/"));
+    };
+    for (const name of names) ancestors(name);
+    for (const name of explicitDirs) {
+        live.add(name);
+        ancestors(name);
+    }
+    return live;
+}
+
+async function persist() {
+    const dir = await opfsDir();
+    if (dir === null) return;
+    const entries = fs.list();
+    const names = new Set(entries.filter((e) => e.kind === "file").map((e) => e.path));
+    const explicitDirs = entries.filter((e) => e.kind === "directory").map((e) => e.path);
+    for (const name of names) {
+        const at = await opfsParent(dir, name, true);
+        if (at === null) continue;
+        const handle = await at.parent.getFileHandle(at.name, { create: true });
+        const writable = await handle.createWritable();
+        await writable.write(fs.read(name));
+        await writable.close();
+    }
+    for (const name of explicitDirs) await opfsMkdir(dir, name);
+    /** @type {Array<[string, FileSystemFileHandle]>} */
+    const existing = [];
+    /** @type {Array<string>} */
+    const existingDirs = [];
+    await opfsWalk(dir, "", existing, existingDirs);
+    for (const [path] of existing) {
+        if (names.has(path)) continue;
+        const at = await opfsParent(dir, path, false);
+        if (at !== null) await at.parent.removeEntry(at.name);
+    }
+    const live = liveDirs(names, explicitDirs);
+    for (const path of existingDirs) {
+        if (live.has(path)) continue;
+        const at = await opfsParent(dir, path, false);
+        if (at !== null) await at.parent.removeEntry(at.name, { recursive: true });
+    }
+}
+
+/** @typedef {{ dirs: Map<string, TreeNode>, files: Array<string> }} TreeNode */
+
+/** @param {TreeNode} root @param {Array<string>} segments @returns {TreeNode} */
+function descend(root, segments) {
+    let node = root;
+    for (const segment of segments) {
+        let child = node.dirs.get(segment);
+        if (child === undefined) {
+            child = { dirs: new Map(), files: [] };
+            node.dirs.set(segment, child);
+        }
+        node = child;
+    }
+    return node;
+}
+
+/** @param {Array<import("./wasm.js").FsEntry>} entries @returns {TreeNode} */
+function buildTree(entries) {
+    /** @type {TreeNode} */
+    const root = { dirs: new Map(), files: [] };
+    for (const entry of entries) {
+        const parts = entry.path.split("/");
+        if (entry.kind === "directory") descend(root, parts);
+        else descend(root, parts.slice(0, -1)).files.push(entry.path);
+    }
+    return root;
+}
+
+/** @type {Set<string>} */
+const collapsed = new Set();
+
+/** @param {TreeNode} node @param {string} prefix @param {HTMLElement} container */
+function renderTree(node, prefix, container) {
+    for (const name of [...node.dirs.keys()].sort()) {
+        const path = prefix ? `${prefix}/${name}` : name;
+        const li = document.createElement("li");
+        li.className = "tree-dir";
+        const details = document.createElement("details");
+        details.open = !collapsed.has(path);
+        details.addEventListener("toggle", () => {
+            if (details.open) collapsed.delete(path);
+            else collapsed.add(path);
+        });
+        const summary = document.createElement("summary");
+        summary.className = "dir-name";
+        summary.textContent = name;
+        summary.addEventListener("contextmenu", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            showMenu(event.clientX, event.clientY, [
+                { label: "New File", action: () => newFile(`${path}/`) },
+                { label: "New Folder", action: () => newFolder(`${path}/`) },
+                { label: "Rename", action: () => renameDir(path) },
+                { label: "Delete", action: () => deleteDir(path) },
+            ]);
+        });
+        const sub = document.createElement("ul");
+        sub.className = "tree-sub";
+        renderTree(/** @type {TreeNode} */ (node.dirs.get(name)), path, sub);
+        details.append(summary, sub);
+        li.appendChild(details);
+        container.appendChild(li);
+    }
+    for (const path of [...node.files].sort()) {
+        const li = document.createElement("li");
+        li.className = "tree-file";
+        li.classList.toggle("active", path === activeFile);
+        li.textContent = /** @type {string} */ (path.split("/").pop());
+        li.addEventListener("click", () => selectFile(path));
+        li.addEventListener("contextmenu", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            showMenu(event.clientX, event.clientY, [
+                { label: "Rename", action: () => renameFile(path) },
+                { label: "Delete", action: () => deleteFile(path) },
+            ]);
+        });
+        container.appendChild(li);
+    }
+}
+
+function renderFileTree() {
+    fileList.replaceChildren();
+    renderTree(buildTree(fs.list()), "", fileList);
+}
+
+/** @param {string} path */
+function selectFile(path) {
+    activeFile = path;
+    envEditor.value = fs.read(path);
+    envActive.textContent = path;
+    renderFileTree();
+}
+
+/** @param {string} path */
+function renameFile(path) {
+    const to = window.prompt("Rename to (a path moves it)", path);
+    if (to === null) return;
+    const clean = to.trim();
+    if (!validPath(clean) || clean === path) return;
+    fs.rename(path, clean);
+    if (activeFile === path) selectFile(clean);
+    else renderFileTree();
+    void persist();
+}
+
+/** @param {string} path */
+function deleteFile(path) {
+    fs.remove(path);
+    if (activeFile === path) {
+        activeFile = null;
+        envEditor.value = "";
+        envActive.textContent = "";
+    }
+    renderFileTree();
+    void persist();
+}
+
+// A file path is one or more non-empty, `/`-separated segments -- no leading or
+// trailing slash, no empty segment (which would be a directory, not a file).
+/** @param {string} path @returns {boolean} */
+function validPath(path) {
+    return path.length > 0 && !path.split("/").some((segment) => segment.length === 0);
+}
+
+/** @param {string} prefix */
+function newFile(prefix) {
+    const path = window.prompt("File path (use / for a directory)", `${prefix}new.zig`);
+    if (path === null) return;
+    const clean = path.trim();
+    if (!validPath(clean)) return;
+    fs.write(clean, "");
+    selectFile(clean);
+    void persist();
+}
+
+/** @param {string} prefix */
+function newFolder(prefix) {
+    const path = window.prompt("Folder path", `${prefix}new`);
+    if (path === null) return;
+    const clean = path.trim().replace(/\/+$/, "");
+    if (!validPath(clean)) return;
+    fs.mkdir(clean);
+    collapsed.delete(clean);
+    renderFileTree();
+    void persist();
+}
+
+/** @param {string} path @param {string} dir @returns {boolean} */
+function isUnder(path, dir) {
+    return path === dir || path.startsWith(`${dir}/`);
+}
+
+/** @param {string} dir */
+function renameDir(dir) {
+    const to = window.prompt("Rename folder to", dir);
+    if (to === null) return;
+    const clean = to.trim().replace(/\/+$/, "");
+    if (!validPath(clean) || clean === dir) return;
+    fs.rename(dir, clean);
+    if (activeFile !== null && isUnder(activeFile, dir)) {
+        activeFile = clean + activeFile.slice(dir.length);
+        envActive.textContent = activeFile;
+    }
+    renderFileTree();
+    void persist();
+}
+
+/** @param {string} dir */
+function deleteDir(dir) {
+    fs.remove(dir);
+    if (activeFile !== null && isUnder(activeFile, dir)) {
+        activeFile = null;
+        envEditor.value = "";
+        envActive.textContent = "";
+    }
+    renderFileTree();
+    void persist();
+}
+
+envEditor.addEventListener("input", () => {
+    if (activeFile === null) return;
+    fs.write(activeFile, envEditor.value);
+    void persist();
+});
+
+/** @type {HTMLElement} */ (document.getElementById("file-new")).addEventListener("click", () => newFile(""));
+
+/** @type {HTMLElement} */ (document.getElementById("run-active")).addEventListener("click", () => {
+    if (activeFile !== null) envOutput.textContent = run(activeFile);
+});
+
+/** @type {HTMLElement} */ (document.getElementById("run-main")).addEventListener("click", () => {
+    envOutput.textContent = run("main.zig");
+});
+
+async function initEnvironment() {
+    const dir = await opfsDir();
+    if (dir !== null) {
+        /** @type {Array<[string, FileSystemFileHandle]>} */
+        const stored = [];
+        /** @type {Array<string>} */
+        const storedDirs = [];
+        await opfsWalk(dir, "", stored, storedDirs);
+        for (const [path, handle] of stored) fs.write(path, await (await handle.getFile()).text());
+        for (const d of storedDirs) {
+            if (!stored.some(([path]) => path.startsWith(`${d}/`))) fs.mkdir(d);
+        }
+    }
+    if (fs.list().length === 0) {
+        fs.write("main.zig", "pub fn main() void {\n    @import(\"std\").debug.print(\"Hello from the VFS!\\n\", .{});\n}\n");
+    }
+    const files = fs.list().filter((e) => e.kind === "file").map((e) => e.path);
+    if (files.length > 0) selectFile(files[0]);
+    else renderFileTree();
+}
+await initEnvironment();
 
 // Readiness signal for automated harnesses: handlers attach only after the
 // wasm has instantiated, so a test must wait for this before interacting.
