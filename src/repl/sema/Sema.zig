@@ -7765,11 +7765,28 @@ fn evalElemType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     return .{ .index = sema.intern_pool.indexToKey(ptr_ty).ptr_type.child };
 }
 
+fn checkMemOperand(sema: *Sema, src: LazySrcLoc, ty: Type) Error!void {
+    const ip = sema.intern_pool;
+    if (ty.zigTypeTag(ip) == .pointer) {
+        switch (ip.indexToKey(ty.index).ptr_type.flags.size) {
+            .slice, .many, .c => return,
+            .one => if (ty.childType(ip).zigTypeTag(ip) == .array) return,
+        }
+    }
+    return sema.failWithOwnedErrorMsg(sema.block, msg: {
+        const msg = try sema.errMsg(src, "type '{f}' is not an indexable pointer", .{ty.fmt(ip)});
+        errdefer msg.destroy(sema.gpa);
+        try sema.errNote(src, msg, "operand must be a slice, a many pointer or a pointer to an array", .{});
+        break :msg msg;
+    });
+}
+
 fn evalIndexablePtrElemType(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     assert(@backingInt(inst) < sema.zir.instructions.len);
     const ip = sema.intern_pool;
     const un_node = sema.zir.instructions.items(.data)[@backingInt(inst)].un_node;
     const ptr_ty = Type.fromIndex(try sema.resolveDestType(un_node.operand));
+    try sema.checkMemOperand(sema.block.nodeOffset(sema.srcNodeOffset(inst)), ptr_ty);
     const ptr_child = Type.fromIndex(ip.indexToKey(ptr_ty.index).ptr_type.child);
     const elem_ty = switch (ip.indexToKey(ptr_ty.index).ptr_type.flags.size) {
         .slice, .many, .c => ptr_child,
