@@ -313,12 +313,43 @@ fn replExpressionValue(sema: *Sema, body: []const Zir.Inst.Index) Error!?Value {
                 const str_op = datas[@backingInt(inst)].str_op;
                 if (!std.mem.eql(u8, sema.zir.nullTerminatedString(str_op.str), InputShape.expression_value_name)) continue;
                 const bound = try sema.resolveInst(str_op.operand);
-                return if (tag == .dbg_var_ptr) try sema.loadValue(bound) else bound;
+                const result = if (tag == .dbg_var_ptr) try sema.loadValue(bound) else bound;
+                return sema.snapshotComptimeBacking(result);
             },
             else => {},
         }
     }
     return null;
+}
+
+/// A comptime alloc is freed when analysis ends, so a result pointing into one is snapshotted while it is still live.
+fn snapshotComptimeBacking(sema: *Sema, value: Value) Value {
+    const ip = sema.intern_pool;
+    if (!value.canMutateComptimeVarState(ip)) return value;
+    switch (ip.indexToKey(value.index)) {
+        .ptr => |p| {
+            const ptr_ty = ip.indexToKey(p.ty).ptr_type;
+            if (ptr_ty.flags.size != .one or ip.indexToKey(ptr_ty.child) != .array_type) return value;
+            const loaded = sema.loadValue(value) catch return value;
+            return .{ .index = sema.uavPtr(p.ty, loaded.index) catch return value };
+        },
+        .slice => |s| {
+            const slice_ptr_ty = ip.indexToKey(s.ty).ptr_type;
+            const elem = slice_ptr_ty.child;
+            const len = sema.resolveUsizeInt(.{ .index = s.len }) catch return value;
+            const elems = sema.arena.alloc(InternPool.Index, len) catch return value;
+            for (elems, 0..) |*e, i| {
+                const elem_ptr = Value.fromIndex(s.ptr).ptrElem(i, ip) catch return value;
+                e.* = (sema.loadValue(elem_ptr) catch return value).index;
+            }
+            const arr_ty = ip.internArrayType(.{ .len = len, .child = elem }) catch return value;
+            const arr_val = sema.aggregateValue(.fromIndex(arr_ty), elems) catch return value;
+            const many_ty = ip.internPtrType(.{ .child = elem, .flags = .{ .size = .many, .is_const = slice_ptr_ty.flags.is_const } }) catch return value;
+            const many_ptr = sema.uavPtr(many_ty, arr_val.index) catch return value;
+            return .{ .index = ip.get(.{ .slice = .{ .ty = s.ty, .ptr = many_ptr, .len = s.len } }) catch return value };
+        },
+        else => return value,
+    }
 }
 
 const ReplInputBody = struct {

@@ -24,6 +24,15 @@ test "compliance: u8 arrays and slices render as strings" {
     });
 }
 
+test "compliance: a var-backed slice renders its contents" {
+    try compliance.check(a, &.{
+        .{ .src = &.{"blk: { var arr = [_]u8{ 104, 105 }; break :blk arr[0..2]; }"}, .rendered = "\"hi\"" },
+        .{ .src = &.{"blk: { var arr = [_]u8{ 104, 105 }; arr[0] = 72; break :blk arr[0..2]; }"}, .rendered = "\"Hi\"" },
+        .{ .src = &.{"blk: { var arr = [_]u8{ 1, 2, 3 }; const s: []u8 = &arr; break :blk s; }"}, .rendered = "\"\\x01\\x02\\x03\"" },
+        .{ .src = &.{"blk: { var xs = [_]u32{ 10, 20, 30 }; break :blk xs[1..3]; }"}, .rendered = "{ 20, 30 }" },
+    });
+}
+
 // Floats render through `{d}` with no trailing `.0`. `.rendered` is used because `{any}` switches to
 // scientific notation for large magnitudes.
 test "compliance: floats render like the compiler's value printer" {
