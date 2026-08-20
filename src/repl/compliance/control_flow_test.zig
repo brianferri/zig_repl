@@ -92,8 +92,10 @@ test "compliance: for loops (range and array)" {
             break :blk result[0] + result[2];
         }) },
         .{ .src = &.{"blk: { const a = [_]u8{ 1, 2 }; const b = [_]u8{ 1, 2, 3 }; var s: u8 = 0; for (a, b) |x, y| { s += x + y; } break :blk s; }"}, .reject = true },
+        .{ .src = &.{"for (5..2) |i| { _ = i; }"}, .reject = true },
     });
     try compliance.expectDiagnostic(a, &.{"blk: { const a = [_]u8{ 1, 2 }; const b = [_]u8{ 1, 2, 3 }; var s: u8 = 0; for (a, b) |x, y| { s += x + y; } break :blk s; }"}, "non-matching for loop lengths");
+    try compliance.expectDiagnostic(a, &.{"for (5..2) |i| { _ = i; }"}, "overflow of integer type 'usize' with value '-3'");
     try compliance.expectDiagnostic(a, &.{"for (@as(u32, 5)) |e| { _ = e; }"}, "type 'u32' is not indexable and not a range");
 }
 

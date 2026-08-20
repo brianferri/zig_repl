@@ -11412,12 +11412,12 @@ fn evalForLen(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
                 },
             }
         } else blk: {
-            const start = try sema.resolveUsizeInt(try sema.resolveInst(pair[0]));
-            const end = try sema.resolveUsizeInt(try sema.resolveInst(pair[1]));
-            if (end < start) {
-                return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "for: range end is before range start", .{});
-            }
-            break :blk end - start;
+            const range_start = try sema.resolveInst(pair[0]);
+            const range_end = try sema.resolveInst(pair[1]);
+            // The length is `end - start`, so a descending range underflows usize and reports an integer
+            // overflow; a `start` of 0 skips the subtraction. Mirrors the compiler's `zirForLen`.
+            if (try sema.resolveUsizeInt(range_start) == 0) break :blk try sema.resolveUsizeInt(range_end);
+            break :blk try sema.resolveUsizeInt(try arith.sub(sema, .fromIndex(.usize_type), range_end, range_start));
         };
         if (len) |existing| {
             if (existing != arg_len) {
