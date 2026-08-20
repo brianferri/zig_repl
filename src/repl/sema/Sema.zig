@@ -337,7 +337,7 @@ fn snapshotComptimeBacking(sema: *Sema, value: Value) Value {
             const slice_ptr_ty = ip.indexToKey(s.ty).ptr_type;
             const elem = slice_ptr_ty.child;
             const len = sema.resolveUsizeInt(.{ .index = s.len }) catch return value;
-            const elems = sema.arena.alloc(InternPool.Index, len) catch return value;
+            const elems = sema.arena.alloc(InternPool.Index, @intCast(len)) catch return value;
             for (elems, 0..) |*e, i| {
                 const elem_ptr = Value.fromIndex(s.ptr).ptrElem(i, ip) catch return value;
                 e.* = (sema.loadValue(elem_ptr) catch return value).index;
