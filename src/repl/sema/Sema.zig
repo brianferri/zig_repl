@@ -8916,7 +8916,7 @@ fn fieldValOnType(sema: *Sema, ty: InternPool.Index, name: InternPool.NullTermin
             return sema.failBadMemberAccess(ty, name);
         },
         else => {
-            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "decl literal: result type is not a container with members", .{});
+            return sema.fail(sema.block, sema.block.nodeOffset(.zero), "type '{f}' has no members", .{Type.fromIndex(ty).fmt(sema.intern_pool)});
         },
     }
 }

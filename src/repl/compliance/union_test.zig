@@ -335,7 +335,10 @@ test "compliance: union member declarations and decl literals" {
         },
         // Reading a field of an undefined union cannot determine the active field: use-of-undef, not a crash.
         .{ .src = &.{"blk: { const U = union(enum) { a: u32, b: u32 }; const u: U = undefined; break :blk u.a; }"}, .reject = true, .skip = true },
+        // A decl literal resolves against a container; a non-container result type has no members.
+        .{ .src = &.{"@as(u8, .foo)"}, .reject = true },
     });
+    try compliance.expectDiagnostic(a, &.{"@as(u8, .foo)"}, "type 'u8' has no members");
 }
 
 // A packed union reinterprets the backing bits on any field read (no active-tag check), like a packed struct.
