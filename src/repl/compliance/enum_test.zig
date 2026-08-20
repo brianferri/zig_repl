@@ -203,8 +203,12 @@ test "compliance: explicit enum tag types and values" {
             }),
         },
         .{ .src = &.{"blk: { const E = enum(u8) { a = 1.5 }; break :blk @intFromEnum(E.a); }"}, .reject = true },
+        // A non-integer or non-type backing must reject.
+        .{ .src = &.{"blk: { const E = enum(bool) { a = true }; break :blk @intFromEnum(E.a); }"}, .reject = true },
+        .{ .src = &.{"blk: { const E = enum(5) { a }; break :blk @intFromEnum(E.a); }"}, .reject = true },
     });
     try compliance.expectDiagnostic(a, &.{"blk: { const E = enum(u8) { a = 1.5 }; break :blk @intFromEnum(E.a); }"}, "fractional component prevents float value '1.5' from coercion to type 'u8'");
+    try compliance.expectDiagnostic(a, &.{"blk: { const E = enum(bool) { a = true }; break :blk @intFromEnum(E.a); }"}, "expected integer tag type, found 'bool'");
     try compliance.expectDiagnostic(a, &.{"blk: { const E = enum(u8) { a = 300 }; break :blk @intFromEnum(E.a); }"}, "type 'u8' cannot represent integer value '300'");
 }
 

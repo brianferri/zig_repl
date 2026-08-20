@@ -8680,13 +8680,32 @@ fn enumFieldScan(sema: *Sema, enum_ty: InternPool.Index, match: EnumMatch) Error
 fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.LoadedEnumType {
     const ip = sema.intern_pool;
     assert(ip.indexToKey(enum_ty).enum_type == .declared);
+    if (ip.enumFieldsResolved(enum_ty)) return ip.loadEnumType(enum_ty);
 
-    const tag_ty = try sema.enumIntTagTypeOf(enum_ty);
     var block: Block = undefined;
     const cf = try sema.enterContainer(&block, enum_ty, "enum field");
     defer cf.restore(sema);
     const decl = sema.zir.getEnumDecl(cf.decl_inst);
     const have_values = decl.nonexhaustive or decl.tag_type_body != null;
+
+    // Backing integer type: if explicitly provided, validate it; otherwise infer it from the field count.
+    const explicit_int_tag_ty: ?InternPool.Index = if (decl.tag_type_body) |body|
+        (try sema.coerceValueToType(try sema.resolveInlineBody(body, cf.decl_inst), .type_type)).index
+    else
+        null;
+    const empty_exhaustive = decl.field_names.len == 0 and !decl.nonexhaustive;
+    const tag_ty: InternPool.Index = if (explicit_int_tag_ty) |int_tag_ty| ty: {
+        const src = sema.block.nodeOffset(.zero);
+        switch (Type.fromIndex(int_tag_ty).zigTypeTag(ip)) {
+            .int => if (empty_exhaustive) return sema.fail(sema.block, src, "empty exhaustive enums must be backed by 'noreturn'", .{}),
+            .noreturn => if (!empty_exhaustive) return sema.fail(sema.block, src, "non-empty enums cannot be backed by 'noreturn'", .{}),
+            else => return sema.fail(sema.block, src, "expected integer tag type, found '{f}'", .{Type.fromIndex(int_tag_ty).fmt(ip)}),
+        }
+        break :ty int_tag_ty;
+    } else if (empty_exhaustive)
+        .noreturn_type
+    else
+        try sema.enumIntTagType(@intCast(decl.field_names.len));
 
     var names: std.ArrayListUnmanaged(InternPool.NullTerminatedString) = .empty;
     defer names.deinit(sema.gpa);
@@ -8756,20 +8775,11 @@ pub fn enumIntTagTypeOf(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool
             defer cf.restore(sema);
             const decl = sema.zir.getUnionDecl(cf.decl_inst);
             return if (decl.kind == .tagged_enum_explicit)
-                (try sema.resolveInlineBody(decl.arg_type_body.?, cf.decl_inst)).index
+                (try sema.coerceValueToType(try sema.resolveInlineBody(decl.arg_type_body.?, cf.decl_inst), .type_type)).index
             else
                 try sema.enumIntTagType(@intCast(decl.field_names.len));
         },
-        .declared => {
-            var block: Block = undefined;
-            const cf = try sema.enterContainer(&block, enum_ty, "enum tag type");
-            defer cf.restore(sema);
-            const decl = sema.zir.getEnumDecl(cf.decl_inst);
-            return if (decl.tag_type_body) |body|
-                (try sema.resolveInlineBody(body, cf.decl_inst)).index
-            else
-                try sema.enumIntTagType(@intCast(decl.field_names.len));
-        },
+        .declared => return (try sema.resolveEnumFields(enum_ty)).int_tag_type,
     }
 }
 

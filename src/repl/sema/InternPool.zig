@@ -3478,6 +3478,12 @@ pub const LoadedEnumType = struct {
     }
 };
 
+pub fn enumFieldsResolved(pool: *const InternPool, enum_ty: Index) bool {
+    const item = pool.items.get(@backingInt(enum_ty));
+    assert(item.tag == .type_enum);
+    return pool.extraDataTrail(TypeEnum, item.data).data.flags.fields_resolved;
+}
+
 pub fn loadEnumType(pool: *const InternPool, enum_ty: Index) LoadedEnumType {
     const item = pool.items.get(@backingInt(enum_ty));
     assert(item.tag == .type_enum);
