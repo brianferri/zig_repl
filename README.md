@@ -26,9 +26,6 @@ Evaluation is a port of the compiler's `Sema`, `InternPool`, `Type`, and `Value`
 every expression folds to a concrete value, with session state persisting across
 lines.
 
-There is no runtime or codegen backend; the REPL models the compiler's
-compile-time semantics, not machine execution.
-
 ---
 
 ## Run it
@@ -39,7 +36,7 @@ zig build wasm    # the wasm REPL + web explorer -> zig-out/web
 zig build test    # compliance and unit tests (--fuzz to drive the coverage-guided fuzzer)
 ```
 
-A hosted build runs in the browser at **brianferri.github.io/zig_repl**.
+A hosted build runs in the browser at [brianferri.github.io/zig_repl](https://brianferri.github.io/zig_repl).
 
 ---
 
@@ -84,15 +81,6 @@ The wasm frontend is two views over the same core:
 - a **REPL** with persistent session state, and
 - an **explorer** that renders the **AST** and the tree-walked **ZIR** for any
   input side by side, so you can watch the front end lower your code.
-
----
-
-## Faithfulness
-
-The evaluator is a 1:1 (attempted) port of the compiler's comptime pipeline; the same
-`InternPool` interning, `Type` / `Value` model, and `Sema` instruction handling.
-Where behavior would need a runtime (I/O side effects, codegen), you will encounter some
-limits, soon to be broken (hopefully)
 
 ---
 
