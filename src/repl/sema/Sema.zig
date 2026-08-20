@@ -3591,7 +3591,13 @@ fn resolveUnionLayout(sema: *Sema, union_ty: InternPool.Index) Error!void {
 
     const tag_usage = ip.unionFields(union_ty).tag_usage;
     const enum_tag_ty: InternPool.Index = if (tag_usage != .none) try sema.unionTagEnumType(union_ty) else .none;
-    if (tag_usage != .none) try sema.ensureLayoutResolved(enum_tag_ty);
+    if (tag_usage != .none) {
+        try sema.ensureLayoutResolved(enum_tag_ty);
+        // Persist the resolved tag enum on the type so a tagged union's tag can be read from the type,
+        // not only recovered from a value. A declared union's tag enum is generated
+        // lazily above, so this is the first point it is knowable.
+        ip.setUnionEnumTagType(union_ty, enum_tag_ty);
+    }
 
     const f = ip.unionFields(union_ty);
     var payload_align: InternPool.Alignment = .@"1";
@@ -8983,17 +8989,16 @@ fn evalTagName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
             return try sema.internStringLiteral(ip.stringSlice(tag_name));
         },
         .@"enum" => operand_ty,
-        // The REPL carries a tagged union's tag enum on the tag value (`uv.tag.ty`), not the type
-        // (`enum_tag_type` stays `.none` there), so the tag type is read from the value.
         .@"union" => blk: {
             try sema.ensureLayoutResolved(operand_ty.index);
             if (ip.unionFields(operand_ty.index).tag_usage != .tagged)
                 return sema.fail(sema.block, src, "union '{f}' is untagged", .{operand_ty.fmt(ip)});
-            break :blk operand.unionTag(ip).?.typeOf(ip);
+            break :blk operand_ty.unionTagTypeHypothetical(ip);
         },
         else => return sema.fail(sema.block, operand_src, "expected enum or union; found '{f}'", .{operand_ty.fmt(ip)}),
     };
     const casted_operand = try sema.coerceValueToType(operand, enum_ty.index);
+    if (casted_operand.isUndef(ip)) return sema.failWithUseOfUndef();
     const field_index = (try sema.enumTagFieldIndex(enum_ty.index, casted_operand)) orelse {
         return sema.failWithOwnedErrorMsg(sema.block, msg: {
             const msg = try sema.errMsg(src, "no field with value '{f}' in enum '{f}'", .{ render_value.fmt(casted_operand, ip), enum_ty.fmt(ip) });

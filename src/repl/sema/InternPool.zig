@@ -3701,6 +3701,12 @@ pub fn setUnionPackedBackingInt(pool: *InternPool, union_ty: Index, backing: Ind
     pool.extra.items[item.data + std.meta.fieldIndex(TypeUnion, "backing_int").?] = @backingInt(backing);
 }
 
+pub fn setUnionEnumTagType(pool: *InternPool, union_ty: Index, enum_tag_type: Index) void {
+    const item = pool.items.get(@backingInt(union_ty));
+    assert(item.tag == .type_union);
+    pool.extra.items[item.data + std.meta.fieldIndex(TypeUnion, "enum_tag_type").?] = @backingInt(enum_tag_type);
+}
+
 pub fn setStructLayout(
     pool: *InternPool,
     struct_ty: Index,

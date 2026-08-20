@@ -43,8 +43,12 @@ test "compliance: @tagName of a tagged union names the active field" {
             .src = &.{"blk: { const U = union { a: u32, b: bool }; const u = U{ .a = 5 }; break :blk @tagName(u)[0]; }"},
             .reject = true,
         },
+        // The tag of an undefined tagged union is unknown, so its name cannot be taken.
+        .{ .src = &.{"blk: { const U = union(enum) { a: u32, b: u64 }; break :blk @tagName(@as(U, undefined)); }"}, .reject = true },
+        .{ .src = &.{"blk: { const E = enum { x, y }; break :blk @tagName(@as(E, undefined)); }"}, .reject = true },
     });
     try compliance.expectDiagnostic(a, &.{ "const U = union { a: u32 };", "const u = U{ .a = 5 };", "@tagName(u)" }, "is untagged");
+    try compliance.expectDiagnostic(a, &.{ "const U = union(enum) { a: u32, b: u64 };", "@tagName(@as(U, undefined))" }, "undefined value");
 }
 
 test "compliance: switch on a tagged union captures the active payload" {
