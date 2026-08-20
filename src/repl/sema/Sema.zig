@@ -3408,6 +3408,9 @@ fn evalNegateWrap(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .int, .comptime_int, .float, .comptime_float => {},
         else => return sema.fail(sema.block, src, "negation of type '{f}'", .{rhs_ty.fmt(ip)}),
     }
+    // `-%` lowers to `0 -% rhs`; the compiler's `analyzeArithmetic` rejects a float operand, which the
+    // `arith.subWrap` kernel below does not, so run the operand check first.
+    try sema.checkArithmeticOp(rhs_scalar_ty.zigTypeTag(ip), rhs_ty.zigTypeTag(ip), rhs_ty.zigTypeTag(ip), .subwrap);
 
     const lhs = try sema.splat(rhs_ty, try sema.intValue_u64(rhs_scalar_ty, 0));
     return try arith.subWrap(sema, rhs_ty, lhs, rhs);
