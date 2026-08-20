@@ -172,17 +172,6 @@ pub fn build(b: *std.Build) void {
     test_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
     test_options.addOption([]const u8, "zig_std_dir", zigStdDir(b));
 
-    // Knobs for the randomized stress suite (src/fuzz).
-    test_options.addOption(
-        usize,
-        "fuzz_iterations",
-        b.option(usize, "fuzz-iterations", "Randomized stress iterations (default 256; raise for a real fuzzing run)") orelse 256,
-    );
-    test_options.addOption(
-        u64,
-        "fuzz_seed",
-        b.option(u64, "fuzz-seed", "Seed for the randomized stress suite (default 0)") orelse 0,
-    );
     test_options.addOption(
         bool,
         "reject_oracle",
@@ -196,6 +185,11 @@ pub fn build(b: *std.Build) void {
     });
     repl_test_module.addOptions("build_options", test_options);
 
+    // The compliance suite hosts the coverage-guided fuzzer (`std.testing.fuzz`). The
+    // program-counter table `--fuzz` slices to guide mutation is only emitted by the LLVM backend;
+    // under the self-hosted backend the table is empty and the fuzzer panics slicing it. Force LLVM
+    // until self-hosted fuzz coverage lands.
+    //   https://codeberg.org/ziglang/zig/issues/30655
     const repl_tests = b.addTest(.{ .root_module = repl_test_module, .use_llvm = true });
     const tty_tests = b.addTest(.{ .root_module = tty, .use_llvm = true });
     const exe_tests = b.addTest(.{ .root_module = exe_module, .use_llvm = true });
@@ -209,21 +203,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(device_tests).step);
     test_step.dependOn(&b.addRunArtifact(terminal_tests).step);
     test_step.dependOn(&b.addRunArtifact(editor_tests).step);
-
-    // Deterministic randomized stress; imports `repl` by name (see src/fuzz).
-    const fuzz_module = b.createModule(.{
-        .root_source_file = b.path("src/fuzz/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "repl", .module = repl }},
-    });
-    fuzz_module.addOptions("build_options", test_options);
-    // Coverage instrumentation (the program-counter table `--fuzz` slices to guide mutation) is only
-    // emitted by the LLVM backend; under the self-hosted backend the table is empty and the fuzzer
-    // panics slicing it. Force LLVM until self-hosted fuzz coverage lands.
-    //   https://codeberg.org/ziglang/zig/issues/30655
-    const fuzz_tests = b.addTest(.{ .root_module = fuzz_module, .use_llvm = true });
-    test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 }
 
 /// The running compiler's `std` source directory. Reuses the compiler's own

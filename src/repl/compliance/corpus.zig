@@ -1,6 +1,4 @@
-//! Seed inputs for the mutational stress suite: valid REPL snippets spanning the
-//! supported feature surface, for the mutator (see stress_test.zig) to perturb.
-//! Breadth over depth -- every distinct construct is a seed it can splice.
+//! Seed inputs for the coverage-guided fuzzer.
 
 /// Single-line expressions and declarations.
 pub const lines = [_][]const u8{
@@ -103,4 +101,19 @@ pub const sequences = [_][]const []const u8{
     &.{ "const S = struct { const k: u8 = 42; };", "S.k" },
     &.{ "const Point = struct { x: i32, y: i32 };", "const origin = Point{ .x = 0, .y = 0 };", "origin.x + origin.y" },
     &.{ "const E = enum(u8) { lo = 1, hi = 255 };", "@intFromEnum(E.hi)" },
+};
+
+/// Flat seed set handed to `std.testing.fuzz` as its corpus: every single-line snippet, plus each
+/// multi-line sequence joined into one newline-delimited program, so the generator is steered across
+/// the full feature surface in both the single-line and cross-line session shapes.
+pub const seeds: []const []const u8 = &(lines ++ joined_sequences);
+
+const joined_sequences: [sequences.len][]const u8 = blk: {
+    var out: [sequences.len][]const u8 = undefined;
+    for (sequences, 0..) |seq, i| {
+        var text: []const u8 = "";
+        for (seq, 0..) |line, j| text = text ++ (if (j == 0) "" else "\n") ++ line;
+        out[i] = text;
+    }
+    break :blk out;
 };

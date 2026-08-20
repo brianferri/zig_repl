@@ -10,6 +10,7 @@ const Value = @import("../sema/Value.zig");
 const render = @import("../render/Value.zig");
 const NativeModuleSource = @import("../module/Native.zig");
 const WriterIo = @import("../io/writer_io.zig");
+const corpus = @import("corpus.zig");
 const build_options = @import("build_options");
 
 pub const Case = struct {
@@ -141,10 +142,11 @@ pub fn expectDiagnostic(gpa: std.mem.Allocator, inputs: []const []const u8, need
     }
 }
 
-// Run generated zig through the evaluator, discarding the result -- what matters is that no input
-// panics, corrupts, or leaks. `zig build test` runs it once on an empty seed; `--fuzz` drives it for real.
+// Run generated zig through the evaluator, discarding results -- what matters is that the evaluator
+// stays live and leak-free across every input. `zig build test` replays the seed corpus; `--fuzz`
+// drives generation for real.
 test "fuzz: the evaluator survives arbitrary zig source" {
-    try std.testing.fuzz({}, fuzzEval, .{});
+    try std.testing.fuzz({}, fuzzEval, .{ .corpus = corpus.seeds });
 }
 
 test "fuzz-harness: a pathological comptime allocation fails gracefully" {
@@ -273,10 +275,38 @@ fn fuzzEval(_: void, smith: *std.testing.Smith) anyerror!void {
     const token_smith = try gpa.create(std.zig.TokenSmith);
     defer gpa.destroy(token_smith);
     token_smith.* = .gen(smith);
-    const src = token_smith.source();
-    if (src.len == 0) return; // eval.run requires non-empty input (the REPL never feeds it a blank line)
-    const out = replRun(gpa, &.{src}) catch return;
-    gpa.free(out);
+    survive(gpa, token_smith.source()) catch {};
+}
+
+/// Feed generated source into a fresh session line by line, discarding values and swallowing analysis
+/// rejections, so a run exercises session persistence the same way an interactive session does. A
+/// capped allocation abandons the session; a crash or a leak is the signal the fuzzer hunts.
+fn survive(gpa: std.mem.Allocator, src: []const u8) !void {
+    var io_instance: Io.Threaded = .init(gpa, .{});
+    defer io_instance.deinit();
+    const io = io_instance.io();
+    var root = try std.Io.Dir.openDirAbsolute(io, build_options.zig_std_dir, .{});
+    defer root.close(io);
+    var native: NativeModuleSource = .{ .io = io, .root = root };
+
+    var pool = try InternPool.init(gpa);
+    defer pool.deinit();
+    const ns = try pool.createNamespace(gpa, .{});
+    var session = Session.init(gpa, &pool, ns);
+    defer session.deinit();
+    session.module_source = &native.interface;
+
+    var diag: Io.Writer.Allocating = .init(gpa);
+    defer diag.deinit();
+
+    var it = std.mem.splitScalar(u8, src, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue; // eval.run requires non-empty input (the REPL never feeds it a blank line)
+        _ = eval.run(&session, line, &diag.writer) catch |err| switch (err) {
+            error.ParseError, error.ZirError, error.AnalysisFail => continue,
+            else => return err,
+        };
+    }
 }
 
 /// Wraps a child allocator, failing any single allocation or in-place grow over `max_alloc_bytes` instead

@@ -36,7 +36,7 @@ compile-time semantics, not machine execution.
 ```sh
 zig build run     # the terminal REPL
 zig build wasm    # the wasm REPL + web explorer -> zig-out/web
-zig build test    # compliance, unit, and stress tests (--fuzz to coverage-fuzz; -Dfuzz-iterations, -Dfuzz-seed)
+zig build test    # compliance and unit tests (--fuzz to drive the coverage-guided fuzzer)
 ```
 
 A hosted build runs in the browser at **brianferri.github.io/zig_repl**.
