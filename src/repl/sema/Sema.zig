@@ -2408,7 +2408,7 @@ fn resolveDestType(
     const dest_value = try sema.resolveInst(ref);
     const key = sema.intern_pool.indexToKey(dest_value.index);
     if (key.isType()) return dest_value.index;
-    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "destination is not a type", .{});
+    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected type 'type', found '{f}'", .{dest_value.typeOf(sema.intern_pool).fmt(sema.intern_pool)});
 }
 
 fn binData(sema: *Sema, inst: Zir.Inst.Index) Zir.Inst.Bin {

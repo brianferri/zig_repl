@@ -1260,9 +1260,11 @@ test "cast builtins reject ptr_type destinations with their own diagnostic" {
     // Each builtin uses `resolveDestType`, so a ptr_type dest is
     // accepted as a type Index -- the kind-specific check inside
     // the handler rejects the mismatch with the compiler's diagnostic,
-    // not "destination is not a type".
+    // rather than a generic non-type rejection.
     try expectEvalFails(gpa, &pool, "@as(*const u8, @intCast(5))", "expected integer or vector, found '*const u8'");
     try expectEvalFails(gpa, &pool, "@as(*u8, @bitCast(@as(u64, 0)))", "cannot @bitCast to '*u8'");
+    // A non-type in a type position is rejected with the coercion diagnostic.
+    try expectEvalFails(gpa, &pool, "@as(5, 3)", "expected type 'type', found 'comptime_int'");
 }
 
 test "ptr_type: a sentinel-terminated pointer carries the coerced sentinel value" {
