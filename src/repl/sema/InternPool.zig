@@ -192,9 +192,8 @@ const EmbeddedNulls = enum {
     }
 };
 
-/// A byte string whose length is known from context (e.g. an aggregate's array type) rather than
-/// NUL-termination, so it may contain embedded NUL bytes. Shares the string table with
-/// NullTerminatedString.
+/// A byte string whose length is known from context (e.g. an aggregate's array type), so it may
+/// contain embedded NUL bytes. Shares the string table with NullTerminatedString.
 pub const String = enum(u32) {
     empty = 0,
     _,

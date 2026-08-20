@@ -167,7 +167,7 @@ export async function loadRepl(env = {}) {
     function outline(line) {
         const text = call(wasm.replOutline, line);
         // `call` returns a plain message (not JSON) when allocation fails;
-        // degrade to an empty outline rather than throwing into the caller.
+        // degrade to an empty outline.
         try {
             return /** @type {Outline} */ (JSON.parse(text));
         } catch {

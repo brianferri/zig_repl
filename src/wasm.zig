@@ -262,7 +262,7 @@ fn preview(input: []const u8) !void {
     var preview_session = Session.init(gpa, &preview_pool, root_namespace);
     preview_session.module_source = &module_source.interface;
     // Reuse the live session's host Io (its stderr routes to `output`, this session's `w`), so a
-    // previewed `std.debug.print` behaves as in the real session rather than hitting the posix stack.
+    // previewed `std.debug.print` behaves as in the real session, on the intrinsic Io path.
     preview_session.runtime.io = session.runtime.io;
     defer preview_session.deinit();
 

@@ -1,5 +1,5 @@
 //! Standalone fuzz suite: imports `repl` by name, run via `zig build fuzz`. Its own
-//! build step rather than folded into `test`, because the coverage-guided runtime
+//! build step, separate from `test`, because the coverage-guided runtime
 //! (`std.testing.fuzz` under `--fuzz`) still segfaults in the pinned toolchain
 //! (`fuzzer.zig` `fuzzer_new_input`); the replay and mutation paths run clean.
 

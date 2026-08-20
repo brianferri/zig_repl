@@ -879,7 +879,7 @@ pub fn structFieldValueComptime(ty: Type, sema: *Sema, index: usize) Sema.Error!
         .struct_type => {
             if (ty.structFieldIsComptime(index, pool)) {
                 // A declared struct evaluates its field defaults lazily, so the default is fetched
-                // through `structFieldDefault` rather than the reified `field_defaults` slice.
+                // through `structFieldDefault`; the reified `field_defaults` slice is empty here.
                 const name = (try sema.structFieldNameAt(ty.index, @intCast(index))).?;
                 return .fromIndex(try sema.structFieldDefault(ty.index, name));
             } else {

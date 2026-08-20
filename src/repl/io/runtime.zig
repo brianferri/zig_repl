@@ -269,7 +269,7 @@ const PtrBacking = struct {
 
 /// The backing aggregate and start element a `[*]const u8`/`[]const u8` points at. Mirrors the render
 /// module's `ptrBacking`, plus the `comptime_alloc` base a runtime-mutated buffer resolves to -- that one
-/// needs `sema` to read the alloc's live value, so this takes `sema` rather than a bare pool.
+/// needs `sema` to read the alloc's live value.
 fn ptrBacking(sema: *Sema, ptr_index: InternPool.Index) Sema.Error!?PtrBacking {
     const ip = sema.intern_pool;
     if (ip.indexToKey(ptr_index) != .ptr) return null;

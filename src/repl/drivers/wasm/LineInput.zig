@@ -41,7 +41,7 @@ pub fn setup(self: *LineInput, gpa: std.mem.Allocator) void {
 pub fn feed(self: *LineInput, bytes: []const u8) !void {
     for (bytes) |b| {
         // A full buffer with no complete sequence is malformed wire input; drop
-        // it and keep going rather than wedging the editor.
+        // it and keep going.
         if (self.read_len >= read_buffer_bytes) self.read_len = 0;
         self.read_buffer[self.read_len] = b;
         self.read_len += 1;

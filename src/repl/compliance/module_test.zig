@@ -41,8 +41,8 @@ fn builtinDeclProbes() []const Probe {
     return list;
 }
 
-/// Run one probe against `session`, printing and counting a mismatch rather than
-/// aborting so every gap in a probe set surfaces in a single run.
+/// Run one probe against `session`, printing and counting a mismatch, so every
+/// gap in a probe set surfaces in a single run.
 fn runProbe(session: *Session, p: Probe, failures: *usize) void {
     expectReplValue(session, p.src, p.want) catch |err| {
         std.debug.print("PROBE FAILED ({s}): {s}\n", .{ @errorName(err), p.src });

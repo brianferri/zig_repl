@@ -8,7 +8,7 @@ const Color = @import("Color.zig");
 
 const Device = @This();
 
-/// Data, not behavior, so it lives on the interface rather than behind a vtable call.
+/// Plain data carried on the interface as a field.
 color_level: Color.ColorLevel,
 vtable: *const VTable,
 

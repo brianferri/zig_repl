@@ -204,8 +204,7 @@ main {
 }
 
 /* Each section opens with its label sitting on a 1px rule -- `-- ZIR -------`
-   -- using the same divider line as the nav and the editor split, rather than
-   a free-standing card. */
+   -- using the same divider line as the nav and the editor split */
 .pane {
     display: flex;
     flex-direction: column;

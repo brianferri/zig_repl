@@ -3,7 +3,7 @@ const compliance = @import("root.zig");
 
 const a = std.testing.allocator;
 
-// Non-power-of-two widths reach the int_type handler rather than a well-known Inst.Ref.
+// Non-power-of-two widths reach the int_type handler.
 const awkward = .{ 1, 3, 7, 33, 69, 420 };
 
 fn U(comptime bits: u16) type {

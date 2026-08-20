@@ -376,7 +376,7 @@ editor.addEventListener("input", () => {
 
 /**
  * Record each ast node's source range, shifted by `base` so the offsets address
- * `editor.value` (what `setSelectionRange` indexes) rather than the outline's own source.
+ * `editor.value`, the string `setSelectionRange` indexes.
  * @param {Array<AstNode>} nodes
  * @param {number} base
  */

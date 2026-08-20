@@ -1,7 +1,6 @@
 //! Per-standard escape-sequence parser interface. Each ECMA-48 / VT100 / xterm
 //! wire form (CSI, SS3, OSC, ...) lives under `standard/`; `Parser` dispatches
-//! on the byte after ESC. Stateless, so a plain `(introducer, name, parse)`
-//! struct rather than a vtable.
+//! on the byte after ESC. Stateless, so a plain `(introducer, name, parse)` struct.
 
 const std = @import("std");
 

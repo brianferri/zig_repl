@@ -3408,8 +3408,8 @@ fn evalNegateWrap(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         .int, .comptime_int, .float, .comptime_float => {},
         else => return sema.fail(sema.block, src, "negation of type '{f}'", .{rhs_ty.fmt(ip)}),
     }
-    // `-%` lowers to `0 -% rhs`; the compiler's `analyzeArithmetic` rejects a float operand, which the
-    // `arith.subWrap` kernel below does not, so run the operand check first.
+    // `-%` lowers to `0 -% rhs`; run the operand check the compiler's `analyzeArithmetic` applies, before
+    // handing the wrapping subtract to the `arith.subWrap` kernel.
     try sema.checkArithmeticOp(rhs_scalar_ty.zigTypeTag(ip), rhs_ty.zigTypeTag(ip), rhs_ty.zigTypeTag(ip), .subwrap);
 
     const lhs = try sema.splat(rhs_ty, try sema.intValue_u64(rhs_scalar_ty, 0));
@@ -6474,7 +6474,7 @@ fn evalReifyStruct(sema: *Sema, extended: Zir.Inst.Extended.InstData, inst: Zir.
         const default_ptr = ip.indexToKey((try attr_v.fieldValue(comptime std.meta.fieldIndex(StructFieldAttributes, "default_value_ptr").?, ip)).index).opt.val;
 
         // `default_value_ptr` is typed `*const anyopaque`; re-type it to a pointer to the field type
-        // before loading, so the deref reinterprets from the pointee rather than the opaque type.
+        // before loading, so the deref reinterprets the pointee as the field type.
         const field_default: InternPool.Index = if (default_ptr == .none) .none else d: {
             const field_ptr_ty = try ip.internPtrType(.{ .child = type_out.*, .flags = .{ .size = .one, .is_const = true } });
             break :d (try sema.loadValue(.{ .index = try ip.getCoerced(default_ptr, field_ptr_ty) })).index;

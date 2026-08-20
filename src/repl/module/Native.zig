@@ -12,7 +12,7 @@ io: std.Io,
 root: std.Io.Dir,
 interface: Fs = .{ .vtable = &vtable },
 
-/// A file larger than this is treated as unreadable rather than exhausting memory; source files sit far
+/// A file larger than this is treated as unreadable to bound memory use; source files sit far
 /// below it.
 const max_bytes: std.Io.Limit = .limited(4 * 1024 * 1024);
 

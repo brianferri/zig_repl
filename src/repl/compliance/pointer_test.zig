@@ -199,7 +199,7 @@ test "compliance: &decl carries the binding's constness and alignment" {
 
 test "compliance: @intFromPtr honors the pointer's alignment" {
     // The REPL's address is synthetic, so it never equals a `zig run` address; pin the
-    // alignment and pointer-identity invariants rather than a concrete (unfoldable) address.
+    // alignment and pointer-identity invariants.
     try compliance.check(a, &.{
         .{ .src = &.{ "var x: u32 align(8) = 5;", "@intFromPtr(&x) % 8" }, .rendered = "0" },
         .{ .src = &.{ "var w: u64 align(16) = 5;", "@intFromPtr(&w) % 16" }, .rendered = "0" },

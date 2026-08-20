@@ -90,7 +90,7 @@ test "compliance: wrap, saturating, shift, and bitwise arithmetic" {
             .want = compliance.want(@as(u16, 1000) & @as(u16, 0xff)),
         },
         .{ .src = &.{"-%@as(i8, 5)"}, .want = compliance.want(-%@as(i8, 5)) },
-        // `-%` is integer-only; a float operand rejects rather than crashing on a bogus integer zero.
+        // `-%` is integer-only; a float operand is rejected before the wrapping subtract.
         .{ .src = &.{"-%@as(f32, 1.0)"}, .reject = true },
     });
     try compliance.expectDiagnostic(a, &.{"-%@as(f32, 1.0)"}, "invalid operands to binary expression: 'float' and 'float'");

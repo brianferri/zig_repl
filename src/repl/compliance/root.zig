@@ -281,7 +281,7 @@ fn fuzzEval(_: void, smith: *std.testing.Smith) anyerror!void {
 
 /// Wraps a child allocator, failing any single allocation or in-place grow over `max_alloc_bytes` instead
 /// of forwarding it, so a pathological comptime request (gigabytes in one alloc) becomes
-/// `error.OutOfMemory` rather than an overcommit the OS kills on first write. Frees and shrinks pass
+/// `error.OutOfMemory` immediately. Frees and shrinks pass
 /// straight through, so the child's leak tracking stays intact.
 const CappedAllocator = struct {
     child: std.mem.Allocator,

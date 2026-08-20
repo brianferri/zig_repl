@@ -1,5 +1,5 @@
 //! Randomized stress: drive the interpreter with mutated inputs so a leak or crash
-//! surfaces. Mutates the seed corpus rather than raw bytes -- the parser rejects
+//! surfaces. Mutates the seed corpus of working programs -- the parser rejects
 //! random bytes on sight, so perturbing working programs keeps inputs near-valid and
 //! reaches AstGen/Sema/eval. Deterministic per `-Dfuzz-seed`, scaled by `-Dfuzz-iterations`.
 

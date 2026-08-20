@@ -55,8 +55,7 @@ test "survives adversarial single-line inputs" {
         "1.0 | 2",
         "2.5 ^ 1",
         "true & 1.0",
-        // Wrapping / saturating operators reject floats (integer-only), rather
-        // than reaching the kernels' `else => unreachable`.
+        // Wrapping / saturating operators reject floats (integer-only).
         "@as(u4, 15) *% @as(f64, @floatFromInt(7))",
         "3.0 +% 1",
         "2.5 -% 1",

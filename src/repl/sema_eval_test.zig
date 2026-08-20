@@ -1019,9 +1019,8 @@ test "vector_type: e2e Key shape + dedup" {
     const second = try evalSource(gpa, &pool, "@Vector(4, i32)", &diag_buf);
     try testing.expectEqual(value.index, second.index);
 
-    // A u69 child interns a fresh int_type rather than a well-known
-    // Index, so the child slot must round-trip the interned type, not
-    // just a built-in constant.
+    // A u69 child interns a fresh int_type, so the child slot must
+    // round-trip the interned type.
     const wide = try evalSource(gpa, &pool, "@Vector(7, u69)", &diag_buf);
     const wide_key = pool.indexToKey(wide.index);
     try testing.expect(wide_key == .vector_type);
@@ -1253,8 +1252,7 @@ test "cast builtins reject ptr_type destinations with their own diagnostic" {
 
     // Each builtin uses `resolveDestType`, so a ptr_type dest is
     // accepted as a type Index -- the kind-specific check inside
-    // the handler rejects the mismatch with the compiler's diagnostic,
-    // rather than a generic non-type rejection.
+    // the handler rejects the mismatch with the compiler's diagnostic.
     try expectEvalFails(gpa, &pool, "@as(*const u8, @intCast(5))", "expected integer or vector, found '*const u8'");
     try expectEvalFails(gpa, &pool, "@as(*u8, @bitCast(@as(u64, 0)))", "cannot @bitCast to '*u8'");
     // A non-type in a type position is rejected with the coercion diagnostic.

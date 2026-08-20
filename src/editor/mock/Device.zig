@@ -11,8 +11,7 @@ const Color = @import("device").Color;
 const Mock = @This();
 
 interface: Device,
-/// Pending events, oldest at `head`; `readEvent` advances `head` rather
-/// than shifting, so a drained queue keeps its capacity.
+/// Pending events, oldest at `head`; `readEvent` advances `head`, so a drained queue keeps its capacity.
 queue: std.ArrayListUnmanaged(Event.Event),
 head: usize,
 gpa: std.mem.Allocator,
