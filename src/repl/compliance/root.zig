@@ -3,6 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 const eval = @import("../eval.zig");
+const InputShape = @import("../front/InputShape.zig");
 const Session = @import("../Session.zig");
 const InternPool = @import("../sema/InternPool.zig");
 const Value = @import("../sema/Value.zig");
@@ -19,6 +20,12 @@ pub const Case = struct {
     reject: bool = false,
     /// A reject that zig itself accepts: a deliberate divergence, skipped and excluded from the oracle.
     skip: bool = false,
+    /// How the reject-oracle should evaluate this case, matching how the interpreter does. Most rejects
+    /// hold in any context (default); a rejection specific to runtime type rules (a narrowing coercion of
+    /// a function parameter) needs the runtime function body the interpreter wraps a top-level expression in.
+    ctx: OracleCtx = .comptime_fold,
+
+    pub const OracleCtx = enum { comptime_fold, runtime_body };
 };
 
 pub fn want(comptime v: anytype) []const u8 {
@@ -35,7 +42,7 @@ pub fn check(gpa: std.mem.Allocator, cases: []const Case) !void {
                 std.debug.print("expected rejection but evaluated: {s}\n", .{case.src[case.src.len - 1]});
                 return error.TestUnexpectedSuccess;
             } else |_| {}
-            if (build_options.reject_oracle and !try zigRejects(gpa, case.src)) {
+            if (build_options.reject_oracle and !try zigRejects(gpa, case.src, case.ctx)) {
                 std.debug.print("REPL rejects but zig accepts: {s}\n", .{case.src[case.src.len - 1]});
                 oracle_diverged = true;
             }
@@ -55,7 +62,7 @@ fn normalize(text: []const u8) []const u8 {
     return std.mem.trim(u8, text, " \r\n\t");
 }
 
-fn zigRejects(gpa: std.mem.Allocator, src: []const []const u8) !bool {
+fn zigRejects(gpa: std.mem.Allocator, src: []const []const u8, ctx: Case.OracleCtx) !bool {
     var io_instance: Io.Threaded = .init(gpa, .{});
     defer io_instance.deinit();
     const io = io_instance.io();
@@ -65,8 +72,23 @@ fn zigRejects(gpa: std.mem.Allocator, src: []const []const u8) !bool {
 
     var program: Io.Writer.Allocating = .init(gpa);
     defer program.deinit();
-    for (src[0 .. src.len - 1]) |decl| try program.writer.print("{s}\n", .{decl});
-    try program.writer.print("comptime {{ _ = {s}; }}\n", .{src[src.len - 1]});
+    switch (ctx) {
+        .comptime_fold => {
+            for (src[0 .. src.len - 1]) |decl| try program.writer.print("{s}\n", .{decl});
+            try program.writer.print("comptime {{ _ = {s}; }}\n", .{src[src.len - 1]});
+        },
+        // Match the interpreter's runtime evaluation: prior lines at file scope, the final line wrapped in
+        // the same runtime function body, so a runtime-only rejection is checked against the same boundary.
+        .runtime_body => {
+            var injection: Io.Writer.Allocating = .init(gpa);
+            defer injection.deinit();
+            for (src[0 .. src.len - 1]) |decl| try injection.writer.print("{s}\n", .{decl});
+            var wrapped = try InputShape.wrapWithInjection(gpa, injection.written(), src[src.len - 1]);
+            defer wrapped.deinit(gpa);
+            try program.writer.print("{s}\n", .{wrapped.text});
+            if (wrapped.shape == .expression) try program.writer.print("comptime {{ _ = &{s}; }}\n", .{InputShape.expression_decl_name});
+        },
+    }
     try tmp.dir.writeFile(io, .{ .sub_path = "reject.zig", .data = program.written() });
 
     const result = std.process.run(gpa, io, .{

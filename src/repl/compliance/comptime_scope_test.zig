@@ -39,8 +39,8 @@ test "comptime scope: a container declaration initializer folds a call" {
 // A top-level REPL expression evaluates in a runtime function body, so a runtime narrowing without a cast is rejected at the call site as the compiler does.
 test "comptime scope: a runtime narrowing in a called function is rejected" {
     try compliance.check(a, &.{
-        .{ .src = &.{"blk: { const S = struct { fn f(x: u32) u8 { return x; } }; break :blk S.f(5); }"}, .reject = true, .skip = true },
-        .{ .src = &.{"blk: { const S = struct { fn f(x: u64) u8 { return x; } }; break :blk S.f(1); }"}, .reject = true, .skip = true },
+        .{ .src = &.{"blk: { const S = struct { fn f(x: u32) u8 { return x; } }; break :blk S.f(5); }"}, .reject = true, .ctx = .runtime_body },
+        .{ .src = &.{"blk: { const S = struct { fn f(x: u64) u8 { return x; } }; break :blk S.f(1); }"}, .reject = true, .ctx = .runtime_body },
     });
     try compliance.expectDiagnostic(
         a,

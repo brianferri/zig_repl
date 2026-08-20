@@ -57,18 +57,18 @@ test "compliance: a function return coerces to the declared return type" {
             }
         }).widen(7)) },
         .{ .src = &.{ "fn small() u8 { return 300; }", "small()" }, .reject = true },
-        .{ .src = &.{ "fn id(a: u32) i32 { return a; }", "id(7)" }, .reject = true, .skip = true },
-        .{ .src = &.{ "fn add(a: u32, b: u32) i32 { return a + b; }", "add(40, 2)" }, .reject = true, .skip = true },
+        .{ .src = &.{ "fn id(a: u32) i32 { return a; }", "id(7)" }, .reject = true, .ctx = .runtime_body },
+        .{ .src = &.{ "fn add(a: u32, b: u32) i32 { return a + b; }", "add(40, 2)" }, .reject = true, .ctx = .runtime_body },
     });
 }
 
 test "compliance: runtime-ness propagates through operations" {
     try compliance.check(a, &.{
-        .{ .src = &.{ "fn f(x: u32) i32 { return x & 1; }", "f(7)" }, .reject = true, .skip = true },
-        .{ .src = &.{ "fn f(x: u32) i32 { return x << 1; }", "f(7)" }, .reject = true, .skip = true },
-        .{ .src = &.{ "fn f(x: i32) i16 { return -x; }", "f(7)" }, .reject = true, .skip = true },
-        .{ .src = &.{ "fn f(x: u8) i32 { return @as(u32, x); }", "f(7)" }, .reject = true, .skip = true },
-        .{ .src = &.{ "fn f(x: u32) i32 { return blk: { break :blk x; }; }", "f(7)" }, .reject = true, .skip = true },
+        .{ .src = &.{ "fn f(x: u32) i32 { return x & 1; }", "f(7)" }, .reject = true, .ctx = .runtime_body },
+        .{ .src = &.{ "fn f(x: u32) i32 { return x << 1; }", "f(7)" }, .reject = true, .ctx = .runtime_body },
+        .{ .src = &.{ "fn f(x: i32) i16 { return -x; }", "f(7)" }, .reject = true, .ctx = .runtime_body },
+        .{ .src = &.{ "fn f(x: u8) i32 { return @as(u32, x); }", "f(7)" }, .reject = true, .ctx = .runtime_body },
+        .{ .src = &.{ "fn f(x: u32) i32 { return blk: { break :blk x; }; }", "f(7)" }, .reject = true, .ctx = .runtime_body },
         .{ .src = &.{ "fn f(x: u8) u32 { return x & 1; }", "f(7)" }, .want = compliance.want((struct {
             fn f(x: u8) u32 {
                 return x & 1;
@@ -86,8 +86,8 @@ test "compliance: runtime-ness propagates through operations" {
 
 test "compliance: runtime float coercion is type-based" {
     try compliance.check(a, &.{
-        .{ .src = &.{ "fn f(x: f64) f32 { return x; }", "f(1.5)" }, .reject = true, .skip = true },
-        .{ .src = &.{ "fn f(x: u32) f32 { return x; }", "f(5)" }, .reject = true, .skip = true },
+        .{ .src = &.{ "fn f(x: f64) f32 { return x; }", "f(1.5)" }, .reject = true, .ctx = .runtime_body },
+        .{ .src = &.{ "fn f(x: u32) f32 { return x; }", "f(5)" }, .reject = true, .ctx = .runtime_body },
         .{ .src = &.{ "fn f(x: f32) f64 { return x; }", "f(1.5)" }, .want = compliance.want((struct {
             fn f(x: f32) f64 {
                 return x;
@@ -152,7 +152,7 @@ test "compliance: a generic return coerces a runtime value type-based" {
                 return x;
             }
         }).make(u16, 300)) },
-        .{ .src = &.{ "fn make(comptime T: type, x: u16) T { return x; }", "make(u8, 5)" }, .reject = true, .skip = true },
+        .{ .src = &.{ "fn make(comptime T: type, x: u16) T { return x; }", "make(u8, 5)" }, .reject = true, .ctx = .runtime_body },
     });
 }
 
