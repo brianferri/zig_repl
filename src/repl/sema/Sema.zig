@@ -10295,7 +10295,7 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
     const ptr_ptr_ty = ptr_ptr.typeOf(ip);
     const ptr_ptr_child_ty: Type = switch (ip.indexToKey(ptr_ptr_ty.index)) {
         .ptr_type => |pt| .fromIndex(pt.child),
-        else => return sema.failSliceNotArrayPtr(),
+        else => return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected pointer, found '{f}'", .{ptr_ptr_ty.fmt(ip)}),
     };
 
     // The pointer or slice to advance; loaded from `ptr_ptr` for the double-pointer cases.
@@ -10368,7 +10368,7 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
                 },
             }
         },
-        else => return sema.failSliceNotArrayPtr(),
+        else => return sema.fail(sema.block, sema.block.nodeOffset(.zero), "slice of non-array type '{f}'", .{ptr_ptr_child_ty.fmt(ip)}),
     }
 
     if (!Type.fromIndex(elem_ty).comptimeOnly(ip)) try sema.ensureLayoutResolved(elem_ty);
@@ -10412,10 +10412,6 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
     const result_ptr_ty = try ip.internPtrType(.{ .child = result_array_ty, .flags = .{ .size = .one, .is_const = is_const } });
     const elem_ptr = try ptr_or_slice.ptrElem(start, ip);
     return .{ .index = try ip.getCoerced(elem_ptr.index, result_ptr_ty) };
-}
-
-fn failSliceNotArrayPtr(sema: *Sema) Error {
-    return sema.fail(sema.block, sema.block.nodeOffset(.zero), "slice: operand is not an array pointer", .{});
 }
 
 fn evalSliceStart(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {

@@ -264,7 +264,9 @@ test "compliance: out-of-bounds and mismatched-sentinel slices are rejected" {
         .{ .src = &.{"(&[_]i32{ 1, 2, 3 })[5..].*"}, .reject = true },
         .{ .src = &.{"(&[_]i32{ 1, 2, 3 })[1..][0..5].*"}, .reject = true },
         .{ .src = &.{"blk: { var x: i32 = 5; _ = &x; const p: *i32 = &x; break :blk p[0..1 :0]; }"}, .reject = true },
+        .{ .src = &.{"blk: { const x: u32 = 5; break :blk x[0..1]; }"}, .reject = true },
     });
+    try compliance.expectDiagnostic(a, &.{"blk: { const x: u32 = 5; break :blk x[0..1]; }"}, "slice of non-array type 'u32'");
 }
 
 // Indexing a sentinel-terminated slice at its length reads the sentinel (one past the last element);
