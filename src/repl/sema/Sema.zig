@@ -8669,9 +8669,10 @@ fn resolveEnumFields(sema: *Sema, enum_ty: InternPool.Index) Error!InternPool.Lo
         if (!have_values) continue;
         const cur: i128 = if (field.value_body) |body| blk: {
             const raw = try sema.resolveInlineBody(body, cf.decl_inst);
-            break :blk sema.intAsI128(raw.index) orelse {
-                return sema.fail(sema.block, sema.block.nodeOffset(.zero), "enum: tag value is not an integer", .{});
-            };
+            // Coerce to the tag type as the compiler does, so an out-of-range or fractional value reports the
+            // coercion error.
+            const coerced = try sema.coerceValueToType(raw, tag_ty);
+            break :blk sema.intAsI128(coerced.index).?;
         } else next_auto;
         next_auto = cur + 1;
         try values.append(sema.gpa, try sema.enumTagIntValue(tag_ty, cur));

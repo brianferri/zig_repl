@@ -194,7 +194,18 @@ test "compliance: explicit enum tag types and values" {
                 break :blk @backingInt(E.unlimited);
             }),
         },
+        // A whole float coerces to the integer tag type; the fractional and out-of-range cases below reject.
+        .{
+            .src = &.{"blk: { const E = enum(u8) { a = 2.0, b }; break :blk @intFromEnum(E.b); }"},
+            .want = compliance.want(blk: {
+                const E = enum(u8) { a = 2.0, b };
+                break :blk @backingInt(E.b);
+            }),
+        },
+        .{ .src = &.{"blk: { const E = enum(u8) { a = 1.5 }; break :blk @intFromEnum(E.a); }"}, .reject = true },
     });
+    try compliance.expectDiagnostic(a, &.{"blk: { const E = enum(u8) { a = 1.5 }; break :blk @intFromEnum(E.a); }"}, "fractional component prevents float value '1.5' from coercion to type 'u8'");
+    try compliance.expectDiagnostic(a, &.{"blk: { const E = enum(u8) { a = 300 }; break :blk @intFromEnum(E.a); }"}, "type 'u8' cannot represent integer value '300'");
 }
 
 test "compliance: @tagName of an enum value" {
