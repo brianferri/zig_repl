@@ -10319,35 +10319,28 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
         else => return sema.fail(sema.block, sema.block.nodeOffset(.zero), "expected pointer, found '{f}'", .{ptr_ptr_ty.fmt(ip)}),
     };
 
-    // The pointer or slice to advance; loaded from `ptr_ptr` for the double-pointer cases.
-    var ptr_or_slice: Value = undefined;
-    // The operand's element count, or null when it is unbounded (a many-item / C pointer).
-    var maybe_len: ?u64 = null;
+    var array_ty = ptr_ptr_child_ty;
+    var slice_ty = ptr_ptr_ty;
+    var ptr_or_slice = ptr_ptr;
     var elem_ty: InternPool.Index = undefined;
-    var is_const: bool = undefined;
     var ptr_sentinel: InternPool.Index = .none;
-    var operand_is_slice = false;
-
     switch (ptr_ptr_child_ty.zigTypeTag(ip)) {
         .array => {
             const arr = ip.indexToKey(ptr_ptr_child_ty.index).array_type;
-            ptr_or_slice = ptr_ptr;
-            maybe_len = arr.len;
-            elem_ty = arr.child;
-            is_const = ip.indexToKey(ptr_ptr_ty.index).ptr_type.flags.is_const;
             ptr_sentinel = arr.sentinel;
+            elem_ty = arr.child;
         },
         .pointer => {
             const inner = ip.indexToKey(ptr_ptr_child_ty.index).ptr_type;
-            is_const = inner.flags.is_const;
             switch (inner.flags.size) {
                 .one => {
                     ptr_or_slice = try sema.loadValue(ptr_ptr);
                     switch (ip.indexToKey(inner.child)) {
                         .array_type => |arr| {
-                            maybe_len = arr.len;
-                            elem_ty = arr.child;
                             ptr_sentinel = arr.sentinel;
+                            slice_ty = ptr_ptr_child_ty;
+                            array_ty = .fromIndex(inner.child);
+                            elem_ty = arr.child;
                         },
                         // Slice of a single-item pointer to a non-array: `(&x)[0..1]` yields `*[1]T` ->
                         // `[]T`. Bounds must be [0..0], [0..1], or [1..1].
@@ -10363,9 +10356,15 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
                             } else if (bound > 1) {
                                 return sema.fail(sema.block, sema.block.nodeOffset(.zero), "end index {d} out of bounds for slice of single-item pointer", .{bound});
                             }
-                            maybe_len = 1;
+                            array_ty = .fromIndex(try ip.internArrayType(.{ .len = 1, .child = inner.child }));
+                            slice_ty = .fromIndex(try ip.internPtrType(.{ .child = array_ty.index, .flags = .{
+                                .alignment = inner.flags.alignment,
+                                .is_const = inner.flags.is_const,
+                                .is_allowzero = inner.flags.is_allowzero,
+                                .is_volatile = inner.flags.is_volatile,
+                                .address_space = inner.flags.address_space,
+                            } }));
                             elem_ty = inner.child;
-                            ptr_sentinel = .none;
                             // A single-item pointer cannot be indexed, so reinterpret it as a many-item
                             // pointer, as the compiler coerces to `[*]T` before the slice arithmetic.
                             ptr_or_slice = .fromIndex(try ip.getCoerced(ptr_or_slice.index, try ip.internPtrType(.{ .child = inner.child, .flags = .{ .size = .many, .is_const = inner.flags.is_const } })));
@@ -10374,18 +10373,17 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
                 },
                 .many, .c => {
                     ptr_or_slice = try sema.loadValue(ptr_ptr);
+                    slice_ty = ptr_ptr_child_ty;
+                    array_ty = ptr_ptr_child_ty;
                     elem_ty = inner.child;
                     ptr_sentinel = inner.sentinel;
                 },
                 .slice => {
-                    operand_is_slice = true;
                     ptr_or_slice = try sema.loadValue(ptr_ptr);
-                    const s = ip.indexToKey(ptr_or_slice.index).slice;
-                    maybe_len = try sema.resolveUsizeInt(.{ .index = s.len });
-                    const s_ptr_ty = ip.indexToKey(s.ty).ptr_type;
-                    elem_ty = s_ptr_ty.child;
-                    is_const = s_ptr_ty.flags.is_const;
-                    ptr_sentinel = s_ptr_ty.sentinel;
+                    slice_ty = ptr_ptr_child_ty;
+                    array_ty = ptr_ptr_child_ty;
+                    elem_ty = inner.child;
+                    ptr_sentinel = inner.sentinel;
                 },
             }
         },
@@ -10393,6 +10391,16 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
     }
 
     if (!Type.fromIndex(elem_ty).comptimeOnly(ip)) try sema.ensureLayoutResolved(elem_ty);
+
+    // Length of the underlying object: an array carries it in its type, a comptime-known slice in its
+    // value, a many-item/C pointer is unbounded. The compiler branches array vs slice at each use; with
+    // no runtime AIR both collapse into one comptime length here.
+    const maybe_len: ?u64 = if (array_ty.zigTypeTag(ip) == .array)
+        array_ty.arrayLen(ip)
+    else if (slice_ty.isSlice(ip))
+        try sema.resolveUsizeInt(.{ .index = ip.indexToKey(ptr_or_slice.index).slice.len })
+    else
+        null;
 
     // Slicing an unbounded many-item pointer to its end (`p[start..]`) yields a many-item pointer.
     if (maybe_len == null and end_opt == null) {
@@ -10409,7 +10417,7 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
     if (maybe_len) |l| {
         if (end > l + @intFromBool(ptr_sentinel != .none)) {
             const sentinel_label: []const u8 = if (ptr_sentinel != .none) " +1 (sentinel)" else "";
-            const kind: []const u8 = if (operand_is_slice) "slice" else "array";
+            const kind: []const u8 = if (slice_ty.isSlice(ip)) "slice" else "array";
             return sema.fail(sema.block, sema.block.nodeOffset(.zero), "end index {d} out of bounds for {s} of length {d}{s}", .{ end, kind, l, sentinel_label });
         }
     }
@@ -10430,6 +10438,7 @@ fn analyzeSlice(sema: *Sema, ptr_ptr: Value, start: u64, end_opt: ?u64, sentinel
     // The sub-array pointer is the pointer to element `start`, re-typed to the sub-array type (the
     // compiler's `analyzePtrArithmetic` + `getCoerced`).
     const result_array_ty = try ip.internArrayType(.{ .len = end - start, .child = elem_ty, .sentinel = sentinel });
+    const is_const = ip.indexToKey(slice_ty.index).ptr_type.flags.is_const;
     const result_ptr_ty = try ip.internPtrType(.{ .child = result_array_ty, .flags = .{ .size = .one, .is_const = is_const } });
     const elem_ptr = try ptr_or_slice.ptrElem(start, ip);
     return .{ .index = try ip.getCoerced(elem_ptr.index, result_ptr_ty) };
