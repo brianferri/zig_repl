@@ -10,16 +10,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // The input-device vocabulary (`Device`, `Event`, `Color`) -- a leaf that
-    // depends only on `std`, so frontends build on it without the tty stack.
     const device = b.createModule(.{
         .root_source_file = b.path("src/device/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    // The raw-mode terminal input stack, built on `device`. Separate from the
-    // repl so the wasm frontend -- which never touches the tty -- omits it.
     const terminal = b.createModule(.{
         .root_source_file = b.path("src/terminal/root.zig"),
         .target = target,
@@ -92,10 +88,6 @@ pub fn build(b: *std.Build) void {
         .single_threaded = true,
         .link_libc = false,
     });
-    // The device vocabulary, terminal parser, and line editor, rebuilt for the
-    // wasm target so the wasm frontend reuses the same input + editing stack the
-    // tty does (the `Terminal` platform backends are never referenced, so they
-    // do not compile here).
     const device_wasm = b.createModule(.{
         .root_source_file = b.path("src/device/root.zig"),
         .target = wasm_target,
@@ -175,22 +167,35 @@ pub fn build(b: *std.Build) void {
     wasm_step.dependOn(&install_wasm.step);
     wasm_step.dependOn(&install_web.step);
 
-    // The compliance tests load real `std`; the build hands them its path so they
-    // need not search for it. Scoped to a test-only module so the production
-    // `repl` (exe/tty/docs) never carries a build-machine path.
+    // The compliance tests load real `std`; the build hands them its path so they need not search for it.
     const test_options = b.addOptions();
-    test_options.addOption([]const u8, "zig_std_dir", zigStdDir(b));
-    // Knobs for the randomized stress suite (src/fuzz).
-    test_options.addOption(usize, "fuzz_iterations", b.option(usize, "fuzz-iterations", "Randomized stress iterations (default 256; raise for a real fuzzing run)") orelse 256);
-    test_options.addOption(u64, "fuzz_seed", b.option(u64, "fuzz-seed", "Seed for the randomized stress suite (default 0)") orelse 0);
-    test_options.addOption(bool, "reject_oracle", b.option(bool, "reject-oracle", "Cross-check every .reject compliance case against the real zig compiler") orelse false);
     test_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    test_options.addOption([]const u8, "zig_std_dir", zigStdDir(b));
+
+    // Knobs for the randomized stress suite (src/fuzz).
+    test_options.addOption(
+        usize,
+        "fuzz_iterations",
+        b.option(usize, "fuzz-iterations", "Randomized stress iterations (default 256; raise for a real fuzzing run)") orelse 256,
+    );
+    test_options.addOption(
+        u64,
+        "fuzz_seed",
+        b.option(u64, "fuzz-seed", "Seed for the randomized stress suite (default 0)") orelse 0,
+    );
+    test_options.addOption(
+        bool,
+        "reject_oracle",
+        b.option(bool, "reject-oracle", "Cross-check every .reject compliance case against the real zig compiler") orelse false,
+    );
+
     const repl_test_module = b.createModule(.{
         .root_source_file = b.path("src/repl/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     repl_test_module.addOptions("build_options", test_options);
+
     const repl_tests = b.addTest(.{ .root_module = repl_test_module, .use_llvm = true });
     const tty_tests = b.addTest(.{ .root_module = tty, .use_llvm = true });
     const exe_tests = b.addTest(.{ .root_module = exe_module, .use_llvm = true });
