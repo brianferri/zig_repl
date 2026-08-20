@@ -375,5 +375,17 @@ test "compliance: the C-pointer coercion family" {
             break :blk c != null;
         }) },
         .{ .src = &.{"blk: { const a2 = [_]u8{ 1, 2 }; const c: [*c]const u8 = &a2; const m: [*]u8 = c; break :blk m[0]; }"}, .reject = true },
+        // An undefined value does not excuse a const-discarding pointer coercion; only the bare `undefined`
+        // literal coerces freely. A concretely-typed undefined still fails the const check.
+        .{ .src = &.{"blk: { const c: [*c]const u8 = undefined; const m: [*]u8 = c; break :blk m[0]; }"}, .reject = true },
+    });
+}
+
+test "compliance: an undefined value coerces across numeric, optional, and const-adding pointer types" {
+    try compliance.check(a, &.{
+        .{ .src = &.{"blk: { const x: u32 = undefined; const y: u8 = x; break :blk @TypeOf(y); }"}, .want = compliance.want(u8) },
+        .{ .src = &.{"blk: { const x: f64 = undefined; const y: f32 = x; break :blk @TypeOf(y); }"}, .want = compliance.want(f32) },
+        .{ .src = &.{"blk: { const x: u8 = undefined; const y: ?u16 = x; break :blk @TypeOf(y); }"}, .want = compliance.want(?u16) },
+        .{ .src = &.{"blk: { const p: *u8 = undefined; const q: *const u8 = p; break :blk @TypeOf(q); }"}, .want = compliance.want(*const u8) },
     });
 }

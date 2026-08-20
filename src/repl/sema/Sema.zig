@@ -5456,12 +5456,11 @@ fn coerceExtra(
     const value_type = Value.typeOf(value, ip);
     if (value_type.index == dest_ty) return value;
 
-    const key = ip.indexToKey(value.index);
-
-    if (key == .undef) {
-        const idx = try ip.get(.{ .undef = dest_ty });
-        return .{ .index = idx };
-    }
+    // The interpreter produces `undefined` as the untyped literal (`undefined_type`) rather than typing it
+    // from a result location as the compiler does, so coerce the bare literal to any destination here. A
+    // concretely-typed undefined value instead flows through the per-arm checks below (e.g. a `[*c]const T`
+    // undefined still fails a const-discarding pointer coercion).
+    if (value_type.index == .undefined_type) return .{ .index = try ip.get(.{ .undef = dest_ty }) };
 
     // In-memory-coercible types re-type the value directly (e.g. `*[n:s]T` -> `*[n]T`, error-set
     // widening, distinct-but-layout-identical types). The REPL only ever holds comptime values, so
@@ -5727,6 +5726,9 @@ fn coerceTupleToArray(sema: *Sema, value: Value, dest_ty: InternPool.Index) Erro
 fn coerceToFixedWidthInt(sema: *Sema, value: Value, dest_ty: InternPool.Index) Error!?Value {
     const ip = sema.intern_pool;
     const dest = Type.fromIndex(dest_ty);
+    // An undefined value carries no bits to check against the destination, so it coerces to undefined of
+    // the destination (compiler: coerceExtra's per-arm `undefValue` for a numeric destination).
+    if (value.isUndef(ip)) return try sema.undefValue(dest);
     // A comptime-known float coerces to an integer type when it has no fractional part; otherwise it is
     // an error (compiler: coerceExtra's int-dest / float-source arm, via `intFromFloat(.exact)`).
     if (ip.indexToKey(value.index) == .float and value.is_comptime) {
@@ -5752,6 +5754,7 @@ fn coerceToFixedWidthInt(sema: *Sema, value: Value, dest_ty: InternPool.Index) E
 fn coerceToFloat(sema: *Sema, value: Value, dest_ty: InternPool.Index) Error!?Value {
     const ip = sema.intern_pool;
     const dest = Type.fromIndex(dest_ty);
+    if (value.isUndef(ip)) return try sema.undefValue(dest);
     const value_type = Value.typeOf(value, ip);
     switch (value_type.zigTypeTag(ip)) {
         // A `comptime_float` always coerces (it carries full precision; the narrowing rounds).
@@ -5783,7 +5786,6 @@ fn coerceToFloat(sema: *Sema, value: Value, dest_ty: InternPool.Index) Error!?Va
                 const result_val = try sema.floatValue(dest, value.toFloat(f128, ip));
                 return .{ .index = result_val.index, .is_comptime = false };
             }
-            if (value.isUndef(ip)) return try sema.undefValue(dest);
             const result_val = try sema.floatValue(dest, value.toFloat(f128, ip));
             var buffer: InternPool.Key.Int.Storage.BigIntSpace = undefined;
             const operand_big_int = value.toBigInt(&buffer, ip);
@@ -5818,6 +5820,9 @@ fn coerceToOptional(
     dest_ty: InternPool.Index,
 ) Error!Value {
     const ip = sema.intern_pool;
+    const dest = Type.fromIndex(dest_ty);
+    // Undefined sets the optional's presence bit to undefined too (compiler: coerceExtra's optional arm).
+    if (value.isUndef(ip)) return (try dest.onePossibleValue(sema)) orelse try sema.undefValue(dest);
     if (value.index == .null_value) {
         const idx = try ip.internOpt(.{ .ty = dest_ty, .val = .none });
         return .{ .index = idx };
@@ -8997,8 +9002,8 @@ fn evalTagName(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         },
         else => return sema.fail(sema.block, operand_src, "expected enum or union; found '{f}'", .{operand_ty.fmt(ip)}),
     };
+    if (operand.isUndef(ip)) return sema.failWithUseOfUndef();
     const casted_operand = try sema.coerceValueToType(operand, enum_ty.index);
-    if (casted_operand.isUndef(ip)) return sema.failWithUseOfUndef();
     const field_index = (try sema.enumTagFieldIndex(enum_ty.index, casted_operand)) orelse {
         return sema.failWithOwnedErrorMsg(sema.block, msg: {
             const msg = try sema.errMsg(src, "no field with value '{f}' in enum '{f}'", .{ render_value.fmt(casted_operand, ip), enum_ty.fmt(ip) });
