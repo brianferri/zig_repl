@@ -917,8 +917,8 @@ fn failWithNeededComptime(
 }
 
 /// Emit notes explaining why `ty` is comptime-only. `ty` is a comptime-only type reached from a
-/// "needs comptime" diagnostic. Struct/union/tuple field notes attach to `src` rather than the
-/// offending field, as the REPL's `LazySrcLoc` has no container-field offset.
+/// "needs comptime" diagnostic. Struct/union/tuple field notes attach to `src`,
+/// as the REPL's `LazySrcLoc` has no container-field offset.
 fn explainWhyTypeIsComptime(sema: *Sema, msg: *ErrorMsg, src: LazySrcLoc, ty: Type) Allocator.Error!void {
     const ip = sema.intern_pool;
     assert(ty.comptimeOnly(ip));
@@ -2591,7 +2591,7 @@ fn intCast(sema: *Sema, dest_ty: Type, dest_ty_src: LazySrcLoc, operand: Value, 
         return sema.fail(sema.block, operand_src, "unable to cast runtime value to 'comptime_int'", .{});
     }
     // The compiler emits an AIR `int_cast` for a runtime operand; with no AIR layer, the interpreter
-    // holds the value and performs the width refit directly (the runtime cast truncates rather than
+    // holds the value and performs the width refit directly (the runtime cast truncates instead of
     // raising a comptime range error).
     return sema.refitIntToFixedWidth(operand.index, dest_ty.index);
 }
@@ -5488,9 +5488,9 @@ fn coerceExtra(
     const value_type = Value.typeOf(value, ip);
     if (value_type.index == dest_ty) return value;
 
-    // The interpreter produces `undefined` as the untyped literal (`undefined_type`) rather than typing it
-    // from a result location as the compiler does, so coerce the bare literal to any destination here. A
-    // concretely-typed undefined value instead flows through the per-arm checks below (e.g. a `[*c]const T`
+    // The interpreter produces `undefined` as the untyped literal (`undefined_type`),
+    // so coerce the bare literal to any destination here.
+    // A concretely-typed undefined value instead flows through the per-arm checks below (e.g. a `[*c]const T`
     // undefined still fails a const-discarding pointer coercion).
     if (value_type.index == .undefined_type) return .{ .index = try ip.get(.{ .undef = dest_ty }) };
 
@@ -10697,7 +10697,7 @@ fn evalMemcpy(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
         return sema.fail(sema.block, sema.block.nodeOffset(sema.srcNodeOffset(inst)), "@memcpy: arguments alias", .{});
     }
 
-    // Implement @memcpy as a single array load and store rather than N element accesses.
+    // @memcpy as a single array load and store.
     const array_ty = try ip.internArrayType(.{ .len = len, .child = dest_elem.index });
     const dest_array_ptr_ty = try ip.internPtrType(info: {
         var info = dest_ty.ptrInfo(ip);
