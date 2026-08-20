@@ -2960,6 +2960,9 @@ fn cmpNumeric(sema: *Sema, uncasted_lhs: Value, uncasted_rhs: Value, op: std.mat
     else
         uncasted_rhs;
 
+    // The comparison depends on both values, so the result is undef if either is undef.
+    if (lhs.isUndef(ip) or rhs.isUndef(ip)) return .{ .index = .undef_bool };
+
     return boolValue(Value.compareHetero(lhs, op, rhs, ip));
 }
 
