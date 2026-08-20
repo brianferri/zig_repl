@@ -254,7 +254,15 @@ pub fn analyze(session: *Session, file_index: Session.Index, writer: *std.Io.Wri
         top_block.src_base_inst = bound.decl_inst;
         return try sema.evalReplExpression(bound.body, bound.decl_inst);
     }
+    const ns_idx = sema.block.namespace.?;
+    const comptime_start = intern_pool.namespacePtr(ns_idx).comptime_decls.items.len;
     try sema.bindDecls();
+    // Analyze the container-scope `comptime {}` blocks bound this pass. Re-read the namespace pointer per
+    // iteration: analyzing a block may intern a new type and reallocate the namespace list.
+    var cu_i = comptime_start;
+    while (cu_i < intern_pool.namespacePtr(ns_idx).comptime_decls.items.len) : (cu_i += 1) {
+        try sema.analyzeComptimeUnit(intern_pool.namespacePtr(ns_idx).comptime_decls.items[cu_i]);
+    }
     return null;
 }
 
@@ -11090,6 +11098,30 @@ fn bindAnonymousDecl(
         },
         else => unreachable,
     }
+}
+
+fn analyzeComptimeUnit(sema: *Sema, cu_id: InternPool.ComptimeUnit.Id) Error!void {
+    const unit = sema.intern_pool.getComptimeUnit(cu_id);
+    const decl_inst = unit.zir_index;
+    const zir_decl = sema.zir.getDeclaration(decl_inst);
+    assert(zir_decl.kind == .@"comptime");
+    const value_body = zir_decl.value_body.?;
+
+    const parent_block = sema.block;
+    var block: Block = .{
+        .namespace = unit.namespace,
+        .src_base_inst = decl_inst,
+        .type_name_ctx = parent_block.type_name_ctx,
+        .comptime_reason = .{ .reason = .{
+            .src = .{ .base_node_inst = decl_inst, .offset = LazySrcLoc.Offset.nodeOffset(.zero) },
+            .r = .{ .simple = .comptime_keyword },
+        } },
+    };
+    defer block.deinit(sema.gpa);
+    sema.block = &block;
+    defer sema.block = parent_block;
+
+    _ = try sema.resolveInlineBody(value_body, decl_inst);
 }
 
 fn evalErrorSetDecl(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {

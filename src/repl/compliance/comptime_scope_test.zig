@@ -49,6 +49,17 @@ test "comptime scope: a runtime narrowing in a called function is rejected" {
     );
 }
 
+// A container-scope `comptime {}` block is analyzed for its side effects, so illegal behavior inside it is caught as the compiler's comptime-unit analysis does.
+test "comptime scope: a container comptime block is evaluated" {
+    try compliance.check(a, &.{
+        .{ .src = &.{"comptime { _ = @as(u8, 300); }"}, .reject = true },
+        .{ .src = &.{"comptime { _ = @as(?i32, null).?; }"}, .reject = true },
+        .{ .src = &.{"comptime { const p: *u8 = undefined; _ = p.*; }"}, .reject = true },
+        .{ .src = &.{"comptime { var arr: [2]u8 = undefined; arr[5] = 1; }"}, .reject = true },
+    });
+    try compliance.expectDiagnostic(a, &.{"comptime { _ = @as(?i32, null).?; }"}, "unable to unwrap null");
+}
+
 // A nested container reads an enclosing declaration through a closure capture, which arises once the outer container is declared in a runtime function body.
 test "comptime scope: a nested container captures an enclosing declaration" {
     try compliance.check(a, &.{
