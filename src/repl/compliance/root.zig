@@ -516,6 +516,7 @@ fn expectRendersTrue(gpa: std.mem.Allocator, session: *Session, src: []const u8)
 // Pull every co-located compliance suite into the build so `zig build test`
 // discovers them; each file drives `check`/`expectDiagnostic` from this module.
 test {
+    _ = @import("adversarial_test.zig");
     _ = @import("aggregate_test.zig");
     _ = @import("arith_test.zig");
     _ = @import("array_ops_test.zig");

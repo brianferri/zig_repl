@@ -210,7 +210,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(terminal_tests).step);
     test_step.dependOn(&b.addRunArtifact(editor_tests).step);
 
-    // Standalone fuzz module; imports `repl` by name (see src/fuzz).
+    // Deterministic randomized stress; imports `repl` by name (see src/fuzz).
     const fuzz_module = b.createModule(.{
         .root_source_file = b.path("src/fuzz/root.zig"),
         .target = target,
@@ -223,8 +223,7 @@ pub fn build(b: *std.Build) void {
     // panics slicing it. Force LLVM until self-hosted fuzz coverage lands.
     //   https://codeberg.org/ziglang/zig/issues/30655
     const fuzz_tests = b.addTest(.{ .root_module = fuzz_module, .use_llvm = true });
-    const fuzz_step = b.step("fuzz", "Stress-test the interpreter (scale with -Dfuzz-iterations, reproduce with -Dfuzz-seed)");
-    fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
+    test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 }
 
 /// The running compiler's `std` source directory. Reuses the compiler's own

@@ -14,21 +14,6 @@ const Random = std.Random;
 
 const max_bytes = InputShape.max_input_bytes;
 
-// Coverage-guided entry point (`zig build fuzz --fuzz`); without `--fuzz` it replays
-// the corpus once. Newlines split a candidate into a session for cross-line paths.
-test "coverage-guided interpreter stress" {
-    try std.testing.fuzz({}, fuzzOne, .{ .corpus = &corpus.lines });
-}
-
-fn fuzzOne(_: void, smith: *std.testing.Smith) anyerror!void {
-    var buf: [max_bytes]u8 = undefined;
-    const n = smith.slice(buf[0..]);
-    if (n == 0) return;
-    var runner = harness.SessionRunner.init(gpa) orelse return;
-    defer runner.deinit();
-    var it = std.mem.splitScalar(u8, buf[0..n], '\n');
-    while (it.next()) |line| runner.feed(line);
-}
 const Strategy = enum { mutated_line, pristine_line, mutated_sequence, spliced_sequence };
 const Op = enum { flip, replace, insert, delete, duplicate };
 
