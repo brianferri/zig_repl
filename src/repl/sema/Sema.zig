@@ -7320,7 +7320,7 @@ fn evalStdLangValue(sema: *Sema, extended: Zir.Inst.Extended.InstData) Error!?Va
 fn evalTypeInfo(sema: *Sema, inst: Zir.Inst.Index) Error!?Value {
     const ip = sema.intern_pool;
     const un_node = sema.zir.instructions.items(.data)[@backingInt(inst)].un_node;
-    const ty = (try sema.resolveInst(un_node.operand)).index;
+    const ty = try sema.resolveDestType(un_node.operand);
 
     const type_info_ty = try sema.getStdLangType(.Type);
     const tag_enum = try sema.unionTagEnumType(type_info_ty);

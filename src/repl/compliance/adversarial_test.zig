@@ -35,6 +35,8 @@ test "adversarial: a value in a type position rejects" {
         .{ .src = &.{"const x: 5 = 1;"}, .reject = true },
         .{ .src = &.{"fn f(x: 5) void { _ = x; }"}, .reject = true },
         .{ .src = &.{"fn f() 5 { return 1; }"}, .reject = true },
+        .{ .src = &.{"@typeInfo(3)"}, .reject = true },
+        .{ .src = &.{"@typeInfo(struct { fn f() void {} }.f)"}, .reject = true },
     });
 }
 

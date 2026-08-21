@@ -395,3 +395,19 @@ test "compliance: @hasField and @hasDecl" {
         },
     });
 }
+
+test "compliance: @typeInfo reads type structure" {
+    @setEvalBranchQuota(20_000); // many cases, each comptime-rendering its want
+    try compliance.check(a, &.{
+        .{ .src = &.{"@typeInfo(u8).int.bits"}, .want = compliance.want(@typeInfo(u8).int.bits) },
+        .{ .src = &.{"@typeInfo(i64).int.signedness == .signed"}, .want = compliance.want(@typeInfo(i64).int.signedness == .signed) },
+        .{ .src = &.{"@typeInfo([4]u32).array.len"}, .want = compliance.want(@typeInfo([4]u32).array.len) },
+        .{ .src = &.{"@typeInfo([4]u32).array.child == u32"}, .want = compliance.want(@typeInfo([4]u32).array.child == u32) },
+        .{ .src = &.{"@typeInfo(*const u8).pointer.attrs.@\"const\""}, .want = compliance.want(@typeInfo(*const u8).pointer.attrs.@"const") },
+        .{ .src = &.{"@typeInfo(?u8).optional.child == u8"}, .want = compliance.want(@typeInfo(?u8).optional.child == u8) },
+        .{ .src = &.{"@typeInfo(fn (u8, u16) u8).@\"fn\".param_types.len"}, .want = compliance.want(@typeInfo(fn (u8, u16) u8).@"fn".param_types.len) },
+        .{ .src = &.{"@typeInfo(fn (u8) u8).@\"fn\".return_type.? == u8"}, .want = compliance.want(@typeInfo(fn (u8) u8).@"fn".return_type.? == u8) },
+        .{ .src = &.{"@typeInfo(enum { a, b, c }).@\"enum\".field_names.len"}, .want = compliance.want(@typeInfo(enum { a, b, c }).@"enum".field_names.len) },
+        .{ .src = &.{"@typeInfo(struct { x: u8, y: u16 }).@\"struct\".field_names.len"}, .want = compliance.want(@typeInfo(struct { x: u8, y: u16 }).@"struct".field_names.len) },
+    });
+}
